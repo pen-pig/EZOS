@@ -1,0 +1,22 @@
+# 工具链与备份（不入库）
+/tools/
+/archive/
+/src.broken/
+/src.rar
+/src.zip
+/dir.txt
+
+# 构建产物（全局匹配）
+*.o
+*.d
+*.bin
+*.img
+*.vhd
+*.ppm
+ninja.exe
+.ninja_log
+.ninja_deps
+build_auto.ninja
+
+# 旧备份源码
+gui_20260816_132824_254.c
