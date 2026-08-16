@@ -11,6 +11,7 @@ void mouse_handler(void);
 void irq12_handler(void);
 int mouse_get_wheel(void);   // >0 向上滚，<0 向下滚，0 无事件
 int mouse_present(void);     // 1 有指点设备，0 无
+int mouse_get_irq_count(void); // 调试：IRQ12 触发次数
 int mouse_get_x(void);       // 当前 X 坐标（屏幕像素）
 int mouse_get_y(void);       // 当前 Y 坐标（屏幕像素）
 int mouse_get_buttons(void); // 当前按钮状态（MOUSE_BTN_* 位组合）

@@ -1295,59 +1295,281 @@ static void cmd_vi(const char *args) {
 // ---- ��ͼ�� UI��VGA 320x200x256��----
 
 // ����ʽ��ֵ����������֧�� + - * / % �����ţ�
+// ---- 高精度大数（bigint），32*32=1024 位，约 308 位十进制 ----
+#define BIG_MAX_WORDS 32
+
+typedef struct {
+    int len;                    // 有效 word 数（0 表示 0）
+    int neg;                    // 符号
+    uint32_t w[BIG_MAX_WORDS];  // 低位在前
+} bigint;
+
+static void big_zero(bigint *a) { a->len = 0; a->neg = 0; }
+static int big_is_zero(const bigint *a) { return a->len == 0; }
+
+// 绝对值比较
+static int big_cmp(const bigint *a, const bigint *b) {
+    if (a->len != b->len) return a->len > b->len ? 1 : -1;
+    for (int i = a->len - 1; i >= 0; i--) {
+        if (a->w[i] != b->w[i]) return a->w[i] > b->w[i] ? 1 : -1;
+    }
+    return 0;
+}
+
+static void big_add_abs(bigint *r, const bigint *a, const bigint *b) {
+    bigint t; big_zero(&t);
+    uint32_t carry = 0;
+    int n = a->len > b->len ? a->len : b->len;
+    for (int i = 0; i < n; i++) {
+        uint64_t cur = (uint64_t)(i < a->len ? a->w[i] : 0) + (i < b->len ? b->w[i] : 0) + carry;
+        t.w[i] = (uint32_t)cur;
+        carry = (uint32_t)(cur >> 32);
+    }
+    if (carry) { t.w[n] = carry; n++; }
+    t.len = n;
+    while (t.len > 0 && t.w[t.len - 1] == 0) t.len--;
+    *r = t;
+}
+
+// 绝对值相减，要求 a >= b
+static void big_sub_abs(bigint *r, const bigint *a, const bigint *b) {
+    bigint t; big_zero(&t);
+    int64_t borrow = 0;
+    for (int i = 0; i < a->len; i++) {
+        int64_t cur = (int64_t)a->w[i] - (i < b->len ? b->w[i] : 0) - borrow;
+        if (cur < 0) { cur += 0x100000000LL; borrow = 1; } else borrow = 0;
+        t.w[i] = (uint32_t)cur;
+    }
+    t.len = a->len;
+    while (t.len > 0 && t.w[t.len - 1] == 0) t.len--;
+    *r = t;
+}
+
+static void big_add(bigint *r, const bigint *a, const bigint *b) {
+    if (a->neg == b->neg) {
+        big_add_abs(r, a, b);
+        r->neg = a->neg;
+    } else {
+        int c = big_cmp(a, b);
+        if (c >= 0) { big_sub_abs(r, a, b); r->neg = a->neg; }
+        else { big_sub_abs(r, b, a); r->neg = b->neg; }
+    }
+}
+
+static void big_sub(bigint *r, const bigint *a, const bigint *b) {
+    bigint nb = *b;
+    nb.neg = !nb.neg;
+    big_add(r, a, &nb);
+}
+
+static void big_mul(bigint *r, const bigint *a, const bigint *b) {
+    bigint t; big_zero(&t);
+    for (int i = 0; i < a->len; i++) {
+        uint32_t carry = 0;
+        for (int j = 0; j < b->len; j++) {
+            if (i + j >= BIG_MAX_WORDS) break;
+            uint64_t cur = (uint64_t)t.w[i + j] + (uint64_t)a->w[i] * b->w[j] + carry;
+            t.w[i + j] = (uint32_t)cur;
+            carry = (uint32_t)(cur >> 32);
+        }
+        int k = i + b->len;
+        while (carry && k < BIG_MAX_WORDS) {
+            uint64_t cur = (uint64_t)t.w[k] + carry;
+            t.w[k] = (uint32_t)cur;
+            carry = (uint32_t)(cur >> 32);
+            k++;
+        }
+    }
+    t.len = a->len + b->len;
+    if (t.len > BIG_MAX_WORDS) t.len = BIG_MAX_WORDS;
+    while (t.len > 0 && t.w[t.len - 1] == 0) t.len--;
+    t.neg = a->neg ^ b->neg;
+    *r = t;
+}
+
+static void big_mul_small(bigint *a, uint32_t m) {
+    uint32_t carry = 0;
+    for (int i = 0; i < a->len; i++) {
+        uint64_t cur = (uint64_t)a->w[i] * m + carry;
+        a->w[i] = (uint32_t)cur;
+        carry = (uint32_t)(cur >> 32);
+    }
+    if (carry && a->len < BIG_MAX_WORDS) a->w[a->len++] = carry;
+}
+
+static void big_add_small(bigint *a, uint32_t s) {
+    uint32_t carry = s;
+    for (int i = 0; i < a->len && carry; i++) {
+        uint64_t cur = (uint64_t)a->w[i] + carry;
+        a->w[i] = (uint32_t)cur;
+        carry = (uint32_t)(cur >> 32);
+    }
+    if (carry && a->len < BIG_MAX_WORDS) a->w[a->len++] = carry;
+}
+
+static uint32_t big_divmod_small(bigint *a, uint32_t d) {
+    uint64_t rem = 0;
+    for (int i = a->len - 1; i >= 0; i--) {
+        uint64_t cur = (rem << 32) | a->w[i];
+        a->w[i] = (uint32_t)(cur / d);
+        rem = cur % d;
+    }
+    while (a->len > 0 && a->w[a->len - 1] == 0) a->len--;
+    return (uint32_t)rem;
+}
+
+static int big_test_bit(const bigint *a, int bit) {
+    return (a->w[bit / 32] >> (bit % 32)) & 1;
+}
+
+static void big_set_bit(bigint *a, int bit) {
+    a->w[bit / 32] |= (1u << (bit % 32));
+    if (bit / 32 + 1 > a->len) a->len = bit / 32 + 1;
+}
+
+static void big_shift_left(bigint *r, int bits) {
+    if (big_is_zero(r)) return;
+    uint32_t carry = 0;
+    for (int i = 0; i < r->len; i++) {
+        uint64_t cur = ((uint64_t)r->w[i] << bits) | carry;
+        r->w[i] = (uint32_t)cur;
+        carry = (uint32_t)(cur >> 32);
+    }
+    if (carry && r->len < BIG_MAX_WORDS) r->w[r->len++] = carry;
+}
+
+static void big_divmod(bigint *q, bigint *rem, const bigint *a, const bigint *b) {
+    big_zero(q);
+    big_zero(rem);
+    if (big_is_zero(b)) return;
+    int total_bits = a->len * 32;
+    while (total_bits > 0 && !big_test_bit(a, total_bits - 1)) total_bits--;
+    for (int i = total_bits - 1; i >= 0; i--) {
+        big_shift_left(rem, 1);
+        if (big_test_bit(a, i)) {
+            if (rem->len == 0) rem->len = 1;
+            rem->w[0] |= 1;
+        }
+        if (big_cmp(rem, b) >= 0) {
+            big_sub_abs(rem, rem, b);
+            big_set_bit(q, i);
+        }
+    }
+    q->neg = a->neg ^ b->neg;
+    rem->neg = a->neg;
+}
+
+static void big_from_str(bigint *r, const char *s) {
+    big_zero(r);
+    if (*s == '-') { r->neg = 1; s++; }
+    while (*s >= '0' && *s <= '9') {
+        big_mul_small(r, 10);
+        big_add_small(r, (uint32_t)(*s - '0'));
+        s++;
+    }
+}
+
+static void big_to_str(const bigint *a, char *buf, int bufsize) {
+    bigint t = *a;
+    char tmp[BIG_MAX_WORDS * 10 + 2];
+    int i = 0;
+    if (big_is_zero(&t)) { buf[0] = '0'; buf[1] = '\0'; return; }
+    while (!big_is_zero(&t)) {
+        uint32_t rem = big_divmod_small(&t, 10);
+        tmp[i++] = (char)('0' + rem);
+    }
+    int j = 0;
+    if (a->neg) buf[j++] = '-';
+    while (i > 0 && j < bufsize - 1) buf[j++] = tmp[--i];
+    buf[j] = '\0';
+}
+
+// 表达式求值（高精度），支持 + - * / % 和括号
 static int gfx_expr_pos;
 static int gfx_expr_err;
 static const char *gfx_expr_str;
 
-static int gfx_expr_parse_expr(void);
+static bigint gfx_expr_parse_expr(void);
 
-static int gfx_expr_parse_factor(void) {
-    int v;
+static bigint gfx_expr_parse_factor(void) {
+    bigint v;
     if (gfx_expr_str[gfx_expr_pos] == '(') {
         gfx_expr_pos++;
         v = gfx_expr_parse_expr();
         if (gfx_expr_str[gfx_expr_pos] == ')') gfx_expr_pos++;
         return v;
     }
-    v = 0;
+    big_zero(&v);
     while (gfx_expr_str[gfx_expr_pos] >= '0' && gfx_expr_str[gfx_expr_pos] <= '9') {
-        v = v * 10 + (gfx_expr_str[gfx_expr_pos] - '0');
+        big_mul_small(&v, 10);
+        big_add_small(&v, (uint32_t)(gfx_expr_str[gfx_expr_pos] - '0'));
         gfx_expr_pos++;
     }
     return v;
 }
 
-static int gfx_expr_parse_term(void) {
-    int v = gfx_expr_parse_factor();
+static bigint gfx_expr_parse_term(void) {
+    bigint v = gfx_expr_parse_factor();
     while (1) {
         char c = gfx_expr_str[gfx_expr_pos];
-        if (c == '*') { gfx_expr_pos++; v *= gfx_expr_parse_factor(); }
-        else if (c == '/') { gfx_expr_pos++; int d = gfx_expr_parse_factor(); if (d != 0) v /= d; else gfx_expr_err = 1; }
-        else if (c == '%') { gfx_expr_pos++; int d = gfx_expr_parse_factor(); if (d != 0) v %= d; else gfx_expr_err = 1; }
+        if (c == '*') {
+            gfx_expr_pos++;
+            bigint f = gfx_expr_parse_factor();
+            bigint r; big_mul(&r, &v, &f);
+            v = r;
+        }
+        else if (c == '/') {
+            gfx_expr_pos++;
+            bigint d = gfx_expr_parse_factor();
+            if (!big_is_zero(&d)) {
+                bigint q, rem;
+                big_divmod(&q, &rem, &v, &d);
+                v = q;
+            } else gfx_expr_err = 1;
+        }
+        else if (c == '%') {
+            gfx_expr_pos++;
+            bigint d = gfx_expr_parse_factor();
+            if (!big_is_zero(&d)) {
+                bigint q, rem;
+                big_divmod(&q, &rem, &v, &d);
+                v = rem;
+            } else gfx_expr_err = 1;
+        }
         else break;
     }
     return v;
 }
 
-static int gfx_expr_parse_expr(void) {
-    int v = gfx_expr_parse_term();
+static bigint gfx_expr_parse_expr(void) {
+    bigint v = gfx_expr_parse_term();
     while (1) {
         char c = gfx_expr_str[gfx_expr_pos];
-        if (c == '+') { gfx_expr_pos++; v += gfx_expr_parse_term(); }
-        else if (c == '-') { gfx_expr_pos++; v -= gfx_expr_parse_term(); }
+        if (c == '+') {
+            gfx_expr_pos++;
+            bigint t = gfx_expr_parse_term();
+            bigint r; big_add(&r, &v, &t);
+            v = r;
+        }
+        else if (c == '-') {
+            gfx_expr_pos++;
+            bigint t = gfx_expr_parse_term();
+            bigint r; big_sub(&r, &v, &t);
+            v = r;
+        }
         else break;
     }
     return v;
 }
 
-static int gfx_eval(const char *s, int *ok) {
+static void gfx_eval(const char *s, bigint *out, int *ok) {
     gfx_expr_pos = 0;
     gfx_expr_err = 0;
     gfx_expr_str = s;
-    int v = gfx_expr_parse_expr();
+    bigint v = gfx_expr_parse_expr();
     while (gfx_expr_str[gfx_expr_pos] == ' ') gfx_expr_pos++;
     *ok = (gfx_expr_str[gfx_expr_pos] == '\0') && !gfx_expr_err;
-    return v;
+    *out = v;
 }
 
 #if 0  // ===== cmd_gfx 图形模式已注释（保留原代码），菜单已合并到 gui 文本模式 =====
@@ -1644,20 +1866,23 @@ static void print_int(int num) {
     print_dec((uint32_t)num);
 }
 
-// calc: ����ʽ������������ gfx_eval��
+// calc: 表达式求值（高精度），调用 gfx_eval
 void cmd_calc(const char *args) {
     if (*args == '\0') {
         terminal_writestring("Usage: calc <expr>   e.g. calc 1+2*3\n");
         return;
     }
     int ok = 0;
-    int v = gfx_eval(args, &ok);
+    bigint v;
+    gfx_eval(args, &v, &ok);
     if (!ok) {
         terminal_writestring("Error: bad expression\n");
         return;
     }
     terminal_writestring("= ");
-    print_int(v);
+    char buf[400];
+    big_to_str(&v, buf, sizeof(buf));
+    terminal_writestring(buf);
     terminal_writestring("\n");
 }
 

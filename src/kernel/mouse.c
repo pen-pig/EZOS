@@ -1,6 +1,7 @@
 #include "mouse.h"
 #include "port.h"
 #include "types.h"
+#include "tty.h"
 // #include "gfx.h"  // gfx 图形模式已注释
 
 #define MOUSE_WHEEL_BUF_SIZE 64
@@ -11,6 +12,7 @@ static int wheel_end = 0;
 
 static int mouse_available = 0;
 static int has_wheel = 0;
+static int mouse_irq_count = 0;  // 调试：IRQ12 触发次数
 
 static uint8_t packet[4];
 static int packet_index = 0;
@@ -58,6 +60,8 @@ static void mouse_cmd(uint8_t cmd) {
 
 void mouse_init(void) {
     uint8_t status;
+
+    terminal_writestring("mouse_init start\n");
 
     // 使能辅助端口
     ps2_wait_write();
@@ -112,9 +116,20 @@ void mouse_init(void) {
 
     // 使能数据报告
     mouse_cmd(0xF4);
+
+    terminal_writestring("mouse_init end, irq=");
+    // 简单十进制输出
+    {
+        int v = mouse_irq_count;
+        char buf[12]; int i = 0;
+        if (v == 0) { terminal_putchar('0'); }
+        else { while (v > 0 && i < 11) { buf[i++] = (char)('0' + v % 10); v /= 10; } while (i > 0) terminal_putchar(buf[--i]); }
+    }
+    terminal_writestring("\n");
 }
 
 void mouse_handler(void) {
+    mouse_irq_count++;
     if (!mouse_available) {
         outb(0xA0, 0x20);
         outb(0x20, 0x20);
@@ -179,6 +194,10 @@ int mouse_get_wheel(void) {
 
 int mouse_present(void) {
     return mouse_available;
+}
+
+int mouse_get_irq_count(void) {
+    return mouse_irq_count;
 }
 
 int mouse_get_x(void) {

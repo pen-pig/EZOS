@@ -11,6 +11,16 @@
 #define GUI_CHAR_W 8
 #define GUI_CHAR_H 16
 
+// 输出十进制数（调试用）
+static void gui_write_dec(int v) {
+    char buf[12];
+    int i = 0;
+    if (v < 0) { terminal_putchar('-'); v = -v; }
+    if (v == 0) { terminal_putchar('0'); return; }
+    while (v > 0 && i < 11) { buf[i++] = (char)('0' + v % 10); v /= 10; }
+    while (i > 0) terminal_putchar(buf[--i]);
+}
+
 // 读取一行输入（Enter 结束；Esc 或 q 返回 -1；支持退格）
 static int gui_read_line(char *buf, int maxlen) {
     int n = 0;
@@ -133,6 +143,8 @@ void gui_start(void) {
 
     // 鼠标点击边沿检测
     int prev_buttons = 0;
+    // 记录上次鼠标坐标，仅当鼠标移动时才跟随高亮（避免固定坐标覆盖键盘选择）
+    int last_mx = -1, last_my = -1;
 
     while (1) {
         terminal_initialize();
@@ -149,9 +161,13 @@ void gui_start(void) {
         int mouse_click = (mbuttons & MOUSE_BTN_LEFT) && !(prev_buttons & MOUSE_BTN_LEFT);
         prev_buttons = mbuttons;
 
-        // 鼠标悬停：若鼠标行落在菜单项区域，跟随高亮
-        if (mrow >= 2 && mrow < 2 + menu_count) {
-            selected = mrow - 2;
+        // 鼠标悬停：仅当鼠标可用且坐标发生变化时跟随高亮
+        if (mouse_present() && (mx != last_mx || my != last_my)) {
+            last_mx = mx;
+            last_my = my;
+            if (mrow >= 2 && mrow < 2 + menu_count) {
+                selected = mrow - 2;
+            }
         }
 
         for (int i = 0; i < menu_count; i++) {
@@ -170,6 +186,15 @@ void gui_start(void) {
         terminal_writestring("\nUse Up/Down (or W/S) to move, Enter to confirm.\n");
         terminal_writestring("Mouse: move to select, left-click to confirm.\n");
 
+        // 调试：显示鼠标 IRQ 计数与坐标
+        terminal_writestring("DBG irq=");
+        gui_write_dec(mouse_get_irq_count());
+        terminal_writestring(" x=");
+        gui_write_dec(mx);
+        terminal_writestring(" y=");
+        gui_write_dec(my);
+        terminal_writestring("\n");
+
         // 绘制鼠标光标（反显块），不超出屏幕
         if (mouse_present()) {
             if (mrow >= 0 && mrow < GUI_TXT_H && mcol >= 0 && mcol < GUI_TXT_W) {
@@ -180,8 +205,8 @@ void gui_start(void) {
             }
         }
 
-        // 鼠标点击菜单项 = 回车确认
-        if (mouse_click && mrow >= 2 && mrow < 2 + menu_count) {
+        // 鼠标点击菜单项 = 回车确认（仅当鼠标可用）
+        if (mouse_present() && mouse_click && mrow >= 2 && mrow < 2 + menu_count) {
             selected = mrow - 2;
             if (gui_run_app(selected)) return;
             continue;
