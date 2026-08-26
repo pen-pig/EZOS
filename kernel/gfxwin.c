@@ -2005,15 +2005,16 @@ static void term_draw(gw_window_t *w)
     int start = 0;
     if (term_nrows > rows) start = term_nrows - rows;
     /* 先整体填充终端底色，避免未写行露出白底/黑底导致颜色错乱 */
-    gw_fill(x, y, w->inner_w - 8, w->inner_h - 8, 0xE8E8E8);
+    gw_fill(x, y, w->inner_w - 8, w->inner_h - 8, 0xF0F0F0);
     for (int r = 0; r < rows; r++) {
         int src_row = start + r;
         if (src_row >= term_nrows) break;
         for (int c = 0; c < cols; c++) {
             char ch2 = term_buf[src_row * TERM_COLS + c];
             if (ch2 == 0) ch2 = ' ';
-            /* 终端常规配色：黑底 + 白字，输入行与历史行统一 */
-            gfx_draw_text(x + c * cw, y + r * ch, &ch2, 0x0F, 0x00);
+            /* 终端 Win10 配色：白底 + 黑字（透明背景绘制，
+             * 避免每个字符格被填成黑块导致“彩条/竖线”） */
+            gfx_draw_text_scaled(x + c * cw, y + r * ch, &ch2, 0x00, -1, 1);
         }
     }
     /* 光标 */
@@ -2021,7 +2022,7 @@ static void term_draw(gw_window_t *w)
     int cy = (term_caret / TERM_COLS) - start;
     if (cy < 0) cy = 0;
     if (cy >= rows) cy = rows - 1;
-    gfx_draw_text(x + cx * cw, y + cy * ch, "_", 0x0F, 0x00);
+    gfx_draw_text_scaled(x + cx * cw, y + cy * ch, "_", 0x00, -1, 1);
 }
 
 static void term_key(gw_window_t *w, int key)
