@@ -1,13 +1,12 @@
 @echo off
-chcp 936 >nul
 setlocal
 cd /d "%~dp0"
 
-rem ===== build-only 模式：只构建，不启动 QEMU，不 pause =====
+rem ===== build-only mode: build only, no QEMU, no pause =====
 set "BUILD_ONLY=0"
 if /i "%~1"=="build-only" set "BUILD_ONLY=1"
 
-rem ===== 自动探测 MyOS 根目录（遍历 C-H 盘找工具链） =====
+rem ===== auto-detect MyOS root (scan C-H drives for toolchain) =====
 set "MYOS_ROOT="
 for %%D in (C D E F G H) do (
     if not defined MYOS_ROOT (
@@ -15,27 +14,40 @@ for %%D in (C D E F G H) do (
     )
 )
 if not defined MYOS_ROOT (
-    echo [错误] 未找到 MyOS 工具链，请检查 E:\MyOS\tools 是否存在。
+    echo [ERROR] MyOS toolchain not found. Check that MyOS\tools exists on C-H drives.
     pause
     exit /b 1
 )
 
-rem ===== 生成带正确盘符的临时 ninja 文件 =====
+rem ===== generate temp ninja file with correct root path =====
+rem dynamically replace any drive-letter path (D:/MyOS or E:/MyOS), never hardcoded
 set "MYOS_ROOT_SLASH=%MYOS_ROOT:\=/%"
-powershell -NoProfile -Command "(Get-Content -Raw '%~dp0build.ninja') -replace 'E:/MyOS', '%MYOS_ROOT_SLASH%' | Set-Content -NoNewline '%~dp0build_auto.ninja'"
+powershell -NoProfile -Command "(Get-Content -Raw '%~dp0build.ninja') -replace '[A-Za-z]:/MyOS', '%MYOS_ROOT_SLASH%' | Set-Content -NoNewline '%~dp0build_auto.ninja'"
 
-rem ===== 多线程并行构建（-j 取 CPU 逻辑核数） =====
-set "NINJA_JOBS=%NUMBER_OF_PROCESSORS%"
-if "%BUILD_ONLY%"=="1" (
-    echo [build-only] ninja -j%NINJA_JOBS% 并行构建 os-image.bin（不启动 QEMU）...
-    ninja -f "%~dp0build_auto.ninja" -j%NINJA_JOBS% os-image.bin
+rem ===== ninja resolution: prefer ninja.exe next to this script, fallback to PATH =====
+set "NINJA=%~dp0ninja.exe"
+if not exist "%NINJA%" (
+    where ninja >nul 2>nul
     if errorlevel 1 (
-        echo [错误] 构建失败。
+        echo [ERROR] ninja not found. Add ninja to PATH or place it next to this script.
+        pause
         exit /b 1
     )
-    echo [build-only] 构建完成：os-image.bin
+    set "NINJA=ninja"
+)
+
+rem ===== parallel build (-j = CPU logical cores) =====
+set "NINJA_JOBS=%NUMBER_OF_PROCESSORS%"
+if "%BUILD_ONLY%"=="1" (
+    echo [build-only] ninja -j%NINJA_JOBS% building os-image.bin, no QEMU...
+    "%NINJA%" -f "%~dp0build_auto.ninja" -j%NINJA_JOBS% os-image.bin
+    if errorlevel 1 (
+        echo [ERROR] build failed.
+        exit /b 1
+    )
+    echo [build-only] build done: os-image.bin
     exit /b 0
 )
-echo [多线程] ninja -j%NINJA_JOBS% 并行构建并启动 QEMU...
-ninja -f "%~dp0build_auto.ninja" -j%NINJA_JOBS% run
+echo [parallel] ninja -j%NINJA_JOBS% building and launching QEMU...
+"%NINJA%" -f "%~dp0build_auto.ninja" -j%NINJA_JOBS% run
 pause

@@ -35,6 +35,8 @@ disk.img
 disk.img.bak_std
 *.bak
 *.bak_*
+*.bak[0-9]
+gui_2*.c
 .ninja_deps
 .ninja_log
 build.ninja
@@ -85,3 +87,6 @@ sindows_v2_ref/
 backups/
 *.hex
 ninja.exe
+b*.txt
+*_err.txt
+merge_*.txt
