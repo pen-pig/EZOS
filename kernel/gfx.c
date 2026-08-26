@@ -23,6 +23,10 @@ static inline void io_wait(void) {
     outb(0x80, 0);
 }
 
+/* VGA 8x16 文本字体的保存/恢复（plane 2），解决 GUI→文本模式切换后字体被破坏 */
+static void gfx_save_font(void);
+static void gfx_restore_font(void);
+
 static uint8_t font8x8[256][8];
 // 锟斤拷锟斤拷 8x8 锟斤拷锟藉（锟斤拷锟斤拷锟斤拷锟秸革拷锟斤拷锟街★拷锟斤拷写锟斤拷母锟斤拷锟斤拷锟矫凤拷锟脚ｏ拷
 static const uint8_t builtin_font[][8] = {
@@ -123,6 +127,7 @@ static const uint8_t builtin_font[][8] = {
     [0x7E] = {0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00}, // ~
 };// 鍒囨崲锟?? 320x200x256 鍥惧舰妯″紡锛圴GA 妯″紡 0x13锟??
 void gfx_init(void) {
+    gfx_save_font();   /* VBE 切换前保存文本模式 8x16 字体（plane2），供 gfx_restore_text 还原 */
     /* boot.asm 锟斤拷锟斤拷实模式锟斤拷锟? VBE 锟斤拷直锟斤拷锟教斤拷獠⑿达拷锟? 0x5000 锟结构锟斤拷
      *   0x5000: dword LFB 锟斤拷锟斤拷锟斤拷址锟斤拷0 = 锟睫匡拷锟斤拷模式锟斤拷锟斤拷锟斤拷 VGA 0x13锟斤拷
      *   0x5004: word  XRES
@@ -282,6 +287,50 @@ void gfx_dump_regs_dbg(void)
     gfx_dump_regs_dbg_line(0);
 }
 
+/* 进入图形模式前调用：把 VGA 8x16 文本字体（plane 2，SeaBIOS 已加载）读入内存。
+ * GUI 期间 0xA0000 平面被 LFB/bank 映射覆盖，字体随之被破坏，返回文本模式须还原。 */
+static uint8_t g_vga_font[256 * 16];
+static int g_vga_font_saved = 0;
+
+static void gfx_save_font(void) {
+    if (g_vga_font_saved) return;
+    outb(0x3CE, 0x06); outb(0x3CF, 0x05);  /* GC6 misc: odd/even off -> 线性读平面 */
+    outb(0x3CE, 0x05); outb(0x3CF, 0x00);  /* GC5: read mode 0 */
+    outb(0x3CE, 0x04); outb(0x3CF, 0x02);  /* GC4: read map plane 2 */
+    {
+        volatile uint8_t *fp = (volatile uint8_t*)0xA0000;
+        int n, j;
+        for (n = 0; n < 256; n++)
+            for (j = 0; j < 16; j++)
+                g_vga_font[n * 16 + j] = fp[n * 32 + j];
+    }
+    outb(0x3CE, 0x04); outb(0x3CF, 0x00);  /* read map plane 0 */
+    outb(0x3CE, 0x06); outb(0x3CF, 0x0E);  /* GC6 misc: 回文本模式 */
+    outb(0x3CE, 0x05); outb(0x3CF, 0x10);  /* GC5: read mode 1 */
+    g_vga_font_saved = 1;
+}
+
+/* 文本模式恢复时调用：把保存的 8x16 字体写回 plane 2，清掉图形阶段写入的残留字形。 */
+static void gfx_restore_font(void) {
+    if (!g_vga_font_saved) return;
+    outb(0x3C4, 0x04); outb(0x3C5, 0x04);  /* SC4: odd/even off */
+    outb(0x3C4, 0x02); outb(0x3C5, 0x04);  /* SC2: map mask plane 2 */
+    outb(0x3CE, 0x05); outb(0x3CF, 0x00);  /* GC5: write mode 0 */
+    outb(0x3CE, 0x06); outb(0x3CF, 0x04);  /* GC6: 图形平面写模式 */
+    {
+        volatile uint8_t *fp = (volatile uint8_t*)0xA0000;
+        int n, j;
+        for (n = 0; n < 256; n++)
+            for (j = 0; j < 16; j++)
+                fp[n * 32 + j] = g_vga_font[n * 16 + j];
+    }
+    outb(0x3CE, 0x04); outb(0x3CF, 0x02);  /* read map plane 2 */
+    outb(0x3CE, 0x05); outb(0x3CF, 0x10);  /* GC5: read mode 1 */
+    outb(0x3CE, 0x06); outb(0x3CF, 0x0E);  /* GC6: 文本模式 */
+    outb(0x3C4, 0x02); outb(0x3C5, 0x0F);  /* SC2: map mask 全部平面 */
+    outb(0x3C4, 0x04); outb(0x3C5, 0x03);  /* SC4: odd/even（文本模式） */
+}
+
 void gfx_restore_text(void) {
     /* disable VBE (bochs-vbe) first so VGA register sequence restores text mode */
     outw(0x1CE, 0x04); outw(0x1CF, 0x00);  /* VBE_DISPI_ENABLE = 0 */
@@ -379,25 +428,10 @@ void gfx_restore_text(void) {
         }
     }
 
-    /* Reload VGA 8x16 font into plane 2 so text mode shows glyphs after VBE LFB */
-#if 1 // EXPERIMENT5: 写 0x400..0x40F=0xFF，保持 GC4=2（read plane 2），供 QMP pmemsave 读回
-    outb(0x3C4, 0x04); outb(0x3C5, 0x04);   /* SC4 disable odd/even */
-    outb(0x3C4, 0x02); outb(0x3C5, 0x04);   /* SC2 map mask plane 2 */
-    outb(0x3CE, 0x05); outb(0x3CF, 0x00);   /* GC5 write mode 0 */
-    outb(0x3CE, 0x06); outb(0x3CF, 0x04);   /* GC6 graphics plane mode */
-    {
-        volatile uint8_t* fp = (volatile uint8_t*)0xA0000;
-        int fj;
-        for (fj = 0; fj < 16; fj++)
-            fp[0x400 + fj] = 0xFF;          /* 0x20 字形 16 行 = 全 1 */
-    }
-    outb(0x3CE, 0x04); outb(0x3CF, 0x02);   /* read map: plane 2（保持，供 QMP 读回） */
-#endif
-    outb(0x3CE, 0x04); outb(0x3CF, 0x02);   /* Read Map Select: plane 2（EXPERIMENT5 读回用） */
-    outb(0x3CE, 0x05); outb(0x3CF, 0x10);   /* Graphics Mode: read mode 1 */
-    outb(0x3CE, 0x06); outb(0x3CF, 0x0E);   /* Misc: text mode */
-    outb(0x3C4, 0x02); outb(0x3C5, 0x0F);   /* Map Mask: all planes */
-    outb(0x3C4, 0x04); outb(0x3C5, 0x03);   /* Memory Mode: odd/even */
+    /* Reload saved VGA 8x16 font into plane 2 so text mode shows clean glyphs
+     * after VBE LFB mapped over the 0xA0000 planes (removes the EXPERIMENT5
+     * 0x20=0xFF debug fill that produced colored blocks). */
+    gfx_restore_font();
 }
 
 void gfx_set_palette(void) {
