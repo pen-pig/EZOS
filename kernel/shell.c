@@ -10,6 +10,7 @@
 #include "mouse.h"
 #include "gfx.h"
 #include "gfxwin.h"
+#include "games.h"
 
 #define CMD_BUFFER_SIZE 128
 #define HISTORY_SIZE 8
@@ -1876,6 +1877,7 @@ static int read_line(char *buf, int maxlen) {
 // guess: 猜数字游戏
 void cmd_guess(const char *args) {
     (void)args;
+    if (games_gui_launch(1)) return;   /* 图形桌面：直接图形运行 */
     int target = (int)(my_rand() % 100) + 1;
     terminal_writestring("I picked a number 1-100. Guess it! (0 to quit)\n");
     char line[16];
@@ -1937,6 +1939,7 @@ static void tt_draw(char b[9]) {
 
 void cmd_tictactoe(const char *args) {
     (void)args;
+    if (games_gui_launch(2)) return;   /* 图形桌面：直接图形运行 */
     char b[9] = {0};
     terminal_writestring("Tic-Tac-Toe: you are X, AI is O. Enter 1-9.\n");
     while (1) {
@@ -2011,6 +2014,7 @@ static void delay_ticks(uint32_t ticks) {
 
 void cmd_snake(const char *args) {
     (void)args;
+    if (games_gui_launch(3)) return;   /* 图形桌面：直接图形运行 */
     int sx[SNAKE_MAX], sy[SNAKE_MAX];
     int len = 3;
     int dir = KEY_RIGHT;
