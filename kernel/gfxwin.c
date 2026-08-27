@@ -710,23 +710,6 @@ void gw_draw_taskbar(void)
     gw_fill(GFX_W - 19, ty + (th - 12) / 2 + 3, 4, 2, 0xAAAAAAu);
     gw_fill(GFX_W - 19, ty + (th - 12) / 2 + 7, 4, 2, 0xAAAAAAu);
     gfx_draw_text(tx, ty + (th - 8) / 2, tbuf, 0x0F, GW_C_TASKBAR);
-    /* [DEBUG] 鼠标坐标显示 */
-    {
-        char mbuf[24];
-        int mxx = mouse_get_x(), myy = mouse_get_y();
-        int len = 0;
-        if (mxx >= 1000) mbuf[len++] = '0' + mxx / 1000;
-        if (mxx >= 100) mbuf[len++] = '0' + (mxx / 100) % 10;
-        if (mxx >= 10) mbuf[len++] = '0' + (mxx / 10) % 10;
-        mbuf[len++] = '0' + mxx % 10;
-        mbuf[len++] = ',';
-        if (myy >= 1000) mbuf[len++] = '0' + myy / 1000;
-        if (myy >= 100) mbuf[len++] = '0' + (myy / 100) % 10;
-        if (myy >= 10) mbuf[len++] = '0' + (myy / 10) % 10;
-        mbuf[len++] = '0' + myy % 10;
-        mbuf[len] = 0;
-        gfx_draw_text(tx - 100, ty + (th - 8) / 2, mbuf, 0x0F, GW_C_TASKBAR);
-    }
 }
 
 /* ==================================================================
@@ -1996,7 +1979,10 @@ void gw_term_output(const char *s)
 
 static void term_draw(gw_window_t *w)
 {
-    int x = w->x + 4, y = w->y + GW_TITLE_H + 4;
+    /* 与窗口内容区对齐：内容区背景起点 = (w->x+1, w->y+GW_TITLE_H+1)。
+     * 旧代码用 x+4/y+T+4 相对内容区偏移(+3,+3)，导致字符笔画与 8px 网格错位
+     * （白底从内容区起、字形从+3起），看起来就是"乱码"。 */
+    int x = w->x + 1, y = w->y + GW_TITLE_H + 1;
     int cw = 8, ch = 16;
     int cols = (w->inner_w - 8) / cw;
     int rows = (w->inner_h - 8) / ch;
@@ -2425,6 +2411,10 @@ static void gw_game_yield(void)
     /* 图形游戏：先整窗清背景，再覆盖绘制画面，消除文本残留黑条纹 */
     gw_fill(tw->x + 4, tw->y + GW_TITLE_H + 4, tw->inner_w - 8, tw->inner_h - 8, 0xF0F0F0);
     gw_game_draw(tw);
+    /* 游戏期间 games_play 阻塞在主循环外，主循环末尾的光标绘制不执行；
+     * 这里每帧补画光标，否则图形游戏内看不到鼠标指针。下一帧整窗清背景
+     * 会先覆盖旧光标，因此无需背景缓存也不会有残影。 */
+    gw_cursor_draw(mouse_get_x(), mouse_get_y());
 }
 
 /* 运行单个游戏（idx 1..7），复用 Terminal 窗口宿主；不打印提示符，
@@ -2475,6 +2465,8 @@ static int gw_game_menu(void)
     int sel = 1;
     for (;;) {
         gw_game_draw_menu(tw, sel);
+        /* 菜单循环同样阻塞在主循环外，补画光标否则看不到指针 */
+        gw_cursor_draw(mouse_get_x(), mouse_get_y());
         int c = keyboard_getchar();
         if (c == 0) continue;
         if (c == 'q' || c == 'Q' || c == 0x1B) break;
