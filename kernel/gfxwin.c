@@ -38,6 +38,7 @@ static void term_print(const char *s);
 static void term_draw(gw_window_t *w);
 static void term_key(gw_window_t *w, int key);
 static void term_newline(void);
+static void term_prompt(void);
 static int term_nrows;
 static int gw_launch_game(int idx);
 static void gw_game_yield(void);
@@ -51,6 +52,21 @@ static int gw_strlen(const char *s)
     int n = 0;
     while (s[n]) n++;
     return n;
+}
+
+/* [DEBUG-MOUSE] 临时：十进制整数转字符串（用于任务栏坐标标定，验证后移除） */
+static void gw_itoa(int v, char *buf)
+{
+    int n = 0, i;
+    char tmp[12];
+    int neg = 0;
+    if (v < 0) { neg = 1; v = -v; }
+    if (v == 0) tmp[n++] = '0';
+    while (v) { tmp[n++] = '0' + (v % 10); v /= 10; }
+    i = 0;
+    if (neg) buf[i++] = '-';
+    while (n > 0) buf[i++] = tmp[--n];
+    buf[i] = 0;
 }
 
 static uint8_t gw_cmos_read(uint8_t reg)
@@ -339,7 +355,9 @@ static void gw_cursor_draw(int mx, int my)
         for (int i = 0; i < 16; i++) {
             char ch = gw_cursor_map[j][i];
             if (ch == '.') continue;
-            gw_px(mx + i, my + j, (ch == 'B') ? 0x000000u : 0xFFFFFFu);
+            int x = mx + i, y = my + j;
+            if (x < 0 || x >= GFX_W || y < 0 || y >= GFX_H) continue;
+            gw_px(x, y, (ch == 'B') ? 0x000000u : 0xFFFFFFu);
         }
     }
 }
@@ -699,6 +717,7 @@ void gw_draw_taskbar(void)
     /* 时钟（右侧）HH:MM + 小通知图标 */
     uint8_t hour = (uint8_t)((gw_bcd(gw_cmos_read(0x04)) + 8) % 24);   /* UTC+8 */
     uint8_t minute = (uint8_t)gw_bcd(gw_cmos_read(0x02));
+    if (minute > 59) minute = 0;   /* CMOS 无效值（BCD 0xFF -> 105）clamp */
     char tbuf[8];
     tbuf[0] = '0' + hour / 10; tbuf[1] = '0' + hour % 10;
     tbuf[2] = ':';
@@ -711,23 +730,6 @@ void gw_draw_taskbar(void)
     gw_fill(GFX_W - 19, ty + (th - 12) / 2 + 3, 4, 2, 0xAAAAAAu);
     gw_fill(GFX_W - 19, ty + (th - 12) / 2 + 7, 4, 2, 0xAAAAAAu);
     gfx_draw_text(tx, ty + (th - 8) / 2, tbuf, 0x0F, GW_C_TASKBAR);
-    /* [DEBUG] 鼠标坐标显示 */
-    {
-        char mbuf[24];
-        int mxx = mouse_get_x(), myy = mouse_get_y();
-        int len = 0;
-        if (mxx >= 1000) mbuf[len++] = '0' + mxx / 1000;
-        if (mxx >= 100) mbuf[len++] = '0' + (mxx / 100) % 10;
-        if (mxx >= 10) mbuf[len++] = '0' + (mxx / 10) % 10;
-        mbuf[len++] = '0' + mxx % 10;
-        mbuf[len++] = ',';
-        if (myy >= 1000) mbuf[len++] = '0' + myy / 1000;
-        if (myy >= 100) mbuf[len++] = '0' + (myy / 100) % 10;
-        if (myy >= 10) mbuf[len++] = '0' + (myy / 10) % 10;
-        mbuf[len++] = '0' + myy % 10;
-        mbuf[len] = 0;
-        gfx_draw_text(tx - 100, ty + (th - 8) / 2, mbuf, 0x0F, GW_C_TASKBAR);
-    }
 }
 
 /* ==================================================================
@@ -955,8 +957,8 @@ static void fm_refresh(void)
 {
     fm_count = exfat_read_dir(fm_entries, 40);
     if (fm_count < 0) fm_count = 0;
-    if (fm_scroll > fm_count) fm_scroll = 0;
-    if (fm_sel > fm_count) fm_sel = 0;
+    if (fm_scroll >= fm_count) fm_scroll = 0;
+    if (fm_sel >= fm_count) fm_sel = 0;
 }
 
 static void fm_enter(int idx)
@@ -1366,6 +1368,13 @@ static void clock_draw(gw_window_t *w)
     uint8_t second = (uint8_t)gw_bcd(gw_cmos_read(0x00));
     uint8_t day = (uint8_t)gw_bcd(gw_cmos_read(0x07));
     uint8_t month = (uint8_t)gw_bcd(gw_cmos_read(0x08));
+    /* CMOS 无效值（如全 0xFF，BCD 解码可到 105）clamp 到合法范围，
+     * 防止 second/minute 超过 59 越界读 gw_sin128/gw_cos128（仅 60 项） */
+    if (hour > 23) hour = 0;
+    if (minute > 59) minute = 0;
+    if (second > 59) second = 0;
+    if (day < 1 || day > 31) day = 1;
+    if (month < 1 || month > 12) month = 1;
 
     gw_draw_circle(cx, cy, r, 0x333333u);
     gw_draw_circle(cx, cy, r - 1, 0x333333u);
@@ -1533,6 +1542,7 @@ static gw_window_t *gw_spawn_app(int idx)
             term_print("EZOS Terminal - type 'help' for commands");
             term_newline();
         }
+        term_prompt();   /* 打印 "> " 提示符，输入从提示符后开始 */
         break;
     default:
         break;
@@ -1786,6 +1796,17 @@ void gw_handle_mouse(int mx, int my, int buttons)
 
 void gw_handle_key(int key)
 {
+    if (!gw_focused_wnd) {
+        /* 桌面调试热键（排障复现用，正式版可移除）：
+         * m=开/关开始菜单  t=打开Terminal  s=Snake  d=2048  q=退出GUI回终端 */
+        if (key == 'm' || key == 'M') { gw_start_menu_active = !gw_start_menu_active; return; }
+        if (key == 'q' || key == 'Q') { gw_quit = 1; return; }
+        if (key == 't' || key == 'T') { gw_launch_app(GW_APP_TERMINAL); return; }
+        if (key == 's' || key == 'S' || key == 'd' || key == 'D') {
+            gw_launch_game((key == 's' || key == 'S') ? 3 : 4);
+            return;
+        }
+    }
     if (gw_focused_wnd && gw_focused_wnd->key)
         gw_focused_wnd->key(gw_focused_wnd, key);
 }
@@ -1948,6 +1969,36 @@ static char term_buf[TERM_ROWS * TERM_COLS];
 static int term_nrows = 0;
 static int term_caret = 0;
 
+/* [DEBUG-TERMBUF] 临时访问函数：供任务栏调试打印 term_buf/游标状态 */
+void term_dbg_dump(char *hx, int maxb)
+{
+    static const char hd[] = "0123456789ABCDEF";
+    int k = 0, i;
+    for (i = 0; i < maxb && i < TERM_ROWS * TERM_COLS; i++) {
+        unsigned char b = (unsigned char)term_buf[i];
+        hx[k++] = hd[b >> 4];
+        hx[k++] = hd[b & 15];
+    }
+    hx[k] = 0;
+}
+int term_dbg_nrows(void) { return term_nrows; }
+int term_dbg_caret(void) { return term_caret; }
+static char term_input[TERM_COLS + 1];   /* 独立输入行缓冲（避免滚动/参数空格导致命令错乱） */
+static int  term_input_len = 0;
+
+static void term_input_reset(void)
+{
+    term_input_len = 0;
+    term_input[0] = 0;
+}
+
+/* 打印 shell 提示符并清空输入缓冲 */
+static void term_prompt(void)
+{
+    term_print("> ");
+    term_input_reset();
+}
+
 static void term_newline(void)
 {
     while (term_caret % TERM_COLS != 0) term_buf[term_caret++] = ' ';
@@ -1959,16 +2010,21 @@ static void term_newline(void)
     term_nrows = term_caret / TERM_COLS + 1;
 }
 
+static void term_scroll_if_full(void)
+{
+    if (term_caret >= TERM_ROWS * TERM_COLS) {
+        for (int _ti = 0; _ti < (TERM_ROWS - 1) * TERM_COLS; _ti++)
+            term_buf[_ti] = term_buf[_ti + TERM_COLS];
+        term_caret -= TERM_COLS;
+    }
+}
+
 static void term_print(const char *s)
 {
     while (*s) {
         if (*s == '\n') { term_newline(); s++; continue; }
+        term_scroll_if_full();   /* 写入前滚动，防止 term_buf[1920] 越界写 */
         term_buf[term_caret++] = *s++;
-        if (term_caret >= TERM_ROWS * TERM_COLS) {
-            for (int _ti = 0; _ti < (TERM_ROWS - 1) * TERM_COLS; _ti++)
-                term_buf[_ti] = term_buf[_ti + TERM_COLS];
-            term_caret -= TERM_COLS;
-        }
     }
     term_nrows = term_caret / TERM_COLS + 1;
 }
@@ -1981,7 +2037,10 @@ void gw_term_output(const char *s)
 
 static void term_draw(gw_window_t *w)
 {
-    int x = w->x + 4, y = w->y + GW_TITLE_H + 4;
+    /* 与窗口内容区对齐：内容区背景起点 = (w->x+1, w->y+GW_TITLE_H+1)。
+     * 旧代码用 x+4/y+T+4 相对内容区偏移(+3,+3)，导致字符笔画与 8px 网格错位
+     * （白底从内容区起、字形从+3起），看起来就是"乱码"。 */
+    int x = w->x + 1, y = w->y + GW_TITLE_H + 1;
     int cw = 8, ch = 16;
     int cols = (w->inner_w - 8) / cw;
     int rows = (w->inner_h - 8) / ch;
@@ -1989,13 +2048,18 @@ static void term_draw(gw_window_t *w)
     if (rows > TERM_ROWS) rows = TERM_ROWS;
     int start = 0;
     if (term_nrows > rows) start = term_nrows - rows;
+    /* 先整体填充终端底色，避免未写行露出白底/黑底导致颜色错乱 */
+    gw_fill(x, y, w->inner_w - 8, w->inner_h - 8, 0xF0F0F0);
     for (int r = 0; r < rows; r++) {
         int src_row = start + r;
         if (src_row >= term_nrows) break;
         for (int c = 0; c < cols; c++) {
-            char ch2 = term_buf[src_row * TERM_COLS + c];
-            if (ch2 == 0) ch2 = ' ';
-            gfx_draw_text(x + c * cw, y + r * ch, &ch2, 0x0A, 0x00);
+            char ch2[2];
+            ch2[0] = term_buf[src_row * TERM_COLS + c];
+            if (ch2[0] == 0) ch2[0] = ' ';
+            ch2[1] = 0;   /* NUL-terminate: gfx_draw_text_scaled stops at NUL */
+            /* Win10 palette: white bg + black fg (transparent bg draw) */
+            gfx_draw_text_scaled(x + c * cw, y + r * ch, ch2, 0x00, -1, 1);
         }
     }
     /* 光标 */
@@ -2003,44 +2067,364 @@ static void term_draw(gw_window_t *w)
     int cy = (term_caret / TERM_COLS) - start;
     if (cy < 0) cy = 0;
     if (cy >= rows) cy = rows - 1;
-    gfx_draw_text(x + cx * cw, y + cy * ch, "_", 0x0F, 0x00);
+    gfx_draw_text_scaled(x + cx * cw, y + cy * ch, "_", 0x00, -1, 1);
 }
 
 static void term_key(gw_window_t *w, int key)
 {
     if (key == '\n' || key == '\r') {
-        /* 执行当前行 */
+        /* 执行输入缓冲中的完整命令（保留空格参数） */
         char line[TERM_COLS + 1];
-        int len = 0;
-        int row = term_caret / TERM_COLS;
-        for (int c = 0; c < TERM_COLS; c++) {
-            char ch2 = term_buf[row * TERM_COLS + c];
-            if (ch2 == ' ' || ch2 == 0) break;
-            line[len++] = ch2;
-        }
+        int len = term_input_len;
+        if (len > TERM_COLS) len = TERM_COLS;
+        for (int i = 0; i < len; i++) line[i] = term_input[i];
         line[len] = 0;
         term_newline();
-        shell_exec_line(line);
+        if (len > 0) shell_exec_line(line);
         term_newline();
+        term_prompt();
     } else if (key == 0x08) {  /* Backspace */
-        if (term_caret > 0 && term_caret % TERM_COLS != 0) term_caret--;
-        term_buf[term_caret] = ' ';
-    } else if (key >= 0x20 && key < 0x7F) {
-        term_buf[term_caret++] = (char)key;
-        if (term_caret >= TERM_ROWS * TERM_COLS) {
-            for (int _ti = 0; _ti < (TERM_ROWS - 1) * TERM_COLS; _ti++)
-                term_buf[_ti] = term_buf[_ti + TERM_COLS];
-            term_caret -= TERM_COLS;
+        if (term_input_len > 0) {
+            term_input_len--;
+            term_input[term_input_len] = 0;
+            if (term_caret > 0 && term_caret % TERM_COLS != 0) {
+                term_caret--;
+                term_buf[term_caret] = ' ';
+            }
         }
+    } else if (key >= 0x20 && key < 0x7F) {
+        if (term_input_len < TERM_COLS) {
+            term_input[term_input_len++] = (char)key;
+            term_input[term_input_len] = 0;
+        }
+        term_scroll_if_full();   /* scroll before write: prevent term_buf[1920] overflow */
+        term_buf[term_caret++] = (char)key;
         term_nrows = term_caret / TERM_COLS + 1;
     }
+}
+
+/* ==================================================================
+ * 游戏图形绘制：基于 games.h 导出状态，把 7 个游戏画成图形界面。
+ * 猜数字(1) 本身走文本缓冲（games_gfx_buf），其余由本组函数绘制。
+ * ================================================================== */
+static void gw_game_draw_text_center(int x, int y, int w, int h, const char *s, uint8_t fg, int scale)
+{
+    if (scale < 1) scale = 1;
+    int len = 0;
+    while (s[len]) len++;
+    int tw = len * 8 * scale;
+    gfx_draw_text_scaled(x + (w - tw) / 2, y + (h - 8 * scale) / 2, s, fg, -1, scale);
+}
+
+static void gw_draw_score_line(int x, int y, const char *label, int value, uint8_t fg)
+{
+    char buf[24];
+    int n = 0, i = 0;
+    while (label[i]) buf[n++] = label[i++];
+    if (value == 0) {
+        buf[n++] = '0';
+    } else {
+        char d[8];
+        int m = 0;
+        while (value) { d[m++] = (char)('0' + value % 10); value /= 10; }
+        while (m) buf[n++] = d[--m];
+    }
+    buf[n] = 0;
+    gfx_draw_text(x, y, buf, fg, 0);
+}
+
+static void gw_game_draw_tic(gw_window_t *w)
+{
+    int x0 = w->x + 4, y0 = w->y + GW_TITLE_H + 4;
+    int iw = w->inner_w - 8, ih = w->inner_h - 8;
+    int cw = iw / 3, chh = ih / 3;
+    if (cw < 16) cw = 16;
+    if (chh < 16) chh = 16;
+    int bw = cw * 3, bh = chh * 3;
+    int ox = x0 + (iw - bw) / 2, oy = y0 + (ih - bh) / 2;
+    gw_fill(ox - 3, oy - 3, bw + 6, bh + 6, 0xE8E8E8);
+    for (int i = 1; i < 3; i++) {
+        gw_fill(ox + i * cw - 1, oy, 2, bh, 0x606060);
+        gw_fill(ox, oy + i * chh - 1, bw, 2, 0x606060);
+    }
+    for (int r = 0; r < 3; r++) {
+        for (int c = 0; c < 3; c++) {
+            int b = games_tic_board(r * 3 + c);
+            if (b != 'X' && b != 'O') continue;
+            char s[2] = { (char)b, 0 };
+            int scale = (chh < cw ? chh : cw) / 12;
+            if (scale < 1) scale = 1;
+            if (scale > 6) scale = 6;
+            gw_game_draw_text_center(ox + c * cw, oy + r * chh, cw, chh, s,
+                                     (b == 'X') ? 0x0C : 0x09, scale);
+        }
+    }
+}
+
+static void gw_game_draw_snake(gw_window_t *w)
+{
+    int x0 = w->x + 4, y0 = w->y + GW_TITLE_H + 4;
+    int iw = w->inner_w - 8, ih = w->inner_h - 8;
+    int cell = (iw / 20 < ih / 10) ? iw / 20 : ih / 10;
+    if (cell < 3) cell = 3;
+    int bw = cell * 20, bh = cell * 10;
+    int ox = x0 + (iw - bw) / 2, oy = y0 + (ih - bh) / 2;
+    gw_fill(ox - 2, oy - 2, bw + 4, bh + 4, 0x202020);
+    for (int y = 0; y < 10; y++)
+        for (int x = 0; x < 20; x++)
+            gw_fill(ox + x * cell + 1, oy + y * cell + 1, cell - 1, cell - 1, 0x181818);
+    gw_fill(ox + games_snake_food_x() * cell + 1, oy + games_snake_food_y() * cell + 1,
+            cell - 1, cell - 1, 0xE04040);
+    int n = games_snake_len();
+    for (int i = 0; i < n; i++) {
+        int sx = games_snake_body_x(i), sy = games_snake_body_y(i);
+        uint32_t col = (i == n - 1) ? 0x50E050 : 0x10A010;
+        gw_fill(ox + sx * cell + 1, oy + sy * cell + 1, cell - 1, cell - 1, col);
+    }
+    gfx_draw_text(ox, oy + bh + 6,
+                  games_snake_alive() ? "Arrows: move   Q: quit" : "Game Over - press Q",
+                  0x0F, 0);
+}
+
+static void gw_game_draw_2048(gw_window_t *w)
+{
+    int x0 = w->x + 4, y0 = w->y + GW_TITLE_H + 4;
+    int iw = w->inner_w - 8, ih = w->inner_h - 8;
+    int cell = (iw / 4 < ih / 5) ? iw / 4 : ih / 5;
+    if (cell < 12) cell = 12;
+    int bw = cell * 4, bh = cell * 4;
+    int ox = x0 + (iw - bw) / 2, oy = y0 + (ih - 8 - bh) / 2;
+    gw_fill(ox - 4, oy - 4, bw + 8, bh + 8, 0xBBADA0);
+    for (int i = 0; i < 16; i++) {
+        int r = i / 4, c = i % 4;
+        int v = games_2048_cell(i);
+        uint32_t col = 0xCDC1B4;
+        if (v >= 128) col = 0xEDC22E;
+        else if (v >= 64) col = 0xF65E3B;
+        else if (v >= 32) col = 0xF67C5F;
+        else if (v >= 16) col = 0xF59563;
+        else if (v >= 8) col = 0xF2B179;
+        else if (v >= 4) col = 0xEDE0C8;
+        else if (v >= 2) col = 0xEEE4DA;
+        gw_fill(ox + c * cell + 2, oy + r * cell + 2, cell - 4, cell - 4, col);
+        if (v > 0) {
+            char num[8];
+            int len = 0, t = v;
+            do { num[len++] = (char)('0' + t % 10); t /= 10; } while (t);
+            for (int k = 0; k < len / 2; k++) {
+                char tmp = num[k]; num[k] = num[len - 1 - k]; num[len - 1 - k] = tmp;
+            }
+            num[len] = 0;
+            int scale = cell / 14;
+            if (scale < 1) scale = 1;
+            if (scale > 5) scale = 5;
+            gw_game_draw_text_center(ox + c * cell, oy + r * cell, cell, cell, num,
+                                     (v >= 8) ? 0x0F : 0x08, scale);
+        }
+    }
+    gfx_draw_text(ox, oy + bh + 8, "Arrows: slide   R: restart   Q: quit", 0x0F, 0);
+}
+
+static void gw_game_draw_ms(gw_window_t *w)
+{
+    int x0 = w->x + 4, y0 = w->y + GW_TITLE_H + 4;
+    int iw = w->inner_w - 8, ih = w->inner_h - 8;
+    int cell = (iw / 9 < ih / 9) ? iw / 9 : ih / 9;
+    if (cell < 6) cell = 6;
+    int bw = cell * 9, bh = cell * 9;
+    int ox = x0 + (iw - bw) / 2, oy = y0 + (ih - bh) / 2;
+    gw_fill(ox - 2, oy - 2, bw + 4, bh + 4, 0x606060);
+    for (int r = 0; r < 9; r++) {
+        for (int c = 0; c < 9; c++) {
+            int px = ox + c * cell, py = oy + r * cell;
+            int rev = games_ms_revealed(r, c);
+            int flg = games_ms_flagged(r, c);
+            int v = games_ms_cell(r, c);
+            gw_fill(px + 1, py + 1, cell - 2, cell - 2, rev ? 0xD0D0D0 : 0x9E9E9E);
+            if (flg) {
+                gw_game_draw_text_center(px, py, cell, cell, "F", 0x0C, 1);
+            } else if (rev) {
+                if (v == 9) {
+                    gw_game_draw_text_center(px, py, cell, cell, "*", 0x00, 1);
+                } else if (v > 0) {
+                    char s[2] = { (char)('0' + v), 0 };
+                    uint8_t ci = (v == 1) ? 0x09 : (v == 2) ? 0x0A : (v == 3) ? 0x0C : 0x0D;
+                    gw_game_draw_text_center(px, py, cell, cell, s, ci, 1);
+                }
+            }
+        }
+    }
+    gw_frame(ox + games_ms_cursor_x() * cell, oy + games_ms_cursor_y() * cell, cell, cell, 0x0000E0);
+    gfx_draw_text(ox, oy + bh + 6, "Arrows: move  Enter: open  F: flag  Q: quit", 0x0F, 0);
+}
+
+static void gw_game_draw_rps(gw_window_t *w)
+{
+    int x0 = w->x + 4, y0 = w->y + GW_TITLE_H + 4;
+    int iw = w->inner_w - 8, ih = w->inner_h - 8;
+    gw_fill(x0, y0, iw, ih, 0xF4F4F4);
+    gw_game_draw_text_center(x0, y0 + 8, iw, 18, "Rock Paper Scissors", 0x06, 2);
+    int colw = iw / 3;
+    gw_draw_score_line(x0 + 8, y0 + 34, "You : ", games_rps_pwins(), 0x0A);
+    gw_draw_score_line(x0 + colw + 8, y0 + 34, "CPU: ", games_rps_cwins(), 0x0C);
+    gw_draw_score_line(x0 + colw * 2 + 8, y0 + 34, "Draw: ", games_rps_draws(), 0x08);
+    int lp = games_rps_last_p(), lc = games_rps_last_c();
+    char ps[2] = { 0 }, cs[2] = { 0 };
+    if (lp >= 1 && lp <= 3) ps[0] = "RPS"[lp - 1];
+    if (lc >= 1 && lc <= 3) cs[0] = "RPS"[lc - 1];
+    int half = ih / 2 + 10;
+    if (lp) {
+        gw_game_draw_text_center(x0, y0 + half - 44, iw / 2, 32, ps, 0x09, 3);
+        gw_game_draw_text_center(x0, y0 + half - 12, iw / 2, 14, "YOU", 0x01, 1);
+    }
+    if (lc) {
+        gw_game_draw_text_center(x0 + iw / 2, y0 + half - 44, iw / 2, 32, cs, 0x0C, 3);
+        gw_game_draw_text_center(x0 + iw / 2, y0 + half - 12, iw / 2, 14, "CPU", 0x04, 1);
+    }
+    int d = games_rps_last_d();
+    if (d >= 0) {
+        const char *res = (d == 1) ? "You win!" : (d == 2) ? "CPU wins" : "Draw";
+        gw_game_draw_text_center(x0, y0 + ih - 36, iw, 16, res,
+                                 (d == 1) ? 0x0A : (d == 2) ? 0x0C : 0x08, 2);
+    }
+    gfx_draw_text(x0 + 8, y0 + ih - 14, "1:Rock  2:Paper  3:Scissors   Q:quit", 0x00, 0);
+}
+
+static void gw_game_draw_mem(gw_window_t *w)
+{
+    int x0 = w->x + 4, y0 = w->y + GW_TITLE_H + 4;
+    int iw = w->inner_w - 8, ih = w->inner_h - 8;
+    int cell = (iw / 4 < ih / 5) ? iw / 4 : ih / 5;
+    if (cell < 12) cell = 12;
+    int bw = cell * 4, bh = cell * 4;
+    int ox = x0 + (iw - bw) / 2, oy = y0 + (ih - 8 - bh) / 2;
+    gw_fill(ox - 3, oy - 3, bw + 6, bh + 6, 0x103040);
+    for (int i = 0; i < 16; i++) {
+        int r = i / 4, c = i % 4;
+        int face = games_mem_face(i), show = games_mem_show(i);
+        uint32_t col = face ? 0x40C040 : (show ? 0xFFFFFF : 0x2A6BB8);
+        gw_fill(ox + c * cell + 2, oy + r * cell + 2, cell - 4, cell - 4, col);
+        if (face || show) {
+            char s[2] = { (char)games_mem_cell(i), 0 };
+            gw_game_draw_text_center(ox + c * cell, oy + r * cell, cell, cell, s, 0x00, 2);
+        }
+    }
+    gw_frame(ox + games_mem_cursor_x() * cell, oy + games_mem_cursor_y() * cell, cell, cell, 0xE03030);
+    gfx_draw_text(ox, oy + bh + 8, "Arrows: move  Enter: flip  Q: quit", 0x0F, 0);
+}
+
+/* 分派：当前游戏类型对应的图形绘制（kind 1 猜数字走文本缓冲） */
+static void gw_game_draw(gw_window_t *w)
+{
+    int kind = games_gfx_kind();
+    switch (kind) {
+    case 2: gw_game_draw_tic(w); break;
+    case 3: gw_game_draw_snake(w); break;
+    case 4: gw_game_draw_2048(w); break;
+    case 5: gw_game_draw_ms(w); break;
+    case 6: gw_game_draw_rps(w); break;
+    case 7: gw_game_draw_mem(w); break;
+    default: break;
+    }
+}
+
+/* 游戏合集图形菜单 */
+static void gw_game_draw_menu(gw_window_t *w, int sel)
+{
+    int x0 = w->x + 4, y0 = w->y + GW_TITLE_H + 4;
+    int iw = w->inner_w - 8, ih = w->inner_h - 8;
+    gw_fill(x0, y0, iw, ih, 0xF0F0F0);
+    gw_game_draw_text_center(x0, y0 + 8, iw, 20, "EZOS Games", 0x06, 2);
+    static const char *names[7] = {
+        "1  Guess the Number", "2  Tic-Tac-Toe", "3  Snake",
+        "4  2048", "5  Minesweeper", "6  Rock-Paper-Scissors", "7  Memory"
+    };
+    int row_h = (ih - 60) / 7;
+    if (row_h < 12) row_h = 12;
+    for (int i = 0; i < 7; i++) {
+        int ry = y0 + 40 + i * row_h;
+        if (i + 1 == sel) {
+            gw_fill(x0 + 20, ry, iw - 40, row_h - 4, 0x2A6BB8);
+            gfx_draw_text(x0 + 40, ry + (row_h - 8) / 2, names[i], 0x0F, 0);
+        } else {
+            gfx_draw_text(x0 + 40, ry + (row_h - 8) / 2, names[i], 0x00, 0);
+        }
+    }
+    gfx_draw_text(x0 + 20, y0 + ih - 18, "Up/Down: select  Enter: run  Q: back", 0x08, 0);
 }
 
 /* ==================================================================
  * 游戏宿主：桌面图标启动游戏，复用 Terminal 窗口渲染 24x80 缓冲
  * ================================================================== */
 
-/* 游戏 GUI yield 回调：把 games_gfx_buf 同步到终端窗口缓冲并局部重绘 */
+/* 把鼠标坐标映射为当前游戏语义坐标（棋盘行列 / 方向 / 出拳）。
+ * 返回 0=未命中游戏区，1=命中；a/b 含义随 kind 而定：
+ *   2: a=row b=col (0..2)   3/4: a=方向(0上 1下 2左 3右)
+ *   5: a=row b=col (0..8)   6: a=1..3（Rock/Paper/Scissors）
+ *   7: a=row b=col (0..3) */
+static int gw_game_mouse_cell(gw_window_t *tw, int kind, int *a, int *b)
+{
+    if (!tw) return 0;
+    int mx = mouse_get_x(), my = mouse_get_y();
+    int x0 = tw->x + 4, y0 = tw->y + GW_TITLE_H + 4;
+    int iw = tw->inner_w - 8, ih = tw->inner_h - 8;
+    if (mx < x0 || my < y0 || mx >= x0 + iw || my >= y0 + ih) return 0;
+    int ox, oy, bw, bh, cell;
+    switch (kind) {
+    case 2:   /* 井字棋 3x3 */
+        cell = (iw / 3 < ih / 3) ? iw / 3 : ih / 3;
+        if (cell < 16) cell = 16;
+        bw = cell * 3; bh = cell * 3;
+        ox = x0 + (iw - bw) / 2; oy = y0 + (ih - bh) / 2;
+        if (mx < ox || my < oy || mx >= ox + bw || my >= oy + bh) return 0;
+        *a = (my - oy) / cell; *b = (mx - ox) / cell;
+        return 1;
+    case 3:
+    case 4:   /* 贪吃蛇/2048：点击相对窗口中心的方向 */
+        {
+            int dx = mx - (x0 + iw / 2);
+            int dy = my - (y0 + ih / 2);
+            int ax = dx < 0 ? -dx : dx;
+            int ay = dy < 0 ? -dy : dy;
+            if (ax >= ay) *a = (dx < 0) ? 2 : 3;   /* 水平 左/右 */
+            else          *a = (dy < 0) ? 0 : 1;   /* 垂直 上/下 */
+            *b = 0;
+            return 1;
+        }
+    case 5:   /* 扫雷 9x9 */
+        cell = (iw / 9 < ih / 9) ? iw / 9 : ih / 9;
+        if (cell < 6) cell = 6;
+        bw = cell * 9; bh = cell * 9;
+        ox = x0 + (iw - bw) / 2; oy = y0 + (ih - bh) / 2;
+        if (mx < ox || my < oy || mx >= ox + bw || my >= oy + bh) return 0;
+        *a = (my - oy) / cell; *b = (mx - ox) / cell;
+        return 1;
+    case 6:   /* 石头剪刀布：三列按钮 */
+        {
+            int colw = iw / 3;
+            int c2 = (mx - x0) / colw;
+            if (c2 < 0 || c2 > 2) return 0;
+            *a = c2 + 1; *b = 0;
+            return 1;
+        }
+    case 7:   /* 记忆翻牌 4x4 */
+        cell = (iw / 4 < ih / 5) ? iw / 4 : ih / 5;
+        if (cell < 12) cell = 12;
+        bw = cell * 4; bh = cell * 4;
+        ox = x0 + (iw - bw) / 2;
+        oy = y0 + (ih - 20 - bh) / 2;
+        if (mx < ox || my < oy || mx >= ox + bw || my >= oy + bh) return 0;
+        *a = (my - oy) / cell; *b = (mx - ox) / cell;
+        return 1;
+    }
+    return 0;
+}
+
+/* 上一帧鼠标按钮状态（点击沿检测用，文件级） */
+static int g_game_mbtn_prev = 0;
+
+/* 游戏 GUI yield 回调：图形游戏整窗清背景后覆盖绘制，并处理鼠标点击；
+ * 猜数字(1) 走文本缓冲由 term_draw 渲染 */
 static void gw_game_yield(void)
 {
     gw_window_t *tw = NULL;
@@ -2051,20 +2435,46 @@ static void gw_game_yield(void)
         }
     }
     if (!tw) return;
-    char *gb = games_gfx_buf();
-    for (int r = 0; r < TERM_ROWS; r++) {
-        for (int c = 0; c < TERM_COLS; c++) {
-            char ch2 = gb[r * TERM_COLS + c];
-            term_buf[r * TERM_COLS + c] = (ch2 == 0) ? ' ' : ch2;
+    int kind = games_gfx_kind();
+    if (kind == 1) {
+        /* 文本游戏（猜数字）：同步缓冲后由终端渲染 */
+        char *gb = games_gfx_buf();
+        for (int r = 0; r < TERM_ROWS; r++) {
+            for (int c = 0; c < TERM_COLS; c++) {
+                char ch2 = gb[r * TERM_COLS + c];
+                term_buf[r * TERM_COLS + c] = (ch2 == 0) ? ' ' : ch2;
+            }
+        }
+        term_caret = games_gfx_pos();
+        term_nrows = TERM_ROWS;
+        term_draw(tw);
+        return;
+    }
+    /* 鼠标点击沿检测：左键=1 右键=2，命中游戏区写入 games 轮询队列 */
+    {
+        int bt = mouse_get_buttons();
+        int edge = 0;
+        if ((bt & 1) && !(g_game_mbtn_prev & 1)) edge = 1;
+        else if ((bt & 2) && !(g_game_mbtn_prev & 2)) edge = 2;
+        g_game_mbtn_prev = bt;
+        if (edge) {
+            int a = -1, b = -1;
+            if (gw_game_mouse_cell(tw, kind, &a, &b))
+                games_set_mouse(a, b, edge);
         }
     }
-    term_caret = games_gfx_pos();
-    term_nrows = TERM_ROWS;
-    term_draw(tw);
+    /* 图形游戏：先整窗清背景，再覆盖绘制画面，消除文本残留黑条纹 */
+    gw_fill(tw->x + 4, tw->y + GW_TITLE_H + 4, tw->inner_w - 8, tw->inner_h - 8, 0xF0F0F0);
+    gw_game_draw(tw);
+    /* 游戏期间 games_play 阻塞在主循环外，主循环末尾的光标绘制不执行；
+     * 这里每帧补画光标，否则图形游戏内看不到鼠标指针。下一帧整窗清背景
+     * 会先覆盖旧光标，因此无需背景缓存也不会有残影。 */
+    gw_cursor_draw(mouse_get_x(), mouse_get_y());
 }
 
-/* 桌面图标启动游戏：idx 为 1..7，对应 gw_desktop_icon_app 中 7 个游戏 */
-static int gw_launch_game(int idx)
+/* 运行单个游戏（idx 1..7），复用 Terminal 窗口宿主；不打印提示符，
+ * 供桌面图标与 shell 命令两条入口共用 */
+static int gw_run_game(int idx)
 {
     if (idx < 1 || idx > 7) return 0;
     gw_launch_app(GW_APP_TERMINAL);   /* 打开/复用 Terminal 窗口作为游戏宿主 */
@@ -2077,11 +2487,59 @@ static int gw_launch_game(int idx)
     }
     if (!tw) return 0;
     games_set_gfx(1, gw_game_yield);
-    games_play(idx);                  /* 阻塞运行，yield 驱动重绘；游戏内部读键盘 */
+    term_input_reset();           /* 游戏期间终端输入缓冲失效，先清空 */
+    games_play(idx);              /* 阻塞运行，yield 驱动重绘；游戏内部读键盘 */
     games_set_gfx(0, NULL);
-    term_print("\n[game exited] type 'help' for commands\n");
-    gw_dirty = 1;
+    /* 游戏结束不回到终端：直接关闭宿主窗口回桌面 */
+    gw_close(tw);
     return 1;
+}
+
+/* 桌面图标启动游戏：idx 为 1..7，对应 gw_desktop_icon_app 中 7 个游戏 */
+static int gw_launch_game(int idx)
+{
+    /* 游戏结束时 gw_run_game 已关闭宿主窗口，这里不再打印提示符回终端 */
+    gw_dirty = 1;
+    return gw_run_game(idx);
+}
+
+/* 游戏合集图形菜单（games 命令图形入口） */
+static int gw_game_menu(void)
+{
+    gw_launch_app(GW_APP_TERMINAL);
+    gw_window_t *tw = NULL;
+    for (int i = 0; i < GW_MAX_WINDOWS; i++) {
+        if (gw_windows[i].used && (unsigned long)gw_windows[i].user == (unsigned long)GW_APP_TERMINAL) {
+            tw = &gw_windows[i];
+            break;
+        }
+    }
+    if (!tw) return 0;
+    games_set_gfx(1, gw_game_yield);
+    term_input_reset();
+    int sel = 1;
+    for (;;) {
+        gw_game_draw_menu(tw, sel);
+        /* 菜单循环同样阻塞在主循环外，补画光标否则看不到指针 */
+        gw_cursor_draw(mouse_get_x(), mouse_get_y());
+        int c = keyboard_getchar();
+        if (c == 0) continue;
+        if (c == 'q' || c == 'Q' || c == 0x1B) break;
+        if (c == KEY_UP) { sel--; if (sel < 1) sel = 1; }
+        else if (c == KEY_DOWN) { sel++; if (sel > 7) sel = 7; }
+        else if (c == '\n' || c == '\r') games_play(sel);
+        else if (c >= '1' && c <= '7') games_play(c - '0');
+    }
+    games_set_gfx(0, NULL);
+    gw_close(tw);                /* 菜单退出：关闭宿主窗口回桌面 */
+    return 1;
+}
+
+/* shell 命令（games/guess/...）图形入口：0=图形菜单，1..7=直接运行 */
+int gw_launch_gui_game(int idx)
+{
+    if (idx == 0) return gw_game_menu();
+    return gw_run_game(idx);
 }
 
 void gw_demo(void)
@@ -2092,6 +2550,8 @@ void gw_demo(void)
     gw_dirty = 1;
     /* GUI 模式下 shell 输出重定向到终端窗口缓冲 */
     terminal_set_gfx_hook(gw_term_output);
+    /* shell 游戏命令（games/guess/tictactoe/snake）在图形桌面走图形入口 */
+    games_set_gui_launcher(gw_launch_gui_game);
 
     /* 不自动打开窗口：保持桌面干净，避免窗口覆盖桌面图标导致“应用打不开” */
     /* （需要时由用户点击桌面图标 / 开始菜单启动） */
@@ -2194,6 +2654,9 @@ void gw_start(void)
     gfx_init();
     gfx_set_palette();
     gfx_load_font();
+    /* mouse_init 在内核启动早期执行（当时 GFX 仍是 320x200 默认值），
+     * 进入实际分辨率桌面后把指针重新居中 */
+    mouse_warp(GFX_W / 2, GFX_H / 2);
     gw_boot_anim();
     gw_demo();
 }

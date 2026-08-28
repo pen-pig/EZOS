@@ -19,7 +19,6 @@ extern uint16_t gfx_palette16[256];
  *   0x5006: word  YRES
  *   0x5008: byte  BPP（16 = 16bpp RGB565） */
 
-void gfx_dump_regs_dbg(void);   // DBG: dump VGA registers to B8000
 void gfx_init(void);            // 初始化图形模式（优先 VBE 多分辨率 LFB，失败回退 VGA 0x13 320x200）
 void gfx_restore_text(void);    // 恢复 80x25 文本模式
 void gfx_set_palette(void);     // 设置 256 色调色板
@@ -33,6 +32,5 @@ void gfx_draw_text_scaled(int x, int y, const char *s, uint8_t fg, int bg, int s
 void gfx_clear(uint8_t color);
 void gfx_menu(void);          // 图形界面菜单（原 shell.c cmd_gfx迁移）
 int gfx_eval(const char *s, int *ok); // 表达式求值器（图形计算器与 shell calc 共用）
-void gfx_dump_regs_dbg_line(int line);
 
 #endif

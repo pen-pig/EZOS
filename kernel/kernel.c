@@ -23,7 +23,8 @@ static void klog(const char *msg);
 /* 带两个数字的日志行格式化（h1/h2 为 1 时十六进制输出，否则十进制） */
 static void klogf(const char *s1, uint32_t v1, int h1,
                   const char *s2, uint32_t v2, int h2, const char *s3) {
-    char line[80];
+    /* worst case 60+10+10+1=81: enlarge to 96 to avoid overflow */
+    char line[96];
     int n = 0;
     while (*s1 && n < 60) line[n++] = *s1++;
     char t[16];
