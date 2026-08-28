@@ -395,7 +395,9 @@ void gfx_restore_text(void) {
         }
     }
 
-    /* Reload saved 8x16 font into plane 2 (graphics writes clobbered it) */
+    /* Reload saved VGA 8x16 font into plane 2 so text mode shows clean glyphs
+     * after VBE LFB mapped over the 0xA0000 planes (removes the EXPERIMENT5
+     * 0x20=0xFF debug fill that produced colored blocks). */
     gfx_restore_font();
 }
 

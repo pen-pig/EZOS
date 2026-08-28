@@ -39,14 +39,14 @@ disk.img.bak_std
 gui_2*.c
 .ninja_deps
 .ninja_log
-build.ninja
 build_auto.ninja
 build_log.txt
 comp_err.txt
 *.log
 *.err
 *.out
-temp/
+temp/*
+!temp/gen_diskimg.py
 tmp/
 *.tmp
 *.temp
@@ -86,7 +86,7 @@ sindows_v2/
 sindows_v2_ref/
 backups/
 *.hex
-ninja.exe
+!ninja.exe
 b*.txt
 *_err.txt
 merge_*.txt
