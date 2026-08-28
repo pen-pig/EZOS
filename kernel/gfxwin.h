@@ -104,7 +104,8 @@ void gw_scrollbar(int x, int y, int h, int thumb_y, int thumb_h, uint8_t color);
 
 /* 演示程序（shell 调用） */
 void gw_demo(void);
-void gw_start(void);           /* 初始化图形模式并进入窗口 GUI （shell wins 命令调用） */
+void gw_start(void);
+int  gw_launch_gui_game(int idx); /* shell command GUI entry: 0=menu, 1..7=run */           /* 初始化图形模式并进入窗口 GUI （shell wins 命令调用） */
 
 /* Win10 桌面层 */
 void gw_draw_desktop(void);            /* 墙纸：渐变蓝底 + 居中徽标 */

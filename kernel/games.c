@@ -37,6 +37,7 @@ extern int  ezos_console_readline(char *buf, int maxlen);
  *   避免 GUI 主循环被游戏独占导致画面冻结。
  * ================================================================== */
 static int g_gfx = 0;
+static int g_gfx_kind = 0;          /* 当前 GUI 运行的游戏类型 1..7（games_play 设置） */
 static void (*g_yield)(void) = NULL;
 static char g_gbuf[24 * 80];
 static int g_gpos = 0;
@@ -59,6 +60,24 @@ void games_set_gfx(int on, void (*yield_fn)(void)) {
 }
 char *games_gfx_buf(void) { return g_gbuf; }
 int games_gfx_pos(void) { return g_gpos; }
+
+/* GUI 鼠标点击队列：gfxwin 点击沿写入，游戏轮询消费 */
+static int g_mouse_a = -1, g_mouse_b = -1, g_mouse_btn = 0;
+void games_set_mouse(int a, int b, int btn)
+{
+    g_mouse_a = a;
+    g_mouse_b = b;
+    if (btn) g_mouse_btn = btn;   /* 1=左键 2=右键 */
+}
+int games_mouse_poll(int *a, int *b)
+{
+    int btn = g_mouse_btn;
+    if (btn == 0) return 0;
+    g_mouse_btn = 0;              /* 一次消费 */
+    *a = g_mouse_a;
+    *b = g_mouse_b;
+    return btn;
+}
 
 static void games_yield(void) { if (g_yield) g_yield(); }
 
@@ -269,6 +288,7 @@ static int tic_board_row = 0;      // 棋盘首行的屏幕行号
 static void tic_status(const char *s);
 
 static void tic_render(void) {
+    if (g_gfx) { games_yield(); return; }   /* GUI 图形渲染由桌面窗口完成 */
     games_clear();
     ezos_console_write("=== Tic-Tac-Toe ===\n");
     ezos_console_write("You are X, AI is O. Position map:\n");
@@ -291,6 +311,7 @@ static void tic_render(void) {
 
 /* 只更新单个格子的字符（空格 -> X/O），用光标定位覆盖写 */
 static void tic_update_cell(int i) {
+    if (g_gfx) { games_yield(); return; }
     int off = tic_cell_off[i];
     terminal_set_cursor((size_t)(off / 80), (size_t)(off % 80));
     ezos_console_putchar(tic_board[i]);
@@ -298,6 +319,7 @@ static void tic_update_cell(int i) {
 
 /* 覆盖写固定提示行（清行后重写，不追加、不滚动、不堆积） */
 static void tic_status(const char *s) {
+    if (g_gfx) { games_yield(); return; }
     terminal_clear_line((size_t)(tic_board_row + 6));
     terminal_set_cursor((size_t)(tic_board_row + 6), 0);
     ezos_console_write(s);
@@ -305,6 +327,7 @@ static void tic_status(const char *s) {
 
 /* 清空并定位输入提示行（棋盘下方固定位置） */
 static void tic_prompt_line(void) {
+    if (g_gfx) return;
     terminal_clear_line((size_t)(tic_board_row + 7));
     terminal_set_cursor((size_t)(tic_board_row + 7), 0);
 }
@@ -362,6 +385,38 @@ static void game_tic(void) {
     for (int i = 0; i < 9; i++) tic_board[i] = ' ';
     tic_render();   // 首次整盘绘制（内部清屏），之后落子只更新单格
     char buf[8];
+    if (g_gfx) {
+        /* GUI 图形模式：1-9 或鼠标点击落子，AI 立即回应；界面由桌面窗口绘制 */
+        games_yield();
+        for (;;) {
+            int pos = -1;
+            int ma, mb;
+            if (games_mouse_poll(&ma, &mb)) {
+                if (ma >= 0 && ma < 3 && mb >= 0 && mb < 3) pos = ma * 3 + mb;
+                else { games_yield(); continue; }
+            } else {
+                int c = keyboard_getchar();
+                if (c == 0) { games_yield(); continue; }
+                if (c < '1' || c > '9') continue;
+                pos = c - '1';
+            }
+            if (tic_board[pos] != ' ') { games_yield(); continue; }
+            tic_board[pos] = 'X';
+            games_yield();
+            if (tic_winner() == 1) break;
+            if (tic_full()) break;
+            int ai = tic_ai_move();
+            if (ai < 0 || ai > 8 || tic_board[ai] != ' ') break;
+            tic_board[ai] = 'O';
+            games_yield();
+            if (tic_winner() == 2) break;
+            if (tic_full()) break;
+        }
+        games_yield();   /* 终局画面 */
+        while (keyboard_getchar() != 0) { }
+        while (keyboard_getchar() == 0) games_yield();
+        return;
+    }
     for (;;) {
         tic_prompt_line();
         ezos_console_write("Your move (1-9): ");
@@ -400,8 +455,10 @@ static int snake_body[SNAKE_MAX][2];
 static int snake_len;
 static int snake_dir; // 0 up 1 down 2 left 3 right
 static int food_x, food_y;
+static int snake_alive = 1;   /* 0=结束/退出（供 GUI 渲染） */
 
 static void snake_render(void) {
+    if (g_gfx) { games_yield(); return; }   /* GUI 图形渲染由桌面窗口完成 */
     games_clear();
     ezos_console_write("=== Snake (WASD move, Q quit) ===\n");
     for (int y = 0; y < SNAKE_H; y++) {
@@ -439,6 +496,7 @@ static void game_snake(void) {
     ezos_console_write("WASD to steer, Q to quit. Eat * to grow.\n");
     snake_len = 3;
     snake_dir = 3; // 初始向右
+    snake_alive = 1;
     snake_body[0][0] = 4; snake_body[0][1] = 5;
     snake_body[1][0] = 3; snake_body[1][1] = 5;
     snake_body[2][0] = 2; snake_body[2][1] = 5;
@@ -454,6 +512,16 @@ static void game_snake(void) {
         // 非阻塞处理按键：W/A/S/D 只改变方向，Q 退出；
         // Shift+Up/Shift+Down（EZOS 映射 KEY_PGUP/KEY_PGDN）滚动屏幕
         int c;
+        /* 鼠标点击窗口四区改方向（0上 1下 2左 3右） */
+        {
+            int ma, mb;
+            if (games_mouse_poll(&ma, &mb)) {
+                if (ma == 0) { if (snake_dir != 1) snake_dir = 0; }
+                else if (ma == 1) { if (snake_dir != 0) snake_dir = 1; }
+                else if (ma == 2) { if (snake_dir != 3) snake_dir = 2; }
+                else if (ma == 3) { if (snake_dir != 2) snake_dir = 3; }
+            }
+        }
         while ((c = keyboard_getchar()) != 0) {
             if (c == KEY_UP || c == KEY_DOWN) continue;   // 普通方向键在贪吃蛇中无意义
             if (c == KEY_PGUP) { terminal_scroll_up(); continue; }
@@ -498,10 +566,12 @@ static void game_snake(void) {
         snake_render();
     }
     if (!alive) {
+        snake_alive = 0;
         ezos_console_write("Game Over! Score: ");
         ezos_console_print_dec((uint32_t)(snake_len - 3));
         ezos_console_write("\n");
     } else {
+        snake_alive = 0;
         ezos_console_write("Quit.\n");
     }
     ezos_console_write("Press any key to return to menu...\n");
@@ -514,6 +584,7 @@ static void game_snake(void) {
 static uint32_t g2048[16];
 static uint32_t g2048_score;
 static int      g2048_moved;
+static int      g2048_over;   /* 0=进行中 1=结束（供 GUI 渲染） */
 
 static void g2048_spawn(void) {
     int empty[16], n = 0;
@@ -602,6 +673,7 @@ static int g2048_can_move(void) {
 }
 
 static void g2048_render(void) {
+    if (g_gfx) { games_yield(); return; }   /* GUI 图形渲染由桌面窗口完成 */
     games_clear();
     ezos_console_write("=== 2048 ===\n");
     ezos_console_write("WASD to move, Q to quit. Score: ");
@@ -637,13 +709,24 @@ static void game_2048(void) {
     games_rand_seed(games_rdtsc() + 13);
     for (int i = 0; i < 16; i++) g2048[i] = 0;
     g2048_score = 0;
+    g2048_over = 0;
     g2048_spawn();
     g2048_spawn();
     g2048_render();
     int quit = 0;
     while (!quit) {
         int c;
-        while ((c = keyboard_getchar()) == 0) games_yield();   // 阻塞等待一键（sinwindows getch）
+        /* 阻塞等待一输入：键盘任意键或鼠标点击（方向 0..3 由窗口重心换算） */
+        for (;;) {
+            int ma, mb;
+            if (games_mouse_poll(&ma, &mb)) {
+                c = (ma == 0) ? 'w' : (ma == 1) ? 's' : (ma == 2) ? 'a' : 'd';
+                break;
+            }
+            c = keyboard_getchar();
+            if (c != 0) break;
+            games_yield();
+        }
         if (c == 'w' || c == 'W') g2048_move(0);
         else if (c == 's' || c == 'S') g2048_move(1);
         else if (c == 'a' || c == 'A') g2048_move(2);
@@ -653,6 +736,7 @@ static void game_2048(void) {
         if (g2048_moved) g2048_spawn();
         g2048_render();
         if (!g2048_can_move()) {
+            g2048_over = 1;
             ezos_console_write("Game Over!\n");
             break;
         }
@@ -671,6 +755,7 @@ static int      ms_flagged[MS_W * MS_H];
 static int      ms_ready;
 static int      ms_left;                 // 剩余未翻开非雷格数
 static int      ms_lose;
+static int      ms_cx = 4, ms_cy = 4;    // GUI 模式光标（方向键导航）
 
 static void ms_place_mines(int safe_idx) {
     for (int i = 0; i < MS_W * MS_H; i++) {
@@ -713,6 +798,7 @@ static void ms_flood(int r, int c) {
 }
 
 static void ms_render(void) {
+    if (g_gfx) { games_yield(); return; }   /* GUI 图形渲染由桌面窗口完成 */
     games_clear();
     ezos_console_write("=== Minesweeper ===\n");
     ezos_console_write("Input: 'r c' reveal, 'f r c' flag, 'q' quit\n");
@@ -739,11 +825,68 @@ static void ms_render(void) {
     }
 }
 
+/* GUI 模式按键轮询：方向键移动光标，Enter/Space 翻开，F 插旗，Q 退出。
+ * 返回 0=无输入 1=移动 2=翻开 3=插旗 4=退出 */
+static int ms_poll_key_gfx(void)
+{
+    for (;;) {
+        int ma, mb;
+        int mbtn = games_mouse_poll(&ma, &mb);
+        if (mbtn) {
+            if (ma < 0 || ma >= MS_H || mb < 0 || mb >= MS_W) return 1;
+            ms_cx = mb; ms_cy = ma;
+            return (mbtn == 2) ? 3 : 2;   /* 右键=插旗 左键=翻开 */
+        }
+        int c = keyboard_getchar();
+        if (c == 0) { games_yield(); return 0; }
+        if (c == KEY_UP) { if (ms_cy > 0) ms_cy--; return 1; }
+        if (c == KEY_DOWN) { if (ms_cy < MS_H - 1) ms_cy++; return 1; }
+        if (c == KEY_LEFT) { if (ms_cx > 0) ms_cx--; return 1; }
+        if (c == KEY_RIGHT) { if (ms_cx < MS_W - 1) ms_cx++; return 1; }
+        if (c == '\n' || c == '\r' || c == ' ') return 2;
+        if (c == 'f' || c == 'F') return 3;
+        if (c == 'q' || c == 'Q') return 4;
+        games_yield();
+    }
+}
+
 static void game_minesweeper(void) {
     games_rand_seed(games_rdtsc() + 29);
     ms_ready = 0;
     ms_lose = 0;
     ms_left = MS_W * MS_H - 10;
+    ms_cx = 4; ms_cy = 4;
+    if (g_gfx) {
+        /* GUI 图形模式：方向键导航 + Enter 翻开 + F 插旗 + Q 退出 */
+        games_yield();   /* 首绘 */
+        for (;;) {
+            int act = ms_poll_key_gfx();
+            if (act == 0 || act == 1) continue;      /* 移动由 yield 重绘 */
+            if (act == 4) break;                     /* 退出 */
+            int idx = ms_cy * MS_W + ms_cx;
+            if (act == 3) {
+                if (!ms_revealed[idx]) ms_flagged[idx] = !ms_flagged[idx];
+                games_yield();
+                continue;
+            }
+            /* act == 2 翻开 */
+            if (ms_flagged[idx] || ms_revealed[idx]) { games_yield(); continue; }
+            if (!ms_ready) { ms_place_mines(idx); ms_ready = 1; }
+            if (ms_board[idx] == 9) {
+                ms_revealed[idx] = 1;
+                ms_lose = 1;
+                games_yield();
+                break;
+            }
+            ms_flood(ms_cy, ms_cx);
+            games_yield();
+            if (ms_left == 0) break;
+        }
+        games_yield();   /* 终局画面（雷/胜利） */
+        while (keyboard_getchar() != 0) { }
+        while (keyboard_getchar() == 0) games_yield();
+        return;
+    }
     ms_render();
     char buf[16];
     for (;;) {
@@ -794,19 +937,52 @@ static void game_minesweeper(void) {
 }
 
 /* ---------------- 游戏 6：石头剪刀布 ---------------- */
+static int rps_pwins = 0, rps_cwins = 0, rps_draws = 0;
+static int rps_last_p = 0, rps_last_c = 0, rps_last_d = -1;   /* d: 0=平 1=胜 2=负 */
+
 static void game_rps(void) {
     games_clear();
     ezos_console_write("=== Rock Paper Scissors ===\n");
     ezos_console_write("1=Rock 2=Paper 3=Scissors 0=Quit\n");
-    int pwins = 0, cwins = 0, draws = 0;
+    rps_pwins = 0; rps_cwins = 0; rps_draws = 0;
+    rps_last_p = 0; rps_last_c = 0; rps_last_d = -1;
     static const char *names[4] = { "", "Rock", "Paper", "Scissors" };
     char buf[16];
+    if (g_gfx) {
+        /* GUI 图形模式：1/2/3 直接出拳，0/Q 退出，界面由桌面窗口绘制 */
+        games_yield();
+        for (;;) {
+            int c;
+            int ma, mb;
+            if (games_mouse_poll(&ma, &mb)) {
+                if (ma >= 1 && ma <= 3) c = '0' + ma;
+                else { games_yield(); continue; }
+            } else {
+                c = keyboard_getchar();
+                if (c == 0) { games_yield(); continue; }
+            }
+            if (c == '1') rps_last_p = 1;
+            else if (c == '2') rps_last_p = 2;
+            else if (c == '3') rps_last_p = 3;
+            else if (c == '0' || c == 'q' || c == 'Q') break;
+            else { games_yield(); continue; }
+            rps_last_c = (int)(games_rand_next() % 3) + 1;
+            int d = (rps_last_p - rps_last_c + 3) % 3;   /* 1: p 胜 */
+            if (d == 0) { rps_draws++; rps_last_d = 0; }
+            else if (d == 1) { rps_pwins++; rps_last_d = 1; }
+            else { rps_cwins++; rps_last_d = 2; }
+            games_yield();
+        }
+        while (keyboard_getchar() != 0) { }
+        while (keyboard_getchar() == 0) games_yield();
+        return;
+    }
     for (;;) {
-        ezos_console_print_dec((uint32_t)pwins);
+        ezos_console_print_dec((uint32_t)rps_pwins);
         ezos_console_write("-");
-        ezos_console_print_dec((uint32_t)cwins);
+        ezos_console_print_dec((uint32_t)rps_cwins);
         ezos_console_write("-");
-        ezos_console_print_dec((uint32_t)draws);
+        ezos_console_print_dec((uint32_t)rps_draws);
         ezos_console_write("  Choose: ");
         games_readline(buf, sizeof(buf));
         int p = games_atoi(buf);
@@ -822,9 +998,9 @@ static void game_rps(void) {
         ezos_console_write("  CPU: ");
         ezos_console_write(names[c]);
         ezos_console_write("  ");
-        if (d == 0) { ezos_console_write("Draw\n"); draws++; }
-        else if (d == 1) { ezos_console_write("You win\n"); pwins++; }
-        else { ezos_console_write("CPU wins\n"); cwins++; }
+        if (d == 0) { ezos_console_write("Draw\n"); rps_draws++; }
+        else if (d == 1) { ezos_console_write("You win\n"); rps_pwins++; }
+        else { ezos_console_write("CPU wins\n"); rps_cwins++; }
     }
 }
 
@@ -835,8 +1011,10 @@ static char  mem_cards[16];
 static int   mem_face[16];   // 已配对
 static char  mem_show[16];   // 当前翻开的临时显示
 static int   mem_flips;
+static int   mem_cx = 0, mem_cy = 0;   // GUI 模式光标
 
 static void mem_render(void) {
+    if (g_gfx) { games_yield(); return; }   /* GUI 图形渲染由桌面窗口完成 */
     games_clear();
     ezos_console_write("=== Memory Match ===\n");
     ezos_console_write("Flip count: ");
@@ -855,6 +1033,29 @@ static void mem_render(void) {
     }
 }
 
+/* GUI 模式按键轮询：方向键移动光标，Enter/Space 翻牌，Q 退出。
+ * 返回 0=无输入 1=移动 2=翻牌 3=退出 */
+static int mem_poll_key_gfx(void)
+{
+    for (;;) {
+        int ma, mb;
+        if (games_mouse_poll(&ma, &mb)) {
+            if (ma < 0 || ma >= MEM_ROWS || mb < 0 || mb >= MEM_COLS) return 1;
+            mem_cx = mb; mem_cy = ma;
+            return 2;   /* 点击翻牌 */
+        }
+        int c = keyboard_getchar();
+        if (c == 0) { games_yield(); return 0; }
+        if (c == KEY_UP) { if (mem_cy > 0) mem_cy--; return 1; }
+        if (c == KEY_DOWN) { if (mem_cy < MEM_ROWS - 1) mem_cy++; return 1; }
+        if (c == KEY_LEFT) { if (mem_cx > 0) mem_cx--; return 1; }
+        if (c == KEY_RIGHT) { if (mem_cx < MEM_COLS - 1) mem_cx++; return 1; }
+        if (c == '\n' || c == '\r' || c == ' ') return 2;
+        if (c == 'q' || c == 'Q') return 3;
+        games_yield();
+    }
+}
+
 static void game_memory(void) {
     games_rand_seed(games_rdtsc() + 37);
     for (int i = 0; i < 8; i++) {
@@ -868,8 +1069,46 @@ static void game_memory(void) {
     }
     for (int i = 0; i < 16; i++) { mem_face[i] = 0; mem_show[i] = 0; }
     mem_flips = 0;
+    mem_cx = 0; mem_cy = 0;
     int matched = 0;
     char buf[16];
+    if (g_gfx) {
+        /* GUI 图形模式：方向键导航 + Enter 翻牌，不匹配自动翻回 */
+        int first = -1;
+        games_yield();   /* 首绘 */
+        while (matched < 8) {
+            int act = mem_poll_key_gfx();
+            if (act == 0 || act == 1) continue;      /* 移动由 yield 重绘 */
+            if (act == 3) break;                     /* 退出 */
+            int idx = mem_cy * MEM_COLS + mem_cx;
+            if (mem_face[idx] || mem_show[idx]) { games_yield(); continue; }
+            mem_flips++;
+            mem_show[idx] = mem_cards[idx];
+            if (first < 0) { first = idx; games_yield(); continue; }
+            if (first == idx) { mem_show[idx] = 0; first = -1; games_yield(); continue; }
+            games_yield();   /* 显示第二张 */
+            if (mem_cards[first] == mem_cards[idx]) {
+                mem_face[first] = 1; mem_face[idx] = 1;
+                mem_show[first] = 0; mem_show[idx] = 0;
+                matched++;
+                first = -1;
+            } else {
+                /* 不匹配：停留约 1.2s 后自动翻回（期间忽略输入） */
+                uint32_t t0 = games_rdtsc();
+                while ((uint32_t)(games_rdtsc() - t0) < 120000000u) {
+                    while (keyboard_getchar() != 0) { }
+                    games_yield();
+                }
+                mem_show[first] = 0;
+                mem_show[idx] = 0;
+                first = -1;
+            }
+        }
+        games_yield();
+        while (keyboard_getchar() != 0) { }
+        while (keyboard_getchar() == 0) games_yield();
+        return;
+    }
     while (matched < 8) {
         mem_render();
         int first = -1;
@@ -946,6 +1185,7 @@ static int games_menu_select(void) {
 
 /* GUI 桌面模式：直接运行指定游戏（1..7），游戏结束后返回 */
 void games_play(int choice) {
+    g_gfx_kind = choice;
     switch (choice) {
         case 1: game_guess(); break;
         case 2: game_tic(); break;
@@ -958,9 +1198,57 @@ void games_play(int choice) {
     }
 }
 
+/* ---------------- GUI 渲染状态导出（供 gfxwin.c 图形化绘制） ---------------- */
+int  games_gfx_kind(void)  { return g_gfx_kind; }
+
+int  games_tic_board(int i)          { return tic_board[i]; }
+int  games_tic_winner(void)          { return tic_winner(); }
+
+int  games_snake_len(void)           { return snake_len; }
+int  games_snake_alive(void)         { return snake_alive; }
+int  games_snake_body_x(int i)       { return snake_body[i][0]; }
+int  games_snake_body_y(int i)       { return snake_body[i][1]; }
+int  games_snake_food_x(void)        { return food_x; }
+int  games_snake_food_y(void)        { return food_y; }
+
+int  games_2048_cell(int i)          { return (int)g2048[i]; }
+int  games_2048_score(void)          { return (int)g2048_score; }
+int  games_2048_over(void)           { return g2048_over; }
+
+int  games_ms_cell(int r, int c)     { return ms_board[r * MS_W + c]; }
+int  games_ms_revealed(int r, int c) { return ms_revealed[r * MS_W + c]; }
+int  games_ms_flagged(int r, int c)  { return ms_flagged[r * MS_W + c]; }
+int  games_ms_cursor_x(void)         { return ms_cx; }
+int  games_ms_cursor_y(void)         { return ms_cy; }
+int  games_ms_lose(void)             { return ms_lose; }
+int  games_ms_left(void)             { return ms_left; }
+
+int  games_mem_cell(int i)           { return (int)mem_cards[i]; }
+int  games_mem_face(int i)           { return mem_face[i]; }
+int  games_mem_show(int i)           { return (int)mem_show[i]; }
+int  games_mem_flips(void)           { return mem_flips; }
+int  games_mem_cursor_x(void)        { return mem_cx; }
+int  games_mem_cursor_y(void)        { return mem_cy; }
+
+int  games_rps_pwins(void)           { return rps_pwins; }
+int  games_rps_cwins(void)           { return rps_cwins; }
+int  games_rps_draws(void)           { return rps_draws; }
+int  games_rps_last_p(void)          { return rps_last_p; }
+int  games_rps_last_c(void)          { return rps_last_c; }
+int  games_rps_last_d(void)          { return rps_last_d; }
+
 /* ---------------- shell 命令入口：games ---------------- */
+/* GUI 宿主启动器（gfxwin.c 注册）：fn(0)=图形菜单，fn(1..7)=直接运行游戏。
+ * 非空说明处于图形桌面；内核 shell 阶段为 NULL，命令走文本菜单。 */
+static int (*g_gui_launch)(int idx) = NULL;
+
+void games_set_gui_launcher(int (*fn)(int)) { g_gui_launch = fn; }
+
+int games_gui_launch(int idx) { return g_gui_launch ? g_gui_launch(idx) : 0; }
+
 void cmd_games(const char *args) {
     (void)args;
+    if (games_gui_launch(0)) return;   /* 图形桌面：打开图形游戏菜单 */
     for (;;) {
         int sel = games_menu_select();
         if (sel == 0) { ezos_console_write("Back to shell.\n"); break; }

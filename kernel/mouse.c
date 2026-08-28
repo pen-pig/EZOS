@@ -25,6 +25,15 @@ static int mouse_buttons = 0;   // bit0=左, bit1=右, bit2=中
 static uint8_t packet[4];
 static int packet_index = 0;
 static int packet_len = 3;
+static unsigned long pkt_cnt = 0;   /* [DEBUG] 收到的完整包计数 */
+static unsigned char last_raw[2];   /* [DEBUG] 最近收到的 2 个原始字节 */
+static int last_raw_n = 0;
+static unsigned long raw_cnt = 0;   /* [DEBUG] 收到的原始字节总数 */
+
+/* [DEBUG] mouse_init 失败阶段探针（.bss, volatile 防 DCE; QEMU 内存读可靠）:
+   0x55=成功  1=A9 测试全失败  2=BAT 未收到 0xAA  0xAA=未到末尾  0=未执行 */
+volatile unsigned char mouse_fail_stage;
+volatile unsigned char mouse_a9val;   // [DEBUG] A9 测试实际返回字节
 
 // 等待 PS/2 输出缓冲可读
 static void ps2_wait_read(void) {
@@ -83,17 +92,27 @@ static void mouse_accumulate(int dx, int dy) {
 
 void mouse_init(void) {
     uint8_t status;
+    int tries;
+
+    mouse_fail_stage = 0xAA;  /* [DEBUG] 进入 init */
 
     // 使能辅助端口
     ps2_wait_write();
     outb(0x64, 0xA8);
 
-    // 测试辅助端口是否有设备（返回 0x00 = 有设备）
-    ps2_wait_write();
-    outb(0x64, 0xA9);
-    ps2_wait_read();
-    if (inb(0x60) != 0x00) {
+    // 测试辅助端口是否有设备（返回 0x00 = 有设备）。
+    // QEMU/部分固件应答较慢，单次读取可能碰上 0x60 未就绪读到 0xFF，
+    // 这里做多次重试，避免误判“无鼠标”导致 GUI 鼠标整个不可用。
+    for (tries = 0; tries < 5; tries++) {
+        ps2_wait_write();
+        outb(0x64, 0xA9);
+        ps2_wait_read();
+        mouse_a9val = inb(0x60);   /* [DEBUG] 记录 A9 返回值 */
+        if (mouse_a9val == 0x00) break;
+    }
+    if (tries >= 5) {
         mouse_available = 0;
+        mouse_fail_stage = 1;   // A9 测试全失败
         return;   // 无鼠标 / 无触摸板，优雅降级
     }
 
@@ -109,34 +128,36 @@ void mouse_init(void) {
     ps2_wait_write();
     outb(0x60, status);
 
-    // 重置鼠标
-    mouse_cmd(0xFF);
-    if (mouse_read() != 0xAA) {   // BAT 自检结果应为 0xAA
-        mouse_available = 0;
-        return;
+    // 重置鼠标：BAT 自检应答为 0xAA（之前会先回 ACK 0xFA）。
+    // 虚拟环境/慢固件可能让 ACK 或 BAT 晚到，这里不依赖“恰好下一字节就是 0xAA”，
+    // 改为轮询有限个字节直到等来 0xAA，期间跳过无意义的 0xFA/0xFE。
+    mouse_write(0xFF);
+    {
+        uint8_t bb = 0;
+        int guard = 40;               /* 最多轮询 40 字节 */
+        int bat_ok = 0;
+        while (guard-- > 0) {
+            ps2_wait_read();
+            bb = inb(0x60);
+            if (bb == 0xAA) { bat_ok = 1; mouse_fail_stage = 0xBB; break; }
+            if (bb != 0xFA && bb != 0xFE) break;   /* 非预期应答，直接判失败 */
+        }
+        if (!bat_ok) {
+            mouse_available = 0;
+            mouse_fail_stage = 2;   // BAT 未收到 0xAA
+            return;
+        }
     }
     mouse_read();  // 设备 ID（通常 0x00）
 
     mouse_available = 1;
+    mouse_fail_stage = 0x55;   // [DEBUG] init 成功（0=未执行 1=A9失败 2=BAT失败 0xAA=未到末尾）
 
     // 启用滚轮（IntelliMouse 协议）：采样率 200 -> 100 -> 80
-    mouse_cmd(0xF3); mouse_cmd(200);
-    mouse_cmd(0xF3); mouse_cmd(100);
-    mouse_cmd(0xF3); mouse_cmd(80);
-
-    // 读设备 ID：0x03 = IntelliMouse（4 字节包，带滚轮）
-    mouse_cmd(0xF2);
-    uint8_t id = mouse_read();
-    if (id == 0x03) {
-        has_wheel = 1;
-        packet_len = 4;
-    } else {
-        has_wheel = 0;
-        packet_len = 3;
-    }
-
-    // 使能数据报告
-    mouse_cmd(0xF4);
+    // [DEBUG] 强制 3 字节标准 PS/2 协议,避免与 QEMU 包长错位
+    has_wheel = 0;
+    packet_len = 3;
+    mouse_cmd(0xF4);   // 使能数据报告
 
     // 分辨率自适应：指针初始位置 = 屏幕中心（320x200 -> 160,100；640x480 -> 320,240）
     if (GFX_W > 0 && GFX_H > 0) {
@@ -155,6 +176,9 @@ void mouse_handler(void) {
         return;
     }
     uint8_t data = inb(0x60);
+    last_raw[last_raw_n] = data;                    /* [DEBUG] 记录原始字节 */
+    last_raw_n = (last_raw_n + 1) % 2;
+    raw_cnt++;
 
     if (packet_index == 0) {
         if (!(data & 0x08)) {   // 同步位必须为 1
@@ -169,6 +193,7 @@ void mouse_handler(void) {
         packet_index++;
         if (packet_index >= packet_len) {
             packet_index = 0;
+            pkt_cnt++;
 
             // PS/2 位移累积（带符号），并按当前分辨率裁剪
             int dx = (int)(int8_t)packet[1];
@@ -213,6 +238,21 @@ int mouse_get_y(void) {
 
 int mouse_get_buttons(void) {
     return mouse_buttons;
+}
+
+/* [DEBUG] 完整包计数（用于验证 PS/2 按钮/移动事件是否到达驱动） */
+unsigned long mouse_packet_count(void) {
+    return pkt_cnt;
+}
+
+/* [DEBUG] 最近 2 个原始字节（out[0]=较新, out[1]=较旧） + 原始字节总数 */
+void mouse_raw_trace(unsigned char *out, unsigned long *cnt) {
+    unsigned char s[2] = {0, 0};
+    int n = last_raw_n;
+    s[0] = last_raw[(n + 1) % 2];   /* 最近一个 */
+    s[1] = last_raw[(n + 0) % 2];   /* 上一个 */
+    out[0] = s[0]; out[1] = s[1];
+    if (cnt) *cnt = raw_cnt;
 }
 
 void irq12_handler(void) {
