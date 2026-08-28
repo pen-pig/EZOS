@@ -684,6 +684,9 @@ static void cmd_time(const char *args) {
     hour = ((hour & 0x0F) + ((hour >> 4) * 10));
     minute = ((minute & 0x0F) + ((minute >> 4) * 10));
     second = ((second & 0x0F) + ((second >> 4) * 10));
+    if (hour > 23) hour = 0;          /* clamp invalid CMOS values */
+    if (minute > 59) minute = 0;
+    if (second > 59) second = 0;
     terminal_writestring("Current time: ");
     print_dec(hour);
     terminal_putchar(':');
@@ -703,6 +706,8 @@ static void cmd_date(const char *args) {
     year = ((year & 0x0F) + ((year >> 4) * 10));
     month = ((month & 0x0F) + ((month >> 4) * 10));
     day = ((day & 0x0F) + ((day >> 4) * 10));
+    if (month < 1 || month > 12) month = 1;   /* clamp invalid CMOS values */
+    if (day < 1 || day > 31) day = 1;
     terminal_writestring("Current date: ");
     print_dec(year + 2000);
     terminal_putchar('-');
@@ -2060,6 +2065,7 @@ void cmd_snake(const char *args) {
             if (nx == fx && ny == fy) {
                 len++;
                 score++;
+                if (len >= SNAKE_MAX) break;   /* full board: stop before sx[len] overflows */
                 int ok = 0;
                 for (int tries = 0; tries < 200 && !ok; tries++) {
                     fx = (int)(my_rand() % SNAKE_W);

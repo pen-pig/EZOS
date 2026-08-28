@@ -26,6 +26,8 @@ void terminal_begin_capture(char *buf, int max) {
 
 int terminal_end_capture(void) {
     int n = g_capture_len;
+    /* NUL-terminate so callers may treat buffer as a string */
+    if (g_capture_buf && g_capture_len < g_capture_max) g_capture_buf[g_capture_len] = '\0';
     g_capture_buf = NULL;
     g_capture_max = 0;
     return n;

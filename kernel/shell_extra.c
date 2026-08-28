@@ -249,6 +249,9 @@ void cmd_sysinfo(const char *args) {
     uint8_t hour = x_bcd2dec(x_cmos_read(0x04));
     uint8_t minute = x_bcd2dec(x_cmos_read(0x02));
     uint8_t second = x_bcd2dec(x_cmos_read(0x00));
+    if (hour > 23) hour = 0;          /* clamp invalid CMOS values */
+    if (minute > 59) minute = 0;
+    if (second > 59) second = 0;
     ezos_console_write("Time    : ");
     if (hour < 10) ezos_console_putchar('0');
     ezos_console_print_dec(hour);
@@ -263,6 +266,8 @@ void cmd_sysinfo(const char *args) {
     uint8_t year = x_bcd2dec(x_cmos_read(0x09));
     uint8_t month = x_bcd2dec(x_cmos_read(0x08));
     uint8_t day = x_bcd2dec(x_cmos_read(0x07));
+    if (month < 1 || month > 12) month = 1;   /* clamp invalid CMOS values */
+    if (day < 1 || day > 31) day = 1;
     ezos_console_write("Date    : ");
     ezos_console_print_dec(year + 2000);
     ezos_console_putchar('-');
