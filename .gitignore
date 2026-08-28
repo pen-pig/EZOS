@@ -86,7 +86,7 @@ sindows_v2/
 sindows_v2_ref/
 backups/
 *.hex
-ninja.exe
+!ninja.exe
 b*.txt
 *_err.txt
 merge_*.txt
