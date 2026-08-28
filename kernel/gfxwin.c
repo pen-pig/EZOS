@@ -2159,6 +2159,7 @@ static void gw_game_draw_tic(gw_window_t *w)
                                      (b == 'X') ? 0x0C : 0x09, scale);
         }
     }
+    gfx_draw_text(x0, y0 + ih - 12, "1-9/click: move   Q: quit", 0x08, 0);
 }
 
 static void gw_game_draw_snake(gw_window_t *w)
