@@ -101,12 +101,14 @@ static void games_clear_gfx(void) {
 
 static void games_set_cursor_gfx(size_t r, size_t c) {
     if (!g_gfx) { real_term_set_cursor(r, c); return; }
+    if (r >= 24 || c >= 80) return;   /* 行列越界：忽略，防止 g_gpos 越界 */
     g_gpos = (int)(r * 80 + c);
     if (g_gpos > 24 * 80) g_gpos = 24 * 80 - 1;
 }
 
 static void games_clear_line_gfx(size_t r) {
     if (!g_gfx) { real_term_clear_line(r); return; }
+    if (r >= 24) return;              /* 行越界：忽略，防止 g_gbuf 越界写 */
     for (int c = 0; c < 80; c++) g_gbuf[(int)r * 80 + c] = ' ';
 }
 

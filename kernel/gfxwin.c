@@ -699,6 +699,7 @@ void gw_draw_taskbar(void)
     /* 时钟（右侧）HH:MM + 小通知图标 */
     uint8_t hour = (uint8_t)((gw_bcd(gw_cmos_read(0x04)) + 8) % 24);   /* UTC+8 */
     uint8_t minute = (uint8_t)gw_bcd(gw_cmos_read(0x02));
+    if (minute > 59) minute = 0;   /* CMOS 无效值（BCD 0xFF -> 105）clamp */
     char tbuf[8];
     tbuf[0] = '0' + hour / 10; tbuf[1] = '0' + hour % 10;
     tbuf[2] = ':';
@@ -955,8 +956,8 @@ static void fm_refresh(void)
 {
     fm_count = exfat_read_dir(fm_entries, 40);
     if (fm_count < 0) fm_count = 0;
-    if (fm_scroll > fm_count) fm_scroll = 0;
-    if (fm_sel > fm_count) fm_sel = 0;
+    if (fm_scroll >= fm_count) fm_scroll = 0;
+    if (fm_sel >= fm_count) fm_sel = 0;
 }
 
 static void fm_enter(int idx)
@@ -1366,6 +1367,13 @@ static void clock_draw(gw_window_t *w)
     uint8_t second = (uint8_t)gw_bcd(gw_cmos_read(0x00));
     uint8_t day = (uint8_t)gw_bcd(gw_cmos_read(0x07));
     uint8_t month = (uint8_t)gw_bcd(gw_cmos_read(0x08));
+    /* CMOS 无效值（如全 0xFF，BCD 解码可到 105）clamp 到合法范围，
+     * 防止 second/minute 超过 59 越界读 gw_sin128/gw_cos128（仅 60 项） */
+    if (hour > 23) hour = 0;
+    if (minute > 59) minute = 0;
+    if (second > 59) second = 0;
+    if (day < 1 || day > 31) day = 1;
+    if (month < 1 || month > 12) month = 1;
 
     gw_draw_circle(cx, cy, r, 0x333333u);
     gw_draw_circle(cx, cy, r - 1, 0x333333u);
@@ -1959,16 +1967,21 @@ static void term_newline(void)
     term_nrows = term_caret / TERM_COLS + 1;
 }
 
+static void term_scroll_if_full(void)
+{
+    if (term_caret >= TERM_ROWS * TERM_COLS) {
+        for (int _ti = 0; _ti < (TERM_ROWS - 1) * TERM_COLS; _ti++)
+            term_buf[_ti] = term_buf[_ti + TERM_COLS];
+        term_caret -= TERM_COLS;
+    }
+}
+
 static void term_print(const char *s)
 {
     while (*s) {
         if (*s == '\n') { term_newline(); s++; continue; }
+        term_scroll_if_full();   /* 写入前滚动，防止 term_buf[1920] 越界写 */
         term_buf[term_caret++] = *s++;
-        if (term_caret >= TERM_ROWS * TERM_COLS) {
-            for (int _ti = 0; _ti < (TERM_ROWS - 1) * TERM_COLS; _ti++)
-                term_buf[_ti] = term_buf[_ti + TERM_COLS];
-            term_caret -= TERM_COLS;
-        }
     }
     term_nrows = term_caret / TERM_COLS + 1;
 }
@@ -1993,9 +2006,11 @@ static void term_draw(gw_window_t *w)
         int src_row = start + r;
         if (src_row >= term_nrows) break;
         for (int c = 0; c < cols; c++) {
-            char ch2 = term_buf[src_row * TERM_COLS + c];
-            if (ch2 == 0) ch2 = ' ';
-            gfx_draw_text(x + c * cw, y + r * ch, &ch2, 0x0A, 0x00);
+            char ch2[2];
+            ch2[0] = term_buf[src_row * TERM_COLS + c];
+            if (ch2[0] == 0) ch2[0] = ' ';
+            ch2[1] = 0;   /* gfx_draw_text 按 NUL 结尾遍历，必须补终止符 */
+            gfx_draw_text(x + c * cw, y + r * ch, ch2, 0x0A, 0x00);
         }
     }
     /* 光标 */
@@ -2026,12 +2041,8 @@ static void term_key(gw_window_t *w, int key)
         if (term_caret > 0 && term_caret % TERM_COLS != 0) term_caret--;
         term_buf[term_caret] = ' ';
     } else if (key >= 0x20 && key < 0x7F) {
+        term_scroll_if_full();   /* 写入前滚动，防止 term_buf[1920] 越界写 */
         term_buf[term_caret++] = (char)key;
-        if (term_caret >= TERM_ROWS * TERM_COLS) {
-            for (int _ti = 0; _ti < (TERM_ROWS - 1) * TERM_COLS; _ti++)
-                term_buf[_ti] = term_buf[_ti + TERM_COLS];
-            term_caret -= TERM_COLS;
-        }
         term_nrows = term_caret / TERM_COLS + 1;
     }
 }
