@@ -54,6 +54,21 @@ static int gw_strlen(const char *s)
     return n;
 }
 
+/* [DEBUG-MOUSE] 临时：十进制整数转字符串（用于任务栏坐标标定，验证后移除） */
+static void gw_itoa(int v, char *buf)
+{
+    int n = 0, i;
+    char tmp[12];
+    int neg = 0;
+    if (v < 0) { neg = 1; v = -v; }
+    if (v == 0) tmp[n++] = '0';
+    while (v) { tmp[n++] = '0' + (v % 10); v /= 10; }
+    i = 0;
+    if (neg) buf[i++] = '-';
+    while (n > 0) buf[i++] = tmp[--n];
+    buf[i] = 0;
+}
+
 static uint8_t gw_cmos_read(uint8_t reg)
 {
     outb(0x70, reg);
@@ -338,7 +353,9 @@ static void gw_cursor_draw(int mx, int my)
         for (int i = 0; i < 16; i++) {
             char ch = gw_cursor_map[j][i];
             if (ch == '.') continue;
-            gw_px(mx + i, my + j, (ch == 'B') ? 0x000000u : 0xFFFFFFu);
+            int x = mx + i, y = my + j;
+            if (x < 0 || x >= GFX_W || y < 0 || y >= GFX_H) continue;
+            gw_px(x, y, (ch == 'B') ? 0x000000u : 0xFFFFFFu);
         }
     }
 }
@@ -1769,6 +1786,17 @@ void gw_handle_mouse(int mx, int my, int buttons)
 
 void gw_handle_key(int key)
 {
+    if (!gw_focused_wnd) {
+        /* 桌面调试热键（排障复现用，正式版可移除）：
+         * m=开/关开始菜单  t=打开Terminal  s=Snake  d=2048  q=退出GUI回终端 */
+        if (key == 'm' || key == 'M') { gw_start_menu_active = !gw_start_menu_active; return; }
+        if (key == 'q' || key == 'Q') { gw_quit = 1; return; }
+        if (key == 't' || key == 'T') { gw_launch_app(GW_APP_TERMINAL); return; }
+        if (key == 's' || key == 'S' || key == 'd' || key == 'D') {
+            gw_launch_game((key == 's' || key == 'S') ? 3 : 4);
+            return;
+        }
+    }
     if (gw_focused_wnd && gw_focused_wnd->key)
         gw_focused_wnd->key(gw_focused_wnd, key);
 }
@@ -1930,6 +1958,21 @@ static void gw_boot_anim(void)
 static char term_buf[TERM_ROWS * TERM_COLS];
 static int term_nrows = 0;
 static int term_caret = 0;
+
+/* [DEBUG-TERMBUF] 临时访问函数：供任务栏调试打印 term_buf/游标状态 */
+void term_dbg_dump(char *hx, int maxb)
+{
+    static const char hd[] = "0123456789ABCDEF";
+    int k = 0, i;
+    for (i = 0; i < maxb && i < TERM_ROWS * TERM_COLS; i++) {
+        unsigned char b = (unsigned char)term_buf[i];
+        hx[k++] = hd[b >> 4];
+        hx[k++] = hd[b & 15];
+    }
+    hx[k] = 0;
+}
+int term_dbg_nrows(void) { return term_nrows; }
+int term_dbg_caret(void) { return term_caret; }
 static char term_input[TERM_COLS + 1];   /* 独立输入行缓冲（避免滚动/参数空格导致命令错乱） */
 static int  term_input_len = 0;
 
