@@ -36,7 +36,12 @@ static int exfat_write_sector(uint32_t sector, const uint8_t *buffer) {
     return ata_write_sector(exfat_drive, sector, buffer);
 }
 
+static int exfat_cluster_valid(uint32_t cluster) {
+    return cluster >= 2 && cluster < exfat_info.cluster_count + 2;
+}
+
 static int exfat_read_cluster(uint32_t cluster, uint8_t *buffer) {
+    if (!exfat_cluster_valid(cluster)) return -1;
     uint32_t first_sector = exfat_partition_start + exfat_info.cluster_heap_offset +
                             (cluster - 2) * exfat_info.sectors_per_cluster;
     for (int i = 0; i < exfat_info.sectors_per_cluster; i++) {
@@ -47,6 +52,7 @@ static int exfat_read_cluster(uint32_t cluster, uint8_t *buffer) {
 }
 
 static int exfat_write_cluster(uint32_t cluster, const uint8_t *buffer) {
+    if (!exfat_cluster_valid(cluster)) return -1;
     uint32_t first_sector = exfat_partition_start + exfat_info.cluster_heap_offset +
                             (cluster - 2) * exfat_info.sectors_per_cluster;
     for (int i = 0; i < exfat_info.sectors_per_cluster; i++) {
@@ -243,7 +249,8 @@ static void exfat_write_entry_set(uint8_t *dir_buf, int free_off,
 static int exfat_parse_entry_set(const uint8_t *entry, uint8_t *out) {
     if (entry[0] != 0x85) return -1;
     int sec_count = entry[1];
-    if (sec_count < 2) return -1;
+    /* 上界校验：255 字符名最多 17+1 个条目，超界值说明目录项损坏 */
+    if (sec_count < 2 || sec_count > 20) return -1;
     const uint8_t *ec0 = entry + 32;
     int name_len = ec0[3];
     uint32_t first_cluster = *((uint32_t*)(ec0 + 0x14));
@@ -362,7 +369,8 @@ int exfat_change_dir(const char *name) {
         char comp[128];
         while (*p) {
             int cl = 0;
-            while (*p && *p != '/') comp[cl++] = *p++;
+            while (*p && *p != '/' && cl < 127) comp[cl++] = *p++;
+            while (*p && *p != '/') p++;   /* 丢弃超长分量的剩余字符 */
             comp[cl] = '\0';
             if (*p == '/') p++;
             if (cl == 0) continue;
@@ -378,6 +386,8 @@ int exfat_change_dir(const char *name) {
                 continue;
             }
             if (my_strcmp(comp, ".") == 0) continue;
+            // 目录栈深度上限
+            if (depth >= 31) return -1;
             // 查找子目录
             uint8_t entry[512];
             if (exfat_find_entry(cur_cluster, comp, entry) < 0) return -1;
@@ -385,6 +395,8 @@ int exfat_change_dir(const char *name) {
             cur_cluster = *((uint32_t*)(entry + EXFAT_MERGED_CLUSTER_OFF));
             depth++;
             dir_stack[depth] = cur_cluster;
+            /* 路径缓冲区边界检查（pb 预留 1 字节给 NUL） */
+            if (pb + cl + 1 >= (int)sizeof(pathbuf)) return -1;
             if (pb > 1) pathbuf[pb++] = '/';
             for (int i = 0; i < cl; i++) pathbuf[pb++] = comp[i];
         }
@@ -412,7 +424,8 @@ int exfat_change_dir(const char *name) {
     while (*p) {
         char comp[128];
         int cl = 0;
-        while (*p && *p != '/') comp[cl++] = *p++;
+        while (*p && *p != '/' && cl < 127) comp[cl++] = *p++;
+        while (*p && *p != '/') p++;   /* 丢弃超长分量的剩余字符 */
         comp[cl] = '\0';
         if (*p == '/') p++;
         if (cl == 0) continue;
@@ -427,23 +440,16 @@ int exfat_change_dir(const char *name) {
             continue;
         }
         if (my_strcmp(comp, ".") == 0) continue;
+        // 目录栈深度上限
+        if (depth >= 31) goto rollback;
         uint8_t entry[512];
-        if (exfat_find_entry(cur_cluster, comp, entry) < 0) {
-            // 回滚目录栈
-            dir_depth = saved_depth;
-            for (int i = 0; i <= saved_depth; i++) dir_stack[i] = saved_stack[i];
-            current_dir_cluster = saved_cwd;
-            return -1;
-        }
-        if ((entry[1] & EXFAT_ATTR_DIRECTORY) == 0) {
-            dir_depth = saved_depth;
-            for (int i = 0; i <= saved_depth; i++) dir_stack[i] = saved_stack[i];
-            current_dir_cluster = saved_cwd;
-            return -1;
-        }
+        if (exfat_find_entry(cur_cluster, comp, entry) < 0) goto rollback;
+        if ((entry[1] & EXFAT_ATTR_DIRECTORY) == 0) goto rollback;
         cur_cluster = *((uint32_t*)(entry + EXFAT_MERGED_CLUSTER_OFF));
         depth++;
         dir_stack[depth] = cur_cluster;
+        /* 路径缓冲区边界检查（预留 1 字节给 NUL） */
+        if (path_pb + cl + 1 >= (int)sizeof(pathbuf2)) goto rollback;
         if (path_pb > 1) pathbuf2[path_pb++] = '/';
         for (int i = 0; i < cl; i++) pathbuf2[path_pb++] = comp[i];
         pathbuf2[path_pb] = '\0';
@@ -453,6 +459,13 @@ int exfat_change_dir(const char *name) {
     current_dir_cluster = cur_cluster;
     for (int i = 0; i <= path_pb; i++) cwd_path[i] = pathbuf2[i];
     return 0;
+
+rollback:
+    // 回滚目录栈到调用前状态
+    dir_depth = saved_depth;
+    for (int i = 0; i <= saved_depth && i < 32; i++) dir_stack[i] = saved_stack[i];
+    current_dir_cluster = saved_cwd;
+    return -1;
 }
 
 // 创建子目录（支持多级路径 /a/b/c，最后一段为目录名，前面各级必须已存在）
@@ -782,6 +795,8 @@ int exfat_init(void) {
 
     if (exfat_info.bytes_per_sector != 512) return -1;
     if (exfat_info.sectors_per_cluster == 0) return -1;
+    /* 目录/FAT 缓冲区均为 512*16 字节，簇最大 16 扇区（8KB） */
+    if (spc_shift > 4) return -1;
 
     exfat_ready = 1;
     return 0;
@@ -951,6 +966,8 @@ int exfat_create_file(const char *name, const uint8_t *data, uint32_t size) {
     int name_len = 0;
     while (name[name_len]) name_len++;
     if (name_len == 0) return -1;
+    /* exFAT 规范文件名最长 255 字符，防止 name_utf16 缓冲区溢出 */
+    if (name_len > 255) return -1;
 
     // 重名检查
     uint8_t exist_entry[512];
