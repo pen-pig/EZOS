@@ -163,6 +163,8 @@ static void gw_fill(int x, int y, int w, int h, uint32_t rgb)
 static void gw_fill_vgrad(int x, int y, int w, int h, uint32_t top, uint32_t bot)
 {
     if (h <= 0) return;
+    if (w <= 0) return;
+    if (h == 1) { gw_fill(x, y, w, 1, top); return; }   /* h==1 时 h-1 为 0，避免除零 */
     int tr = (int)((top >> 16) & 0xFF), tg = (int)((top >> 8) & 0xFF), tb = (int)(top & 0xFF);
     int br = (int)((bot >> 16) & 0xFF), bg = (int)((bot >> 8) & 0xFF), bb = (int)(bot & 0xFF);
     for (int j = 0; j < h; j++) {

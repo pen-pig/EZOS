@@ -956,7 +956,7 @@ static void cmd_ls(const char *args) {
                 if (entries[idx].is_dir) shell_fg(CLR_LIGHT_BLUE);
                 else if (is_exe_name(entries[idx].name)) shell_fg(CLR_LIGHT_GREEN);
                 else shell_fg(CLR_LIGHT_GREY);
-                int l = 0; while (entries[idx].name[l]) { namebuf[l] = entries[idx].name[l]; l++; }
+                int l = 0; while (entries[idx].name[l] && l < 60) { namebuf[l] = entries[idx].name[l]; l++; }
                 namebuf[l] = '\0';
                 for (int k = 0; k < l; k++) terminal_putchar(namebuf[k]);
                 if (entries[idx].is_dir) terminal_putchar('/');
