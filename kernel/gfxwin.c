@@ -456,6 +456,23 @@ static void gw_bb_end(int x, int y, int w, int h)
     }
 }
 
+/* 光标 16x16 是否完全落在窗口矩形内（决定画进离屏缓冲还是 blit 后直绘） */
+static int gw_cursor_in_win(gw_window_t *w, int mx, int my)
+{
+    return (mx >= w->x && my >= w->y &&
+            mx + 16 <= w->x + w->w && my + 16 <= w->y + w->h);
+}
+
+/* 旧光标（背景缓存位置）是否完全落在窗口内：
+ * 在窗口内则 blit 会覆盖其像素，无需手工擦除 */
+static int gw_cursor_old_in_win(gw_window_t *w)
+{
+    return (gw_cursor_bg_valid &&
+            gw_cursor_bg_x >= w->x && gw_cursor_bg_y >= w->y &&
+            gw_cursor_bg_x + 16 <= w->x + w->w &&
+            gw_cursor_bg_y + 16 <= w->y + w->h);
+}
+
 /* ==================================================================
  * 窗口表
  * ================================================================== */
@@ -2532,11 +2549,15 @@ static void gw_game_yield(void)
     if ((uint32_t)(now - gw_game_last_draw_ms) < GW_BB_FPS_MS) return;
     gw_game_last_draw_ms = now;
 
-    /* 先擦除旧位置光标（光标在桌面上时 blit 不会覆盖它，防残影） */
-    gw_cursor_restore_bg();
+    int mx = mouse_get_x(), my = mouse_get_y();
+    int cur_in_win = gw_cursor_in_win(tw, mx, my);
+    int old_in_win = gw_cursor_old_in_win(tw);
 
     if (gw_bb_begin()) {
-        /* 双缓冲：整窗（含窗框/标题栏）画进离屏缓冲，再一次搬运 */
+        /* 1. 新帧画进离屏缓冲（较慢）：期间 LFB 仍显示上一帧（含光标），
+         *    光标持续可见。旧实现先擦光标再慢慢绘制，绘制耗时一旦接近
+         *    帧周期，光标在两次重绘之间几乎无可见时间——这正是
+         *    "游戏内看不到鼠标"的根因 */
         if (kind == 1) {
             gw_draw_window_body(tw, 1);          /* 窗框 + 终端文本内容 */
         } else {
@@ -2545,7 +2566,22 @@ static void gw_game_yield(void)
                     tw->inner_w - 8, tw->inner_h - 8, 0xF0F0F0);
             gw_game_draw(tw);
         }
+        /* 2. 光标完全在窗口内：画进离屏缓冲，随 blit 原子上屏
+         *    （不存在独立的擦除阶段，光标零间隙可见） */
+        if (cur_in_win) {
+            gw_cursor_save_bg(mx, my);           /* 保存离屏缓冲中光标下背景 */
+            gw_cursor_draw(mx, my);
+        }
         gw_bb_end(tw->x, tw->y, tw->w, tw->h);
+        /* 3. 旧光标在窗口外才需手工擦除（窗口内的像素已被 blit 覆盖）；
+         *    必须在 bb_end 之后 —— restore 写 gfx_fb，此时才指回真实 LFB */
+        if (!old_in_win)
+            gw_cursor_restore_bg();
+        /* 4. 光标（部分）在窗口外：blit 后直绘，背景从 LFB 保存 */
+        if (!cur_in_win) {
+            gw_cursor_save_bg(mx, my);
+            gw_cursor_draw(mx, my);
+        }
     } else {
         /* 8bpp 回退 / 分辨率超限：维持旧直绘路径 */
         if (kind == 1) {
@@ -2555,13 +2591,6 @@ static void gw_game_yield(void)
                     tw->inner_w - 8, tw->inner_h - 8, 0xF0F0F0);
             gw_game_draw(tw);
         }
-    }
-
-    /* 游戏期间 games_play 阻塞在主循环外，主循环末尾的光标绘制不执行；
-     * 这里每帧补画光标，否则游戏内看不到鼠标指针 */
-    {
-        int mx = mouse_get_x(), my = mouse_get_y();
-        gw_cursor_save_bg(mx, my);
         gw_cursor_draw(mx, my);
     }
 }
@@ -2616,22 +2645,30 @@ static int gw_game_menu(void)
     int sel = 1;
     gw_game_last_draw_ms = 0;   /* 菜单进入立即绘制首帧 */
     for (;;) {
-        /* 忙等循环：节流 + 双缓冲重绘，消除菜单高速直绘造成的闪动 */
+        /* 忙等循环：节流 + 双缓冲重绘，消除菜单高速直绘造成的闪动。
+         * 光标画进离屏缓冲随 blit 原子上屏（同 gw_game_yield，见其注释） */
         uint32_t now = g_pit_ticks;
         if ((uint32_t)(now - gw_game_last_draw_ms) >= GW_BB_FPS_MS) {
             gw_game_last_draw_ms = now;
-            gw_cursor_restore_bg();
+            int mx = mouse_get_x(), my = mouse_get_y();
+            int cur_in_win = gw_cursor_in_win(tw, mx, my);
+            int old_in_win = gw_cursor_old_in_win(tw);
             if (gw_bb_begin()) {
                 gw_draw_window_body(tw, 0);
                 gw_game_draw_menu(tw, sel);
+                if (cur_in_win) {
+                    gw_cursor_save_bg(mx, my);
+                    gw_cursor_draw(mx, my);
+                }
                 gw_bb_end(tw->x, tw->y, tw->w, tw->h);
+                if (!old_in_win)
+                    gw_cursor_restore_bg();
+                if (!cur_in_win) {
+                    gw_cursor_save_bg(mx, my);
+                    gw_cursor_draw(mx, my);
+                }
             } else {
                 gw_game_draw_menu(tw, sel);
-            }
-            /* 菜单循环同样阻塞在主循环外，补画光标否则看不到指针 */
-            {
-                int mx = mouse_get_x(), my = mouse_get_y();
-                gw_cursor_save_bg(mx, my);
                 gw_cursor_draw(mx, my);
             }
         }
