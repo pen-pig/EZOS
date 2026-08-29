@@ -31,9 +31,11 @@ extern void shell_set_user_mode(int on);
 #include "keyboard.h"
 #include "exfat.h"
 #include "games.h"
+#include "isr.h"
 
 /* 前置声明：定义顺序在调用之后（gw_spawn_app / gw_demo 使用） */
 void gw_redraw_region(int x, int y, int w, int h);
+static void gw_draw_window_body(gw_window_t *w, int with_content);
 static void term_print(const char *s);
 static void term_draw(gw_window_t *w);
 static void term_key(gw_window_t *w, int key);
@@ -405,6 +407,56 @@ static void gw_cursor_restore_bg(void)
 }
 
 /* ==================================================================
+ * 游戏窗口双缓冲
+ * ------------------------------------------------------------------
+ * 游戏轮询循环调用 yield 的频率极高（每次无键可读都会 yield），旧实现
+ * 每次 yield 都直接在可见帧缓冲上"整窗清背景 -> 重绘"，无垂直同步时
+ * 扫描线恰好扫到清空阶段就看到整窗闪白，高速循环下表现为持续闪动看不清。
+ * 双缓冲：先把整窗画进离屏缓冲，再一次性顺序搬回 LFB（扫描线最多看到
+ * 一次完整新画面，不再出现清空阶段的空白）。
+ *
+ * 缓冲放在固定物理地址 16MB 处：内核加载于 0x10000、镜像仅 256KB，
+ * 若用 .bss 大数组会跨到 VGA 显存区（0xA0000）损坏硬件区域；
+ * 16MB 是 QEMU 默认内存内无人使用的空闲 DRAM。上限 1600x1200。
+ * ================================================================== */
+#define GW_BB_ADDR   0x1000000u    /* 16MB 空闲 DRAM */
+#define GW_BB_CAP    (1600u * 1200u)
+#define GW_BB_FPS_MS 16            /* 重绘节流：约 60FPS */
+
+static uint16_t *g_gw_bb = (uint16_t*)GW_BB_ADDR;
+static uint8_t *g_gw_real_fb = NULL;
+static uint32_t gw_game_last_draw_ms = 0;
+
+/* 进入离屏绘制：成功返回 1 并把 gfx_fb 切到后备缓冲，调用方随后用常规
+ * gw_ 与 gfx_ 系列接口以屏幕坐标绘制，绘制函数本身无需任何改动。
+ * 失败（8bpp 回退或分辨率超限）返回 0，调用方走旧直绘路径。 */
+static int gw_bb_begin(void)
+{
+    if (gfx_bpp != 2) return 0;
+    if ((uint32_t)GFX_W * (uint32_t)GFX_H > GW_BB_CAP) return 0;
+    g_gw_real_fb = gfx_fb;
+    gfx_fb = (uint8_t*)g_gw_bb;
+    return 1;
+}
+
+/* 退出离屏绘制，把 (x,y,w,h) 区域从后备缓冲一次性搬回真实 LFB */
+static void gw_bb_end(int x, int y, int w, int h)
+{
+    gfx_fb = g_gw_real_fb;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > GFX_W) w = GFX_W - x;
+    if (y + h > GFX_H) h = GFX_H - y;
+    if (w <= 0 || h <= 0) return;
+    uint16_t *dst = (uint16_t*)gfx_fb + (uint32_t)y * GFX_W + x;
+    uint16_t *src = g_gw_bb + (uint32_t)y * GFX_W + x;
+    for (int j = 0; j < h; j++) {
+        for (int i = 0; i < w; i++)
+            dst[(uint32_t)j * GFX_W + i] = src[(uint32_t)j * GFX_W + i];
+    }
+}
+
+/* ==================================================================
  * 窗口表
  * ================================================================== */
 static gw_window_t gw_windows[GW_MAX_WINDOWS];
@@ -536,11 +588,21 @@ static int gw_title_btn_hit(gw_window_t *w, int mx, int my)
 static void gw_draw_window(gw_window_t *w)
 {
     int x = w->x, y = w->y, ww = w->w, hh = w->h;
-    int mx = mouse_get_x(), my = mouse_get_y();
 
-    /* 阴影（右下 3px 半透明黑） */
+    /* 阴影（右下 3px 半透明黑）——需读 LFB 原像素做 alpha 混合，
+     * 双缓冲路径（离屏）不能画，单独拆出 */
     gw_fill_rgba(x + 3, y + hh - 2, ww, 3, 0x000000u, 80);
     gw_fill_rgba(x + ww - 2, y + 3, 3, hh - 3, 0x000000u, 80);
+
+    gw_draw_window_body(w, 1);
+}
+
+/* 窗口主体：边框/标题栏/内容（with_content=0 时只画窗框和底色，
+ * 供游戏双缓冲路径先铺窗框再覆盖游戏画面） */
+static void gw_draw_window_body(gw_window_t *w, int with_content)
+{
+    int x = w->x, y = w->y, ww = w->w, hh = w->h;
+    int mx = mouse_get_x(), my = mouse_get_y();
 
     /* 边框 */
     gw_frame(x, y, ww, hh, CLR_BORDER);
@@ -579,7 +641,7 @@ static void gw_draw_window(gw_window_t *w)
     /* 内容区背景 */
     gw_fill(x + 1, y + GW_TITLE_H + 1, ww - 2, hh - GW_TITLE_H - 1, gw_bg_rgb);
 
-    if (w->draw && !w->hidden)
+    if (with_content && w->draw && !w->hidden)
         w->draw(w);
 }
 
@@ -2424,8 +2486,10 @@ static int gw_game_mouse_cell(gw_window_t *tw, int kind, int *a, int *b)
 /* 上一帧鼠标按钮状态（点击沿检测用，文件级） */
 static int g_game_mbtn_prev = 0;
 
-/* 游戏 GUI yield 回调：图形游戏整窗清背景后覆盖绘制，并处理鼠标点击；
- * 猜数字(1) 走文本缓冲由 term_draw 渲染 */
+/* 游戏 GUI yield 回调：处理鼠标点击沿 + 双缓冲整窗重绘（含 60FPS 节流）；
+ * 猜数字(1) 走文本缓冲由 term_draw 渲染。
+ * 旧实现在可见帧缓冲上"清背景->重绘"且每次 yield 都执行（轮询频率极高），
+ * 无垂直同步时表现为游戏窗口持续闪动看不清 —— 双缓冲后彻底消除。 */
 static void gw_game_yield(void)
 {
     gw_window_t *tw = NULL;
@@ -2438,7 +2502,7 @@ static void gw_game_yield(void)
     if (!tw) return;
     int kind = games_gfx_kind();
     if (kind == 1) {
-        /* 文本游戏（猜数字）：同步缓冲后由终端渲染 */
+        /* 文本游戏（猜数字）：同步缓冲，绘制交给下方统一重绘 */
         char *gb = games_gfx_buf();
         for (int r = 0; r < TERM_ROWS; r++) {
             for (int c = 0; c < TERM_COLS; c++) {
@@ -2448,11 +2512,9 @@ static void gw_game_yield(void)
         }
         term_caret = games_gfx_pos();
         term_nrows = TERM_ROWS;
-        term_draw(tw);
-        return;
-    }
-    /* 鼠标点击沿检测：左键=1 右键=2，命中游戏区写入 games 轮询队列 */
-    {
+    } else {
+        /* 鼠标点击沿检测：左键=1 右键=2，命中游戏区写入 games 轮询队列。
+         * 必须每次 yield 执行（不受节流限制），否则快速点击可能丢沿 */
         int bt = mouse_get_buttons();
         int edge = 0;
         if ((bt & 1) && !(g_game_mbtn_prev & 1)) edge = 1;
@@ -2464,13 +2526,44 @@ static void gw_game_yield(void)
                 games_set_mouse(a, b, edge);
         }
     }
-    /* 图形游戏：先整窗清背景，再覆盖绘制画面，消除文本残留黑条纹 */
-    gw_fill(tw->x + 4, tw->y + GW_TITLE_H + 4, tw->inner_w - 8, tw->inner_h - 8, 0xF0F0F0);
-    gw_game_draw(tw);
+
+    /* 帧率节流：距上帧不足 16ms 跳过重绘（游戏输入轮询在上面已处理） */
+    uint32_t now = g_pit_ticks;
+    if ((uint32_t)(now - gw_game_last_draw_ms) < GW_BB_FPS_MS) return;
+    gw_game_last_draw_ms = now;
+
+    /* 先擦除旧位置光标（光标在桌面上时 blit 不会覆盖它，防残影） */
+    gw_cursor_restore_bg();
+
+    if (gw_bb_begin()) {
+        /* 双缓冲：整窗（含窗框/标题栏）画进离屏缓冲，再一次搬运 */
+        if (kind == 1) {
+            gw_draw_window_body(tw, 1);          /* 窗框 + 终端文本内容 */
+        } else {
+            gw_draw_window_body(tw, 0);          /* 窗框 + 内容底色 */
+            gw_fill(tw->x + 4, tw->y + GW_TITLE_H + 4,
+                    tw->inner_w - 8, tw->inner_h - 8, 0xF0F0F0);
+            gw_game_draw(tw);
+        }
+        gw_bb_end(tw->x, tw->y, tw->w, tw->h);
+    } else {
+        /* 8bpp 回退 / 分辨率超限：维持旧直绘路径 */
+        if (kind == 1) {
+            term_draw(tw);
+        } else {
+            gw_fill(tw->x + 4, tw->y + GW_TITLE_H + 4,
+                    tw->inner_w - 8, tw->inner_h - 8, 0xF0F0F0);
+            gw_game_draw(tw);
+        }
+    }
+
     /* 游戏期间 games_play 阻塞在主循环外，主循环末尾的光标绘制不执行；
-     * 这里每帧补画光标，否则图形游戏内看不到鼠标指针。下一帧整窗清背景
-     * 会先覆盖旧光标，因此无需背景缓存也不会有残影。 */
-    gw_cursor_draw(mouse_get_x(), mouse_get_y());
+     * 这里每帧补画光标，否则游戏内看不到鼠标指针 */
+    {
+        int mx = mouse_get_x(), my = mouse_get_y();
+        gw_cursor_save_bg(mx, my);
+        gw_cursor_draw(mx, my);
+    }
 }
 
 /* 运行单个游戏（idx 1..7），复用 Terminal 窗口宿主；不打印提示符，
@@ -2489,6 +2582,8 @@ static int gw_run_game(int idx)
     if (!tw) return 0;
     games_set_gfx(1, gw_game_yield);
     term_input_reset();           /* 游戏期间终端输入缓冲失效，先清空 */
+    gw_game_last_draw_ms = 0;     /* 进入游戏立即绘制首帧 */
+    g_game_mbtn_prev = mouse_get_buttons();   /* 消化启动点击，防止幻影点击传入游戏 */
     games_play(idx);              /* 阻塞运行，yield 驱动重绘；游戏内部读键盘 */
     games_set_gfx(0, NULL);
     /* 游戏结束不回到终端：直接关闭宿主窗口回桌面 */
@@ -2519,10 +2614,27 @@ static int gw_game_menu(void)
     games_set_gfx(1, gw_game_yield);
     term_input_reset();
     int sel = 1;
+    gw_game_last_draw_ms = 0;   /* 菜单进入立即绘制首帧 */
     for (;;) {
-        gw_game_draw_menu(tw, sel);
-        /* 菜单循环同样阻塞在主循环外，补画光标否则看不到指针 */
-        gw_cursor_draw(mouse_get_x(), mouse_get_y());
+        /* 忙等循环：节流 + 双缓冲重绘，消除菜单高速直绘造成的闪动 */
+        uint32_t now = g_pit_ticks;
+        if ((uint32_t)(now - gw_game_last_draw_ms) >= GW_BB_FPS_MS) {
+            gw_game_last_draw_ms = now;
+            gw_cursor_restore_bg();
+            if (gw_bb_begin()) {
+                gw_draw_window_body(tw, 0);
+                gw_game_draw_menu(tw, sel);
+                gw_bb_end(tw->x, tw->y, tw->w, tw->h);
+            } else {
+                gw_game_draw_menu(tw, sel);
+            }
+            /* 菜单循环同样阻塞在主循环外，补画光标否则看不到指针 */
+            {
+                int mx = mouse_get_x(), my = mouse_get_y();
+                gw_cursor_save_bg(mx, my);
+                gw_cursor_draw(mx, my);
+            }
+        }
         int c = keyboard_getchar();
         if (c == 0) continue;
         if (c == 'q' || c == 'Q' || c == 0x1B) break;
