@@ -150,14 +150,18 @@ void mouse_init(void) {
     }
     mouse_read();  // 设备 ID（通常 0x00）
 
-    mouse_available = 1;
-    mouse_fail_stage = 0x55;   // [DEBUG] init 成功（0=未执行 1=A9失败 2=BAT失败 0xAA=未到末尾）
-
     // 启用滚轮（IntelliMouse 协议）：采样率 200 -> 100 -> 80
     // [DEBUG] 强制 3 字节标准 PS/2 协议,避免与 QEMU 包长错位
     has_wheel = 0;
     packet_len = 3;
+    packet_index = 0;
+    /* 关键：必须在 mouse_available=1 之前使能数据报告并消费其 ACK(0xFA)。
+     * 否则 IRQ12 处理程序会把 0xFA 当作包首字节（0xFA 的 bit3=1，能通过
+     * 同步位检查），导致整个数据包流永久错位 —— 鼠标移动/点击全部错乱。 */
     mouse_cmd(0xF4);   // 使能数据报告
+
+    mouse_available = 1;
+    mouse_fail_stage = 0x55;   // [DEBUG] init 成功（0=未执行 1=A9失败 2=BAT失败 0xAA=未到末尾）
 
     // 分辨率自适应：指针初始位置 = 屏幕中心（320x200 -> 160,100；640x480 -> 320,240）
     if (GFX_W > 0 && GFX_H > 0) {
@@ -186,6 +190,13 @@ void mouse_handler(void) {
             outb(0x20, 0x20);
             return;
         }
+        /* 防御：命令应答字节（ACK=0xFA / BAT=0xAA / 回显=0xEE）虽然 bit3=1
+         * 能通过同步检查，但不是数据包首字节。混入会导致包流错位。 */
+        if (data == 0xFA || data == 0xAA || data == 0xEE) {
+            outb(0xA0, 0x20);
+            outb(0x20, 0x20);
+            return;
+        }
         packet[0] = data;
         packet_index = 1;
     } else {
@@ -198,8 +209,15 @@ void mouse_handler(void) {
             // PS/2 位移累积（带符号），并按当前分辨率裁剪
             int dx = (int)(int8_t)packet[1];
             int dy = (int)(int8_t)packet[2];
-            mouse_accumulate(dx, dy);
             mouse_buttons = packet[0] & 0x07;
+            /* PS/2 规范：byte0 的 bit7/bit6 为 X/Y 溢出标志，溢出包的
+             * 增量数据无效，必须整包丢弃（否则指针会乱跳/卡死）。 */
+            if (packet[0] & 0xC0) {
+                outb(0xA0, 0x20);
+                outb(0x20, 0x20);
+                return;
+            }
+            mouse_accumulate(dx, dy);
 
             if (has_wheel) {
                 int8_t z = (int8_t)packet[3];
@@ -230,6 +248,16 @@ int mouse_present(void) {
 
 int mouse_get_x(void) {
     return mouse_x;
+}
+
+/* 直接设置指针位置（用于 GUI 启动时按实际分辨率居中） */
+void mouse_warp(int x, int y) {
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (GFX_W > 0 && x > GFX_W - 1) x = GFX_W - 1;
+    if (GFX_H > 0 && y > GFX_H - 1) y = GFX_H - 1;
+    mouse_x = x;
+    mouse_y = y;
 }
 
 int mouse_get_y(void) {

@@ -397,6 +397,7 @@ static void game_tic(void) {
             } else {
                 int c = keyboard_getchar();
                 if (c == 0) { games_yield(); continue; }
+                if (c == 'q' || c == 'Q' || c == 0x1B) break;   /* Q/Esc 中途退出 */
                 if (c < '1' || c > '9') continue;
                 pos = c - '1';
             }

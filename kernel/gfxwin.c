@@ -2159,6 +2159,7 @@ static void gw_game_draw_tic(gw_window_t *w)
                                      (b == 'X') ? 0x0C : 0x09, scale);
         }
     }
+    gfx_draw_text(x0, y0 + ih - 12, "1-9/click: move   Q: quit", 0x08, 0);
 }
 
 static void gw_game_draw_snake(gw_window_t *w)
@@ -2654,6 +2655,9 @@ void gw_start(void)
     gfx_init();
     gfx_set_palette();
     gfx_load_font();
+    /* mouse_init 在内核启动早期执行（当时 GFX 仍是 320x200 默认值），
+     * 进入实际分辨率桌面后把指针重新居中 */
+    mouse_warp(GFX_W / 2, GFX_H / 2);
     gw_boot_anim();
     gw_demo();
 }

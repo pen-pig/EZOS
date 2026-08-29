@@ -259,33 +259,6 @@ void gfx_init(void) {
 
 }
 
-// 鎭?锟??? 80x25 鏂囨湰妯″紡
-void gfx_dump_regs_dbg_line(int line)
-{
-    volatile uint8_t* vm = (volatile uint8_t*)(0xB8000 + (line & 1) * 160);
-    static const char hexd[] = "0123456789ABCDEF";
-    uint8_t v[48];
-    int i, k = 0;
-    for (i = 0; i <= 0x18; i++) { outb(0x3D4, i); v[k++] = inb(0x3D5); }
-    v[k++] = inb(0x3CC);
-    for (i = 0; i <= 0x04; i++) { outb(0x3C4, i); v[k++] = inb(0x3C5); }
-    for (i = 0; i <= 0x08; i++) { outb(0x3CE, i); v[k++] = inb(0x3CF); }
-    inb(0x3DA);
-    outb(0x3C0, 0x10 | 0x20); v[k++] = inb(0x3C1);
-    outb(0x3C0, 0x12 | 0x20); v[k++] = inb(0x3C1);
-    outb(0x3C0, 0x20);
-    for (i = 0; i < 40 && i * 4 + 3 < 160; i++) {
-        vm[i*4+0] = hexd[v[i] >> 4];
-        vm[i*4+1] = 0x07;
-        vm[i*4+2] = hexd[v[i] & 0x0F];
-        vm[i*4+3] = 0x07;
-    }
-}
-
-void gfx_dump_regs_dbg(void)
-{
-    gfx_dump_regs_dbg_line(0);
-}
 
 /* 进入图形模式前调用：把 VGA 8x16 文本字体（plane 2，SeaBIOS 已加载）读入内存。
  * GUI 期间 0xA0000 平面被 LFB/bank 映射覆盖，字体随之被破坏，返回文本模式须还原。 */
@@ -294,26 +267,19 @@ static int g_vga_font_saved = 0;
 
 static void gfx_save_font(void) {
     if (g_vga_font_saved) return;
-    outb(0x3CE, 0x06); outb(0x3CF, 0x05);  /* GC6 misc: odd/even off -> 线性读平面 */
-    outb(0x3CE, 0x05); outb(0x3CF, 0x00);  /* GC5: read mode 0 */
-    outb(0x3CE, 0x04); outb(0x3CF, 0x02);  /* GC4: read map plane 2 */
-    {
-        volatile uint8_t *fp = (volatile uint8_t*)0xA0000;
-        int n, j;
-        for (n = 0; n < 256; n++)
-            for (j = 0; j < 16; j++)
-                g_vga_font[n * 16 + j] = fp[n * 32 + j];
-    }
-    outb(0x3CE, 0x04); outb(0x3CF, 0x00);  /* read map plane 0 */
-    outb(0x3CE, 0x06); outb(0x3CF, 0x0E);  /* GC6 misc: 回文本模式 */
-    outb(0x3CE, 0x05); outb(0x3CF, 0x10);  /* GC5: read mode 1 */
+    /* Use the built-in 8x16 font instead of reading plane 2 back:
+     * while the sequencer is still in odd/even (text) mode, CPU reads
+     * from 0xA0000 interleave plane 0 (char codes) with plane 2 (font),
+     * producing garbage. Program the known-good font on restore. */
+    for (int i = 0; i < 256 * 16; i++)
+        g_vga_font[i] = vga_font_8x16[i];
     g_vga_font_saved = 1;
 }
 
 /* 文本模式恢复时调用：把保存的 8x16 字体写回 plane 2，清掉图形阶段写入的残留字形。 */
 static void gfx_restore_font(void) {
     if (!g_vga_font_saved) return;
-    outb(0x3C4, 0x04); outb(0x3C5, 0x04);  /* SC4: odd/even off */
+    outb(0x3C4, 0x04); outb(0x3C5, 0x06);  /* SC4: odd/even off + extended memory */
     outb(0x3C4, 0x02); outb(0x3C5, 0x04);  /* SC2: map mask plane 2 */
     outb(0x3CE, 0x05); outb(0x3CF, 0x00);  /* GC5: write mode 0 */
     outb(0x3CE, 0x06); outb(0x3CF, 0x04);  /* GC6: 图形平面写模式 */
@@ -324,10 +290,10 @@ static void gfx_restore_font(void) {
             for (j = 0; j < 16; j++)
                 fp[n * 32 + j] = g_vga_font[n * 16 + j];
     }
-    outb(0x3CE, 0x04); outb(0x3CF, 0x02);  /* read map plane 2 */
+    outb(0x3CE, 0x04); outb(0x3CF, 0x00);  /* GC4: read map plane 0 */
     outb(0x3CE, 0x05); outb(0x3CF, 0x10);  /* GC5: read mode 1 */
     outb(0x3CE, 0x06); outb(0x3CF, 0x0E);  /* GC6: 文本模式 */
-    outb(0x3C4, 0x02); outb(0x3C5, 0x0F);  /* SC2: map mask 全部平面 */
+    outb(0x3C4, 0x02); outb(0x3C5, 0x03);  /* SC2: mask plane 0/1 only - protect font plane 2 */
     outb(0x3C4, 0x04); outb(0x3C5, 0x03);  /* SC4: odd/even（文本模式） */
 }
 
@@ -368,7 +334,7 @@ void gfx_restore_text(void) {
     outb(0x3D4, 0x11); outb(0x3D5, 0x8E);   /* V Retrace End (锟侥憋拷模式) */
     outb(0x3D4, 0x12); outb(0x3D5, 0x8F);
     outb(0x3D4, 0x13); outb(0x3D5, 0x28);
-    outb(0x3D4, 0x14); outb(0x3D5, 0x00);
+    outb(0x3D4, 0x14); outb(0x3D5, 0x1F);  /* CR14: underline location (mode 3 value) */
     outb(0x3D4, 0x15); outb(0x3D5, 0x96);
     outb(0x3D4, 0x16); outb(0x3D5, 0xB9);
     outb(0x3D4, 0x17); outb(0x3D5, 0xA3);   /* Mode Control (锟侥憋拷模式) */
@@ -402,7 +368,7 @@ void gfx_restore_text(void) {
     outb(0x3C0, 0x0D); outb(0x3C0, 0x0D);
     outb(0x3C0, 0x0E); outb(0x3C0, 0x0E);
     outb(0x3C0, 0x0F); outb(0x3C0, 0x0F);
-    outb(0x3C0, 0x10); outb(0x3C0, 0x08);  // Mode Control: text mode (AG=0)
+    outb(0x3C0, 0x10); outb(0x3C0, 0x0C);  // Mode Control: text + line-graphics + blink
     outb(0x3C0, 0x11); outb(0x3C0, 0x00);  // Overscan: black
     outb(0x3C0, 0x12); outb(0x3C0, 0x0F);  // Color Plane Enable
     outb(0x3C0, 0x13); outb(0x3C0, 0x00);  // PEL Panning
@@ -651,7 +617,6 @@ int gfx_eval(const char *s, int *ok) {
 }
 
 void gfx_menu(void) {
-    gfx_dump_regs_dbg();   // DBG: dump BIOS text-mode registers to B8000 before switching
     gfx_init();
     gfx_set_palette();
     gfx_load_font();
