@@ -84,10 +84,12 @@ static void mouse_accumulate(int dx, int dy) {
     dy = (int)((dy * mouse_speed) / 256);
     mouse_x += dx;
     mouse_y -= dy;
+    int max_x = (GFX_W > 0) ? (GFX_W - 1) : 319;   /* 未初始化时按 320x200 兜底 */
+    int max_y = (GFX_H > 0) ? (GFX_H - 1) : 199;
     if (mouse_x < 0) mouse_x = 0;
-    else if (mouse_x > GFX_W - 1) mouse_x = GFX_W - 1;
+    else if (mouse_x > max_x) mouse_x = max_x;
     if (mouse_y < 0) mouse_y = 0;
-    else if (mouse_y > GFX_H - 1) mouse_y = GFX_H - 1;
+    else if (mouse_y > max_y) mouse_y = max_y;
 }
 
 void mouse_init(void) {

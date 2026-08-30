@@ -107,7 +107,9 @@ static int x_strcasecmp(const char *a, const char *b) {
 static int x_atoi(const char *s) {
     int result = 0;
     while (*s >= '0' && *s <= '9') {
-        result = result * 10 + (*s - '0');
+        int d = *s - '0';
+        if (result > (2147483647 - d) / 10) return 2147483647;  /* 溢出钳制 */
+        result = result * 10 + d;
         s++;
     }
     return result;
@@ -439,13 +441,15 @@ void cmd_unalias(const char *args) {
 }
 
 /* sleep: RDTSC 忙等延时（近似，QEMU 下按 ~1GHz TSC 估算） */
-static void x_delay_ticks(uint32_t ticks) {
+static void x_delay_ticks(uint64_t ticks) {
+    uint64_t elapsed = 0;
     uint32_t start;
     __asm__ __volatile__("rdtsc" : "=a"(start) : : "edx");
-    while (1) {
+    while (elapsed < ticks) {
         uint32_t now;
         __asm__ __volatile__("rdtsc" : "=a"(now) : : "edx");
-        if (now - start >= ticks) break;
+        elapsed += (uint32_t)(now - start);
+        start = now;
     }
 }
 
@@ -456,7 +460,7 @@ void cmd_sleep(const char *args) {
         return;
     }
     if (ms > 60000) ms = 60000;
-    x_delay_ticks((uint32_t)ms * 1000000u);  /* 约 1ms/1e6 ticks（QEMU 近似） */
+    x_delay_ticks((uint64_t)ms * 1000000ull);  /* 约 1ms/1e6 ticks（QEMU 近似） */
     ezos_console_write("Done (");
     ezos_console_print_dec(ms);
     ezos_console_write(" ms).\n");

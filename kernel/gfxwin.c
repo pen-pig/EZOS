@@ -56,21 +56,6 @@ static int gw_strlen(const char *s)
     return n;
 }
 
-/* [DEBUG-MOUSE] 临时：十进制整数转字符串（用于任务栏坐标标定，验证后移除） */
-static void gw_itoa(int v, char *buf)
-{
-    int n = 0, i;
-    char tmp[12];
-    int neg = 0;
-    if (v < 0) { neg = 1; v = -v; }
-    if (v == 0) tmp[n++] = '0';
-    while (v) { tmp[n++] = '0' + (v % 10); v /= 10; }
-    i = 0;
-    if (neg) buf[i++] = '-';
-    while (n > 0) buf[i++] = tmp[--n];
-    buf[i] = 0;
-}
-
 static uint8_t gw_cmos_read(uint8_t reg)
 {
     outb(0x70, reg);
@@ -279,12 +264,12 @@ void gw_win10_palette(void)
         { 0x00, 0x16, 0x27 }, /* F1 #005A9E */
         { 0x0F, 0x26, 0x3A }, /* F2 #3C9BE8 */
         { 0x3C, 0x3C, 0x3C }, /* F3 #F3F3F3 */
-        { 0x37, 0x37, 0x37 }, /* F4 #E1E1E1 */
-        { 0x32, 0x32, 0x32 }, /* F5 #CDCDCD */
-        { 0x25, 0x25, 0x25 }, /* F6 #999999 */
-        { 0x39, 0x04, 0x08 }, /* F7 #E81123 */
-        { 0x10, 0x10, 0x10 }, /* F8 #202020 */
-        { 0x20, 0x20, 0x20 }, /* F9 #404040 */
+        { 0x38, 0x38, 0x38 }, /* F4 #E1E1E1 */
+        { 0x33, 0x33, 0x33 }, /* F5 #CDCDCD */
+        { 0x26, 0x26, 0x26 }, /* F6 #999999 */
+        { 0x3A, 0x04, 0x08 }, /* F7 #E81123 */
+        { 0x08, 0x08, 0x08 }, /* F8 #202020 */
+        { 0x10, 0x10, 0x10 }, /* F9 #404040 */
     };
     outb(0x3C8, 0xF0);
     for (int i = 0; i < 10; i++) {
@@ -533,7 +518,9 @@ gw_window_t *gw_create(const char *title, int x, int y, int w, int h, int flags)
         wnd->draw = NULL; wnd->key = NULL; wnd->click = NULL; wnd->mousedown = NULL;
         wnd->user = NULL;
         int n = 0;
-        while (title[n] && n < GW_TITLE_MAX - 1) { wnd->title[n] = title[n]; n++; }
+        if (title) {
+            while (title[n] && n < GW_TITLE_MAX - 1) { wnd->title[n] = title[n]; n++; }
+        }
         wnd->title[n] = 0;
         gw_bring_front(wnd);
         return wnd;
@@ -554,6 +541,10 @@ void gw_minimize(gw_window_t *w)
     if (!w) return;
     w->hidden = 1;
     w->minimized = 1;
+    if (gw_focused_wnd == w) {
+        gw_focused_wnd = NULL;
+        w->focused = 0;
+    }
 }
 
 void gw_restore(gw_window_t *w)
@@ -567,7 +558,7 @@ void gw_restore(gw_window_t *w)
 gw_window_t *gw_focused(void) { return gw_focused_wnd; }
 
 int gw_ox(gw_window_t *w) { return w->x + 1; }
-int gw_oy(gw_window_t *w) { return w->y + GW_TITLE_H; }
+int gw_oy(gw_window_t *w) { return w->y + GW_TITLE_H + 1; }
 
 /* ==================================================================
  * 窗口绘制
@@ -1262,7 +1253,8 @@ static void notepad_draw(gw_window_t *w)
 
 static void notepad_key(gw_window_t *w, int key)
 {
-    (void)w;
+    int vis = (w->inner_h - 15) / 10;
+    if (vis < 1) vis = 1;
     if (key >= 32 && key < 127 && np_col < NP_COLS) {
         char *line = np_buf[np_row];
         int len = gw_strlen(line);
@@ -1287,12 +1279,12 @@ static void notepad_key(gw_window_t *w, int key)
         if (np_row < NP_ROWS - 1) {
             np_row++;
             np_col = 0;
-            if (np_row >= np_scroll + 10) np_scroll = np_row - 9;
+            if (np_row >= np_scroll + vis) np_scroll = np_row - vis + 1;
         }
     } else if (key == KEY_UP) {
         if (np_row > 0) { np_row--; if (np_row < np_scroll) np_scroll = np_row; }
     } else if (key == KEY_DOWN) {
-        if (np_row < NP_ROWS - 1) { np_row++; if (np_row >= np_scroll + 10) np_scroll = np_row - 9; }
+        if (np_row < NP_ROWS - 1) { np_row++; if (np_row >= np_scroll + vis) np_scroll = np_row - vis + 1; }
     } else if (key == KEY_LEFT) {
         if (np_col > 0) np_col--;
         else if (np_row > 0) { np_row--; np_col = gw_strlen(np_buf[np_row]); }
@@ -1845,10 +1837,10 @@ void gw_handle_mouse(int mx, int my, int buttons)
             } else {
                 int nx = mx - hit->move_dx;
                 int ny = my - hit->move_dy;
-                if (nx < 0) nx = 0;
-                if (ny < 0) ny = 0;
                 if (ny + hit->h > GFX_H - gw_taskbar_h()) ny = GFX_H - gw_taskbar_h() - hit->h;
                 if (nx + hit->w > GFX_W) nx = GFX_W - hit->w;
+                if (nx < 0) nx = 0;
+                if (ny < 0) ny = 0;
                 hit->x = nx;   /* 实时跟随：窗口本体随鼠标移动 */
                 hit->y = ny;
                 /* 边界钳制后按新位置重校准偏移，保证鼠标不会滑出标题栏导致拖动中断 */
@@ -1919,8 +1911,10 @@ void gw_scrollbar(int x, int y, int h, int thumb_y, int thumb_h, uint8_t color)
     (void)color;
     gw_fill(x, y, 6, h, 0xE8E8E8u);
     if (thumb_h < 8) thumb_h = 8;
+    if (thumb_h > h) thumb_h = h;
     if (thumb_y < 0) thumb_y = 0;
     if (thumb_y + thumb_h > h) thumb_y = h - thumb_h;
+    if (thumb_y < 0) thumb_y = 0;
     gw_fill(x + 1, y + thumb_y, 4, thumb_h, 0xB0B0B0u);
 }
 
@@ -2123,6 +2117,8 @@ static void term_draw(gw_window_t *w)
     int cw = 8, ch = 16;
     int cols = (w->inner_w - 8) / cw;
     int rows = (w->inner_h - 8) / ch;
+    if (cols < 0) cols = 0;
+    if (rows < 0) rows = 0;
     if (cols > TERM_COLS) cols = TERM_COLS;
     if (rows > TERM_ROWS) rows = TERM_ROWS;
     int start = 0;
@@ -2163,13 +2159,11 @@ static void term_key(gw_window_t *w, int key)
         term_newline();
         term_prompt();
     } else if (key == 0x08) {  /* Backspace */
-        if (term_input_len > 0) {
+        if (term_input_len > 0 && term_caret > 0 && term_caret % TERM_COLS != 0) {
             term_input_len--;
             term_input[term_input_len] = 0;
-            if (term_caret > 0 && term_caret % TERM_COLS != 0) {
-                term_caret--;
-                term_buf[term_caret] = ' ';
-            }
+            term_caret--;
+            term_buf[term_caret] = ' ';
         }
     } else if (key >= 0x20 && key < 0x7F) {
         if (term_input_len < TERM_COLS) {
@@ -2246,7 +2240,7 @@ static void gw_game_draw_snake(gw_window_t *w)
     int x0 = w->x + 4, y0 = w->y + GW_TITLE_H + 4;
     int iw = w->inner_w - 8, ih = w->inner_h - 8;
     int cell = (iw / 20 < ih / 10) ? iw / 20 : ih / 10;
-    if (cell < 3) cell = 3;
+    if (cell < 1) cell = 1;
     int bw = cell * 20, bh = cell * 10;
     int ox = x0 + (iw - bw) / 2, oy = y0 + (ih - bh) / 2;
     gw_fill(ox - 2, oy - 2, bw + 4, bh + 4, 0x202020);
@@ -2310,7 +2304,7 @@ static void gw_game_draw_ms(gw_window_t *w)
     int x0 = w->x + 4, y0 = w->y + GW_TITLE_H + 4;
     int iw = w->inner_w - 8, ih = w->inner_h - 8;
     int cell = (iw / 9 < ih / 9) ? iw / 9 : ih / 9;
-    if (cell < 6) cell = 6;
+    if (cell < 1) cell = 1;
     int bw = cell * 9, bh = cell * 9;
     int ox = x0 + (iw - bw) / 2, oy = y0 + (ih - bh) / 2;
     gw_fill(ox - 2, oy - 2, bw + 4, bh + 4, 0x606060);
@@ -2420,7 +2414,7 @@ static void gw_game_draw_menu(gw_window_t *w, int sel)
         "4  2048", "5  Minesweeper", "6  Rock-Paper-Scissors", "7  Memory"
     };
     int row_h = (ih - 60) / 7;
-    if (row_h < 12) row_h = 12;
+    if (row_h < 1) row_h = 1;
     for (int i = 0; i < 7; i++) {
         int ry = y0 + 40 + i * row_h;
         if (i + 1 == sel) {
@@ -2553,6 +2547,11 @@ static void gw_game_yield(void)
     int cur_in_win = gw_cursor_in_win(tw, mx, my);
     int old_in_win = gw_cursor_old_in_win(tw);
 
+    /* 先擦除旧光标：旧位置在窗口外时 blit 不会覆盖它，需手工恢复背景；
+     * 必须在保存新位置背景（gw_cursor_save_bg）之前完成，否则旧背景缓存被新位置覆盖 */
+    if (!old_in_win)
+        gw_cursor_restore_bg();
+
     if (gw_bb_begin()) {
         /* 1. 新帧画进离屏缓冲（较慢）：期间 LFB 仍显示上一帧（含光标），
          *    光标持续可见。旧实现先擦光标再慢慢绘制，绘制耗时一旦接近
@@ -2573,11 +2572,7 @@ static void gw_game_yield(void)
             gw_cursor_draw(mx, my);
         }
         gw_bb_end(tw->x, tw->y, tw->w, tw->h);
-        /* 3. 旧光标在窗口外才需手工擦除（窗口内的像素已被 blit 覆盖）；
-         *    必须在 bb_end 之后 —— restore 写 gfx_fb，此时才指回真实 LFB */
-        if (!old_in_win)
-            gw_cursor_restore_bg();
-        /* 4. 光标（部分）在窗口外：blit 后直绘，背景从 LFB 保存 */
+        /* 3. 光标（部分）在窗口外：blit 后直绘，背景从 LFB 保存 */
         if (!cur_in_win) {
             gw_cursor_save_bg(mx, my);
             gw_cursor_draw(mx, my);
@@ -2653,6 +2648,9 @@ static int gw_game_menu(void)
             int mx = mouse_get_x(), my = mouse_get_y();
             int cur_in_win = gw_cursor_in_win(tw, mx, my);
             int old_in_win = gw_cursor_old_in_win(tw);
+            /* 先擦除旧光标（窗口外不会被 blit 覆盖），再保存/绘制新位置背景 */
+            if (!old_in_win)
+                gw_cursor_restore_bg();
             if (gw_bb_begin()) {
                 gw_draw_window_body(tw, 0);
                 gw_game_draw_menu(tw, sel);
@@ -2661,8 +2659,6 @@ static int gw_game_menu(void)
                     gw_cursor_draw(mx, my);
                 }
                 gw_bb_end(tw->x, tw->y, tw->w, tw->h);
-                if (!old_in_win)
-                    gw_cursor_restore_bg();
                 if (!cur_in_win) {
                     gw_cursor_save_bg(mx, my);
                     gw_cursor_draw(mx, my);

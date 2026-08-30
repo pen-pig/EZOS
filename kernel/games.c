@@ -91,11 +91,12 @@ static void games_putc(char c) {
     if (!g_gfx) { real_putchar(c); return; }
     if (c == '\n') {
         g_gpos = (g_gpos / 80 + 1) * 80;
+        if (g_gpos >= 24 * 80) games_gfx_scroll();
     } else {
+        if (g_gpos >= 24 * 80) games_gfx_scroll();
         g_gbuf[g_gpos] = c;
         g_gpos++;
     }
-    if (g_gpos >= 24 * 80) games_gfx_scroll();
 }
 
 static void games_write(const char *s) {
@@ -155,7 +156,7 @@ static int games_readline_gfx(char *buf, int maxlen) {
         }
         if (c == 0x08 && n > 0) {
             n--;
-            if (g_gpos > 0) {
+            if (g_gpos > 0 && (g_gpos % 80) != 0) {
                 g_gpos--;
                 g_gbuf[g_gpos] = ' ';
             }
@@ -203,7 +204,9 @@ static uint32_t games_rdtsc(void) {
 static int games_atoi(const char *s) {
     int result = 0;
     while (*s >= '0' && *s <= '9') {
-        result = result * 10 + (*s - '0');
+        int d = *s - '0';
+        if (result > (0x7FFFFFFF - d) / 10) break;   /* 溢出：停止解析 */
+        result = result * 10 + d;
         s++;
     }
     return result;
@@ -552,14 +555,12 @@ static void game_snake(void) {
             if (snake_body[i][0] == nx && snake_body[i][1] == ny) { alive = 0; break; }
         }
         if (!alive) break;
-        for (int i = snake_len - 1; i > 0; i--) {
+        for (int i = snake_len; i > 0; i--) {
             snake_body[i][0] = snake_body[i - 1][0];
             snake_body[i][1] = snake_body[i - 1][1];
         }
         snake_body[0][0] = nx; snake_body[0][1] = ny;
         if (nx == food_x && ny == food_y) {
-            snake_body[snake_len][0] = snake_body[snake_len - 1][0];
-            snake_body[snake_len][1] = snake_body[snake_len - 1][1];
             snake_len++;
             if (snake_len >= SNAKE_MAX) { alive = 0; break; }
             snake_spawn_food();
@@ -1082,11 +1083,17 @@ static void game_memory(void) {
             if (act == 0 || act == 1) continue;      /* 移动由 yield 重绘 */
             if (act == 3) break;                     /* 退出 */
             int idx = mem_cy * MEM_COLS + mem_cx;
-            if (mem_face[idx] || mem_show[idx]) { games_yield(); continue; }
+            if (mem_face[idx]) { games_yield(); continue; }
+            if (first == idx) {          /* 再次点击第一张牌：取消选择 */
+                mem_show[idx] = 0;
+                first = -1;
+                games_yield();
+                continue;
+            }
+            if (mem_show[idx]) { games_yield(); continue; }
             mem_flips++;
             mem_show[idx] = mem_cards[idx];
             if (first < 0) { first = idx; games_yield(); continue; }
-            if (first == idx) { mem_show[idx] = 0; first = -1; games_yield(); continue; }
             games_yield();   /* 显示第二张 */
             if (mem_cards[first] == mem_cards[idx]) {
                 mem_face[first] = 1; mem_face[idx] = 1;
@@ -1125,14 +1132,21 @@ static void game_memory(void) {
             continue;
         }
         int idx = r * MEM_COLS + c;
-        if (mem_face[idx] || mem_show[idx]) {
+        if (mem_face[idx]) {
+            ezos_console_write("Already open\n");
+            continue;
+        }
+        if (first == idx) {              /* 再次输入第一张牌：取消选择 */
+            mem_show[idx] = 0;
+            continue;
+        }
+        if (mem_show[idx]) {
             ezos_console_write("Already open\n");
             continue;
         }
         mem_flips++;
         mem_show[idx] = mem_cards[idx];
         if (first < 0) continue;
-        if (first == idx) { mem_show[idx] = 0; continue; }
         mem_render();
         if (mem_cards[first] == mem_cards[idx]) {
             mem_face[first] = 1;
