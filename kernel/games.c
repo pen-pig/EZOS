@@ -21,6 +21,7 @@
 #include "types.h"
 #include "tty.h"
 #include "keyboard.h"
+#include "shell.h"
 
 /* ---- ezos_console 适配层（定义于 shell_extra.c） ---- */
 extern void ezos_console_putchar(char c);
@@ -406,15 +407,24 @@ static void game_tic(void) {
             }
             if (tic_board[pos] != ' ') { games_yield(); continue; }
             tic_board[pos] = 'X';
+            beep(880, 40);            /* 玩家落子 */
             games_yield();
             if (tic_winner() == 1) break;
             if (tic_full()) break;
             int ai = tic_ai_move();
             if (ai < 0 || ai > 8 || tic_board[ai] != ' ') break;
             tic_board[ai] = 'O';
+            beep(560, 40);            /* AI 落子 */
             games_yield();
             if (tic_winner() == 2) break;
             if (tic_full()) break;
+        }
+        /* 终局音效：玩家胜上扬、AI 胜下沉、平局短促 */
+        {
+            int wr = tic_winner();
+            if (wr == 1) beep(1200, 150);
+            else if (wr == 2) beep(220, 250);
+            else beep(700, 80);
         }
         games_yield();   /* 终局画面 */
         while (keyboard_getchar() != 0) { }
@@ -562,12 +572,14 @@ static void game_snake(void) {
         snake_body[0][0] = nx; snake_body[0][1] = ny;
         if (nx == food_x && ny == food_y) {
             snake_len++;
+            beep(700, 30);           /* 吃到食物 */
             if (snake_len >= SNAKE_MAX) { alive = 0; break; }
             snake_spawn_food();
         }
         snake_render();
     }
     if (!alive) {
+        beep(220, 250);              /* 游戏结束 */
         snake_alive = 0;
         ezos_console_write("Game Over! Score: ");
         ezos_console_print_dec((uint32_t)(snake_len - 3));

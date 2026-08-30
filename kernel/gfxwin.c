@@ -25,6 +25,7 @@ extern void system_reboot(void);
 extern int shell_exec_line(const char *line);
 extern void terminal_set_gfx_hook(void (*fn)(const char *));
 extern void shell_set_user_mode(int on);
+#include "shell.h"
 #include "gfxwin.h"
 #include "port.h"
 #include "mouse.h"
@@ -748,6 +749,29 @@ void gw_draw_desktop(void)
         gw_draw_desktop_icon(i, mx, my);
 }
 
+/* 任务栏窗口按钮矩形：按绘制顺序返回第 btn_idx 个按钮的窗口与 x 宽度。
+ * 覆盖所有已用窗口（含最小化）；与 gw_draw_taskbar 绘制顺序一致，
+ * 供绘制与点击命中检测共用。返回 0 = 无此按钮 */
+static int gw_taskbar_btn_rect(int btn_idx, gw_window_t **pw, int *bx_out, int *tw_out)
+{
+    int bx = 48;
+    int n = 0;
+    for (int i = 0; i < GW_MAX_WINDOWS; i++) {
+        gw_window_t *w = &gw_windows[i];
+        if (!w->used) continue;
+        int tw = 8 + gw_strlen(w->title) * 8 + 8;
+        if (tw > gw_scale_x(180)) tw = gw_scale_x(180);
+        if (bx + tw > GFX_W - 90) break;
+        if (n == btn_idx) {
+            *pw = w; *bx_out = bx; *tw_out = tw;
+            return 1;
+        }
+        bx += tw + 4;
+        n++;
+    }
+    return 0;
+}
+
 /* 任务栏 */
 void gw_draw_taskbar(void)
 {
@@ -765,23 +789,23 @@ void gw_draw_taskbar(void)
     }
     gfx_draw_text(6, ty + (th - 8) / 2, "start", 0x0F, GW_C_TASKBAR);
 
-    /* 任务按钮：非隐藏窗口 */
-    int bx = 48;
-    for (int i = 0; i < GW_MAX_WINDOWS; i++) {
-        gw_window_t *w = &gw_windows[i];
-        if (!w->used || w->hidden) continue;
-        int tw = 8 + gw_strlen(w->title) * 8 + 8;
-        if (tw > gw_scale_x(180)) tw = gw_scale_x(180);
-        if (bx + tw > GFX_W - 90) break;
+    /* 任务按钮：所有窗口（最小化的暗显，可点击恢复） */
+    for (int btn = 0; ; btn++) {
+        gw_window_t *w;
+        int bx, tw;
+        if (!gw_taskbar_btn_rect(btn, &w, &bx, &tw)) break;
         int hov = (mx >= bx && mx < bx + tw && my >= ty);
-        if (w->focused) {
+        if (w->focused && !w->hidden) {
             gw_fill(bx, ty + 1, tw, th - 2, 0x2A2A2Au);
             gw_fill(bx, ty + th - 3, tw, 3, CLR_TASKBAR_AC);
+        } else if (w->hidden) {
+            gw_fill_rgba(bx, ty + 1, tw, th - 2, 0x000000u, 110);   /* 最小化：暗显 */
         } else if (hov) {
             gw_fill_rgba(bx, ty + 1, tw, th - 2, 0xFFFFFFu, 28);
         }
-        gfx_draw_text(bx + 8, ty + (th - 8) / 2, w->title, 0x0F, w->focused ? 0x08 : GW_C_TASKBAR);
-        bx += tw + 4;
+        gfx_draw_text(bx + 8, ty + (th - 8) / 2, w->title,
+                      w->hidden ? 0x08 : 0x0F,
+                      w->focused ? 0x08 : GW_C_TASKBAR);
     }
 
     /* 时钟（右侧）HH:MM + 小通知图标 */
@@ -1714,23 +1738,19 @@ int gw_handle_desktop_mouse(int mx, int my, int buttons)
         if (gw_start_menu_active && (buttons & 1))
             gw_start_menu_active = 0;
         prev_btn = 0;   /* 不在开始按钮上：清除按下状态 */
-        /* 任务按钮 */
-        int bx = 48;
-        for (int i = 0; i < GW_MAX_WINDOWS; i++) {
-            gw_window_t *w = &gw_windows[i];
-            if (!w->used || w->hidden) continue;
-            int tw = 8 + gw_strlen(w->title) * 8 + 8;
-            if (tw > gw_scale_x(180)) tw = gw_scale_x(180);
-            if (bx + tw > GFX_W - 90) break;
+        /* 任务按钮：与 gw_draw_taskbar 绘制顺序一致（含最小化窗口），
+         * 点击聚焦窗口=最小化，点击非聚焦/最小化窗口=恢复置顶 */
+        for (int btn = 0; ; btn++) {
+            gw_window_t *w; int bx, tw;
+            if (!gw_taskbar_btn_rect(btn, &w, &bx, &tw)) break;
             if (mx >= bx && mx < bx + tw) {
                 if ((buttons & 1) && !(tbtn_prev & 1)) {
-                    if (w->focused) gw_minimize(w);
-                    else gw_restore(w);
+                    if (w->focused && !w->hidden) gw_minimize(w);
+                    else { gw_restore(w); gw_bring_front(w); }
                 }
                 tbtn_prev = buttons;
                 return 1;
             }
-            bx += tw + 4;
         }
         tbtn_prev = 0;   /* 不在任务按钮上：清除按下状态 */
         /* 时钟区：无操作 */
@@ -1755,6 +1775,29 @@ void gw_handle_mouse(int mx, int my, int buttons)
     if (gw_start_menu_active && my < GFX_H - gw_taskbar_h()) {
         if (gw_start_menu_mouse(mx, my, buttons)) { last_btn = buttons; return; }
         if (pressed) gw_start_menu_active = 0;   /* 点击菜单外桌面（按下沿）：关闭菜单 */
+    }
+
+    /* 任务栏区域：开始按钮开关菜单 + 窗口按钮切换（聚焦窗口点击=最小化，
+     * 非聚焦/最小化窗口点击=恢复置顶） */
+    if (my >= GFX_H - gw_taskbar_h()) {
+        if (pressed) {
+            if (mx >= 4 && mx < 48) {
+                gw_start_menu_active = !gw_start_menu_active;
+            } else {
+                for (int btn = 0; ; btn++) {
+                    gw_window_t *w; int bx, tw;
+                    if (!gw_taskbar_btn_rect(btn, &w, &bx, &tw)) break;
+                    if (mx >= bx && mx < bx + tw) {
+                        if (w->focused && !w->hidden) gw_minimize(w);
+                        else { gw_restore(w); gw_bring_front(w); }
+                        break;
+                    }
+                }
+            }
+            gw_dirty = 1;
+        }
+        last_btn = buttons;
+        return;
     }
 
     /* 桌面图标点击（被窗口覆盖的图标不参与，避免窗口区域点击被图标截走） */
@@ -2059,10 +2102,69 @@ int term_dbg_caret(void) { return term_caret; }
 static char term_input[TERM_COLS + 1];   /* 独立输入行缓冲（避免滚动/参数空格导致命令错乱） */
 static int  term_input_len = 0;
 
+/* 命令历史（GUI 终端）：回车提交入栈，Up/Down 翻阅 */
+#define TERM_HIST_MAX 16
+static char term_hist[TERM_HIST_MAX][TERM_COLS + 1];
+static int  term_hist_count = 0;
+static int  term_hist_idx = -1;          /* -1 = 正在编辑新输入 */
+
+static void term_scroll_if_full(void);   /* 前向声明：定义在本组函数之后 */
+
 static void term_input_reset(void)
 {
     term_input_len = 0;
     term_input[0] = 0;
+}
+
+/* 历史入栈（跳过空行与连续重复；满则整体上移一行） */
+static void term_hist_push(const char *line)
+{
+    int len = 0;
+    while (line[len]) len++;
+    if (len == 0) return;
+    if (term_hist_count > 0) {
+        const char *last = term_hist[term_hist_count - 1];
+        int same = 1;
+        for (int i = 0; i <= len; i++) {
+            if (last[i] != line[i]) { same = 0; break; }
+        }
+        if (same) return;
+    }
+    if (term_hist_count < TERM_HIST_MAX) {
+        term_hist_count++;
+    } else {
+        for (int i = 0; i < TERM_HIST_MAX - 1; i++) {
+            for (int j = 0; j <= TERM_COLS; j++) term_hist[i][j] = term_hist[i + 1][j];
+        }
+    }
+    char *dst = term_hist[term_hist_count - 1];
+    for (int i = 0; i < len && i < TERM_COLS; i++) dst[i] = line[i];
+    dst[len > TERM_COLS ? TERM_COLS : len] = 0;
+}
+
+/* 擦除当前输入行字符（输入限长保证不换行），光标回到提示符后 */
+static void term_input_erase(void)
+{
+    while (term_input_len > 0) {
+        term_input_len--;
+        term_caret--;
+        term_buf[term_caret] = ' ';
+    }
+    term_input[0] = 0;
+}
+
+/* 用历史行替换当前输入（重绘进终端缓冲） */
+static void term_input_set(const char *s)
+{
+    term_input_erase();
+    while (*s && term_input_len < TERM_COLS - 3) {
+        term_scroll_if_full();
+        term_input[term_input_len++] = *s;
+        term_buf[term_caret++] = *s;
+        s++;
+    }
+    term_input[term_input_len] = 0;
+    term_nrows = term_caret / TERM_COLS + 1;
 }
 
 /* 打印 shell 提示符并清空输入缓冲 */
@@ -2155,9 +2257,13 @@ static void term_key(gw_window_t *w, int key)
         for (int i = 0; i < len; i++) line[i] = term_input[i];
         line[len] = 0;
         term_newline();
-        if (len > 0) shell_exec_line(line);
+        if (len > 0) {
+            term_hist_push(line);
+            shell_exec_line(line);
+        }
         term_newline();
         term_prompt();
+        term_hist_idx = -1;
     } else if (key == 0x08) {  /* Backspace */
         if (term_input_len > 0 && term_caret > 0 && term_caret % TERM_COLS != 0) {
             term_input_len--;
@@ -2165,14 +2271,57 @@ static void term_key(gw_window_t *w, int key)
             term_caret--;
             term_buf[term_caret] = ' ';
         }
+    } else if (key == KEY_UP) {        /* 历史上一条（更早） */
+        if (term_hist_count > 0 && term_hist_idx < term_hist_count - 1) {
+            term_hist_idx++;
+            term_input_set(term_hist[term_hist_count - 1 - term_hist_idx]);
+        }
+    } else if (key == KEY_DOWN) {      /* 历史下一条（更新） */
+        if (term_hist_idx > 0) {
+            term_hist_idx--;
+            term_input_set(term_hist[term_hist_count - 1 - term_hist_idx]);
+        } else if (term_hist_idx == 0) {
+            term_hist_idx = -1;
+            term_input_erase();
+        }
+    } else if (key == '\t') {          /* Tab 补全第一个词（命令名） */
+        if (term_input_len > 0) {
+            int has_space = 0;
+            for (int i = 0; i < term_input_len; i++) {
+                if (term_input[i] == ' ') { has_space = 1; break; }
+            }
+            if (!has_space) {
+                char full[TERM_COLS + 1];
+                const char *matches[12];
+                int r = shell_complete_command(term_input, full, sizeof(full), matches, 12);
+                if (r == 1) {
+                    term_input_set(full);
+                } else if (r >= 2) {
+                    /* 先保存当前输入（term_input_set 会清空源缓冲） */
+                    char keep[TERM_COLS + 1];
+                    for (int i = 0; i <= term_input_len; i++) keep[i] = term_input[i];
+                    term_newline();
+                    term_print("  ");
+                    for (int i = 0; i < r && i < 12; i++) {
+                        term_print(matches[i]);
+                        term_print(" ");
+                    }
+                    term_newline();
+                    term_prompt();
+                    term_input_set(keep);
+                }
+            }
+        }
     } else if (key >= 0x20 && key < 0x7F) {
-        if (term_input_len < TERM_COLS) {
+        /* 限长 TERM_COLS-3：提示符 "> " 2 格 + 余量，保证输入行不折行
+         * （历史回填/退格擦除均按单行处理） */
+        if (term_input_len < TERM_COLS - 3) {
             term_input[term_input_len++] = (char)key;
             term_input[term_input_len] = 0;
+            term_scroll_if_full();   /* scroll before write: prevent term_buf[1920] overflow */
+            term_buf[term_caret++] = (char)key;
+            term_nrows = term_caret / TERM_COLS + 1;
         }
-        term_scroll_if_full();   /* scroll before write: prevent term_buf[1920] overflow */
-        term_buf[term_caret++] = (char)key;
-        term_nrows = term_caret / TERM_COLS + 1;
     }
 }
 

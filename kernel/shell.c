@@ -11,6 +11,7 @@
 #include "gfx.h"
 #include "gfxwin.h"
 #include "games.h"
+#include "isr.h"
 
 #define CMD_BUFFER_SIZE 128
 #define HISTORY_SIZE 8
@@ -442,6 +443,41 @@ int shell_is_builtin(const char *name) {
     return 0;
 }
 
+/* 命令名前缀补全：prefix 不区分大小写前缀匹配内建命令表。
+ * 唯一匹配 -> 拷贝完整命令名到 out，返回 1；
+ * 多个匹配 -> 各命令名指针写入 matches[]（最多 max_matches 个），返回匹配总数；
+ * 无匹配 -> 返回 0。供内核 shell 与 GUI 终端 Tab 补全共用 */
+int shell_complete_command(const char *prefix, char *out, int outsz,
+                           const char *matches[], int max_matches) {
+    int plen = 0;
+    while (prefix[plen]) plen++;
+    if (plen == 0 || out == NULL || outsz <= 0) return 0;
+    int count = 0;
+    const char *first = NULL;
+    for (int i = 0; commands[i].name != 0; i++) {
+        const char *name = commands[i].name;
+        int nlen = 0;
+        while (name[nlen]) nlen++;
+        if (nlen < plen) continue;
+        /* 前缀大小写不敏感比较 */
+        int ok = 1;
+        for (int j = 0; j < plen; j++) {
+            if (my_tolower(prefix[j]) != my_tolower(name[j])) { ok = 0; break; }
+        }
+        if (!ok) continue;
+        if (count == 0) first = name;
+        if (matches != NULL && count < max_matches) matches[count] = name;
+        count++;
+    }
+    if (count == 1 && first != NULL) {
+        int i = 0;
+        for (; first[i] && i < outsz - 1; i++) out[i] = first[i];
+        out[i] = '\0';
+        return 1;
+    }
+    return count;
+}
+
 // �ػ浱ǰ������
 static void shell_redraw_line(void) {
     terminal_clear_line(current_row);
@@ -488,7 +524,36 @@ void shell_run(void) {
             shell_redraw_line();
         }
 
-        if (c == '\n') {
+        if (c == '\t') {
+            /* Tab 补全：仅当光标停在第一个词内（命令名）时补全 */
+            int word_len = 0;
+            while (word_len < cmd_pos && cmd_buffer[word_len] != ' ') word_len++;
+            if (word_len > 0 && cmd_pos == word_len) {
+                char word[CMD_BUFFER_SIZE];
+                for (int i = 0; i < word_len; i++) word[i] = cmd_buffer[i];
+                word[word_len] = '\0';
+                char full[CMD_BUFFER_SIZE];
+                const char *matches[12];
+                int r = shell_complete_command(word, full, sizeof(full), matches, 12);
+                if (r == 1) {
+                    for (int i = 0; full[i]; i++) cmd_buffer[i] = full[i];
+                    cmd_pos = (int)my_strlen(full);
+                    cursor = cmd_pos;
+                    shell_redraw_line();
+                } else if (r >= 2) {
+                    /* 多个匹配：换行列出候选，重绘提示行 */
+                    terminal_putchar('\n');
+                    for (int i = 0; i < r && i < 12; i++) {
+                        terminal_writestring(matches[i]);
+                        terminal_putchar(' ');
+                    }
+                    terminal_putchar('\n');
+                    current_row = terminal_get_row();
+                    shell_redraw_line();
+                }
+                /* r == 0 无匹配：无操作 */
+            }
+        } else if (c == '\n') {
             terminal_putchar('\n');
             cmd_buffer[cmd_pos] = '\0';
             shell_execute(cmd_buffer);
@@ -858,19 +923,26 @@ static void cmd_hexdump(const char *args) {
     if (len % 16 != 0) terminal_putchar('\n');
 }
 
-static void cmd_beep(const char *args) {
-    (void)args;
-    outb(0x43, 0xB6);
-    uint16_t div = 1193180 / 1000;
+/* PC 蜂鸣器可编程接口：freq Hz 鸣响 ms 毫秒（PIT ch2 + gate 0x61，忙等精确时长）。
+ * 供 shell beep 命令、GUI/游戏音效共用；freq 超出人耳范围或 ms==0 直接返回 */
+void beep(uint32_t freq, uint32_t ms) {
+    if (freq < 20 || freq > 20000 || ms == 0) return;
+    outb(0x43, 0xB6);                       /* ch2: lobyte/hibyte, square wave */
+    uint16_t div = (uint16_t)(1193180 / freq);
+    if (div == 0) div = 1;
     outb(0x42, (uint8_t)(div & 0xFF));
     outb(0x42, (uint8_t)(div >> 8));
     uint8_t tmp = inb(0x61);
-    if (tmp != (tmp | 3)) {
-        outb(0x61, tmp | 3);
-    }
-    for (volatile int i = 0; i < 1000000; i++);
+    outb(0x61, tmp | 3);                    /* gate+speaker on */
+    uint32_t until = g_pit_ticks + ms;      /* PIT ch0 已是 1000Hz，tick=1ms */
+    while ((int32_t)(g_pit_ticks - until) < 0) { asm volatile("pause"); }
     tmp = inb(0x61) & 0xFC;
-    outb(0x61, tmp);
+    outb(0x61, tmp);                        /* gate+speaker off */
+}
+
+static void cmd_beep(const char *args) {
+    (void)args;
+    beep(1000, 300);
 }
 
 static void cmd_about(const char *args) {
