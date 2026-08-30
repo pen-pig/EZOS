@@ -21,8 +21,8 @@ static int cmd_pos = 0;
 static char history[HISTORY_SIZE][CMD_BUFFER_SIZE];
 static int history_count = 0;
 
-static int history_index = -1;      // ��ǰ�������ʷλ�ã�-1 ��ʾ��������
-static size_t cursor = 0;           // ����ڵ�ǰ�����е�λ��
+static int history_index = -1;      // ��ǰ�������ʷλ�ã�?1 ��ʾ��������
+static size_t cursor = 0;           // ����ڵ�ǰ�����е�λ��?
 static size_t current_row = 0;      // ��ǰ��ʾ�������к�
 static int shell_exit_flag = 0;     // exit ������λ��shell_run �ݴ˷���
 /* ��ϣ�shell ѭ��ÿ�ֲ��� EFLAGS��data ��ȫ�֣��� QEMU monitor ���ڴ���֤�� */
@@ -86,10 +86,10 @@ static uint32_t my_htoi(const char *s) {
 }
 
 // 64 λ / 32 λ�޷��ų������������� libgcc �� __udivdi3��
-// ��� hi:lo ��� 64 λ��������d Ϊ������������
+// ���?hi:lo ���?64 λ��������d Ϊ������������
 static uint32_t udiv64_32(uint32_t hi, uint32_t lo, uint32_t d) {
     if (d == 0) return 0;
-    if (hi >= d) return 0xFFFFFFFF;   // ���������
+    if (hi >= d) return 0xFFFFFFFF;   // ���������?
     uint64_t rem = hi;
     uint32_t q = 0;
     for (int i = 31; i >= 0; i--) {
@@ -174,6 +174,7 @@ static void cmd_mkdir(const char *args);
 static void cmd_pwd(const char *args);
 static void cmd_gui(const char *args);
 static void cmd_desktop(const char *args);
+static void cmd_theme(const char *args);
 static void cmd_uname(const char *args);
 static void cmd_vi(const char *args);
 static void cmd_df(const char *args);
@@ -228,6 +229,7 @@ static const command_t commands[] = {
     {"pwd",      cmd_pwd},
     {"gui",      cmd_gui},
     {"desktop",  cmd_desktop},
+    {"theme",    cmd_theme},
     {"uname",    cmd_uname},
     {"vi",       cmd_vi},
     {"df",       cmd_df},
@@ -239,7 +241,7 @@ static const command_t commands[] = {
     {"tictactoe",cmd_tictactoe},
     {"snake",    cmd_snake},
     {"games",    cmd_games},
-    /* ������shell_extra.c ��ǿ������ MikanOS �������������壩 */
+    /* ������shell_extra.c ��ǿ������?MikanOS �������������壩 */
     {"ver",      cmd_ver},
     {"sysinfo",  cmd_sysinfo},
     {"type",     cmd_type},
@@ -269,7 +271,7 @@ static int pipe_len = 0;
 static void shell_fg(uint8_t fg) { terminal_setcolor((uint8_t)(fg | (0 << 4))); }
 static void shell_color_default(void) { shell_fg(CLR_LIGHT_GREY); }
 
-/* �����չ���Ƿ�Ϊ��ִ�� */
+/* �����չ���Ƿ�Ϊ��ִ��?*/
 static int is_exe_name(const char *name) {
     int len = 0; while (name[len]) len++;
     if (len < 4) return 0;
@@ -282,8 +284,9 @@ static int is_exe_name(const char *name) {
 static void shell_execute_raw(char *cmd);
 
 /* shell ģʽ��1=�û� shell��GUI Terminal / User Shell����0=�ں� shell */
-static int shell_user_mode = 0;
-void shell_set_user_mode(int u) { shell_user_mode = u ? 1 : 0; }
+/* 清除 exit 请求标志：GUI Terminal 里敲�?exit 后退出桌面时调用�?
+ * 防止残留标志让下一�?shell_run 立即返回 */
+void shell_exit_clear(void) { shell_exit_flag = 0; }
 
 /* ִ�д��ض���/�ܵ������� */
 static void shell_execute(char *cmd) {
@@ -297,7 +300,7 @@ static void shell_execute(char *cmd) {
     while (*cmd == ' ') cmd++;
     if (*cmd == '\0') return;
 
-    /* �����ض��� >��>> �͹ܵ� |�����ַ���������ţ����������ڣ� */
+    /* �����ض��� >��>> �͹ܵ� |�����ַ���������ţ����������ڣ�?*/
     int in_quote = 0;
     char *gt = NULL, *pipe = NULL;
     for (char *p = cmd; *p; p++) {
@@ -375,22 +378,7 @@ static void shell_execute_raw(char *cmd) {
         space = cmd + my_strlen(cmd);
     }
 
-    /* �ں� shell ���ṩ�û�̬���gui/desktop/games �ȣ���
-     * User Shell��shell_user_mode=1���ſɷ��� */
-    if (!shell_user_mode) {
-        static const char *const user_only_cmds[] = {
-            "gui", "desktop", "games", "guess", "tictactoe", "snake"
-        };
-        for (size_t ui = 0; ui < sizeof(user_only_cmds) / sizeof(user_only_cmds[0]); ui++) {
-            if (my_strcasecmp(cmd, user_only_cmds[ui]) == 0) {
-                terminal_writestring("Unknown command: ");
-                terminal_writestring(cmd);
-                terminal_writestring("\n");
-                return;
-            }
-        }
-    }
-
+    /* 在命令表中查找并执行（gui/desktop/games 等所有命令在唯一 shell 中可用） */
     for (int i = 0; commands[i].name != 0; i++) {
         if (my_strcasecmp(cmd, commands[i].name) == 0) {
             commands[i].func(space);
@@ -398,7 +386,7 @@ static void shell_execute_raw(char *cmd) {
         }
     }
 
-    /* ����չ������� POSIX shell ���壩��alias name=cmd ����ı����ڴ���Ч */
+    /* ����չ�������?POSIX shell ���壩��alias name=cmd ����ı����ڴ����?*/
     const char *alias_exp = shell_extra_lookup_alias(cmd);
     if (alias_exp) {
         static int alias_depth = 0;
@@ -409,7 +397,7 @@ static void shell_execute_raw(char *cmd) {
                 expanded[n] = alias_exp[n];
                 n++;
             }
-            /* 保留原命令后接的参数：alias ll=ls 后 ll subdir 应执行 ls subdir */
+            /* 保留原命令后接的参数：alias ll=ls �?ll subdir 应执�?ls subdir */
             if (*space && n < CMD_BUFFER_SIZE - 1) {
                 expanded[n++] = ' ';
                 while (*space && n < CMD_BUFFER_SIZE - 1) {
@@ -443,10 +431,10 @@ int shell_is_builtin(const char *name) {
     return 0;
 }
 
-/* 命令名前缀补全：prefix 不区分大小写前缀匹配内建命令表。
- * 唯一匹配 -> 拷贝完整命令名到 out，返回 1；
- * 多个匹配 -> 各命令名指针写入 matches[]（最多 max_matches 个），返回匹配总数；
- * 无匹配 -> 返回 0。供内核 shell 与 GUI 终端 Tab 补全共用 */
+/* 命令名前缀补全：prefix 不区分大小写前缀匹配内建命令表�?
+ * 唯一匹配 -> 拷贝完整命令名到 out，返�?1�?
+ * 多个匹配 -> 各命令名指针写入 matches[]（最�?max_matches 个），返回匹配总数�?
+ * 无匹�?-> 返回 0。供内核 shell �?GUI 终端 Tab 补全共用 */
 int shell_complete_command(const char *prefix, char *out, int outsz,
                            const char *matches[], int max_matches) {
     int plen = 0;
@@ -490,10 +478,7 @@ static void shell_redraw_line(void) {
 }
 
 void shell_run(void) {
-    if (shell_user_mode)
-        terminal_writestring("EZOS User Shell - Type 'help' for commands.\n");
-    else
-        terminal_writestring("EZOS Kernel Shell - Type 'help' for commands,'exit' to continue boot.\n");
+    terminal_writestring("EZOS Shell - Type 'help' for commands, 'exit' to launch desktop.\n");
     terminal_writestring("> ");
 
     cmd_pos = 0;
@@ -502,7 +487,7 @@ void shell_run(void) {
     current_row = terminal_get_row();
 
     while (1) {
-        asm volatile("sti; nop; nop; nop; nop; nop");   /* ȷ���жϿ�������� STI ���ƴ��ڣ� */
+        asm volatile("sti; nop; nop; nop; nop; nop");   /* ȷ���жϿ��������?STI ���ƴ��ڣ� */
         { uint32_t fl; asm volatile("pushfl; popl %0" : "=r"(fl)); dbg_shell_eflags = fl; }
         if (shell_exit_flag) {
             shell_exit_flag = 0;
@@ -525,7 +510,7 @@ void shell_run(void) {
         }
 
         if (c == '\t') {
-            /* Tab 补全：仅当光标停在第一个词内（命令名）时补全 */
+            /* Tab 补全：仅当光标停在第一个词内（命令名）时补�?*/
             int word_len = 0;
             while (word_len < cmd_pos && cmd_buffer[word_len] != ' ') word_len++;
             if (word_len > 0 && cmd_pos == word_len) {
@@ -541,7 +526,7 @@ void shell_run(void) {
                     cursor = cmd_pos;
                     shell_redraw_line();
                 } else if (r >= 2) {
-                    /* 多个匹配：换行列出候选，重绘提示行 */
+                    /* 多个匹配：换行列出候选，重绘提示�?*/
                     terminal_putchar('\n');
                     for (int i = 0; i < r && i < 12; i++) {
                         terminal_writestring(matches[i]);
@@ -551,7 +536,7 @@ void shell_run(void) {
                     current_row = terminal_get_row();
                     shell_redraw_line();
                 }
-                /* r == 0 无匹配：无操作 */
+                /* r == 0 无匹配：无操�?*/
             }
         } else if (c == '\n') {
             terminal_putchar('\n');
@@ -564,7 +549,7 @@ void shell_run(void) {
             current_row = terminal_get_row();
         } else if (c == '\b') {
             if (cursor > 0) {
-                // ɾ�����ǰ�ַ�
+                // ɾ�����ǰ�ַ�?
                 for (int i = cursor - 1; i < cmd_pos - 1; i++) {
                     cmd_buffer[i] = cmd_buffer[i + 1];
                 }
@@ -626,7 +611,7 @@ void shell_run(void) {
     }
 }
 
-/* �������ʵ�� */
+/* �������ʵ��?*/
 static void cmd_help(const char *args) {
     if (*args != '\0') {
         const char *detail = shell_extra_help(args);
@@ -673,10 +658,10 @@ static void cmd_help(const char *args) {
     terminal_writestring("  cd <dir>   - change directory\n");
     terminal_writestring("  mkdir <dir> - create directory\n");
     terminal_writestring("  pwd        - print working directory\n");
-    if (shell_user_mode) {
-        terminal_writestring("  desktop    - launch graphical desktop\n");
-        terminal_writestring("  gui        - launch text-mode GUI\n");
-    }
+    terminal_writestring("  desktop    - launch graphical desktop\n");
+    terminal_writestring("  gui        - launch text-mode GUI\n");
+    terminal_writestring("  exit       - launch graphical desktop\n");
+    terminal_writestring("  theme [n]  - list/switch GUI theme\n");
     terminal_writestring("  uname      - print system information\n");
     terminal_writestring("  vi <file>  - edit a text file\n");
     terminal_writestring("  df         - show exFAT disk space usage\n");
@@ -684,12 +669,10 @@ static void cmd_help(const char *args) {
     terminal_writestring("  calc <expr> - evaluate expression (e.g. calc 1+2*3)\n");
     terminal_writestring("  hex <num>  - convert decimal <-> hex (0x.. for hex input)\n");
     terminal_writestring("  rand [max] - generate a random number (default 0-99)\n");
-    if (shell_user_mode) {
-        terminal_writestring("  guess      - guess-the-number game\n");
-        terminal_writestring("  tictactoe  - play tic-tac-toe vs AI\n");
-        terminal_writestring("  snake      - play snake game (arrows, P pause, Esc quit)\n");
-        terminal_writestring("  games      - list/launch games\n");
-    }
+    terminal_writestring("  guess      - guess-the-number game\n");
+    terminal_writestring("  tictactoe  - play tic-tac-toe vs AI\n");
+    terminal_writestring("  snake      - play snake game (arrows, P pause, Esc quit)\n");
+    terminal_writestring("  games      - list/launch games\n");
     terminal_writestring("  ver        - show kernel version\n");
     terminal_writestring("  sysinfo    - show system summary (CPU/memory/time)\n");
     terminal_writestring("  type <cmd> - show command type (builtin/alias/file)\n");
@@ -898,7 +881,7 @@ static void cmd_readdisk(const char *args) {
 static void cmd_hexdump(const char *args) {
     uint32_t addr = my_htoi(args);
     int len = 64;
-    /* ��ѡ���Ȳ�����hexdump <addr> [len]����� 1024 */
+    /* ��ѡ���Ȳ�����hexdump <addr> [len]�����?1024 */
     const char *p = args;
     while (*p && *p != ' ') p++;
     while (*p == ' ') p++;
@@ -923,8 +906,8 @@ static void cmd_hexdump(const char *args) {
     if (len % 16 != 0) terminal_putchar('\n');
 }
 
-/* PC 蜂鸣器可编程接口：freq Hz 鸣响 ms 毫秒（PIT ch2 + gate 0x61，忙等精确时长）。
- * 供 shell beep 命令、GUI/游戏音效共用；freq 超出人耳范围或 ms==0 直接返回 */
+/* PC 蜂鸣器可编程接口：freq Hz 鸣响 ms 毫秒（PIT ch2 + gate 0x61，忙等精确时长）�?
+ * �?shell beep 命令、GUI/游戏音效共用；freq 超出人耳范围或 ms==0 直接返回 */
 void beep(uint32_t freq, uint32_t ms) {
     if (freq < 20 || freq > 20000 || ms == 0) return;
     outb(0x43, 0xB6);                       /* ch2: lobyte/hibyte, square wave */
@@ -999,7 +982,7 @@ static void cmd_ls(const char *args) {
         return;
     }
     if (verbose) {
-        /* -l ��ϸģʽ������ + �Ҷ����С + ���ƣ���� MikanOS ListAllEntries�� */
+        /* -l ��ϸģʽ������ + �Ҷ�����?+ ���ƣ����?MikanOS ListAllEntries�� */
         for (int i = 0; i < n; i++) {
             if (entries[i].is_dir) shell_fg(CLR_LIGHT_BLUE);
             else if (is_exe_name(entries[i].name)) shell_fg(CLR_LIGHT_GREEN);
@@ -1047,7 +1030,7 @@ static void cmd_ls(const char *args) {
                 for (int k = 0; k < l; k++) terminal_putchar(namebuf[k]);
                 if (entries[idx].is_dir) terminal_putchar('/');
                 shell_color_default();
-                /* ��䵽�п� */
+                /* ��䵽�п�?*/
                 int pad = l + (entries[idx].is_dir ? 1 : 0);
                 for (int fill = pad; fill < maxlen + 3; fill++) terminal_putchar(' ');
             }
@@ -1148,9 +1131,9 @@ static void cmd_setdrive(const char *args) {
     terminal_writestring("\n");
 }
 
-/* ============ ���� Linux ��������ʵ�֣� ============ */
+/* ============ ���� Linux ��������ʵ�֣�?============ */
 
-// ������һ���ո�ָ��� token��д�� out������ʣ�����ָ��
+// ������һ���ո�ָ���?token��д�� out������ʣ�����ָ��?
 static const char *parse_token(const char *args, char *out, int max) {
     int i = 0;
     while (*args == ' ') args++;
@@ -1426,12 +1409,43 @@ static void cmd_gui(const char *args) {
     terminal_initialize();
 }
 
-/* User Shell �� desktop �������ͼ�����棨�� kernel_main �û�̬�׶�һ�£� */
+/* desktop command: launch graphical desktop (same as 'exit') */
 static void cmd_desktop(const char *args) {
     (void)args;
     terminal_initialize();
     gw_start();
     terminal_initialize();
+}
+
+/* theme [n]: list or switch GUI theme (also selectable in Settings) */
+static void cmd_theme(const char *args) {
+    int n = gw_theme_count();
+    if (args[0] == '\0') {
+        terminal_writestring("Themes:\n");
+        for (int i = 0; i < n; i++) {
+            terminal_writestring("  ");
+            terminal_putchar((char)('0' + i));
+            terminal_writestring(". ");
+            terminal_writestring(gw_theme_name(i));
+            terminal_writestring("\n");
+        }
+        terminal_writestring("Use: theme <n>\n");
+        return;
+    }
+    int idx = 0, valid = 1;
+    for (const char *p = args; *p; p++) {
+        if (*p == ' ') continue;
+        if (*p < '0' || *p > '9' || idx > 99) { valid = 0; break; }
+        idx = idx * 10 + (*p - '0');
+    }
+    if (!valid || idx >= n) {
+        terminal_writestring("Invalid theme index. Use 'theme' to list.\n");
+        return;
+    }
+    gw_set_theme(idx);
+    terminal_writestring("Theme: ");
+    terminal_writestring(gw_theme_name(idx));
+    terminal_writestring("\n");
 }
 
 
@@ -1452,7 +1466,7 @@ static int vi_modified = 0;
 static int vi_mode = 0;
 static const char *vi_msg = NULL;
 
-// ȷ������ںϷ���Χ
+// ȷ������ںϷ����?
 static void vi_clamp_cursor(void) {
     if (vi_count == 0) { vi_row = 0; vi_col = 0; return; }
     if (vi_row < 0) vi_row = 0;
@@ -1505,7 +1519,7 @@ static void vi_render(void) {
     terminal_set_cursor((size_t)(vi_row - vi_top), (size_t)(vi_col - vi_left));
 }
 
-// �ڹ�괦�����ַ�
+// �ڹ�괦�����ַ�?
 static void vi_insert_char(char c) {
     if (vi_len[vi_row] >= VI_MAX_LINE - 1) return;
     for (int i = vi_len[vi_row]; i > vi_col; i--) {
@@ -1517,7 +1531,7 @@ static void vi_insert_char(char c) {
     vi_modified = 1;
 }
 
-// ɾ����괦�ַ�
+// ɾ����괦�ַ�?
 static void vi_delete_char(void) {
     if (vi_col >= vi_len[vi_row]) return;
     for (int i = vi_col; i < vi_len[vi_row] - 1; i++) {
@@ -1551,7 +1565,7 @@ static void vi_backspace(void) {
     }
 }
 
-// �ڹ�괦����
+// �ڹ�괦����?
 static void vi_insert_newline(void) {
     if (vi_count >= VI_MAX_LINES) return;
     int tail = vi_len[vi_row] - vi_col;
@@ -1874,7 +1888,7 @@ static void print_int(int num) {
     uint32_t mag;
     if (num < 0) {
         terminal_putchar('-');
-        mag = (uint32_t)(-(num + 1)) + 1u;   /* 避免 INT_MIN 取负的 UB */
+        mag = (uint32_t)(-(num + 1)) + 1u;   /* 避免 INT_MIN 取负�?UB */
     } else {
         mag = (uint32_t)num;
     }
@@ -1991,7 +2005,7 @@ void cmd_guess(const char *args) {
     }
 }
 
-// tictactoe: �����壨��� X vs AI O��
+// tictactoe: �����壨���?X vs AI O��
 static int tt_win(char b[9], char p) {
     static const int lines[8][3] = {
         {0,1,2},{3,4,5},{6,7,8},
@@ -2054,7 +2068,7 @@ void cmd_tictactoe(const char *args) {
                 b[i] = 0;
             }
         }
-        for (int i = 0; i < 9 && best < 0; i++) {   // 2) �����
+        for (int i = 0; i < 9 && best < 0; i++) {   // 2) �����?
             if (b[i] == 0) {
                 b[i] = 'X';
                 if (tt_win(b, 'X')) best = i;
@@ -2068,7 +2082,7 @@ void cmd_tictactoe(const char *args) {
                 if (b[corners[i]] == 0) { best = corners[i]; break; }
             }
         }
-        if (best < 0) {                             // 5) ���
+        if (best < 0) {                             // 5) ���?
             int n = (int)(my_rand() % 9);
             for (int i = 0; i < 9; i++) {
                 int idx = (n + i) % 9;

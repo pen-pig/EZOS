@@ -51,9 +51,8 @@ class Qmp:
         self.cmd("input-send-event", events=evs)
         time.sleep(hold/1000)
 
-    KEYMAP = {'a':'a','b':'b','c':'c','d':'d','e':'e','x':'x','i':'i','t':'t',
-              's':'s','k':'k','o':'o','p':'p','q':'q','5':'5',' ':'spc',
-              '\n':'ret','\r':'ret'}
+    KEYMAP = {c: c for c in 'abcdefghijklmnopqrstuvwxyz0123456789'}
+    KEYMAP.update({' ':'spc','\n':'ret','\r':'ret','-':'minus','.':'dot','/':'slash'})
     def type_text(self, text, delay=0.05):
         for ch in text:
             kc = self.KEYMAP.get(ch)
@@ -140,8 +139,7 @@ def main():
         q = Qmp()
         print("[QMP] connected")
         time.sleep(2)
-        q.type_text("exit\n"); time.sleep(1.5)
-        q.type_text("desktop\n"); time.sleep(3)
+        q.type_text("exit\n"); time.sleep(3)   # exit 直接进入图形桌面
         q.screendump("shot_desktop.ppm")
         w, h, base = load_ppm("shot_desktop.ppm")
         print(f"[STEP] desktop {w}x{h}")
