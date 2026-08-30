@@ -181,8 +181,7 @@ def main():
 
         # ===== Phase 2: GUI 任务栏窗口按钮 =====
         print("== Phase 2: 任务栏窗口按钮 ==")
-        q.type_text("exit\n"); time.sleep(1.5)
-        q.type_text("desktop\n"); time.sleep(3)
+        q.type_text("exit\n"); time.sleep(3)   # exit 直接进入图形桌面
         q.type_text("t"); time.sleep(1.5)    # 热键打开 Terminal
         q.screendump("f_term.ppm")
         w, h, base = load_ppm("f_term.ppm")

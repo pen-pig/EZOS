@@ -20,11 +20,11 @@ static size_t my_strlen(const char *s) {
 
 static void klog(const char *msg);
 
-/* ���������ֵ���־�и�ʽ����h1/h2 Ϊ 1 ʱʮ���������������ʮ���ƣ� */
+/* ���������ֵ���־�и�ʽ����h1/h2 Ϊ 1 ʱʮ���������������ʮ���ƣ�?*/
 static void klogf(const char *s1, uint32_t v1, int h1,
                   const char *s2, uint32_t v2, int h2, const char *s3) {
-    /* line 缓冲 96 字节；所有写入（含数字）统一以 sizeof(line)-1 为上界，
-     * 避免数字部分无界写入越过末尾，也保证最后一位留给 '\0'。 */
+    /* line 缓冲 96 字节；所有写入（含数字）统一�?sizeof(line)-1 为上界，
+     * 避免数字部分无界写入越过末尾，也保证最后一位留�?'\0'�?*/
     char line[96];
     int n = 0;
     const int lim = (int)sizeof(line) - 1;
@@ -70,7 +70,7 @@ static void klog_hex32(const char *prefix, uint32_t val, const char *suffix) {
     klog(line);
 }
 
-/* ͨ�� RTC CMOS �Ĵ�����ʵ̽���ڴ��С��
+/* ͨ�� RTC CMOS �Ĵ�����ʵ̽���ڴ��С��?
  * reg 0x15/0x16 �����ڴ� KB����/���ֽڣ���reg 0x17/0x18 ��չ�ڴ� KB��
  * ��չ�ڴ�Ϊ 16 λ�ֶΣ����� 65535K��Լ 64MB������ʱ���� NMI�� */
 static uint16_t cmos_read16(uint8_t reg) {
@@ -96,7 +96,7 @@ static void kput_uint3(uint32_t v) {
     terminal_putchar((char)('0' + v % 10));
 }
 
-/* �����ȡ PIT channel 0 ��ǰ��������Ƶ 1193�������� 1193..0�� */
+/* ������?PIT channel 0 ��ǰ��������Ƶ 1193�������� 1193..0�� */
 static uint16_t pit_read_counter(void) {
     outb(0x43, 0x00);            /* latch channel 0 */
     uint8_t lo = inb(0x40);
@@ -104,7 +104,7 @@ static uint16_t pit_read_counter(void) {
     return (uint16_t)(lo | (hi << 8));
 }
 
-/* ��ʵ΢��ʱ�ӣ�Linux dmesg ��񣩣�
+/* ��ʵ΢��ʱ�ӣ�Linux dmesg ��񣩣�?
  * �벿�� = PIT 1000Hz tick��΢�벿�� = PIT �������м�����ÿ���� 1/1193182s �� 0.838us�� */
 static uint32_t pit_usec(void) {
     uint32_t c = pit_read_counter();
@@ -113,7 +113,7 @@ static uint32_t pit_usec(void) {
     return g_pit_ticks * 1000u + (elapsed * 838u) / 1000u;
 }
 
-/* dmesg ���ʱ�����[    0.000000] �����4�Ҷ��� + 6 λ��ʵ΢�룩 */
+/* dmesg ���ʱ�����[    0.000000] �����?�Ҷ��� + 6 λ��ʵ΢�룩 */
 static void klog_prefix(void) {
     uint32_t us = pit_usec();              /* ��ʵ����΢�� */
     uint32_t sec = us / 1000000u;
@@ -170,7 +170,7 @@ static uint8_t rtc_bcd(uint8_t v) {
     return (uint8_t)((v & 0x0F) + ((v >> 4) * 10));
 }
 
-/* ��� RTC ��ʵ����ʱ�䣨UTC+8���� gfxwin ������ʱ��һ�£���prefix �Դ����� */
+/* ���?RTC ��ʵ����ʱ�䣨UTC+8���� gfxwin ������ʱ��һ�£���prefix �Դ����� */
 static void klog_rtc_time(const char *prefix) {
     uint8_t sec  = rtc_bcd(rtc_read(0x00));
     uint8_t min  = rtc_bcd(rtc_read(0x02));
@@ -197,7 +197,7 @@ static void klog_rtc_time(const char *prefix) {
     klog(buf);
 }
 
-/* CPUID ̽�⣨��ʵ���������ַ��������Ҷ�ӡ�����λ */
+/* CPUID ̽�⣨��ʵ���������ַ��������Ҷ�ӡ������?*/
 static void klog_cpuinfo(void) {
     uint32_t eax, ebx, ecx, edx;
     uint32_t efl;
@@ -258,7 +258,7 @@ static void klog_cpuinfo(void) {
 void kernel_main(void) {
     /* ���ñ��� APIC��EZOS ʹ�ô�ͳ 8259 PIC �ж�·�ɡ�
      * QEMU Ĭ�� LAPIC enabled �� LVT0(ExtINT) masked�����̵� PIC ��
-     * ����/����ж����󣻹ر� LAPIC �� LINT0 �ָ�Ϊ INTR ����ֱͨ PIC�� */
+     * ����/����ж����󣻹ر�?LAPIC �� LINT0 �ָ�Ϊ INTR ����ֱͨ PIC�� */
     {
         uint32_t lo, hi;
         asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0x1B));
@@ -279,7 +279,7 @@ void kernel_main(void) {
     idt_init();
     isr_install();
     irq_install();
-    pit_init();               /* 1000Hz ϵͳʱ�ӣ��˺���־ʱ���Ϊ��ʵ����ʱ�� */
+    pit_init();               /* 1000Hz ϵͳʱ�ӣ��˺���־ʱ���Ϊ��ʵ����ʱ��?*/
     asm volatile("sti");
     klog_ok("PIT: system timer 1000Hz (channel 0 rate generator)");
     klog_rtc_time("RTC: boot time 20");   /* ��ʵ����ʱ�䣨CMOS BCD, UTC+8�� */
@@ -334,7 +334,7 @@ void kernel_main(void) {
         klog_fail("exFAT: init error (ATA read / VBR parse failed)");
     }
 
-    /* exFAT ����������ʵ VBR ֵ����ʱ�����־�� */
+    /* exFAT ����������ʵ VBR ֵ����ʱ�����־��?*/
     {
         const exfat_info_t *ei = exfat_get_info();
         klogf("exFAT: volume ", (uint32_t)ei->volume_length, 0, " sectors, ", ei->cluster_count, 0, " clusters");
@@ -379,20 +379,13 @@ void kernel_main(void) {
     terminal_writestring("\n");
 //	klog_ok("EZOS Kernel Shell - type 'help' for commands, 'exit' to continue boot.");
 
-    /* ===== ��ѭ�����ں� shell -> exit -> User Shell -> desktop ͼ������ -> ���� User Shell -> exit ���ں� shell ===== */
+    /* ===== ��ѭ����shell -> exit -> ͼ������ -> �˳������ shell ===== */
     for (;;) {
-        /* kernel-mode shell first (no gui/desktop/games in command table) */
         shell_run();
 
-        /* exit -> user-mode: User Shell����ͼ�����棬������ desktop ���룩 */
+        /* exit ֱ�ӽ���ͼ�����棨���پ��� User Shell�� */
         terminal_writestring("\n");
-        klog("user-mode: entering User Shell (type 'desktop' to launch graphical desktop)");
-        shell_set_user_mode(1);
-        shell_run();
-
-        /* User Shell exit (desktop ����غ� shell_run ���������ߵ�����) -> back to kernel shell */
-        shell_set_user_mode(0);
-        terminal_writestring("\n");
-        klog("user shell exited, returning to kernel shell");
+        klog("entering graphical desktop - quit from start menu to return to shell");
+        gw_start();
     }
 }
