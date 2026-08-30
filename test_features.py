@@ -1,0 +1,273 @@
+# test_features.py - 新功能端到端测试
+# Phase 1: 内核 shell Tab 补全 + 命令历史（文本模式 OCR 验证）
+# Phase 2: GUI 任务栏窗口按钮（最小化/恢复）
+# Phase 3: 井字棋回归（音效不影响渲染）
+import socket, json, time, subprocess, sys, re
+from collections import Counter
+
+QEMU = "D:/MyOS/tools/qemu-portable-20241220/qemu-system-x86_64.exe"
+
+# ---------- VGA 文本模式 OCR (80x25, 8x16 字体) ----------
+_font = None
+def load_font():
+    global _font
+    if _font is not None: return _font
+    with open('kernel/vga_font.h', 'r', encoding='utf-8', errors='ignore') as f:
+        src = f.read()
+    nums = [int(x, 16) for x in re.findall(r'0x[0-9A-Fa-f]{2}', src)]
+    _font = {ch: nums[ch*16:(ch+1)*16] for ch in range(256)}
+    return _font
+
+def load_ppm(path):
+    with open(path, 'rb') as f:
+        data = f.read()
+    parts = data.split(b'\n', 3)
+    w, h = map(int, parts[1].split())
+    return w, h, parts[3]
+
+def ocr_text(path):
+    """解码 VGA 文本模式截图为 80x25 文本"""
+    w, h, px = load_ppm(path)
+    font = load_font()
+    cols, rows = 80, 25
+    cw, chh = w // cols, h // rows
+    blank = {code for code, glyph in font.items() if all(b == 0 for b in glyph)}
+    lines = []
+    for r in range(rows):
+        line = ""
+        for c in range(cols):
+            best, best_score = '?', -1
+            for code, glyph in font.items():
+                score = 0
+                for gy in range(16):
+                    rowbits = glyph[gy]
+                    yy = r*chh + gy
+                    for gx in range(8):
+                        xx = c*cw + gx
+                        i = (yy*w + xx)*3
+                        lum = (px[i]+px[i+1]+px[i+2])//3
+                        if bool(rowbits & (0x80 >> gx)) == (lum > 96):
+                            score += 1
+                if score > best_score:
+                    best_score, best = score, code
+            if best in blank:
+                line += ' '
+            else:
+                line += chr(best) if 32 <= best < 127 else '.'
+        lines.append(line)
+    return '\n'.join(lines)
+
+# ---------- QMP 客户端 ----------
+class Qmp:
+    def __init__(self, host="127.0.0.1", port=4444):
+        for _ in range(20):
+            try:
+                self.sock = socket.create_connection((host, port), timeout=2)
+                break
+            except OSError:
+                time.sleep(0.3)
+        else:
+            raise RuntimeError("QMP connect failed")
+        self.f = self.sock.makefile("rwb")
+        self._read()
+        self.cmd("qmp_capabilities")
+
+    def _read(self):
+        line = self.f.readline()
+        return json.loads(line) if line.strip() else None
+
+    def cmd(self, execute, **args):
+        obj = {"execute": execute}
+        if args: obj["arguments"] = args
+        self.f.write((json.dumps(obj) + "\n").encode())
+        self.f.flush()
+        while True:
+            resp = self._read()
+            if resp is None: return None
+            if "return" in resp or "error" in resp:
+                if "error" in resp: print(f"  [QMP err] {execute}: {resp['error']}")
+                return resp
+
+    def hmp(self, cmdline):
+        return self.cmd("human-monitor-command", **{"command-line": cmdline}).get("return", "")
+
+    def sendkey(self, key, hold=35):
+        for down in (True, False):
+            evs = [{"type":"key","data":{"down":down,"key":{"type":"qcode","data":key}}}]
+            self.cmd("input-send-event", events=evs)
+            time.sleep(hold/1000)
+
+    def type_text(self, text, delay=0.06):
+        KM = {c: c for c in "abcdefghijklmnopqrstuvwxyz0123456789"}
+        KM.update({'\n':'ret','\r':'ret','\t':'tab',' ':'spc'})
+        for ch in text:
+            kc = KM.get(ch)
+            if kc is None:
+                print(f"  [warn] no keymap {ch!r}"); continue
+            self.sendkey(kc)
+            time.sleep(delay)
+
+    def key(self, name):   # up/down/left/right/pgup 等
+        self.sendkey(name, 45)
+
+    def mouse_rel(self, dx, dy, step=50, gap=0.04):
+        import math
+        n = max(1, math.ceil(max(abs(dx), abs(dy)) / step))
+        ax, ay = round(dx/n), round(dy/n)
+        for _ in range(n):
+            evs = [{"type":"rel","data":{"axis":"x","value":ax}},
+                   {"type":"rel","data":{"axis":"y","value":ay}}]
+            self.cmd("input-send-event", events=evs)
+            time.sleep(gap)
+
+    def mouse_click(self):
+        self.cmd("input-send-event", events=[{"type":"btn","data":{"down":True,"button":"left"}}])
+        time.sleep(0.12)
+        self.cmd("input-send-event", events=[{"type":"btn","data":{"down":False,"button":"left"}}])
+        time.sleep(0.15)
+
+    def screendump(self, name):
+        self.hmp(f"screendump {name}")
+        time.sleep(0.4)
+
+PASS = []
+FAIL = []
+def check(name, ok, detail=""):
+    (PASS if ok else FAIL).append(name)
+    print(f"  [{'PASS' if ok else 'FAIL'}] {name} {detail}")
+
+def count_color(px, w, h, r, g, b, tol=14):
+    n = 0
+    for y in range(0, h, 2):
+        for x in range(0, w, 2):
+            i = (y*w + x)*3
+            if abs(px[i]-r)<=tol and abs(px[i+1]-g)<=tol and abs(px[i+2]-b)<=tol:
+                n += 1
+    return n * 4
+
+def main():
+    proc = subprocess.Popen([QEMU, "-vga","std",
+        "-drive","format=raw,file=os-image.bin",
+        "-drive","format=raw,file=disk.img",
+        "-qmp","tcp:127.0.0.1:4444,server,nowait",
+        "-display","none","-serial","none"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        q = Qmp()
+        print("[QMP] connected")
+        time.sleep(2)
+
+        # ===== Phase 1: 内核 shell Tab 补全 + 历史 =====
+        print("== Phase 1: shell Tab 补全 + 历史 ==")
+        q.type_text("hel"); time.sleep(0.3)
+        q.key("tab"); time.sleep(0.5)
+        q.screendump("f_tab.ppm")
+        txt = ocr_text("f_tab.ppm")
+        check("Tab 补全 hel->help", "> help" in txt)
+        q.type_text("\n"); time.sleep(1.5)   # 执行 help
+
+        q.key("up"); time.sleep(0.5)         # 历史回填
+        q.screendump("f_hist.ppm")
+        txt = ocr_text("f_hist.ppm")
+        check("Up 键历史回填 help", "> help" in txt)
+        q.type_text("\n"); time.sleep(0.3)   # 不再执行，占位回车 -> 会再跑一次 help
+
+        q.type_text("c"); time.sleep(0.3)
+        q.key("tab"); time.sleep(0.5)        # 多匹配列出
+        q.screendump("f_multi.ppm")
+        txt = ocr_text("f_multi.ppm")
+        check("多匹配列出 clear/cls", "clear" in txt and "cls" in txt)
+        q.type_text("\n"); time.sleep(0.3)
+
+        # ===== Phase 2: GUI 任务栏窗口按钮 =====
+        print("== Phase 2: 任务栏窗口按钮 ==")
+        q.type_text("exit\n"); time.sleep(3)   # exit 直接进入图形桌面
+        q.type_text("t"); time.sleep(1.5)    # 热键打开 Terminal
+        q.screendump("f_term.ppm")
+        w, h, base = load_ppm("f_term.ppm")
+        term_white = count_color(base, w, h, 240, 240, 240)
+        check("Terminal 窗口打开", term_white > 20000, f"(white={term_white})")
+
+        # 光标移到任务栏 Terminal 按钮中心 (88, 1008)
+        cur = (w//2, h//2)
+        q.mouse_rel(88-cur[0], 1008-cur[1])
+        time.sleep(0.4)
+        q.screendump("f_probe.ppm")
+        _, _, probe = load_ppm("f_probe.ppm")
+        # 找光标新位置（排除旧位置簇）
+        pts = [(x,y) for y in range(0,h,2) for x in range(0,w,2)
+               if base[(y*w+x)*3:(y*w+x)*3+3] != probe[(y*w+x)*3:(y*w+x)*3+3]]
+        cs = []
+        for x,y in pts:
+            for c in cs:
+                if abs(c['x0']-x)<=30 and abs(c['y0']-y)<=30:
+                    c['x0']=min(c['x0'],x);c['x1']=max(c['x1'],x)
+                    c['y0']=min(c['y0'],y);c['y1']=max(c['y1'],y);c['n']+=1;break
+            else:
+                cs.append({'x0':x,'x1':x,'y0':y,'y1':y,'n':1})
+        cs = [c for c in cs if not (abs((c['x0']+c['x1'])//2-cur[0])<=40 and abs((c['y0']+c['y1'])//2-cur[1])<=40)]
+        cs.sort(key=lambda c:c['n'], reverse=True)
+        if cs:
+            cur = ((cs[0]['x0']+cs[0]['x1'])//2, (cs[0]['y0']+cs[0]['y1'])//2)
+        print(f"  cursor at {cur}, clicking taskbar button")
+
+        # 点击任务栏按钮 -> 最小化
+        q.mouse_click(); time.sleep(1)
+        q.screendump("f_min.ppm")
+        _, _, minpx = load_ppm("f_min.ppm")
+        term_white2 = count_color(minpx, w, h, 240, 240, 240)
+        check("点击任务栏按钮最小化窗口", term_white2 < term_white // 4,
+              f"(white {term_white} -> {term_white2})")
+
+        # 再点击 -> 恢复
+        q.mouse_click(); time.sleep(1)
+        q.screendump("f_restore.ppm")
+        _, _, rspx = load_ppm("f_restore.ppm")
+        term_white3 = count_color(rspx, w, h, 240, 240, 240)
+        check("再点击恢复窗口", term_white3 > term_white // 2,
+              f"(white -> {term_white3})")
+
+        # ===== Phase 3: 井字棋回归（音效后渲染正常）=====
+        print("== Phase 3: 井字棋回归（含音效） ==")
+        # 关闭终端窗口再双击? 直接点 TicTac 图标
+        sx = w/640
+        icon_sz = int(w*40/640); box = icon_sz + 26; gap = int(w*8/640)
+        x0 = int(w*8/640); y0 = int(h*10/480)
+        ix = x0 + (5%4)*(box+gap); iy = y0 + (5//4)*(box+gap)
+        target = (ix+box//2, iy+box//2)
+        q.mouse_rel(target[0]-cur[0], target[1]-cur[1])
+        time.sleep(0.4)
+        q.screendump("f_probe2.ppm")
+        _, _, probe2 = load_ppm("f_probe2.ppm")
+        pts = [(x,y) for y in range(0,h,2) for x in range(0,w,2)
+               if rspx[(y*w+x)*3:(y*w+x)*3+3] != probe2[(y*w+x)*3:(y*w+x)*3+3]]
+        cs = []
+        for x,y in pts:
+            for c in cs:
+                if abs(c['x0']-x)<=30 and abs(c['y0']-y)<=30:
+                    c['x0']=min(c['x0'],x);c['x1']=max(c['x1'],x)
+                    c['y0']=min(c['y0'],y);c['y1']=max(c['y1'],y);c['n']+=1;break
+            else:
+                cs.append({'x0':x,'x1':x,'y0':y,'y1':y,'n':1})
+        cs = [c for c in cs if not (abs((c['x0']+c['x1'])//2-cur[0])<=40 and abs((c['y0']+c['y1'])//2-cur[1])<=40)]
+        cs.sort(key=lambda c:c['n'], reverse=True)
+        if cs:
+            cur = ((cs[0]['x0']+cs[0]['x1'])//2, (cs[0]['y0']+cs[0]['y1'])//2)
+        q.mouse_click(); time.sleep(1.5)
+        q.screendump("f_tic.ppm")
+        _, _, tic = load_ppm("f_tic.ppm")
+        grid = count_color(tic, w, h, 96, 96, 96)
+        check("井字棋渲染正常（含音效路径）", grid > 100, f"(grid={grid})")
+        q.type_text("5"); time.sleep(1.2)
+        q.type_text("q"); time.sleep(0.8)
+        q.type_text(" "); time.sleep(1)
+
+        print(f"\n===== 结果: {len(PASS)} PASS / {len(FAIL)} FAIL =====")
+        if FAIL:
+            print("FAILED:", FAIL)
+        return 0 if not FAIL else 1
+    finally:
+        proc.kill()
+
+if __name__ == "__main__":
+    sys.exit(main())
