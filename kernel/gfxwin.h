@@ -67,10 +67,13 @@ struct gw_window {
     int move_dx, move_dy;   /* 拖动时鼠标偏移 */
     int ghost_x, ghost_y;   /* 移动动画 ghost 虚线框位置 */
     int minimized;          /* 最小化（隐藏）标记，点击桌面空白恢复 */
+    int maximized;          /* 最大化标记（双击标题栏切换） */
+    int save_x, save_y, save_w, save_h;   /* 最大化前的几何，还原用 */
     gw_draw_fn draw;
     gw_key_fn key;
     gw_click_fn click;
     gw_mouse_fn mousedown;
+    gw_mouse_fn mousemove;   /* 内容区鼠标移动回调（每帧调用，Paint 拖画用） */
     void *user;
 };
 

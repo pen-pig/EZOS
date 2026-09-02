@@ -44,8 +44,8 @@ done
 CFLAGS="-ffreestanding -O2 -Wall -Wextra -Ikernel"
 LDFLAGS="-m elf_i386 -T linker.ld --oformat binary -e _start"
 
-OBJS="boot/kernel_entry.o kernel/kernel.o kernel/tty.o kernel/idt.o kernel/isr.o kernel/keyboard.o kernel/ata.o kernel/shell.o kernel/shell_extra.o kernel/exfat.o kernel/gfx.o kernel/gui.o kernel/mouse.o kernel/gfxwin.o kernel/desktop.o kernel/games.o"
-SRCS="kernel/kernel.c kernel/tty.c kernel/idt.c kernel/isr.c kernel/keyboard.c kernel/ata.c kernel/shell.c kernel/shell_extra.c kernel/exfat.c kernel/gfx.c kernel/gui.c kernel/mouse.c kernel/gfxwin.c kernel/desktop.c kernel/games.c"
+OBJS="boot/kernel_entry.o kernel/kernel.o kernel/tty.o kernel/idt.o kernel/isr.o kernel/keyboard.o kernel/ata.o kernel/shell.o kernel/shell_extra.o kernel/exfat.o kernel/gfx.o kernel/gui.o kernel/mouse.o kernel/gfxwin.o kernel/desktop.o kernel/games.o kernel/hiscore.o"
+SRCS="kernel/kernel.c kernel/tty.c kernel/idt.c kernel/isr.c kernel/keyboard.c kernel/ata.c kernel/shell.c kernel/shell_extra.c kernel/exfat.c kernel/gfx.c kernel/gui.c kernel/mouse.c kernel/gfxwin.c kernel/desktop.c kernel/games.c kernel/hiscore.c"
 
 clean() {
     echo "正在清理构建产物..."

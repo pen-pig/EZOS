@@ -10,6 +10,7 @@ static int buffer_end = 0;
 
 static int left_shift = 0;
 static int right_shift = 0;
+static int alt_down = 0;      /* 左/右 Alt 按下状态（Alt+Tab 窗口切换用） */
 
 /* �ȴ� 8042 ���뻺���д��IBF ��գ� */
 static void kb_wait_write(void) {
@@ -100,12 +101,21 @@ void keyboard_handler(void) {
         right_shift = (scancode == 0xB6) ? 0 : right_shift;
         outb(0x20, 0x20);
         return;
+    } else if (scancode == 0x38) {   // Alt ����
+        alt_down = 1;
+        outb(0x20, 0x20);
+        return;
+    } else if (scancode == 0xB8) {   // Alt �ͷ�
+        alt_down = 0;
+        outb(0x20, 0x20);
+        return;
     }
 
     if (!(scancode & 0x80)) { // �����¼�
         int key = 0;
         int shifted = (left_shift || right_shift);
         switch (scancode) {
+            case 0x0F: key = alt_down ? KEY_ALT_TAB : '\t'; break;   /* Tab：Alt 按下时为窗口切换 */
             case 0x48: key = shifted ? KEY_PGUP : KEY_UP; break;
             case 0x50: key = shifted ? KEY_PGDN : KEY_DOWN; break;
             case 0x4B: key = KEY_LEFT; break;
