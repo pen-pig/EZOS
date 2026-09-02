@@ -3,7 +3,7 @@
 #include "types.h"
 #include "tty.h"
 #include "keyboard.h"
-#include "exfat.h"
+#include "fs.h"
 #include "gfxwin.h"
 #include "shell.h"
 #include "vga_font.h"
@@ -295,6 +295,16 @@ static void gfx_restore_font(void) {
     outb(0x3CE, 0x06); outb(0x3CF, 0x0E);  /* GC6: �ı�ģʽ */
     outb(0x3C4, 0x02); outb(0x3C5, 0x03);  /* SC2: mask plane 0/1 only - protect font plane 2 */
     outb(0x3C4, 0x04); outb(0x3C5, 0x03);  /* SC4: odd/even���ı�ģʽ�� */
+}
+
+/* Load the built-in 8x16 font into VGA plane 2 at boot, before any text
+ * output. SeaBIOS's default ROM font differs from vga_font_8x16 on several
+ * glyphs (f/t/0/F/T...), which made text-mode rendering inconsistent with
+ * both the GUI font and the E2E test OCR table. Programming our font from
+ * the start keeps text mode, GUI rendering and the OCR font identical. */
+void gfx_text_font_init(void) {
+    gfx_save_font();
+    gfx_restore_font();
 }
 
 void gfx_restore_text(void) {
@@ -703,7 +713,7 @@ void gfx_menu(void) {
             gfx_draw_text(20, 16, "Viewer", 0x0F, 0x00);
             gfx_draw_text(20, 32, "Shows README.TXT content:", 0x07, 0x00);
             static uint8_t vbuf[512];
-            int vn = exfat_read_file("README.TXT", vbuf, 512);
+            int vn = fs_read_file("README.TXT", vbuf, 512);
             if (vn > 0) {
                 int line = 0;
                 int col = 0;

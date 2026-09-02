@@ -21,6 +21,7 @@ extern uint16_t gfx_palette16[256];
 
 void gfx_init(void);            // 初始化图形模式（优先 VBE 多分辨率 LFB，失败回退 VGA 0x13 320x200）
 void gfx_restore_text(void);    // 恢复 80x25 文本模式
+void gfx_text_font_init(void);  // 启动时把内置 8x16 字体写入 VGA plane 2，统一文本模式字体
 void gfx_set_palette(void);     // 设置 256 色调色板
 void gfx_load_font(void);       // 从 VGA 字体 ROM 读取 8x8 字体
 void gfx_putpixel(int x, int y, uint8_t color);

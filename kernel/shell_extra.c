@@ -16,7 +16,7 @@
 #include "keyboard.h"
 #include "types.h"
 #include "port.h"
-#include "exfat.h"
+#include "fs.h"
 
 /* ==================================================================
  * 1. ezos_console 适配层：把 EZOS tty / 键盘桥接为轻量 console 接口
@@ -306,10 +306,10 @@ static void x_type_common(const char *args, int which_mode) {
         ezos_console_write(which_mode ? ": aliased command\n" : " is an alias\n");
         return;
     }
-    if (exfat_init() == 0) {
+    if (fs_init() == 0) {
         /* 检查当前目录是否存在同名文件 */
         char dummy[1];
-        if (exfat_get_file_size(name) > 0) {
+        if (fs_get_file_size(name) > 0) {
             ezos_console_write(name);
             ezos_console_write(which_mode ? ": external file\n" : " is a file in cwd\n");
             return;

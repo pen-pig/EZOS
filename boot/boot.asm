@@ -72,10 +72,19 @@ disk_load:
     mov word [dap_segment], ax
     mov word [dap_offset], 0
     ; ���� BIOS
+    mov bp, 3                   ; 3 attempts per batch
+.retry:
     mov si, dap
     mov ah, 0x42
+    mov dl, [BOOT_DRIVE]
     int 0x13
-    jc disk_error
+    jnc .batch_done
+    dec bp
+    jz disk_error
+    xor ah, ah                  ; reset disk system (DL kept), retry batch
+    int 0x13
+    jmp .retry
+.batch_done:
     ; �����Ѷ�/ʣ��
     mov ax, word [dap_sectors]
     add cx, ax
@@ -185,13 +194,38 @@ set_vbe:
     ret
 
 ; ��׼ VBE 16bpp ģʽ�������ֱ��ʴӴ�С���У�0 ��β
+; standard VESA 16bpp modes, largest first, 0 terminated
+; (0x115 is 24bpp and 0x110 is 15bpp - both rejected by BPP==16 check)
 vbe_modes:
-    dw 0x011A, 0x0117, 0x0115, 0x0110, 0
+    dw 0x011A, 0x0117, 0x0114, 0x0111, 0
 
+; A20 enable with triple fallback: BIOS int 15h -> port 0x92 -> keyboard ctrl
+; (port 0x92 alone fails on legacy machines whose BIOS gates A20 via KBC)
 enable_a20:
-    in al, 0x92
-    or al, 2
+    mov ax, 0x2401              ; 1) BIOS: enable A20 (modern machines)
+    int 0x15
+    jnc .done
+    in al, 0x92                 ; 2) fast A20 via chipset port 0x92
+    test al, 2                  ;    already enabled?
+    jnz .done
+    or al, 2                    ;    set A20 only, keep bit0 (fast reset)
     out 0x92, al
+    call .kbc_wait              ; 3) keyboard controller fallback (legacy)
+    mov al, 0xD1                ;    write output port command
+    out 0x64, al
+    call .kbc_wait
+    mov al, 0xDF                ;    enable A20 + peripherals
+    out 0x60, al
+.done:
+    ret
+.kbc_wait:                      ; wait KBC input buffer empty (with timeout)
+    xor cx, cx
+.kbc_spin:
+    in al, 0x64
+    test al, 2
+    jz .kbc_ok
+    loop .kbc_spin
+.kbc_ok:
     ret
 
 BOOT_DRIVE db 0

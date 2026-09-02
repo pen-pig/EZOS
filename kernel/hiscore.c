@@ -9,7 +9,7 @@
  */
 
 #include "hiscore.h"
-#include "exfat.h"
+#include "fs.h"
 #include "types.h"
 
 static int scores[HISCORE_GAMES];
@@ -20,10 +20,10 @@ static void hiscore_load(void)
     loaded = 1;
     for (int i = 0; i < HISCORE_GAMES; i++) scores[i] = 0;
     uint8_t buf[HISCORE_GAMES * 4];
-    uint32_t sz = exfat_get_file_size("SCORES.DAT");
+    uint32_t sz = fs_get_file_size("SCORES.DAT");
     if (sz == 0) return;                        /* 无纪录文件 */
     if (sz > sizeof(buf)) sz = sizeof(buf);
-    if (exfat_read_file("SCORES.DAT", buf, sz) != 0) return;
+    if (fs_read_file("SCORES.DAT", buf, sz) != 0) return;
     for (int i = 0; i < HISCORE_GAMES; i++) {
         if ((uint32_t)(i * 4 + 4) > sz) break;  /* 短文件：剩余保持 0 */
         scores[i] = (int)((uint32_t)buf[i * 4]
@@ -44,7 +44,7 @@ static void hiscore_save(void)
         buf[i * 4 + 2] = (uint8_t)(v >> 16);
         buf[i * 4 + 3] = (uint8_t)(v >> 24);
     }
-    exfat_create_file("SCORES.DAT", buf, sizeof(buf));
+    fs_create_file("SCORES.DAT", buf, sizeof(buf));
 }
 
 int hiscore_get(int game)

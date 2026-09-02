@@ -358,6 +358,19 @@ const char *exfat_cwd_path(void) {
     return cwd_path;
 }
 
+// 重置 cwd 到根目录（fs 层换盘/重新挂载时调用，避免旧盘簇号串到新盘）
+void exfat_reset_cwd(void) {
+    if (!exfat_ready) {
+        current_dir_cluster = 0;
+        return;
+    }
+    current_dir_cluster = exfat_info.root_dir_cluster;
+    cwd_path[0] = '/';
+    cwd_path[1] = '\0';
+    dir_stack[0] = exfat_info.root_dir_cluster;
+    dir_depth = 0;
+}
+
 // 切换当前工作目录。支持：
 //   cd ..           返回父目录（目录栈回溯）
 //   cd /            回到根目录
@@ -647,14 +660,14 @@ int exfat_format(void) {
     *((uint32_t*)(vbr + 0x5C)) = exfat_info.cluster_count;       // ClusterCount
     *((uint32_t*)(vbr + 0x60)) = exfat_info.root_dir_cluster;    // RootDirectoryCluster
     *((uint32_t*)(vbr + 0x64)) = 0x12345678;                     // VolumeSerialNumber
-    *((uint16_t*)(vbr + 0x68)) = 0x0000;                         // VolumeFlags
-    vbr[0x6A] = 0;       // ActiveFat
-    vbr[0x6B] = 0;       // Reserved1
-    vbr[0x6C] = 0xFF;    // PercentInUse（0xFF = 未知）
-    vbr[0x6D] = 0;       // Reserved2
-    vbr[0x6E] = 9;       // BytesPerSectorShift（512 = 1<<9）
-    vbr[0x6F] = 0;       // SectorsPerClusterShift（1 扇区/簇 = 1<<0）
-    // 0x70-0x73 Reserved2 全 0（vbr 已清零）
+    *((uint16_t*)(vbr + 0x68)) = 0x0001;  // FileSystemRevision 1.00
+    *((uint16_t*)(vbr + 0x6A)) = 0x0000;  // VolumeFlags（ActiveFat=0）
+    vbr[0x6C] = 9;       // BytesPerSectorShift（512 = 1<<9，spec 偏移）
+    vbr[0x6D] = 0;       // SectorsPerClusterShift（1 扇区/簇 = 1<<0）
+    vbr[0x6E] = 1;       // NumberOfFats
+    vbr[0x6F] = 0x80;    // DriveSelect（BIOS 驱动器号惯例）
+    vbr[0x70] = 0xFF;    // PercentInUse（0xFF = 未指定）
+    // 0x71-0x7F 保留区全 0（vbr 已清零）
     vbr[510] = 0x55;
     vbr[511] = 0xAA;
     if (exfat_write_sector(exfat_partition_start, vbr) != 0) return -1;
@@ -805,8 +818,8 @@ int exfat_init(void) {
     if (vbr[0] != 0xEB || vbr[1] != 0x76 || vbr[2] != 0x90) return -1;
 
     // 标准 exFAT VBR 解析
-    uint8_t bps_shift = vbr[0x6E];   // BytesPerSectorShift @0x6E
-    uint8_t spc_shift = vbr[0x6F];   // SectorsPerClusterShift @0x6F
+    uint8_t bps_shift = vbr[0x6C];   // BytesPerSectorShift @0x6C (spec)
+    uint8_t spc_shift = vbr[0x6D];   // SectorsPerClusterShift @0x6D (spec)
     if (bps_shift < 9 || bps_shift > 12) return -1;
     if (spc_shift > 4) return -1;    // 先校验，避免 1 << spc_shift 移位越界（UB）
     exfat_info.bytes_per_sector = 1 << bps_shift;

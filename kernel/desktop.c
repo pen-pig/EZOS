@@ -7,13 +7,13 @@
 #include "tty.h"
 #include "keyboard.h"
 #include "types.h"
-#include "exfat.h"
+#include "fs.h"
 
 #define MAX_ENTRIES 64
 #define MAX_VIEW_SIZE 4096
 #define LIST_ROWS 20
 
-static exfat_dir_entry_t entries[MAX_ENTRIES];
+static fs_dir_entry_t entries[MAX_ENTRIES];
 static int entry_count = 0;
 static int selected = 0;
 static int scroll = 0;
@@ -94,7 +94,7 @@ static int u32_to_str(uint32_t num, char *buf)
 static void desktop_view_file(const char *name)
 {
     static uint8_t buf[MAX_VIEW_SIZE];
-    int n = exfat_read_file(name, buf, MAX_VIEW_SIZE - 1);
+    int n = fs_read_file(name, buf, MAX_VIEW_SIZE - 1);
     terminal_initialize();
 
     /* 顶部标题栏（Win10 蓝底白字） */
@@ -129,12 +129,12 @@ static void desktop_render(void)
     /* 路径栏（浅灰底黑字） */
     fill_range(1, 0, 80, C_BAR, ' ');
     puts_at(1, 1, C_BAR, "Path: ");
-    puts_at(1, 7, C_BAR, exfat_cwd_path());
+    puts_at(1, 7, C_BAR, fs_cwd_path());
 
     /* 分隔线 */
     fill_range(2, 0, 80, C_DIM, BOX_H[0]);
 
-    entry_count = exfat_read_dir(entries, MAX_ENTRIES);
+    entry_count = fs_read_dir(entries, MAX_ENTRIES);
     if (entry_count < 0) entry_count = 0;
 
     /* 列表区 */
@@ -222,7 +222,7 @@ void desktop_run(void) {
         } else if (c == '\n') {
             if (entry_count > 0 && selected < entry_count) {
                 if (entries[selected].is_dir) {
-                    if (exfat_change_dir(entries[selected].name) == 0) {
+                    if (fs_change_dir(entries[selected].name) == 0) {
                         selected = 0;
                         scroll = 0;
                         desktop_render();
@@ -233,7 +233,7 @@ void desktop_run(void) {
                 }
             }
         } else if (c == '\b') {
-            if (exfat_change_dir("..") == 0) {
+            if (fs_change_dir("..") == 0) {
                 selected = 0;
                 scroll = 0;
                 desktop_render();
