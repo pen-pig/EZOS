@@ -3,7 +3,8 @@
  *
  * 职责：
  *   - MBR 分区扫描（含 superfloppy 整盘卷）
- *   - exFAT / FAT12 / FAT16 / FAT32 自动识别与挂载
+ *   - exFAT / FAT12 / FAT16 / FAT32（可写）自动识别与挂载
+ *   - ext4 / NTFS / F2FS / EROFS（只读）自动识别与挂载
  *   - 对内核其余部分提供与具体文件系统无关的 fs_* API
  *   - fs_create_file 为 create-or-replace 语义（覆盖写）
  */
@@ -18,6 +19,11 @@
 #define FS_FAT12 12
 #define FS_FAT16 16
 #define FS_FAT32 32
+/* 只读文件系统（refs：GRUB fs 驱动 / Linux 内核源码） */
+#define FS_EXT4  4
+#define FS_NTFS  5
+#define FS_F2FS  6
+#define FS_EROFS 7
 
 /* 目录项输出结构（与 exfat_dir_entry_t / fat_dir_entry_t 布局一致） */
 typedef struct {
@@ -43,7 +49,10 @@ int fs_init(void);
 /* 是否已挂载 */
 int fs_ready(void);
 
-/* 类型名："exFAT" / "FAT12" / "FAT16" / "FAT32" / "none" */
+/* 当前挂载是否为只读文件系统（ext4/NTFS/F2FS/EROFS） */
+int fs_is_readonly(void);
+
+/* 类型名："exFAT" / "FAT12" / "FAT16" / "FAT32" / "ext4" / "NTFS" / "F2FS" / "EROFS" / "none" */
 const char *fs_type_name(void);
 
 /* 挂载后卷信息（未挂载时 type==FS_NONE） */
@@ -52,8 +61,10 @@ const fs_info_t *fs_get_info(void);
 /* 切换首选数据盘（0-3；下次 fs_init 重新扫描挂载） */
 void fs_set_drive(uint8_t drive);
 
-/* 将首选数据盘格式化为 exFAT（拒绝格式化 0 号引导盘） */
-int fs_format(void);
+/* 将首选数据盘格式化为指定文件系统（FS_EXFAT/FS_FAT12/FS_FAT16/FS_FAT32；
+ * 只读 FS（ext4/NTFS/F2FS/EROFS）不支持格式化返回 -1；
+ * 拒绝格式化 0 号引导盘。成功后立即挂载为该类型） */
+int fs_format(int fs_type);
 
 /* ---- 以下 API 语义与原 exfat_* 完全一致 ---- */
 int      fs_read_file(const char *name, uint8_t *buffer, uint32_t max_size);

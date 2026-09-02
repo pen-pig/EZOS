@@ -6,6 +6,8 @@
 [extern irq12_handler]
 [extern __bss_start]
 [extern __bss_end]
+[extern __hbss_start]
+[extern __hbss_end]
 
 global _start
 global irq0
@@ -19,6 +21,13 @@ _start:
     ; 清零 .bss 段（内核镜像只加载 64KB，超出部分保持 BIOS 残留，必须显式清零）
     mov edi, __bss_start
     mov ecx, __bss_end
+    sub ecx, edi
+    xor eax, eax
+    rep stosb
+
+    ; zero .bss.hi (high memory at 1MB+, read-only FS driver buffers)
+    mov edi, __hbss_start
+    mov ecx, __hbss_end
     sub ecx, edi
     xor eax, eax
     rep stosb

@@ -39,13 +39,15 @@ static char cwd_path[256] = "/";
 static uint32_t dir_stack[32];
 static int dir_depth = 0;
 
-/* FAT 表扇区缓存（最多跨 2 个连续 FAT 扇区，覆盖 FAT12 跨界项） */
-static uint8_t fat_cache[2 * FAT_MAX_BPS];
+/* FAT 表扇区缓存（最多跨 2 个连续 FAT 扇区，覆盖 FAT12 跨界项）。
+ * 大缓冲放高内存段 .bss.hi（1MB+，见 linker.ld）以缓解低区压力 */
+#define FAT_HIBUF __attribute__((section(".bss.hi")))
+static uint8_t fat_cache[2 * FAT_MAX_BPS] FAT_HIBUF;
 static uint32_t fat_cache_sec = 0xFFFFFFFF;
 static int fat_cache_n = 0;
 
 /* 共享块/簇 IO 暂存区：各使用点互不重叠（无嵌套持有） */
-static uint8_t io_scratch[FAT_MAX_CLUSTER_BYTES];
+static uint8_t io_scratch[FAT_MAX_CLUSTER_BYTES] FAT_HIBUF;
 
 /* 簇分配提示（扫描起点，避免每次从头扫 FAT） */
 static uint32_t alloc_hint = 2;
@@ -315,6 +317,172 @@ int fat_mount(uint8_t drive, uint32_t part_start) {
 
 int fat_ready(void) { return fat_type != 0; }
 const fat_info_t *fat_get_info(void) { return &fi; }
+
+/* ============ Format ============ */
+
+static void put16le(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)((v >> 8) & 0xFF);
+}
+
+static void put32le(uint8_t *p, uint32_t v) {
+    put16le(p, v);
+    put16le(p + 2, v >> 16);
+}
+
+/* Format drive as FAT12/16/32 (MBR + single partition at LBA 1) and mount it.
+ * Returns the mounted type (12/16/32), or -1 on error.
+ * Fixed geometry per type (fits the QEMU test data disk):
+ *   FAT12: 16MB partition, 16 sectors/cluster (~2045 clusters)
+ *   FAT16: 16MB partition, 4 sectors/cluster  (~8167 clusters)
+ *   FAT32: 64MB partition, 1 sector/cluster   (~128991 clusters)
+ * Layout mirrors the gen_diskimg.py reference images: MBR, BPB, 2 FATs,
+ * fixed root area (FAT12/16) or root cluster 2 (FAT32, + FSInfo/backup BS). */
+int fat_format(uint8_t drive, int want_type) {
+    if (want_type != 12 && want_type != 16 && want_type != 32) return -1;
+    if (drive > 3) return -1;
+
+    uint32_t total = (want_type == 32) ? 131071u : 32767u;
+    uint32_t spc = (want_type == 12) ? 16u : ((want_type == 16) ? 4u : 1u);
+    uint32_t reserved = (want_type == 32) ? 32u : 1u;
+    uint32_t root_entries = (want_type == 32) ? 0u : 512u;
+    uint32_t nfats = 2;
+    uint32_t part_start = 1;
+    uint8_t part_type = (want_type == 32) ? 0x0B : ((want_type == 16) ? 0x06 : 0x01);
+
+    /* FAT size fixed-point iteration: fat size shifts first_data, which
+     * shifts cluster count (same loop as gen_diskimg.py build_fat_params) */
+    uint32_t fat_size = 1, root_sectors, first_data, clusters;
+    for (int i = 0; i < 10; i++) {
+        root_sectors = (root_entries * 32 + 511) / 512;
+        first_data = reserved + nfats * fat_size + root_sectors;
+        clusters = (total - first_data) / spc;
+        int t = (clusters < 4085) ? 12 : ((clusters < 65525) ? 16 : 32);
+        if (t != want_type) return -1;
+        uint32_t need = (want_type == 12)
+            ? (((clusters + 2) * 3 + 1) / 2)
+            : ((clusters + 2) * ((want_type == 16) ? 2u : 4u));
+        need = (need + 511) / 512;
+        if (need <= fat_size) break;
+        fat_size = need;
+    }
+    root_sectors = (root_entries * 32 + 511) / 512;
+    first_data = reserved + nfats * fat_size + root_sectors;
+    clusters = (total - first_data) / spc;
+
+    /* 1. MBR: single primary partition starting at LBA 1 */
+    uint8_t mbr[512];
+    for (int i = 0; i < 512; i++) mbr[i] = 0;
+    mbr[447] = 0x00; mbr[448] = 0x02; mbr[449] = 0x00;   /* CHS start */
+    mbr[450] = part_type;
+    mbr[451] = 0x00; mbr[452] = 0x3F; mbr[453] = 0xFF;   /* CHS end */
+    put32le(mbr + 454, part_start);
+    put32le(mbr + 458, total);
+    mbr[510] = 0x55; mbr[511] = 0xAA;
+    if (ata_write_sector(drive, 0, mbr) != 0) return -1;
+
+    /* 2. Boot sector (BPB) */
+    uint8_t bs[512];
+    for (int i = 0; i < 512; i++) bs[i] = 0;
+    bs[0] = 0xEB; bs[1] = 0x3C; bs[2] = 0x90;
+    bs[3] = 'E'; bs[4] = 'Z'; bs[5] = 'O'; bs[6] = 'S';
+    bs[7] = ' '; bs[8] = ' '; bs[9] = ' '; bs[10] = ' ';
+    put16le(bs + 11, 512);                          /* BytesPerSector */
+    bs[13] = (uint8_t)spc;                          /* SectorsPerCluster */
+    put16le(bs + 14, reserved);                     /* ReservedSectors */
+    bs[16] = (uint8_t)nfats;                        /* NumFATs */
+    put16le(bs + 17, root_entries);                 /* RootEntryCount */
+    if (total < 0x10000) put16le(bs + 19, total);   /* TotSectors16 */
+    bs[21] = 0xF8;                                  /* Media descriptor */
+    if (want_type != 32) put16le(bs + 22, fat_size);/* FATSz16 */
+    put16le(bs + 24, 63);                           /* SectorsPerTrack */
+    put16le(bs + 26, 16);                           /* NumHeads */
+    put32le(bs + 28, part_start);                   /* HiddenSectors */
+    if (total >= 0x10000) put32le(bs + 32, total);  /* TotSectors32 */
+    if (want_type == 32) {
+        put32le(bs + 36, fat_size);                 /* FATSz32 */
+        put16le(bs + 40, 0);                        /* ExtFlags */
+        put16le(bs + 42, 0);                        /* FSVer */
+        put32le(bs + 44, 2);                        /* RootClus */
+        put16le(bs + 48, 1);                        /* FSInfo sector */
+        put16le(bs + 50, 6);                        /* BkBootSec */
+        bs[64] = 0x80;                              /* DriveNumber */
+        bs[66] = 0x29;                              /* BootSig */
+        put32le(bs + 68, 0x1BADB002);               /* VolumeID */
+        /* volume label 11B @72 + "FAT32   " 8B @83 */
+        bs[72] = 'N'; bs[73] = 'O'; bs[74] = ' ';
+        bs[75] = 'N'; bs[76] = 'A'; bs[77] = 'M';
+        bs[78] = 'E'; bs[79] = ' '; bs[80] = ' ';
+        bs[81] = ' '; bs[82] = ' ';
+        bs[83] = 'F'; bs[84] = 'A'; bs[85] = 'T';
+        bs[86] = '3'; bs[87] = '2'; bs[88] = ' ';
+        bs[89] = ' '; bs[90] = ' ';
+    } else {
+        bs[36] = 0x80;                              /* DriveNumber */
+        bs[38] = 0x29;                              /* BootSig */
+        put32le(bs + 40, 0x1BADB002);               /* VolumeID */
+        /* volume label 11B @43 + "FAT12   "/"FAT16   " 8B @54 */
+        bs[43] = 'N'; bs[44] = 'O'; bs[45] = ' ';
+        bs[46] = 'N'; bs[47] = 'A'; bs[48] = 'M';
+        bs[49] = 'E'; bs[50] = ' '; bs[51] = ' ';
+        bs[52] = ' '; bs[53] = ' ';
+        bs[54] = 'F'; bs[55] = 'A'; bs[56] = 'T';
+        bs[57] = (want_type == 16) ? '1' : '2';
+        bs[58] = (want_type == 16) ? '6' : '2';
+        bs[59] = ' '; bs[60] = ' '; bs[61] = ' ';
+    }
+    bs[510] = 0x55; bs[511] = 0xAA;
+    if (ata_write_sector(drive, part_start, bs) != 0) return -1;
+
+    /* 3. FAT32: FSInfo + backup boot sector + backup FSInfo */
+    if (want_type == 32) {
+        uint8_t fsi[512];
+        for (int i = 0; i < 512; i++) fsi[i] = 0;
+        put32le(fsi + 0, 0x41615252);               /* 'RRaA' */
+        put32le(fsi + 484, 0x61417272);             /* 'rrAa' */
+        put32le(fsi + 488, clusters - 1);           /* free (cluster 2 = root) */
+        put32le(fsi + 492, 3);                      /* next free */
+        fsi[510] = 0x55; fsi[511] = 0xAA;
+        if (ata_write_sector(drive, part_start + 1, fsi) != 0) return -1;
+        if (ata_write_sector(drive, part_start + 6, bs) != 0) return -1;
+        if (ata_write_sector(drive, part_start + 7, fsi) != 0) return -1;
+    }
+
+    /* 4. FAT tables: FAT[0]=media, FAT[1]=EOC; FAT32 FAT[2]=EOC (root chain) */
+    uint8_t zero[512];
+    uint8_t fat0[512];
+    for (int i = 0; i < 512; i++) { zero[i] = 0; fat0[i] = 0; }
+    if (want_type == 12) {
+        fat0[0] = 0xF8; fat0[1] = 0xFF; fat0[2] = 0xFF;   /* FF8/FFF packed */
+    } else if (want_type == 16) {
+        fat0[0] = 0xF8; fat0[1] = 0xFF; fat0[2] = 0xFF; fat0[3] = 0xFF;
+    } else {
+        put32le(fat0 + 0, 0x0FFFFFF8);
+        put32le(fat0 + 4, 0x0FFFFFFF);
+        put32le(fat0 + 8, 0x0FFFFFFF);              /* cluster 2 = root dir */
+    }
+    for (uint32_t f = 0; f < nfats; f++) {
+        uint32_t base = part_start + reserved + f * fat_size;
+        if (ata_write_sector(drive, base, fat0) != 0) return -1;
+        for (uint32_t s = 1; s < fat_size; s++)
+            if (ata_write_sector(drive, base + s, zero) != 0) return -1;
+    }
+
+    /* 5. Root directory: fixed area (FAT12/16) or cluster 2 (FAT32) */
+    if (want_type == 32) {
+        for (uint32_t s = 0; s < spc; s++)
+            if (ata_write_sector(drive, part_start + first_data + s, zero) != 0)
+                return -1;
+    } else {
+        uint32_t root_lba = part_start + reserved + nfats * fat_size;
+        for (uint32_t s = 0; s < root_sectors; s++)
+            if (ata_write_sector(drive, root_lba + s, zero) != 0) return -1;
+    }
+
+    /* 6. Mount the freshly formatted volume (also resets cwd state) */
+    if (fat_mount(drive, part_start) != want_type) return -1;
+    return want_type;
+}
 
 /* ============ 目录块抽象 ============ */
 
