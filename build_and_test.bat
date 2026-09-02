@@ -96,9 +96,11 @@ i686-elf-gcc %CFLAGS% -c kernel\desktop.c -o kernel\desktop.o
 if errorlevel 1 goto error
 i686-elf-gcc %CFLAGS% -c kernel\games.c -o kernel\games.o
 if errorlevel 1 goto error
+i686-elf-gcc %CFLAGS% -c kernel\hiscore.c -o kernel\hiscore.o
+if errorlevel 1 goto error
 
 echo [4/6] linking kernel...
-i686-elf-ld %LDFLAGS% -o kernel_raw.bin boot\kernel_entry.o kernel\kernel.o kernel\tty.o kernel\idt.o kernel\isr.o kernel\keyboard.o kernel\ata.o kernel\shell.o kernel\shell_extra.o kernel\exfat.o kernel\gfx.o kernel\gui.o kernel\mouse.o kernel\gfxwin.o kernel\desktop.o kernel\games.o
+i686-elf-ld %LDFLAGS% -o kernel_raw.bin boot\kernel_entry.o kernel\kernel.o kernel\tty.o kernel\idt.o kernel\isr.o kernel\keyboard.o kernel\ata.o kernel\shell.o kernel\shell_extra.o kernel\exfat.o kernel\gfx.o kernel\gui.o kernel\mouse.o kernel\gfxwin.o kernel\desktop.o kernel\games.o kernel\hiscore.o
 if errorlevel 1 goto error
 
 echo [5/6] padding kernel to 256KB...

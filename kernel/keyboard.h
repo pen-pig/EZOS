@@ -19,6 +19,7 @@
 #define KEY_F10   -16
 #define KEY_F11   -17
 #define KEY_F12   -18
+#define KEY_ALT_TAB -19   /* Alt+Tab 组合键：窗口切换（gw_handle_key 消费） */
 
 void keyboard_init(void);
 void keyboard_handler(void);

@@ -22,12 +22,23 @@
 #include "tty.h"
 #include "keyboard.h"
 #include "shell.h"
+#include "hiscore.h"
+#include "isr.h"
 
 /* ---- ezos_console 适配层（定义于 shell_extra.c） ---- */
 extern void ezos_console_putchar(char c);
 extern void ezos_console_write(const char *s);
 extern void ezos_console_print_dec(uint32_t num);
 extern int  ezos_console_readline(char *buf, int maxlen);
+
+/* 高分行输出：破纪录时提示 New best!，随后显示当前最佳（磁盘持久化） */
+static void games_score_line(int game, int value) {
+    if (hiscore_update(game, value))
+        ezos_console_write("New best!\n");
+    ezos_console_write("Best: ");
+    ezos_console_print_dec((uint32_t)hiscore_get(game));
+    ezos_console_write("\n");
+}
 
 /* ==================================================================
  * GUI 桌面模式适配层（gfxwin.c 桌面图标启动游戏）
@@ -265,6 +276,7 @@ static void game_guess(void) {
             ezos_console_write("Correct! You win in ");
             ezos_console_print_dec((uint32_t)tries);
             ezos_console_write(" tries.\n");
+            games_score_line(1, tries);
             break;
         } else if (guess < secret) {
             ezos_console_write("Too low.\n");
@@ -584,6 +596,7 @@ static void game_snake(void) {
         ezos_console_write("Game Over! Score: ");
         ezos_console_print_dec((uint32_t)(snake_len - 3));
         ezos_console_write("\n");
+        games_score_line(3, snake_len - 3);
     } else {
         snake_alive = 0;
         ezos_console_write("Quit.\n");
@@ -755,6 +768,7 @@ static void game_2048(void) {
             break;
         }
     }
+    games_score_line(4, (int)g2048_score);
     ezos_console_write("Press Enter to return...\n");
     char buf[8];
     games_readline(buf, sizeof(buf));
@@ -870,6 +884,7 @@ static void game_minesweeper(void) {
     ms_lose = 0;
     ms_left = MS_W * MS_H - 10;
     ms_cx = 4; ms_cy = 4;
+    uint32_t ms_t0 = g_pit_ticks;   /* 通关计时（高分=最快秒数） */
     if (g_gfx) {
         /* GUI 图形模式：方向键导航 + Enter 翻开 + F 插旗 + Q 退出 */
         games_yield();   /* 首绘 */
@@ -897,6 +912,8 @@ static void game_minesweeper(void) {
             if (ms_left == 0) break;
         }
         games_yield();   /* 终局画面（雷/胜利） */
+        if (!ms_lose && ms_left == 0)
+            games_score_line(5, (int)((g_pit_ticks - ms_t0) / 1000));
         while (keyboard_getchar() != 0) { }
         while (keyboard_getchar() == 0) games_yield();
         return;
@@ -943,6 +960,7 @@ static void game_minesweeper(void) {
         ms_render();
         if (ms_left == 0) {
             ezos_console_write("You win!\n");
+            games_score_line(5, (int)((g_pit_ticks - ms_t0) / 1000));
             break;
         }
     }
@@ -1089,6 +1107,7 @@ static void game_memory(void) {
     if (g_gfx) {
         /* GUI 图形模式：方向键导航 + Enter 翻牌，不匹配自动翻回 */
         int first = -1;
+        int won = 0;
         games_yield();   /* 首绘 */
         while (matched < 8) {
             int act = mem_poll_key_gfx();
@@ -1124,7 +1143,9 @@ static void game_memory(void) {
                 first = -1;
             }
         }
+        won = (matched >= 8);
         games_yield();
+        if (won) games_score_line(7, mem_flips);
         while (keyboard_getchar() != 0) { }
         while (keyboard_getchar() == 0) games_yield();
         return;
@@ -1175,9 +1196,14 @@ static void game_memory(void) {
         }
     }
     mem_render();
-    ezos_console_write("You win in ");
-    ezos_console_print_dec((uint32_t)mem_flips);
-    ezos_console_write(" flips!\n");
+    if (matched >= 8) {
+        ezos_console_write("You win in ");
+        ezos_console_print_dec((uint32_t)mem_flips);
+        ezos_console_write(" flips!\n");
+        games_score_line(7, mem_flips);
+    } else {
+        ezos_console_write("Quit.\n");   /* 中途退出不算胜利（修复：原来也打印 You win） */
+    }
     ezos_console_write("Press Enter to return...\n");
     games_readline(buf, sizeof(buf));
 }
