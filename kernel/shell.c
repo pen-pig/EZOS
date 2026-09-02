@@ -5,7 +5,7 @@
 #include "types.h"
 #include "port.h"
 #include "ata.h"
-#include "exfat.h"
+#include "fs.h"
 #include "gui.h"
 #include "mouse.h"
 #include "gfx.h"
@@ -321,8 +321,8 @@ static void shell_execute(char *cmd) {
             static uint8_t old[4096];
             static uint8_t merged[8192];
             int mn = 0;
-            if (exfat_init() == 0) {
-                int on = exfat_read_file(fname, old, 4096);
+            if (fs_init() == 0) {
+                int on = fs_read_file(fname, old, 4096);
                 if (on > 0) for (int i = 0; i < on && mn < 8191; i++) merged[mn++] = old[i];
             }
             static char cap[PIPE_BUF_SIZE];
@@ -330,16 +330,16 @@ static void shell_execute(char *cmd) {
             shell_execute_raw(cmd);
             int n = terminal_end_capture();
             for (int i = 0; i < n && mn < 8191; i++) merged[mn++] = (uint8_t)cap[i];
-            if (mn > 0 && exfat_init() == 0) {
-                exfat_create_file(fname, merged, mn);
+            if (mn > 0 && fs_init() == 0) {
+                fs_create_file(fname, merged, mn);
             }
         } else {
             static char cap[PIPE_BUF_SIZE];
             terminal_begin_capture(cap, PIPE_BUF_SIZE);
             shell_execute_raw(cmd);
             int n = terminal_end_capture();
-            if (n > 0 && exfat_init() == 0) {
-                exfat_create_file(fname, (const uint8_t*)cap, n);
+            if (n > 0 && fs_init() == 0) {
+                fs_create_file(fname, (const uint8_t*)cap, n);
             }
         }
         return;
@@ -642,7 +642,7 @@ static void cmd_help(const char *args) {
     terminal_writestring("  about      - about this OS\n");
     terminal_writestring("  history    - show command history\n");
     terminal_writestring("  setcolor <fg> [bg] - set text color (0-15)\n");
-    terminal_writestring("  setdrive <0|1> - set exFAT drive\n");
+    terminal_writestring("  setdrive <0-3> - set filesystem drive\n");
     terminal_writestring("  ls         - list root directory (exFAT)\n");
     terminal_writestring("  cat <file> - read file content (exFAT)\n");
     terminal_writestring("  write <file> <content> - create file with content\n");
@@ -664,7 +664,7 @@ static void cmd_help(const char *args) {
     terminal_writestring("  theme [n]  - list/switch GUI theme\n");
     terminal_writestring("  uname      - print system information\n");
     terminal_writestring("  vi <file>  - edit a text file\n");
-    terminal_writestring("  df         - show exFAT disk space usage\n");
+    terminal_writestring("  df         - show disk space usage\n");
     terminal_writestring("  du [name]  - show disk usage of current dir or file\n");
     terminal_writestring("  calc <expr> - evaluate expression (e.g. calc 1+2*3)\n");
     terminal_writestring("  hex <num>  - convert decimal <-> hex (0x.. for hex input)\n");
@@ -969,14 +969,14 @@ static void cmd_setcolor(const char *args) {
 static void cmd_ls(const char *args) {
     int verbose = 0;
     if (args[0] == '-' && args[1] == 'l') verbose = 1;
-    if (exfat_init() != 0) {
-        terminal_writestring("exFAT init failed. Is disk formatted?\n");
+    if (fs_init() != 0) {
+        terminal_writestring("FS init failed. Is disk formatted?\n");
         return;
     }
-    terminal_writestring(exfat_cwd_path());
+    terminal_writestring(fs_cwd_path());
     terminal_writestring(":\n");
-    exfat_dir_entry_t entries[64];
-    int n = exfat_read_dir(entries, 64);
+    fs_dir_entry_t entries[64];
+    int n = fs_read_dir(entries, 64);
     if (n < 0) {
         terminal_writestring("read dir failed\n");
         return;
@@ -1040,8 +1040,8 @@ static void cmd_ls(const char *args) {
 }
 
 static void cmd_cat(const char *args) {
-    if (exfat_init() != 0) {
-        terminal_writestring("exFAT init failed.\n");
+    if (fs_init() != 0) {
+        terminal_writestring("FS init failed.\n");
         return;
     }
     char filename[128];
@@ -1060,7 +1060,7 @@ static void cmd_cat(const char *args) {
         return;
     }
     static uint8_t file_buffer[4096];
-    int bytes = exfat_read_file(filename, file_buffer, 4096);
+    int bytes = fs_read_file(filename, file_buffer, 4096);
     if (bytes < 0) {
         terminal_writestring("File not found or read error.\n");
     } else {
@@ -1094,7 +1094,7 @@ static void cmd_write(const char *args) {
     while (content[len]) len++;
     if (len > 512) len = 512;
 
-    if (exfat_create_file(filename, (const uint8_t*)content, len) != 0) {
+    if (fs_create_file(filename, (const uint8_t*)content, len) != 0) {
         terminal_writestring("Failed to write file.\n");
     } else {
         terminal_writestring("File written successfully.\n");
@@ -1102,7 +1102,7 @@ static void cmd_write(const char *args) {
 }
 
 static void cmd_rm(const char *args) {
-    if (exfat_delete_file(args) != 0) {
+    if (fs_delete_file(args) != 0) {
         terminal_writestring("Failed to delete file.\n");
     } else {
         terminal_writestring("File deleted.\n");
@@ -1111,24 +1111,32 @@ static void cmd_rm(const char *args) {
 
 static void cmd_format(const char *args) {
     (void)args;
-    if (exfat_format() != 0) {
+    if (fs_format() != 0) {
         terminal_writestring("Format failed.\n");
     } else {
         terminal_writestring("Disk formatted as exFAT.\n");
-        // exfat_format �ɹ�ʱ������ exfat_ready = 1�������ظ�����
+        // fs_format succeeds with exFAT mounted; no re-init needed
     }
 }
 
 static void cmd_setdrive(const char *args) {
     int drive = my_atoi(args);
-    if (drive < 0 || drive > 1) {
-        terminal_writestring("Usage: setdrive <0|1>\n");
+    if (drive < 0 || drive > 3) {
+        terminal_writestring("Usage: setdrive <0-3>\n");
         return;
     }
-    exfat_set_drive((uint8_t)drive);
-    terminal_writestring("exFAT drive set to ");
-    print_dec(drive);
-    terminal_writestring("\n");
+    fs_set_drive((uint8_t)drive);
+    if (fs_init() == 0) {
+        terminal_writestring("FS drive set to ");
+        print_dec(drive);
+        terminal_writestring(" (");
+        terminal_writestring(fs_type_name());
+        terminal_writestring(")\n");
+    } else {
+        terminal_writestring("Drive ");
+        print_dec(drive);
+        terminal_writestring(": no filesystem found\n");
+    }
 }
 
 /* ============ ���� Linux ��������ʵ�֣�?============ */
@@ -1174,7 +1182,7 @@ static void cmd_grep(const char *args) {
         return;
     }
     static uint8_t file_buffer[4096];
-    int bytes = exfat_read_file(filename, file_buffer, 4096);
+    int bytes = fs_read_file(filename, file_buffer, 4096);
     if (bytes < 0) {
         terminal_writestring("File not found or read error.\n");
         return;
@@ -1222,7 +1230,7 @@ static void cmd_wc(const char *args) {
         return;
     }
     static uint8_t file_buffer[4096];
-    int bytes = exfat_read_file(filename, file_buffer, 4096);
+    int bytes = fs_read_file(filename, file_buffer, 4096);
     if (bytes < 0) {
         terminal_writestring("File not found or read error.\n");
         return;
@@ -1257,7 +1265,7 @@ static void cmd_head(const char *args) {
     }
     int n = numstr[0] ? my_atoi(numstr) : 10;
     static uint8_t file_buffer[4096];
-    int bytes = exfat_read_file(filename, file_buffer, 4096);
+    int bytes = fs_read_file(filename, file_buffer, 4096);
     if (bytes < 0) {
         terminal_writestring("File not found or read error.\n");
         return;
@@ -1284,7 +1292,7 @@ static void cmd_tail(const char *args) {
     }
     int n = numstr[0] ? my_atoi(numstr) : 10;
     static uint8_t file_buffer[4096];
-    int bytes = exfat_read_file(filename, file_buffer, 4096);
+    int bytes = fs_read_file(filename, file_buffer, 4096);
     if (bytes < 0) {
         terminal_writestring("File not found or read error.\n");
         return;
@@ -1312,7 +1320,7 @@ static void cmd_touch(const char *args) {
         terminal_writestring("Usage: touch <file>\n");
         return;
     }
-    if (exfat_create_file(filename, 0, 0) != 0) {
+    if (fs_create_file(filename, 0, 0) != 0) {
         terminal_writestring("Failed to create file.\n");
     } else {
         terminal_writestring("File created.\n");
@@ -1328,12 +1336,12 @@ static void cmd_cp(const char *args) {
         return;
     }
     static uint8_t file_buffer[4096];
-    int bytes = exfat_read_file(src, file_buffer, 4096);
+    int bytes = fs_read_file(src, file_buffer, 4096);
     if (bytes < 0) {
         terminal_writestring("Source file not found.\n");
         return;
     }
-    if (exfat_create_file(dst, file_buffer, (uint32_t)bytes) != 0) {
+    if (fs_create_file(dst, file_buffer, (uint32_t)bytes) != 0) {
         terminal_writestring("Copy failed.\n");
     } else {
         terminal_writestring("Copied.\n");
@@ -1349,16 +1357,16 @@ static void cmd_mv(const char *args) {
         return;
     }
     static uint8_t file_buffer[4096];
-    int bytes = exfat_read_file(src, file_buffer, 4096);
+    int bytes = fs_read_file(src, file_buffer, 4096);
     if (bytes < 0) {
         terminal_writestring("Source file not found.\n");
         return;
     }
-    if (exfat_create_file(dst, file_buffer, (uint32_t)bytes) != 0) {
+    if (fs_create_file(dst, file_buffer, (uint32_t)bytes) != 0) {
         terminal_writestring("Move failed.\n");
         return;
     }
-    if (exfat_delete_file(src) != 0) {
+    if (fs_delete_file(src) != 0) {
         terminal_writestring("Moved, but failed to delete source.\n");
     } else {
         terminal_writestring("Moved.\n");
@@ -1372,11 +1380,11 @@ static void cmd_cd(const char *args) {
         terminal_writestring("Usage: cd <dir>\n");
         return;
     }
-    if (exfat_init() != 0) {
-        terminal_writestring("exFAT init failed. Is disk formatted?\n");
+    if (fs_init() != 0) {
+        terminal_writestring("FS init failed. Is disk formatted?\n");
         return;
     }
-    if (exfat_change_dir(dir) != 0) {
+    if (fs_change_dir(dir) != 0) {
         terminal_writestring("cd: no such directory\n");
     }
 }
@@ -1388,18 +1396,18 @@ static void cmd_mkdir(const char *args) {
         terminal_writestring("Usage: mkdir <dir>\n");
         return;
     }
-    if (exfat_init() != 0) {
-        terminal_writestring("exFAT init failed. Is disk formatted?\n");
+    if (fs_init() != 0) {
+        terminal_writestring("FS init failed. Is disk formatted?\n");
         return;
     }
-    if (exfat_mkdir(dir) != 0) {
+    if (fs_mkdir(dir) != 0) {
         terminal_writestring("mkdir: failed\n");
     }
 }
 
 static void cmd_pwd(const char *args) {
     (void)args;
-    terminal_writestring(exfat_cwd_path());
+    terminal_writestring(fs_cwd_path());
     terminal_putchar('\n');
 }
 
@@ -1614,7 +1622,7 @@ static void vi_save(void) {
         for (int m = 0; m < L && o < 4095; m++) out_buf[o++] = (uint8_t)vi_lines[k][m];
         if (o < 4095) out_buf[o++] = '\n';
     }
-    if (exfat_create_file(vi_filename, out_buf, (uint32_t)o) == 0) {
+    if (fs_create_file(vi_filename, out_buf, (uint32_t)o) == 0) {
         vi_msg = "saved";
         vi_modified = 0;
     } else {
@@ -1659,17 +1667,17 @@ static void cmd_uname(const char *args) {
 
 static void cmd_df(const char *args) {
     (void)args;
-    if (exfat_init() != 0) {
-        terminal_writestring("df: exFAT not available\n");
+    if (fs_init() != 0) {
+        terminal_writestring("df: no filesystem\n");
         return;
     }
-    const exfat_info_t *info = exfat_get_info();
+    const fs_info_t *info = fs_get_info();
     if (!info || info->cluster_count == 0) {
         terminal_writestring("df: no volume info\n");
         return;
     }
     uint32_t cluster_size = (uint32_t)info->bytes_per_sector * info->sectors_per_cluster;
-    uint32_t used_clusters = exfat_count_used_clusters();
+    uint32_t used_clusters = fs_count_used_clusters();
     /* �� 64 λ�˷� + ���ƻ��� KB������ libgcc �� 64 λ�������� */
     uint64_t total_b = (uint64_t)info->cluster_count * cluster_size;
     uint64_t used_b = (uint64_t)used_clusters * cluster_size;
@@ -1681,7 +1689,9 @@ static void cmd_df(const char *args) {
                              info->cluster_count);
 
     terminal_writestring("Filesystem 1K-blocks     Used    Avail Use% Mounted on\n");
-    terminal_writestring("exFAT       ");
+    const char *fsn = fs_type_name();
+    terminal_writestring(fsn);
+    for (int pad = (int)my_strlen(fsn); pad < 12; pad++) terminal_putchar(' ');
     print_dec(total_kb);
     terminal_writestring(" ");
     print_dec(used_kb);
@@ -1699,11 +1709,11 @@ static void cmd_df(const char *args) {
 static void cmd_du(const char *args) {
     char name[128];
     parse_token(args, name, 128);
-    if (exfat_init() != 0) {
-        terminal_writestring("du: exFAT not available\n");
+    if (fs_init() != 0) {
+        terminal_writestring("du: no filesystem\n");
         return;
     }
-    const exfat_info_t *info = exfat_get_info();
+    const fs_info_t *info = fs_get_info();
     if (!info) {
         terminal_writestring("du: no volume info\n");
         return;
@@ -1712,7 +1722,7 @@ static void cmd_du(const char *args) {
 
     /* du <file>����ʾָ���ļ�/Ŀ¼�Ĵ�ռ�ã�KB�� */
     if (name[0] != '\0') {
-        uint32_t clusters = exfat_get_file_clusters(name);
+        uint32_t clusters = fs_get_file_clusters(name);
         uint32_t kb = (uint32_t)(((uint64_t)clusters * cluster_size) >> 10);
         print_dec(kb);
         terminal_writestring("\t");
@@ -1722,15 +1732,15 @@ static void cmd_du(const char *args) {
     }
 
     /* du���г���ǰĿ¼ȫ����Ŀռ�ã�KB�����ܼ� */
-    exfat_dir_entry_t entries[64];
-    int n = exfat_read_dir(entries, 64);
+    fs_dir_entry_t entries[64];
+    int n = fs_read_dir(entries, 64);
     if (n < 0) {
         terminal_writestring("du: cannot read directory\n");
         return;
     }
     uint32_t total = 0;
     for (int i = 0; i < n; i++) {
-        uint32_t clusters = exfat_get_file_clusters(entries[i].name);
+        uint32_t clusters = fs_get_file_clusters(entries[i].name);
         uint32_t kb = (uint32_t)(((uint64_t)clusters * cluster_size) >> 10);
         total += kb;
         print_dec(kb);
@@ -1755,7 +1765,7 @@ static void cmd_vi(const char *args) {
 
     static uint8_t file_buffer[4096];
     vi_count = 0;
-    int bytes = exfat_read_file(filename, file_buffer, 4096);
+    int bytes = fs_read_file(filename, file_buffer, 4096);
     if (bytes > 0) {
         int i = 0;
         while (i < bytes && vi_count < VI_MAX_LINES) {

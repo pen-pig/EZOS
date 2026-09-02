@@ -29,7 +29,7 @@ extern void terminal_set_gfx_hook(void (*fn)(const char *));
 #include "gfxwin.h"
 #include "mouse.h"
 #include "keyboard.h"
-#include "exfat.h"
+#include "fs.h"
 #include "games.h"
 #include "isr.h"
 
@@ -1262,7 +1262,7 @@ static void about_draw(gw_window_t *w);
 /* ==================================================================
  * 应用：文件管理器（exFAT）
  * ================================================================== */
-static exfat_dir_entry_t fm_entries[40];
+static fs_dir_entry_t fm_entries[40];
 static int fm_count = 0;
 static int fm_scroll = 0;
 static int fm_sel = 0;
@@ -1274,7 +1274,7 @@ static int fm_file_scroll = 0;
 
 static void fm_refresh(void)
 {
-    fm_count = exfat_read_dir(fm_entries, 40);
+    fm_count = fs_read_dir(fm_entries, 40);
     if (fm_count < 0) fm_count = 0;
     if (fm_scroll >= fm_count) fm_scroll = 0;
     if (fm_sel >= fm_count) fm_sel = 0;
@@ -1283,24 +1283,24 @@ static void fm_refresh(void)
 static void fm_enter(int idx)
 {
     if (idx < 0 || idx >= fm_count) return;
-    exfat_dir_entry_t *e = &fm_entries[idx];
+    fs_dir_entry_t *e = &fm_entries[idx];
     if (gw_strlen(e->name) == 2 && e->name[0] == '.' && e->name[1] == '.') {
-        exfat_change_dir("..");
+        fs_change_dir("..");
         fm_refresh();
         fm_scroll = 0; fm_sel = 0;
         return;
     }
     if (e->is_dir) {
-        if (exfat_change_dir(e->name) == 0) {
+        if (fs_change_dir(e->name) == 0) {
             fm_refresh();
             fm_scroll = 0; fm_sel = 0;
         }
         return;
     }
     /* 文件：读取内容进查看模式 */
-    uint32_t sz = exfat_get_file_size(e->name);
+    uint32_t sz = fs_get_file_size(e->name);
     if (sz > 2047) sz = 2047;
-    int ok = exfat_read_file(e->name, fm_file_buf, sz);
+    int ok = fs_read_file(e->name, fm_file_buf, sz);
     if (ok == 0) {
         fm_file_len = (int)sz;
         fm_file_scroll = 0;
@@ -1317,7 +1317,7 @@ static void fm_back(void)
         fm_mode = 0;
         fm_file_len = 0;
     } else {
-        exfat_change_dir("..");
+        fs_change_dir("..");
         fm_refresh();
     }
 }
@@ -1331,7 +1331,7 @@ static void files_draw(gw_window_t *w)
     if (fm_mode == 0) {
         /* 地址栏 */
         gw_fill(ox, oy, iw, 16, 0x0078D7u);
-        gfx_draw_text(ox + 3, oy + 4, exfat_cwd_path(), 0x0F, GW_C_BLUE);
+        gfx_draw_text(ox + 3, oy + 4, fs_cwd_path(), 0x0F, GW_C_BLUE);
         int row_h = 16;
         int vis = (ih - 18) / row_h;
         if (vis < 1) vis = 1;
@@ -1341,7 +1341,7 @@ static void files_draw(gw_window_t *w)
             int idx = fm_scroll + r;
             if (idx >= fm_count) break;
             int ry = oy + 18 + r * row_h;
-            exfat_dir_entry_t *e = &fm_entries[idx];
+            fs_dir_entry_t *e = &fm_entries[idx];
             int hover = (mx >= ox && mx < ox + iw && my >= ry && my < ry + row_h);
             if (idx == fm_sel) {
                 gw_fill(ox, ry, iw, row_h, CLR_BLUE_SEL);
@@ -1498,7 +1498,7 @@ static void np_save(void)
         for (int c = 0; np_buf[r][c] && n < lim; c++) sbuf[n++] = (uint8_t)np_buf[r][c];
         if (n < lim) sbuf[n++] = '\n';
     }
-    if (exfat_create_file(np_fname, sbuf, (uint32_t)n) == 0)
+    if (fs_create_file(np_fname, sbuf, (uint32_t)n) == 0)
         np_dirty = 0;
 }
 
@@ -1506,10 +1506,10 @@ static void np_save(void)
 static int np_open(void)
 {
     static uint8_t rbuf[NP_ROWS * (NP_COLS + 1) + 1];
-    uint32_t sz = exfat_get_file_size(np_fname);
+    uint32_t sz = fs_get_file_size(np_fname);
     if (sz == 0) return 0;                       /* 文件不存在 */
     if (sz > sizeof(rbuf) - 1) sz = sizeof(rbuf) - 1;
-    if (exfat_read_file(np_fname, rbuf, sz) != 0) return 0;
+    if (fs_read_file(np_fname, rbuf, sz) != 0) return 0;
     rbuf[sz] = 0;
     np_load_text(np_fname, (const char *)rbuf, (int)sz);
     return 1;

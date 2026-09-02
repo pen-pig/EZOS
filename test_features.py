@@ -101,7 +101,8 @@ class Qmp:
 
     def type_text(self, text, delay=0.06):
         KM = {c: c for c in "abcdefghijklmnopqrstuvwxyz0123456789"}
-        KM.update({'\n':'ret','\r':'ret','\t':'tab',' ':'spc'})
+        KM.update({'\n':'ret','\r':'ret','\t':'tab',' ':'spc',
+                   '.':'dot','/':'slash','-':'minus'})
         for ch in text:
             kc = KM.get(ch)
             if kc is None:
