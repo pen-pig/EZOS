@@ -37,6 +37,7 @@ void exfat_set_drive(uint8_t drive);
 /* 目录支持 */
 uint32_t exfat_cwd_cluster(void);
 const char *exfat_cwd_path(void);
+void exfat_reset_cwd(void);
 int exfat_change_dir(const char *name);
 int exfat_mkdir(const char *name);
 

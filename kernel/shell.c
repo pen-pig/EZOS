@@ -5,12 +5,13 @@
 #include "types.h"
 #include "port.h"
 #include "ata.h"
-#include "exfat.h"
+#include "fs.h"
 #include "gui.h"
 #include "mouse.h"
 #include "gfx.h"
 #include "gfxwin.h"
 #include "games.h"
+#include "isr.h"
 
 #define CMD_BUFFER_SIZE 128
 #define HISTORY_SIZE 8
@@ -20,21 +21,21 @@ static int cmd_pos = 0;
 static char history[HISTORY_SIZE][CMD_BUFFER_SIZE];
 static int history_count = 0;
 
-static int history_index = -1;      // µ±Ç°ä¯ÀÀµÄÀúÊ·Î»ÖÃ£¬-1 ±íÊ¾ĞÂÊäÈëĞĞ
-static size_t cursor = 0;           // ¹â±êÔÚµ±Ç°ÊäÈëĞĞµÄÎ»ÖÃ
-static size_t current_row = 0;      // µ±Ç°ÌáÊ¾·ûËùÔÚĞĞºÅ
-static int shell_exit_flag = 0;     // exit ÃüÁîÖÃÎ»£¬shell_run ¾İ´Ë·µ»Ø
-/* Õï¶Ï£ºshell Ñ­»·Ã¿ÂÖ²ÉÑù EFLAGS£¨data ¶ÎÈ«¾Ö£¬¹© QEMU monitor ¶ÁÄÚ´æÑéÖ¤£© */
+static int history_index = -1;      // ï¿½ï¿½Ç°ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê·Î»ï¿½Ã£ï¿½?1 ï¿½ï¿½Ê¾ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+static size_t cursor = 0;           // ï¿½ï¿½ï¿½ï¿½Úµï¿½Ç°ï¿½ï¿½ï¿½ï¿½ï¿½Ğµï¿½Î»ï¿½ï¿½?
+static size_t current_row = 0;      // ï¿½ï¿½Ç°ï¿½ï¿½Ê¾ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ğºï¿½
+static int shell_exit_flag = 0;     // exit ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Î»ï¿½ï¿½shell_run ï¿½İ´Ë·ï¿½ï¿½ï¿½
+/* ï¿½ï¿½Ï£ï¿½shell Ñ­ï¿½ï¿½Ã¿ï¿½Ö²ï¿½ï¿½ï¿½ EFLAGSï¿½ï¿½data ï¿½ï¿½È«ï¿½Ö£ï¿½ï¿½ï¿½ QEMU monitor ï¿½ï¿½ï¿½Ú´ï¿½ï¿½ï¿½Ö¤ï¿½ï¿½ */
 volatile uint32_t dbg_shell_eflags = 0;
 
-// ×Ö·û´®³¤¶È
+// ï¿½Ö·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 static size_t my_strlen(const char *s) {
     size_t len = 0;
     while (s[len]) len++;
     return len;
 }
 
-// ºöÂÔ´óĞ¡Ğ´±È½Ï
+// ï¿½ï¿½ï¿½Ô´ï¿½Ğ¡Ğ´ï¿½È½ï¿½
 static int my_tolower(char c) {
     if (c >= 'A' && c <= 'Z') return c + ('a' - 'A');
     return c;
@@ -51,17 +52,19 @@ static int my_strcasecmp(const char *a, const char *b) {
     return *a - *b;
 }
 
-// ¼òµ¥ atoi
+// ï¿½ï¿½ atoi
 static int my_atoi(const char *s) {
     int result = 0;
     while (*s >= '0' && *s <= '9') {
-        result = result * 10 + (*s - '0');
+        int d = *s - '0';
+        if (result > (2147483647 - d) / 10) return 2147483647;  /* æº¢å‡ºé’³åˆ¶ */
+        result = result * 10 + d;
         s++;
     }
     return result;
 }
 
-// Ê®Áù½øÖÆ×Ö·û×ªÖµ
+// Ê®ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö·ï¿½×ªÖµ
 static int hex_char_val(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -69,7 +72,7 @@ static int hex_char_val(char c) {
     return -1;
 }
 
-// ½âÎöÊ®Áù½øÖÆ×Ö·û´®ÎªÊı×Ö
+// ï¿½ï¿½ï¿½ï¿½Ê®ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö·ï¿½ï¿½ï¿½Îªï¿½ï¿½ï¿½ï¿½
 static uint32_t my_htoi(const char *s) {
     uint32_t result = 0;
     if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
@@ -82,11 +85,11 @@ static uint32_t my_htoi(const char *s) {
     return result;
 }
 
-// 64 Î» / 32 Î»ÎŞ·ûºÅ³ı·¨£¨±ÜÃâÒÀÀµ libgcc µÄ __udivdi3£©
-// Èë²Î hi:lo ×é³É 64 Î»±»³ıÊı£¬d Îª³ıÊı£¬·µ»ØÉÌ
+// 64 Î» / 32 Î»ï¿½Ş·ï¿½ï¿½Å³ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ libgcc ï¿½ï¿½ __udivdi3ï¿½ï¿½
+// ï¿½ï¿½ï¿½?hi:lo ï¿½ï¿½ï¿½?64 Î»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½d Îªï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 static uint32_t udiv64_32(uint32_t hi, uint32_t lo, uint32_t d) {
     if (d == 0) return 0;
-    if (hi >= d) return 0xFFFFFFFF;   // ÉÌÒç³ö±£»¤
+    if (hi >= d) return 0xFFFFFFFF;   // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½?
     uint64_t rem = hi;
     uint32_t q = 0;
     for (int i = 31; i >= 0; i--) {
@@ -99,7 +102,7 @@ static uint32_t udiv64_32(uint32_t hi, uint32_t lo, uint32_t d) {
     return q;
 }
 
-// ´òÓ¡Ê®½øÖÆ
+// ï¿½ï¿½Ó¡Ê®ï¿½ï¿½ï¿½ï¿½
 static void print_dec(uint32_t num) {
     char buf[16];
     int len = 0;
@@ -114,14 +117,14 @@ static void print_dec(uint32_t num) {
     while (len > 0) terminal_putchar(buf[--len]);
 }
 
-// ´òÓ¡Ê®Áù½øÖÆ×Ö½Ú
+// ï¿½ï¿½Ó¡Ê®ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö½ï¿½
 static void print_hex_byte(uint8_t val) {
     char hex[] = "0123456789ABCDEF";
     terminal_putchar(hex[val >> 4]);
     terminal_putchar(hex[val & 0x0F]);
 }
 
-// ´òÓ¡Ê®Áù½øÖÆ32Î»
+// ï¿½ï¿½Ó¡Ê®ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½32Î»
 static void print_hex32(uint32_t val) {
     print_hex_byte((val >> 24) & 0xFF);
     print_hex_byte((val >> 16) & 0xFF);
@@ -129,13 +132,13 @@ static void print_hex32(uint32_t val) {
     print_hex_byte(val & 0xFF);
 }
 
-// CMOS ¶ÁÒ»¸ö×Ö½Ú
+// CMOS ï¿½ï¿½Ò»ï¿½ï¿½ï¿½Ö½ï¿½
 static uint8_t cmos_read(uint8_t reg) {
     outb(0x70, reg);
     return inb(0x71);
 }
 
-/* ÃüÁîÊµÏÖ */
+/* ï¿½ï¿½ï¿½ï¿½Êµï¿½ï¿½ */
 static void cmd_help(const char *args);
 static void cmd_clear(const char *args);
 static void cmd_exit(const char *args);
@@ -171,6 +174,7 @@ static void cmd_mkdir(const char *args);
 static void cmd_pwd(const char *args);
 static void cmd_gui(const char *args);
 static void cmd_desktop(const char *args);
+static void cmd_theme(const char *args);
 static void cmd_uname(const char *args);
 static void cmd_vi(const char *args);
 static void cmd_df(const char *args);
@@ -225,6 +229,7 @@ static const command_t commands[] = {
     {"pwd",      cmd_pwd},
     {"gui",      cmd_gui},
     {"desktop",  cmd_desktop},
+    {"theme",    cmd_theme},
     {"uname",    cmd_uname},
     {"vi",       cmd_vi},
     {"df",       cmd_df},
@@ -236,7 +241,7 @@ static const command_t commands[] = {
     {"tictactoe",cmd_tictactoe},
     {"snake",    cmd_snake},
     {"games",    cmd_games},
-    /* ĞÂÔö£ºshell_extra.c ÔöÇ¿ÃüÁî£¨½è¼ø MikanOS ²ÎÊı½âÎöÓëÓïÒå£© */
+    /* ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½shell_extra.c ï¿½ï¿½Ç¿ï¿½ï¿½ï¿½î£¨ï¿½ï¿½ï¿½?MikanOS ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½å£© */
     {"ver",      cmd_ver},
     {"sysinfo",  cmd_sysinfo},
     {"type",     cmd_type},
@@ -248,12 +253,12 @@ static const command_t commands[] = {
     {0, 0}
 };
 
-/* ===== ¹ÜµÀÓëÖØ¶¨ÏòÖ§³Ö ===== */
+/* ===== ï¿½Üµï¿½ï¿½ï¿½ï¿½Ø¶ï¿½ï¿½ï¿½Ö§ï¿½ï¿½ ===== */
 #define PIPE_BUF_SIZE 4096
 static char pipe_buffer[PIPE_BUF_SIZE];
 static int pipe_len = 0;
 
-/* ===== ÖÕ¶ËÑÕÉ«¸¨Öú£¨tty µÄ vga_color Ã¶¾ÙÔÚ tty.c ÄÚ static£¬shell.c Ö±½Óµ÷ terminal_setcolor£©===== */
+/* ===== ï¿½Õ¶ï¿½ï¿½ï¿½É«ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½tty ï¿½ï¿½ vga_color Ã¶ï¿½ï¿½ï¿½ï¿½ tty.c ï¿½ï¿½ staticï¿½ï¿½shell.c Ö±ï¿½Óµï¿½ terminal_setcolorï¿½ï¿½===== */
 #define CLR_WHITE     15
 #define CLR_LIGHT_GREY  7
 #define CLR_DARK_GREY   8
@@ -266,7 +271,7 @@ static int pipe_len = 0;
 static void shell_fg(uint8_t fg) { terminal_setcolor((uint8_t)(fg | (0 << 4))); }
 static void shell_color_default(void) { shell_fg(CLR_LIGHT_GREY); }
 
-/* ¼ì²éÀ©Õ¹ÃûÊÇ·ñÎª¿ÉÖ´ĞĞ */
+/* ï¿½ï¿½ï¿½ï¿½ï¿½Õ¹ï¿½ï¿½ï¿½Ç·ï¿½Îªï¿½ï¿½Ö´ï¿½ï¿½?*/
 static int is_exe_name(const char *name) {
     int len = 0; while (name[len]) len++;
     if (len < 4) return 0;
@@ -275,14 +280,15 @@ static int is_exe_name(const char *name) {
         || (name[len-4]=='.' && (name[len-3]=='b'||name[len-3]=='B') && (name[len-2]=='i'||name[len-2]=='I') && (name[len-1]=='n'||name[len-1]=='N'));
 }
 
-/* Ö´ĞĞÔ­Ê¼ÃüÁî£¨²»º¬ÖØ¶¨Ïò/¹ÜµÀÔ¤´¦Àí£© */
+/* Ö´ï¿½ï¿½Ô­Ê¼ï¿½ï¿½ï¿½î£¨ï¿½ï¿½ï¿½ï¿½ï¿½Ø¶ï¿½ï¿½ï¿½/ï¿½Üµï¿½Ô¤ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ */
 static void shell_execute_raw(char *cmd);
 
-/* shell Ä£Ê½£º1=ÓÃ»§ shell£¨GUI Terminal / User Shell£©£¬0=ÄÚºË shell */
-static int shell_user_mode = 0;
-void shell_set_user_mode(int u) { shell_user_mode = u ? 1 : 0; }
+/* shell Ä£Ê½ï¿½ï¿½1=ï¿½Ã»ï¿½ shellï¿½ï¿½GUI Terminal / User Shellï¿½ï¿½ï¿½ï¿½0=ï¿½Úºï¿½ shell */
+/* æ¸…é™¤ exit è¯·æ±‚æ ‡å¿—ï¼šGUI Terminal é‡Œæ•²ï¿½?exit åé€€å‡ºæ¡Œé¢æ—¶è°ƒç”¨ï¿½?
+ * é˜²æ­¢æ®‹ç•™æ ‡å¿—è®©ä¸‹ä¸€ï¿½?shell_run ç«‹å³è¿”å› */
+void shell_exit_clear(void) { shell_exit_flag = 0; }
 
-/* Ö´ĞĞ´øÖØ¶¨Ïò/¹ÜµÀµÄÃüÁî */
+/* Ö´ï¿½Ğ´ï¿½ï¿½Ø¶ï¿½ï¿½ï¿½/ï¿½Üµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ */
 static void shell_execute(char *cmd) {
     if (history_count < HISTORY_SIZE) {
         for (int i = 0; i < CMD_BUFFER_SIZE; i++) {
@@ -294,7 +300,7 @@ static void shell_execute(char *cmd) {
     while (*cmd == ' ') cmd++;
     if (*cmd == '\0') return;
 
-    /* ²éÕÒÖØ¶¨Ïò >¡¢>> ºÍ¹ÜµÀ |£¨Ê××Ö·û·ÇÃüÁî·ûºÅ£¬ºöÂÔÒıºÅÄÚ£© */
+    /* ï¿½ï¿½ï¿½ï¿½ï¿½Ø¶ï¿½ï¿½ï¿½ >ï¿½ï¿½>> ï¿½Í¹Üµï¿½ |ï¿½ï¿½ï¿½ï¿½ï¿½Ö·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Å£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ú£ï¿½?*/
     int in_quote = 0;
     char *gt = NULL, *pipe = NULL;
     for (char *p = cmd; *p; p++) {
@@ -305,18 +311,18 @@ static void shell_execute(char *cmd) {
     }
 
     if (gt) {
-        /* cmd > file »ò cmd >> file */
+        /* cmd > file ï¿½ï¿½ cmd >> file */
         int append = (gt[0] != '\0' && gt[1] == '>');
         *gt = '\0';
         char *fname = gt + 1 + (append ? 1 : 0);
         while (*fname == ' ') fname++;
         if (append) {
-            /* >> ×·¼Ó£ºÏÈ¶Á¾ÉÎÄ¼şÔÙºÏ²¢ */
+            /* >> ×·ï¿½Ó£ï¿½ï¿½È¶ï¿½ï¿½ï¿½ï¿½Ä¼ï¿½ï¿½ÙºÏ²ï¿½ */
             static uint8_t old[4096];
             static uint8_t merged[8192];
             int mn = 0;
-            if (exfat_init() == 0) {
-                int on = exfat_read_file(fname, old, 4096);
+            if (fs_init() == 0) {
+                int on = fs_read_file(fname, old, 4096);
                 if (on > 0) for (int i = 0; i < on && mn < 8191; i++) merged[mn++] = old[i];
             }
             static char cap[PIPE_BUF_SIZE];
@@ -324,16 +330,16 @@ static void shell_execute(char *cmd) {
             shell_execute_raw(cmd);
             int n = terminal_end_capture();
             for (int i = 0; i < n && mn < 8191; i++) merged[mn++] = (uint8_t)cap[i];
-            if (mn > 0 && exfat_init() == 0) {
-                exfat_create_file(fname, merged, mn);
+            if (mn > 0 && fs_init() == 0) {
+                fs_create_file(fname, merged, mn);
             }
         } else {
             static char cap[PIPE_BUF_SIZE];
             terminal_begin_capture(cap, PIPE_BUF_SIZE);
             shell_execute_raw(cmd);
             int n = terminal_end_capture();
-            if (n > 0 && exfat_init() == 0) {
-                exfat_create_file(fname, (const uint8_t*)cap, n);
+            if (n > 0 && fs_init() == 0) {
+                fs_create_file(fname, (const uint8_t*)cap, n);
             }
         }
         return;
@@ -360,14 +366,6 @@ static void shell_execute(char *cmd) {
 }
 
 static void shell_execute_raw(char *cmd) {
-    if (history_count < HISTORY_SIZE) {
-        for (int i = 0; i < CMD_BUFFER_SIZE; i++) {
-            history[history_count][i] = cmd[i];
-            if (cmd[i] == '\0') break;
-        }
-        history_count++;
-    }
-
     while (*cmd == ' ') cmd++;
     if (*cmd == '\0') return;
 
@@ -380,22 +378,7 @@ static void shell_execute_raw(char *cmd) {
         space = cmd + my_strlen(cmd);
     }
 
-    /* ÄÚºË shell ²»Ìá¹©ÓÃ»§Ì¬ÃüÁî£¨gui/desktop/games µÈ£©£¬
-     * User Shell£¨shell_user_mode=1£©²Å¿É·ÃÎÊ */
-    if (!shell_user_mode) {
-        static const char *const user_only_cmds[] = {
-            "gui", "desktop", "games", "guess", "tictactoe", "snake"
-        };
-        for (size_t ui = 0; ui < sizeof(user_only_cmds) / sizeof(user_only_cmds[0]); ui++) {
-            if (my_strcasecmp(cmd, user_only_cmds[ui]) == 0) {
-                terminal_writestring("Unknown command: ");
-                terminal_writestring(cmd);
-                terminal_writestring("\n");
-                return;
-            }
-        }
-    }
-
+    /* åœ¨å‘½ä»¤è¡¨ä¸­æŸ¥æ‰¾å¹¶æ‰§è¡Œï¼ˆgui/desktop/games ç­‰æ‰€æœ‰å‘½ä»¤åœ¨å”¯ä¸€ shell ä¸­å¯ç”¨ï¼‰ */
     for (int i = 0; commands[i].name != 0; i++) {
         if (my_strcasecmp(cmd, commands[i].name) == 0) {
             commands[i].func(space);
@@ -403,7 +386,7 @@ static void shell_execute_raw(char *cmd) {
         }
     }
 
-    /* ±ğÃûÕ¹¿ª£¨½è¼ø POSIX shell ÓïÒå£©£ºalias name=cmd ¶¨ÒåµÄ±ğÃûÔÚ´ËÉúĞ§ */
+    /* ï¿½ï¿½ï¿½ï¿½Õ¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½?POSIX shell ï¿½ï¿½ï¿½å£©ï¿½ï¿½alias name=cmd ï¿½ï¿½ï¿½ï¿½Ä±ï¿½ï¿½ï¿½ï¿½Ú´ï¿½ï¿½ï¿½ï¿½?*/
     const char *alias_exp = shell_extra_lookup_alias(cmd);
     if (alias_exp) {
         static int alias_depth = 0;
@@ -413,6 +396,15 @@ static void shell_execute_raw(char *cmd) {
             while (alias_exp[n] && n < CMD_BUFFER_SIZE - 1) {
                 expanded[n] = alias_exp[n];
                 n++;
+            }
+            /* ä¿ç•™åŸå‘½ä»¤åæ¥çš„å‚æ•°ï¼šalias ll=ls ï¿½?ll subdir åº”æ‰§ï¿½?ls subdir */
+            if (*space && n < CMD_BUFFER_SIZE - 1) {
+                expanded[n++] = ' ';
+                while (*space && n < CMD_BUFFER_SIZE - 1) {
+                    expanded[n] = *space;
+                    n++;
+                    space++;
+                }
             }
             expanded[n] = '\0';
             alias_depth++;
@@ -431,7 +423,7 @@ static void shell_execute_raw(char *cmd) {
     terminal_writestring("\n");
 }
 
-/* ¹© shell_extra.c µÄ type/which ²éÑ¯ÃüÁîÊÇ·ñÎªÄÚ½¨ÃüÁî */
+/* ï¿½ï¿½ shell_extra.c ï¿½ï¿½ type/which ï¿½ï¿½Ñ¯ï¿½ï¿½ï¿½ï¿½ï¿½Ç·ï¿½Îªï¿½Ú½ï¿½ï¿½ï¿½ï¿½ï¿½ */
 int shell_is_builtin(const char *name) {
     for (int i = 0; commands[i].name != 0; i++) {
         if (my_strcasecmp(name, commands[i].name) == 0) return 1;
@@ -439,7 +431,42 @@ int shell_is_builtin(const char *name) {
     return 0;
 }
 
-// ÖØ»æµ±Ç°ÊäÈëĞĞ
+/* å‘½ä»¤åå‰ç¼€è¡¥å…¨ï¼šprefix ä¸åŒºåˆ†å¤§å°å†™å‰ç¼€åŒ¹é…å†…å»ºå‘½ä»¤è¡¨ï¿½?
+ * å”¯ä¸€åŒ¹é… -> æ‹·è´å®Œæ•´å‘½ä»¤ååˆ° outï¼Œè¿”ï¿½?1ï¿½?
+ * å¤šä¸ªåŒ¹é… -> å„å‘½ä»¤åæŒ‡é’ˆå†™å…¥ matches[]ï¼ˆæœ€ï¿½?max_matches ä¸ªï¼‰ï¼Œè¿”å›åŒ¹é…æ€»æ•°ï¿½?
+ * æ— åŒ¹ï¿½?-> è¿”å› 0ã€‚ä¾›å†…æ ¸ shell ï¿½?GUI ç»ˆç«¯ Tab è¡¥å…¨å…±ç”¨ */
+int shell_complete_command(const char *prefix, char *out, int outsz,
+                           const char *matches[], int max_matches) {
+    int plen = 0;
+    while (prefix[plen]) plen++;
+    if (plen == 0 || out == NULL || outsz <= 0) return 0;
+    int count = 0;
+    const char *first = NULL;
+    for (int i = 0; commands[i].name != 0; i++) {
+        const char *name = commands[i].name;
+        int nlen = 0;
+        while (name[nlen]) nlen++;
+        if (nlen < plen) continue;
+        /* å‰ç¼€å¤§å°å†™ä¸æ•æ„Ÿæ¯”è¾ƒ */
+        int ok = 1;
+        for (int j = 0; j < plen; j++) {
+            if (my_tolower(prefix[j]) != my_tolower(name[j])) { ok = 0; break; }
+        }
+        if (!ok) continue;
+        if (count == 0) first = name;
+        if (matches != NULL && count < max_matches) matches[count] = name;
+        count++;
+    }
+    if (count == 1 && first != NULL) {
+        int i = 0;
+        for (; first[i] && i < outsz - 1; i++) out[i] = first[i];
+        out[i] = '\0';
+        return 1;
+    }
+    return count;
+}
+
+// ï¿½Ø»æµ±Ç°ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 static void shell_redraw_line(void) {
     terminal_clear_line(current_row);
     terminal_writestring("> ");
@@ -451,10 +478,7 @@ static void shell_redraw_line(void) {
 }
 
 void shell_run(void) {
-    if (shell_user_mode)
-        terminal_writestring("EZOS User Shell - Type 'help' for commands.\n");
-    else
-        terminal_writestring("EZOS Kernel Shell - Type 'help' for commands,'exit' to continue boot.\n");
+    terminal_writestring("EZOS Shell - Type 'help' for commands, 'exit' to launch desktop.\n");
     terminal_writestring("> ");
 
     cmd_pos = 0;
@@ -463,7 +487,7 @@ void shell_run(void) {
     current_row = terminal_get_row();
 
     while (1) {
-        asm volatile("sti; nop; nop; nop; nop; nop");   /* È·±£ÖĞ¶Ï¿ªÆô£¨¿ç¹ı STI ÒÖÖÆ´°¿Ú£© */
+        asm volatile("sti; nop; nop; nop; nop; nop");   /* È·ï¿½ï¿½ï¿½Ğ¶Ï¿ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½?STI ï¿½ï¿½ï¿½Æ´ï¿½ï¿½Ú£ï¿½ */
         { uint32_t fl; asm volatile("pushfl; popl %0" : "=r"(fl)); dbg_shell_eflags = fl; }
         if (shell_exit_flag) {
             shell_exit_flag = 0;
@@ -485,7 +509,36 @@ void shell_run(void) {
             shell_redraw_line();
         }
 
-        if (c == '\n') {
+        if (c == '\t') {
+            /* Tab è¡¥å…¨ï¼šä»…å½“å…‰æ ‡åœåœ¨ç¬¬ä¸€ä¸ªè¯å†…ï¼ˆå‘½ä»¤åï¼‰æ—¶è¡¥ï¿½?*/
+            int word_len = 0;
+            while (word_len < cmd_pos && cmd_buffer[word_len] != ' ') word_len++;
+            if (word_len > 0 && cmd_pos == word_len) {
+                char word[CMD_BUFFER_SIZE];
+                for (int i = 0; i < word_len; i++) word[i] = cmd_buffer[i];
+                word[word_len] = '\0';
+                char full[CMD_BUFFER_SIZE];
+                const char *matches[12];
+                int r = shell_complete_command(word, full, sizeof(full), matches, 12);
+                if (r == 1) {
+                    for (int i = 0; full[i]; i++) cmd_buffer[i] = full[i];
+                    cmd_pos = (int)my_strlen(full);
+                    cursor = cmd_pos;
+                    shell_redraw_line();
+                } else if (r >= 2) {
+                    /* å¤šä¸ªåŒ¹é…ï¼šæ¢è¡Œåˆ—å‡ºå€™é€‰ï¼Œé‡ç»˜æç¤ºï¿½?*/
+                    terminal_putchar('\n');
+                    for (int i = 0; i < r && i < 12; i++) {
+                        terminal_writestring(matches[i]);
+                        terminal_putchar(' ');
+                    }
+                    terminal_putchar('\n');
+                    current_row = terminal_get_row();
+                    shell_redraw_line();
+                }
+                /* r == 0 æ— åŒ¹é…ï¼šæ— æ“ï¿½?*/
+            }
+        } else if (c == '\n') {
             terminal_putchar('\n');
             cmd_buffer[cmd_pos] = '\0';
             shell_execute(cmd_buffer);
@@ -496,7 +549,7 @@ void shell_run(void) {
             current_row = terminal_get_row();
         } else if (c == '\b') {
             if (cursor > 0) {
-                // É¾³ı¹â±êÇ°×Ö·û
+                // É¾ï¿½ï¿½ï¿½ï¿½ï¿½Ç°ï¿½Ö·ï¿½?
                 for (int i = cursor - 1; i < cmd_pos - 1; i++) {
                     cmd_buffer[i] = cmd_buffer[i + 1];
                 }
@@ -545,7 +598,7 @@ void shell_run(void) {
             }
         } else if (c >= 32 && c <= 126) {
             if (cmd_pos < CMD_BUFFER_SIZE - 1) {
-                // ÔÚ cursor Î»ÖÃ²åÈë×Ö·û
+                // ï¿½ï¿½ cursor Î»ï¿½Ã²ï¿½ï¿½ï¿½ï¿½Ö·ï¿½
                 for (int i = cmd_pos; i > (int)cursor; i--) {
                     cmd_buffer[i] = cmd_buffer[i - 1];
                 }
@@ -558,7 +611,7 @@ void shell_run(void) {
     }
 }
 
-/* ÃüÁî¾ßÌåÊµÏÖ */
+/* ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Êµï¿½ï¿½?*/
 static void cmd_help(const char *args) {
     if (*args != '\0') {
         const char *detail = shell_extra_help(args);
@@ -589,7 +642,7 @@ static void cmd_help(const char *args) {
     terminal_writestring("  about      - about this OS\n");
     terminal_writestring("  history    - show command history\n");
     terminal_writestring("  setcolor <fg> [bg] - set text color (0-15)\n");
-    terminal_writestring("  setdrive <0|1> - set exFAT drive\n");
+    terminal_writestring("  setdrive <0-3> - set filesystem drive\n");
     terminal_writestring("  ls         - list root directory (exFAT)\n");
     terminal_writestring("  cat <file> - read file content (exFAT)\n");
     terminal_writestring("  write <file> <content> - create file with content\n");
@@ -605,23 +658,21 @@ static void cmd_help(const char *args) {
     terminal_writestring("  cd <dir>   - change directory\n");
     terminal_writestring("  mkdir <dir> - create directory\n");
     terminal_writestring("  pwd        - print working directory\n");
-    if (shell_user_mode) {
-        terminal_writestring("  desktop    - launch graphical desktop\n");
-        terminal_writestring("  gui        - launch text-mode GUI\n");
-    }
+    terminal_writestring("  desktop    - launch graphical desktop\n");
+    terminal_writestring("  gui        - launch text-mode GUI\n");
+    terminal_writestring("  exit       - launch graphical desktop\n");
+    terminal_writestring("  theme [n]  - list/switch GUI theme\n");
     terminal_writestring("  uname      - print system information\n");
     terminal_writestring("  vi <file>  - edit a text file\n");
-    terminal_writestring("  df         - show exFAT disk space usage\n");
+    terminal_writestring("  df         - show disk space usage\n");
     terminal_writestring("  du [name]  - show disk usage of current dir or file\n");
     terminal_writestring("  calc <expr> - evaluate expression (e.g. calc 1+2*3)\n");
     terminal_writestring("  hex <num>  - convert decimal <-> hex (0x.. for hex input)\n");
     terminal_writestring("  rand [max] - generate a random number (default 0-99)\n");
-    if (shell_user_mode) {
-        terminal_writestring("  guess      - guess-the-number game\n");
-        terminal_writestring("  tictactoe  - play tic-tac-toe vs AI\n");
-        terminal_writestring("  snake      - play snake game (arrows, P pause, Esc quit)\n");
-        terminal_writestring("  games      - list/launch games\n");
-    }
+    terminal_writestring("  guess      - guess-the-number game\n");
+    terminal_writestring("  tictactoe  - play tic-tac-toe vs AI\n");
+    terminal_writestring("  snake      - play snake game (arrows, P pause, Esc quit)\n");
+    terminal_writestring("  games      - list/launch games\n");
     terminal_writestring("  ver        - show kernel version\n");
     terminal_writestring("  sysinfo    - show system summary (CPU/memory/time)\n");
     terminal_writestring("  type <cmd> - show command type (builtin/alias/file)\n");
@@ -685,6 +736,9 @@ static void cmd_time(const char *args) {
     hour = ((hour & 0x0F) + ((hour >> 4) * 10));
     minute = ((minute & 0x0F) + ((minute >> 4) * 10));
     second = ((second & 0x0F) + ((second >> 4) * 10));
+    if (hour > 23) hour = 0;          /* clamp invalid CMOS values */
+    if (minute > 59) minute = 0;
+    if (second > 59) second = 0;
     terminal_writestring("Current time: ");
     print_dec(hour);
     terminal_putchar(':');
@@ -704,6 +758,8 @@ static void cmd_date(const char *args) {
     year = ((year & 0x0F) + ((year >> 4) * 10));
     month = ((month & 0x0F) + ((month >> 4) * 10));
     day = ((day & 0x0F) + ((day >> 4) * 10));
+    if (month < 1 || month > 12) month = 1;   /* clamp invalid CMOS values */
+    if (day < 1 || day > 31) day = 1;
     terminal_writestring("Current date: ");
     print_dec(year + 2000);
     terminal_putchar('-');
@@ -790,6 +846,11 @@ static void cmd_readdisk(const char *args) {
         lba = my_atoi(p);
     }
 
+    if (drive < 0 || drive > 1) {
+        terminal_writestring("Usage: readdisk [drive 0|1] <lba>\n");
+        return;
+    }
+
     uint8_t buffer[512];
     if (ata_read_sector((uint8_t)drive, (uint32_t)lba, buffer) != 0) {
         terminal_writestring("Disk read error!\n");
@@ -820,7 +881,7 @@ static void cmd_readdisk(const char *args) {
 static void cmd_hexdump(const char *args) {
     uint32_t addr = my_htoi(args);
     int len = 64;
-    /* ¿ÉÑ¡³¤¶È²ÎÊı£ºhexdump <addr> [len]£¬×î´ó 1024 */
+    /* ï¿½ï¿½Ñ¡ï¿½ï¿½ï¿½È²ï¿½ï¿½ï¿½ï¿½ï¿½hexdump <addr> [len]ï¿½ï¿½ï¿½ï¿½ï¿½?1024 */
     const char *p = args;
     while (*p && *p != ' ') p++;
     while (*p == ' ') p++;
@@ -845,19 +906,26 @@ static void cmd_hexdump(const char *args) {
     if (len % 16 != 0) terminal_putchar('\n');
 }
 
-static void cmd_beep(const char *args) {
-    (void)args;
-    outb(0x43, 0xB6);
-    uint16_t div = 1193180 / 1000;
+/* PC èœ‚é¸£å™¨å¯ç¼–ç¨‹æ¥å£ï¼šfreq Hz é¸£å“ ms æ¯«ç§’ï¼ˆPIT ch2 + gate 0x61ï¼Œå¿™ç­‰ç²¾ç¡®æ—¶é•¿ï¼‰ï¿½?
+ * ï¿½?shell beep å‘½ä»¤ã€GUI/æ¸¸æˆéŸ³æ•ˆå…±ç”¨ï¼›freq è¶…å‡ºäººè€³èŒƒå›´æˆ– ms==0 ç›´æ¥è¿”å› */
+void beep(uint32_t freq, uint32_t ms) {
+    if (freq < 20 || freq > 20000 || ms == 0) return;
+    outb(0x43, 0xB6);                       /* ch2: lobyte/hibyte, square wave */
+    uint16_t div = (uint16_t)(1193180 / freq);
+    if (div == 0) div = 1;
     outb(0x42, (uint8_t)(div & 0xFF));
     outb(0x42, (uint8_t)(div >> 8));
     uint8_t tmp = inb(0x61);
-    if (tmp != (tmp | 3)) {
-        outb(0x61, tmp | 3);
-    }
-    for (volatile int i = 0; i < 1000000; i++);
+    outb(0x61, tmp | 3);                    /* gate+speaker on */
+    uint32_t until = g_pit_ticks + ms;      /* PIT ch0 å·²æ˜¯ 1000Hzï¼Œtick=1ms */
+    while ((int32_t)(g_pit_ticks - until) < 0) { asm volatile("pause"); }
     tmp = inb(0x61) & 0xFC;
-    outb(0x61, tmp);
+    outb(0x61, tmp);                        /* gate+speaker off */
+}
+
+static void cmd_beep(const char *args) {
+    (void)args;
+    beep(1000, 300);
 }
 
 static void cmd_about(const char *args) {
@@ -901,20 +969,20 @@ static void cmd_setcolor(const char *args) {
 static void cmd_ls(const char *args) {
     int verbose = 0;
     if (args[0] == '-' && args[1] == 'l') verbose = 1;
-    if (exfat_init() != 0) {
-        terminal_writestring("exFAT init failed. Is disk formatted?\n");
+    if (fs_init() != 0) {
+        terminal_writestring("FS init failed. Is disk formatted?\n");
         return;
     }
-    terminal_writestring(exfat_cwd_path());
+    terminal_writestring(fs_cwd_path());
     terminal_writestring(":\n");
-    exfat_dir_entry_t entries[64];
-    int n = exfat_read_dir(entries, 64);
+    fs_dir_entry_t entries[64];
+    int n = fs_read_dir(entries, 64);
     if (n < 0) {
         terminal_writestring("read dir failed\n");
         return;
     }
     if (verbose) {
-        /* -l ÏêÏ¸Ä£Ê½£ºÀàĞÍ + ÓÒ¶ÔÆë´óĞ¡ + Ãû³Æ£¨½è¼ø MikanOS ListAllEntries£© */
+        /* -l ï¿½ï¿½Ï¸Ä£Ê½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ + ï¿½Ò¶ï¿½ï¿½ï¿½ï¿½ï¿½?+ ï¿½ï¿½ï¿½Æ£ï¿½ï¿½ï¿½ï¿½?MikanOS ListAllEntriesï¿½ï¿½ */
         for (int i = 0; i < n; i++) {
             if (entries[i].is_dir) shell_fg(CLR_LIGHT_BLUE);
             else if (is_exe_name(entries[i].name)) shell_fg(CLR_LIGHT_GREEN);
@@ -939,7 +1007,7 @@ static void cmd_ls(const char *args) {
             terminal_putchar('\n');
         }
     } else {
-        /* eza ·ç¸ñ²ÊÉ«Íø¸ñ */
+        /* eza ï¿½ï¿½ï¿½ï¿½É«ï¿½ï¿½ï¿½ï¿½ */
         int maxlen = 4;
         for (int i = 0; i < n; i++) {
             int l = 0; while (entries[i].name[l]) l++;
@@ -957,12 +1025,12 @@ static void cmd_ls(const char *args) {
                 if (entries[idx].is_dir) shell_fg(CLR_LIGHT_BLUE);
                 else if (is_exe_name(entries[idx].name)) shell_fg(CLR_LIGHT_GREEN);
                 else shell_fg(CLR_LIGHT_GREY);
-                int l = 0; while (entries[idx].name[l]) { namebuf[l] = entries[idx].name[l]; l++; }
+                int l = 0; while (entries[idx].name[l] && l < 60) { namebuf[l] = entries[idx].name[l]; l++; }
                 namebuf[l] = '\0';
                 for (int k = 0; k < l; k++) terminal_putchar(namebuf[k]);
                 if (entries[idx].is_dir) terminal_putchar('/');
                 shell_color_default();
-                /* Ìî³äµ½ÁĞ¿í */
+                /* ï¿½ï¿½äµ½ï¿½Ğ¿ï¿½?*/
                 int pad = l + (entries[idx].is_dir ? 1 : 0);
                 for (int fill = pad; fill < maxlen + 3; fill++) terminal_putchar(' ');
             }
@@ -972,8 +1040,8 @@ static void cmd_ls(const char *args) {
 }
 
 static void cmd_cat(const char *args) {
-    if (exfat_init() != 0) {
-        terminal_writestring("exFAT init failed.\n");
+    if (fs_init() != 0) {
+        terminal_writestring("FS init failed.\n");
         return;
     }
     char filename[128];
@@ -992,7 +1060,7 @@ static void cmd_cat(const char *args) {
         return;
     }
     static uint8_t file_buffer[4096];
-    int bytes = exfat_read_file(filename, file_buffer, 4096);
+    int bytes = fs_read_file(filename, file_buffer, 4096);
     if (bytes < 0) {
         terminal_writestring("File not found or read error.\n");
     } else {
@@ -1026,7 +1094,7 @@ static void cmd_write(const char *args) {
     while (content[len]) len++;
     if (len > 512) len = 512;
 
-    if (exfat_create_file(filename, (const uint8_t*)content, len) != 0) {
+    if (fs_create_file(filename, (const uint8_t*)content, len) != 0) {
         terminal_writestring("Failed to write file.\n");
     } else {
         terminal_writestring("File written successfully.\n");
@@ -1034,7 +1102,7 @@ static void cmd_write(const char *args) {
 }
 
 static void cmd_rm(const char *args) {
-    if (exfat_delete_file(args) != 0) {
+    if (fs_delete_file(args) != 0) {
         terminal_writestring("Failed to delete file.\n");
     } else {
         terminal_writestring("File deleted.\n");
@@ -1043,29 +1111,37 @@ static void cmd_rm(const char *args) {
 
 static void cmd_format(const char *args) {
     (void)args;
-    if (exfat_format() != 0) {
+    if (fs_format() != 0) {
         terminal_writestring("Format failed.\n");
     } else {
         terminal_writestring("Disk formatted as exFAT.\n");
-        // exfat_format ³É¹¦Ê±ÒÑÉèÖÃ exfat_ready = 1£¬ÎŞĞèÖØ¸´ÉèÖÃ
+        // fs_format succeeds with exFAT mounted; no re-init needed
     }
 }
 
 static void cmd_setdrive(const char *args) {
     int drive = my_atoi(args);
-    if (drive < 0 || drive > 1) {
-        terminal_writestring("Usage: setdrive <0|1>\n");
+    if (drive < 0 || drive > 3) {
+        terminal_writestring("Usage: setdrive <0-3>\n");
         return;
     }
-    exfat_set_drive((uint8_t)drive);
-    terminal_writestring("exFAT drive set to ");
-    print_dec(drive);
-    terminal_writestring("\n");
+    fs_set_drive((uint8_t)drive);
+    if (fs_init() == 0) {
+        terminal_writestring("FS drive set to ");
+        print_dec(drive);
+        terminal_writestring(" (");
+        terminal_writestring(fs_type_name());
+        terminal_writestring(")\n");
+    } else {
+        terminal_writestring("Drive ");
+        print_dec(drive);
+        terminal_writestring(": no filesystem found\n");
+    }
 }
 
-/* ============ ĞÂÔö Linux ·ç¸ñÃüÁî£¨×ÔÊµÏÖ£© ============ */
+/* ============ ï¿½ï¿½ï¿½ï¿½ Linux ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½î£¨ï¿½ï¿½Êµï¿½Ö£ï¿½?============ */
 
-// ½âÎöÏÂÒ»¸ö¿Õ¸ñ·Ö¸ôµÄ token£¬Ğ´Èë out£¬·µ»ØÊ£Óà²ÎÊıÖ¸Õë
+// ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò»ï¿½ï¿½ï¿½Õ¸ï¿½Ö¸ï¿½ï¿½ï¿½?tokenï¿½ï¿½Ğ´ï¿½ï¿½ outï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê£ï¿½ï¿½ï¿½ï¿½ï¿½Ö¸ï¿½ï¿½?
 static const char *parse_token(const char *args, char *out, int max) {
     int i = 0;
     while (*args == ' ') args++;
@@ -1085,7 +1161,7 @@ static void cmd_grep(const char *args) {
         return;
     }
     if (filename[0] == '\0' && pipe_len > 0) {
-        /* ´Ó¹ÜµÀÊäÈëËÑË÷ */
+        /* ï¿½Ó¹Üµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ */
         int plen = my_strlen(pattern);
         int line_start = 0, line_end = 0;
         while (line_end < pipe_len) {
@@ -1106,7 +1182,7 @@ static void cmd_grep(const char *args) {
         return;
     }
     static uint8_t file_buffer[4096];
-    int bytes = exfat_read_file(filename, file_buffer, 4096);
+    int bytes = fs_read_file(filename, file_buffer, 4096);
     if (bytes < 0) {
         terminal_writestring("File not found or read error.\n");
         return;
@@ -1154,7 +1230,7 @@ static void cmd_wc(const char *args) {
         return;
     }
     static uint8_t file_buffer[4096];
-    int bytes = exfat_read_file(filename, file_buffer, 4096);
+    int bytes = fs_read_file(filename, file_buffer, 4096);
     if (bytes < 0) {
         terminal_writestring("File not found or read error.\n");
         return;
@@ -1189,7 +1265,7 @@ static void cmd_head(const char *args) {
     }
     int n = numstr[0] ? my_atoi(numstr) : 10;
     static uint8_t file_buffer[4096];
-    int bytes = exfat_read_file(filename, file_buffer, 4096);
+    int bytes = fs_read_file(filename, file_buffer, 4096);
     if (bytes < 0) {
         terminal_writestring("File not found or read error.\n");
         return;
@@ -1216,7 +1292,7 @@ static void cmd_tail(const char *args) {
     }
     int n = numstr[0] ? my_atoi(numstr) : 10;
     static uint8_t file_buffer[4096];
-    int bytes = exfat_read_file(filename, file_buffer, 4096);
+    int bytes = fs_read_file(filename, file_buffer, 4096);
     if (bytes < 0) {
         terminal_writestring("File not found or read error.\n");
         return;
@@ -1244,7 +1320,7 @@ static void cmd_touch(const char *args) {
         terminal_writestring("Usage: touch <file>\n");
         return;
     }
-    if (exfat_create_file(filename, 0, 0) != 0) {
+    if (fs_create_file(filename, 0, 0) != 0) {
         terminal_writestring("Failed to create file.\n");
     } else {
         terminal_writestring("File created.\n");
@@ -1260,12 +1336,12 @@ static void cmd_cp(const char *args) {
         return;
     }
     static uint8_t file_buffer[4096];
-    int bytes = exfat_read_file(src, file_buffer, 4096);
+    int bytes = fs_read_file(src, file_buffer, 4096);
     if (bytes < 0) {
         terminal_writestring("Source file not found.\n");
         return;
     }
-    if (exfat_create_file(dst, file_buffer, (uint32_t)bytes) != 0) {
+    if (fs_create_file(dst, file_buffer, (uint32_t)bytes) != 0) {
         terminal_writestring("Copy failed.\n");
     } else {
         terminal_writestring("Copied.\n");
@@ -1281,16 +1357,16 @@ static void cmd_mv(const char *args) {
         return;
     }
     static uint8_t file_buffer[4096];
-    int bytes = exfat_read_file(src, file_buffer, 4096);
+    int bytes = fs_read_file(src, file_buffer, 4096);
     if (bytes < 0) {
         terminal_writestring("Source file not found.\n");
         return;
     }
-    if (exfat_create_file(dst, file_buffer, (uint32_t)bytes) != 0) {
+    if (fs_create_file(dst, file_buffer, (uint32_t)bytes) != 0) {
         terminal_writestring("Move failed.\n");
         return;
     }
-    if (exfat_delete_file(src) != 0) {
+    if (fs_delete_file(src) != 0) {
         terminal_writestring("Moved, but failed to delete source.\n");
     } else {
         terminal_writestring("Moved.\n");
@@ -1304,11 +1380,11 @@ static void cmd_cd(const char *args) {
         terminal_writestring("Usage: cd <dir>\n");
         return;
     }
-    if (exfat_init() != 0) {
-        terminal_writestring("exFAT init failed. Is disk formatted?\n");
+    if (fs_init() != 0) {
+        terminal_writestring("FS init failed. Is disk formatted?\n");
         return;
     }
-    if (exfat_change_dir(dir) != 0) {
+    if (fs_change_dir(dir) != 0) {
         terminal_writestring("cd: no such directory\n");
     }
 }
@@ -1320,18 +1396,18 @@ static void cmd_mkdir(const char *args) {
         terminal_writestring("Usage: mkdir <dir>\n");
         return;
     }
-    if (exfat_init() != 0) {
-        terminal_writestring("exFAT init failed. Is disk formatted?\n");
+    if (fs_init() != 0) {
+        terminal_writestring("FS init failed. Is disk formatted?\n");
         return;
     }
-    if (exfat_mkdir(dir) != 0) {
+    if (fs_mkdir(dir) != 0) {
         terminal_writestring("mkdir: failed\n");
     }
 }
 
 static void cmd_pwd(const char *args) {
     (void)args;
-    terminal_writestring(exfat_cwd_path());
+    terminal_writestring(fs_cwd_path());
     terminal_putchar('\n');
 }
 
@@ -1341,12 +1417,43 @@ static void cmd_gui(const char *args) {
     terminal_initialize();
 }
 
-/* User Shell µÄ desktop ÃüÁî£º½øÈëÍ¼ĞÎ×ÀÃæ£¨Óë kernel_main ÓÃ»§Ì¬½×¶ÎÒ»ÖÂ£© */
+/* desktop command: launch graphical desktop (same as 'exit') */
 static void cmd_desktop(const char *args) {
     (void)args;
     terminal_initialize();
     gw_start();
     terminal_initialize();
+}
+
+/* theme [n]: list or switch GUI theme (also selectable in Settings) */
+static void cmd_theme(const char *args) {
+    int n = gw_theme_count();
+    if (args[0] == '\0') {
+        terminal_writestring("Themes:\n");
+        for (int i = 0; i < n; i++) {
+            terminal_writestring("  ");
+            terminal_putchar((char)('0' + i));
+            terminal_writestring(". ");
+            terminal_writestring(gw_theme_name(i));
+            terminal_writestring("\n");
+        }
+        terminal_writestring("Use: theme <n>\n");
+        return;
+    }
+    int idx = 0, valid = 1;
+    for (const char *p = args; *p; p++) {
+        if (*p == ' ') continue;
+        if (*p < '0' || *p > '9' || idx > 99) { valid = 0; break; }
+        idx = idx * 10 + (*p - '0');
+    }
+    if (!valid || idx >= n) {
+        terminal_writestring("Invalid theme index. Use 'theme' to list.\n");
+        return;
+    }
+    gw_set_theme(idx);
+    terminal_writestring("Theme: ");
+    terminal_writestring(gw_theme_name(idx));
+    terminal_writestring("\n");
 }
 
 
@@ -1367,7 +1474,7 @@ static int vi_modified = 0;
 static int vi_mode = 0;
 static const char *vi_msg = NULL;
 
-// È·±£¹â±êÔÚºÏ·¨·¶Î§
+// È·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ÚºÏ·ï¿½ï¿½ï¿½ï¿½?
 static void vi_clamp_cursor(void) {
     if (vi_count == 0) { vi_row = 0; vi_col = 0; return; }
     if (vi_row < 0) vi_row = 0;
@@ -1376,7 +1483,7 @@ static void vi_clamp_cursor(void) {
     if (vi_col > vi_len[vi_row]) vi_col = vi_len[vi_row];
 }
 
-// µ÷Õû¹ö¶¯Æ«ÒÆ£¬È·±£¹â±ê¿É¼û
+// ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Æ«ï¿½Æ£ï¿½È·ï¿½ï¿½ï¿½ï¿½ï¿½É¼ï¿½
 static void vi_scroll_into_view(void) {
     if (vi_row < vi_top) vi_top = vi_row;
     if (vi_row >= vi_top + VI_SCREEN_ROWS) vi_top = vi_row - VI_SCREEN_ROWS + 1;
@@ -1386,7 +1493,7 @@ static void vi_scroll_into_view(void) {
     if (vi_top < 0) vi_top = 0;
 }
 
-// äÖÈ¾½çÃæ
+// ï¿½ï¿½È¾ï¿½ï¿½ï¿½ï¿½
 static void vi_render(void) {
     terminal_initialize();
     for (int i = 0; i < VI_SCREEN_ROWS; i++) {
@@ -1420,7 +1527,7 @@ static void vi_render(void) {
     terminal_set_cursor((size_t)(vi_row - vi_top), (size_t)(vi_col - vi_left));
 }
 
-// ÔÚ¹â±ê´¦²åÈë×Ö·û
+// ï¿½Ú¹ï¿½ê´¦ï¿½ï¿½ï¿½ï¿½ï¿½Ö·ï¿½?
 static void vi_insert_char(char c) {
     if (vi_len[vi_row] >= VI_MAX_LINE - 1) return;
     for (int i = vi_len[vi_row]; i > vi_col; i--) {
@@ -1432,7 +1539,7 @@ static void vi_insert_char(char c) {
     vi_modified = 1;
 }
 
-// É¾³ı¹â±ê´¦×Ö·û
+// É¾ï¿½ï¿½ï¿½ï¿½ê´¦ï¿½Ö·ï¿½?
 static void vi_delete_char(void) {
     if (vi_col >= vi_len[vi_row]) return;
     for (int i = vi_col; i < vi_len[vi_row] - 1; i++) {
@@ -1442,7 +1549,7 @@ static void vi_delete_char(void) {
     vi_modified = 1;
 }
 
-// É¾³ı¹â±êÇ°×Ö·û£¨ĞĞÊ×ÔòºÏ²¢µ½ÉÏÒ»ĞĞ£©
+// É¾ï¿½ï¿½ï¿½ï¿½ï¿½Ç°ï¿½Ö·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ï²ï¿½ï¿½ï¿½ï¿½ï¿½Ò»ï¿½Ğ£ï¿½
 static void vi_backspace(void) {
     if (vi_col > 0) {
         vi_col--;
@@ -1466,7 +1573,7 @@ static void vi_backspace(void) {
     }
 }
 
-// ÔÚ¹â±ê´¦²ğĞĞ
+// ï¿½Ú¹ï¿½ê´¦ï¿½ï¿½ï¿½ï¿½?
 static void vi_insert_newline(void) {
     if (vi_count >= VI_MAX_LINES) return;
     int tail = vi_len[vi_row] - vi_col;
@@ -1486,7 +1593,7 @@ static void vi_insert_newline(void) {
     vi_modified = 1;
 }
 
-// É¾³ıµ±Ç°ĞĞ
+// É¾ï¿½ï¿½ï¿½ï¿½Ç°ï¿½ï¿½
 static void vi_delete_line(void) {
     if (vi_count == 0) return;
     for (int r = vi_row; r < vi_count - 1; r++) {
@@ -1506,7 +1613,7 @@ static void vi_delete_line(void) {
     vi_modified = 1;
 }
 
-// ±£´æµ½ÎÄ¼ş
+// ï¿½ï¿½ï¿½æµ½ï¿½Ä¼ï¿½
 static void vi_save(void) {
     static uint8_t out_buf[4096];
     int o = 0;
@@ -1515,7 +1622,7 @@ static void vi_save(void) {
         for (int m = 0; m < L && o < 4095; m++) out_buf[o++] = (uint8_t)vi_lines[k][m];
         if (o < 4095) out_buf[o++] = '\n';
     }
-    if (exfat_create_file(vi_filename, out_buf, (uint32_t)o) == 0) {
+    if (fs_create_file(vi_filename, out_buf, (uint32_t)o) == 0) {
         vi_msg = "saved";
         vi_modified = 0;
     } else {
@@ -1523,7 +1630,7 @@ static void vi_save(void) {
     }
 }
 
-// ÔÚ×´Ì¬À¸¶ÁÈ¡ÃüÁî
+// ï¿½ï¿½×´Ì¬ï¿½ï¿½ï¿½ï¿½È¡ï¿½ï¿½ï¿½ï¿½
 static int vi_read_command(char *buf, int max) {
     terminal_set_cursor(VI_SCREEN_ROWS, 0);
     terminal_setcolor(0x70);
@@ -1560,18 +1667,18 @@ static void cmd_uname(const char *args) {
 
 static void cmd_df(const char *args) {
     (void)args;
-    if (exfat_init() != 0) {
-        terminal_writestring("df: exFAT not available\n");
+    if (fs_init() != 0) {
+        terminal_writestring("df: no filesystem\n");
         return;
     }
-    const exfat_info_t *info = exfat_get_info();
+    const fs_info_t *info = fs_get_info();
     if (!info || info->cluster_count == 0) {
         terminal_writestring("df: no volume info\n");
         return;
     }
     uint32_t cluster_size = (uint32_t)info->bytes_per_sector * info->sectors_per_cluster;
-    uint32_t used_clusters = exfat_count_used_clusters();
-    /* ÓÃ 64 Î»³Ë·¨ + ÓÒÒÆ»»Ëã KB£¬±ÜÃâ libgcc µÄ 64 Î»³ı·¨ÒÀÀµ */
+    uint32_t used_clusters = fs_count_used_clusters();
+    /* ï¿½ï¿½ 64 Î»ï¿½Ë·ï¿½ + ï¿½ï¿½ï¿½Æ»ï¿½ï¿½ï¿½ KBï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ libgcc ï¿½ï¿½ 64 Î»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ */
     uint64_t total_b = (uint64_t)info->cluster_count * cluster_size;
     uint64_t used_b = (uint64_t)used_clusters * cluster_size;
     uint32_t total_kb = (uint32_t)(total_b >> 10);
@@ -1582,7 +1689,9 @@ static void cmd_df(const char *args) {
                              info->cluster_count);
 
     terminal_writestring("Filesystem 1K-blocks     Used    Avail Use% Mounted on\n");
-    terminal_writestring("exFAT       ");
+    const char *fsn = fs_type_name();
+    terminal_writestring(fsn);
+    for (int pad = (int)my_strlen(fsn); pad < 12; pad++) terminal_putchar(' ');
     print_dec(total_kb);
     terminal_writestring(" ");
     print_dec(used_kb);
@@ -1600,20 +1709,20 @@ static void cmd_df(const char *args) {
 static void cmd_du(const char *args) {
     char name[128];
     parse_token(args, name, 128);
-    if (exfat_init() != 0) {
-        terminal_writestring("du: exFAT not available\n");
+    if (fs_init() != 0) {
+        terminal_writestring("du: no filesystem\n");
         return;
     }
-    const exfat_info_t *info = exfat_get_info();
+    const fs_info_t *info = fs_get_info();
     if (!info) {
         terminal_writestring("du: no volume info\n");
         return;
     }
     uint32_t cluster_size = (uint32_t)info->bytes_per_sector * info->sectors_per_cluster;
 
-    /* du <file>£ºÏÔÊ¾Ö¸¶¨ÎÄ¼ş/Ä¿Â¼µÄ´ØÕ¼ÓÃ£¨KB£© */
+    /* du <file>ï¿½ï¿½ï¿½ï¿½Ê¾Ö¸ï¿½ï¿½ï¿½Ä¼ï¿½/Ä¿Â¼ï¿½Ä´ï¿½Õ¼ï¿½Ã£ï¿½KBï¿½ï¿½ */
     if (name[0] != '\0') {
-        uint32_t clusters = exfat_get_file_clusters(name);
+        uint32_t clusters = fs_get_file_clusters(name);
         uint32_t kb = (uint32_t)(((uint64_t)clusters * cluster_size) >> 10);
         print_dec(kb);
         terminal_writestring("\t");
@@ -1622,16 +1731,16 @@ static void cmd_du(const char *args) {
         return;
     }
 
-    /* du£ºÁĞ³öµ±Ç°Ä¿Â¼È«²¿ÌõÄ¿Õ¼ÓÃ£¨KB£©Óë×Ü¼Æ */
-    exfat_dir_entry_t entries[64];
-    int n = exfat_read_dir(entries, 64);
+    /* duï¿½ï¿½ï¿½Ğ³ï¿½ï¿½ï¿½Ç°Ä¿Â¼È«ï¿½ï¿½ï¿½ï¿½Ä¿Õ¼ï¿½Ã£ï¿½KBï¿½ï¿½ï¿½ï¿½ï¿½Ü¼ï¿½ */
+    fs_dir_entry_t entries[64];
+    int n = fs_read_dir(entries, 64);
     if (n < 0) {
         terminal_writestring("du: cannot read directory\n");
         return;
     }
     uint32_t total = 0;
     for (int i = 0; i < n; i++) {
-        uint32_t clusters = exfat_get_file_clusters(entries[i].name);
+        uint32_t clusters = fs_get_file_clusters(entries[i].name);
         uint32_t kb = (uint32_t)(((uint64_t)clusters * cluster_size) >> 10);
         total += kb;
         print_dec(kb);
@@ -1656,7 +1765,7 @@ static void cmd_vi(const char *args) {
 
     static uint8_t file_buffer[4096];
     vi_count = 0;
-    int bytes = exfat_read_file(filename, file_buffer, 4096);
+    int bytes = fs_read_file(filename, file_buffer, 4096);
     if (bytes > 0) {
         int i = 0;
         while (i < bytes && vi_count < VI_MAX_LINES) {
@@ -1782,18 +1891,21 @@ static void cmd_vi(const char *args) {
 
 
 
-/* ================= ÊµÓÃ¹¤¾ß ================= */
+/* ================= Êµï¿½Ã¹ï¿½ï¿½ï¿½ ================= */
 
-// ´òÓ¡ÓĞ·ûºÅÕûÊı
+// ï¿½ï¿½Ó¡ï¿½Ğ·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 static void print_int(int num) {
+    uint32_t mag;
     if (num < 0) {
         terminal_putchar('-');
-        num = -num;
+        mag = (uint32_t)(-(num + 1)) + 1u;   /* é¿å… INT_MIN å–è´Ÿï¿½?UB */
+    } else {
+        mag = (uint32_t)num;
     }
-    print_dec((uint32_t)num);
+    print_dec(mag);
 }
 
-// calc: ±í´ïÊ½¼ÆËãÆ÷£¨¸´ÓÃ gfx_eval£©
+// calc: ï¿½ï¿½ï¿½ï¿½Ê½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ gfx_evalï¿½ï¿½
 static void cmd_calc(const char *args) {
     if (*args == '\0') {
         terminal_writestring("Usage: calc <expr>   e.g. calc 1+2*3\n");
@@ -1810,7 +1922,7 @@ static void cmd_calc(const char *args) {
     terminal_writestring("\n");
 }
 
-// hex: Ê®½øÖÆ/Ê®Áù½øÖÆ»¥×ª
+// hex: Ê®ï¿½ï¿½ï¿½ï¿½/Ê®ï¿½ï¿½ï¿½ï¿½ï¿½Æ»ï¿½×ª
 void cmd_hex(const char *args) {
     if (*args == '\0') {
         terminal_writestring("Usage: hex <num>   dec->hex, or 0x<hex> -> dec\n");
@@ -1829,7 +1941,7 @@ void cmd_hex(const char *args) {
     }
 }
 
-// rand: Î±Ëæ»úÊı£¨LCG£©
+// rand: Î±ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½LCGï¿½ï¿½
 static uint32_t rand_state = 0x9E3779B9u;
 static uint32_t my_rand(void) {
     rand_state = rand_state * 1664525u + 1013904223u;
@@ -1844,9 +1956,9 @@ void cmd_rand(const char *args) {
     terminal_writestring("\n");
 }
 
-/* ================= ÓÎÏ· ================= */
+/* ================= ï¿½ï¿½Ï· ================= */
 
-// ¶ÁÈ¡Ò»ĞĞÊäÈë£¨»ØÏÔ£©£¬·µ»Ø³¤¶È£»Esc ·µ»Ø -1
+// ï¿½ï¿½È¡Ò»ï¿½ï¿½ï¿½ï¿½ï¿½ë£¨ï¿½ï¿½ï¿½Ô£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ø³ï¿½ï¿½È£ï¿½Esc ï¿½ï¿½ï¿½ï¿½ -1
 static int read_line(char *buf, int maxlen) {
     int n = 0;
     while (1) {
@@ -1874,10 +1986,10 @@ static int read_line(char *buf, int maxlen) {
     }
 }
 
-// guess: ²ÂÊı×ÖÓÎÏ·
+// guess: ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ï·
 void cmd_guess(const char *args) {
     (void)args;
-    if (games_gui_launch(1)) return;   /* Í¼ĞÎ×ÀÃæ£ºÖ±½ÓÍ¼ĞÎÔËĞĞ */
+    if (games_gui_launch(1)) return;   /* Í¼ï¿½ï¿½ï¿½ï¿½ï¿½æ£ºÖ±ï¿½ï¿½Í¼ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ */
     int target = (int)(my_rand() % 100) + 1;
     terminal_writestring("I picked a number 1-100. Guess it! (0 to quit)\n");
     char line[16];
@@ -1903,7 +2015,7 @@ void cmd_guess(const char *args) {
     }
 }
 
-// tictactoe: ¾®×ÖÆå£¨Íæ¼Ò X vs AI O£©
+// tictactoe: ï¿½ï¿½ï¿½ï¿½ï¿½å£¨ï¿½ï¿½ï¿½?X vs AI Oï¿½ï¿½
 static int tt_win(char b[9], char p) {
     static const int lines[8][3] = {
         {0,1,2},{3,4,5},{6,7,8},
@@ -1939,7 +2051,7 @@ static void tt_draw(char b[9]) {
 
 void cmd_tictactoe(const char *args) {
     (void)args;
-    if (games_gui_launch(2)) return;   /* Í¼ĞÎ×ÀÃæ£ºÖ±½ÓÍ¼ĞÎÔËĞĞ */
+    if (games_gui_launch(2)) return;   /* Í¼ï¿½ï¿½ï¿½ï¿½ï¿½æ£ºÖ±ï¿½ï¿½Í¼ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ */
     char b[9] = {0};
     terminal_writestring("Tic-Tac-Toe: you are X, AI is O. Enter 1-9.\n");
     while (1) {
@@ -1957,30 +2069,30 @@ void cmd_tictactoe(const char *args) {
         b[mv-1] = 'X';
         if (tt_win(b, 'X')) { tt_draw(b); terminal_writestring("You win!\n"); return; }
         if (tt_full(b)) { tt_draw(b); terminal_writestring("Draw.\n"); return; }
-        // AI Âä×Ó
+        // AI ï¿½ï¿½ï¿½ï¿½
         int best = -1;
-        for (int i = 0; i < 9 && best < 0; i++) {   // 1) ÄÜÓ®¾ÍÓ®
+        for (int i = 0; i < 9 && best < 0; i++) {   // 1) ï¿½ï¿½Ó®ï¿½ï¿½Ó®
             if (b[i] == 0) {
                 b[i] = 'O';
                 if (tt_win(b, 'O')) best = i;
                 b[i] = 0;
             }
         }
-        for (int i = 0; i < 9 && best < 0; i++) {   // 2) ¶ÂÍæ¼Ò
+        for (int i = 0; i < 9 && best < 0; i++) {   // 2) ï¿½ï¿½ï¿½ï¿½ï¿½?
             if (b[i] == 0) {
                 b[i] = 'X';
                 if (tt_win(b, 'X')) best = i;
                 b[i] = 0;
             }
         }
-        if (best < 0 && b[4] == 0) best = 4;        // 3) ÖĞĞÄ
-        if (best < 0) {                             // 4) ½ÇÂä
+        if (best < 0 && b[4] == 0) best = 4;        // 3) ï¿½ï¿½ï¿½ï¿½
+        if (best < 0) {                             // 4) ï¿½ï¿½ï¿½ï¿½
             static const int corners[4] = {0,2,6,8};
             for (int i = 0; i < 4; i++) {
                 if (b[corners[i]] == 0) { best = corners[i]; break; }
             }
         }
-        if (best < 0) {                             // 5) Ëæ»ú
+        if (best < 0) {                             // 5) ï¿½ï¿½ï¿½?
             int n = (int)(my_rand() % 9);
             for (int i = 0; i < 9; i++) {
                 int idx = (n + i) % 9;
@@ -1996,12 +2108,12 @@ void cmd_tictactoe(const char *args) {
     }
 }
 
-// snake: ÎÄ±¾Ì°³ÔÉß
+// snake: ï¿½Ä±ï¿½Ì°ï¿½ï¿½ï¿½ï¿½
 #define SNAKE_W 40
 #define SNAKE_H 20
 #define SNAKE_MAX (SNAKE_W * SNAKE_H)
 
-// RDTSC Ã¦µÈÑÓÊ±£¨Ô¼ ticks ¸ö TSC ÖÜÆÚ£©
+// RDTSC Ã¦ï¿½ï¿½ï¿½ï¿½Ê±ï¿½ï¿½Ô¼ ticks ï¿½ï¿½ TSC ï¿½ï¿½ï¿½Ú£ï¿½
 static void delay_ticks(uint32_t ticks) {
     uint32_t start;
     __asm__ __volatile__("rdtsc" : "=a"(start) : : "edx");
@@ -2014,7 +2126,7 @@ static void delay_ticks(uint32_t ticks) {
 
 void cmd_snake(const char *args) {
     (void)args;
-    if (games_gui_launch(3)) return;   /* Í¼ĞÎ×ÀÃæ£ºÖ±½ÓÍ¼ĞÎÔËĞĞ */
+    if (games_gui_launch(3)) return;   /* Í¼ï¿½ï¿½ï¿½ï¿½ï¿½æ£ºÖ±ï¿½ï¿½Í¼ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ */
     int sx[SNAKE_MAX], sy[SNAKE_MAX];
     int len = 3;
     int dir = KEY_RIGHT;
@@ -2056,21 +2168,22 @@ void cmd_snake(const char *args) {
             for (int i = 0; i < len && !over; i++) {
                 if (sx[i] == nx && sy[i] == ny) over = 1;
             }
-            if (over) break;
+            if (!over) {
+                for (int i = len; i > 0; i--) { sx[i] = sx[i-1]; sy[i] = sy[i-1]; }
+                sx[0] = nx; sy[0] = ny;
 
-            for (int i = len; i > 0; i--) { sx[i] = sx[i-1]; sy[i] = sy[i-1]; }
-            sx[0] = nx; sy[0] = ny;
-
-            if (nx == fx && ny == fy) {
-                len++;
-                score++;
-                int ok = 0;
-                for (int tries = 0; tries < 200 && !ok; tries++) {
-                    fx = (int)(my_rand() % SNAKE_W);
-                    fy = (int)(my_rand() % SNAKE_H);
-                    ok = 1;
-                    for (int i = 0; i < len; i++) {
-                        if (sx[i] == fx && sy[i] == fy) { ok = 0; break; }
+                if (nx == fx && ny == fy) {
+                    len++;
+                    score++;
+                    if (len >= SNAKE_MAX) break;   /* full board: stop before sx[len] overflows */
+                    int ok = 0;
+                    for (int tries = 0; tries < 200 && !ok; tries++) {
+                        fx = (int)(my_rand() % SNAKE_W);
+                        fy = (int)(my_rand() % SNAKE_H);
+                        ok = 1;
+                        for (int i = 0; i < len; i++) {
+                            if (sx[i] == fx && sy[i] == fy) { ok = 0; break; }
+                        }
                     }
                 }
             }
@@ -2111,7 +2224,7 @@ void cmd_snake(const char *args) {
 }
 
 
-/* GUI ÖÕ¶ËµÈÍâ²¿Ä£¿é×¢ÈëÒ»ĞĞÃüÁî */
+/* GUI ï¿½Õ¶Ëµï¿½ï¿½â²¿Ä£ï¿½ï¿½×¢ï¿½ï¿½Ò»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ */
 int shell_exec_line(const char *line) {
     char buf[CMD_BUFFER_SIZE];
     int i = 0;

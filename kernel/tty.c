@@ -1,5 +1,5 @@
 #include "tty.h"
-#include "port.h"        // ±ØÐë°üº¬£¬Ìá¹© outb/inb
+#include "port.h"        // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½á¹© outb/inb
 
 #define VGA_WIDTH  80
 #define VGA_HEIGHT 25
@@ -26,6 +26,8 @@ void terminal_begin_capture(char *buf, int max) {
 
 int terminal_end_capture(void) {
     int n = g_capture_len;
+    /* NUL-terminate so callers may treat buffer as a string */
+    if (g_capture_buf && g_capture_len < g_capture_max) g_capture_buf[g_capture_len] = '\0';
     g_capture_buf = NULL;
     g_capture_max = 0;
     return n;
@@ -78,7 +80,7 @@ void terminal_initialize(void) {
             terminal_buffer[index] = vga_entry(' ', terminal_color);
         }
     }
-    // ³õÊ¼»¯¹â±êÎ»ÖÃ
+    // ï¿½ï¿½Ê¼ï¿½ï¿½ï¿½ï¿½ï¿½Î»ï¿½ï¿½
     terminal_set_cursor(0, 0);
 }
 
@@ -92,7 +94,7 @@ void terminal_putentryat(char c, uint8_t color, size_t x, size_t y) {
 }
 
 void terminal_scroll(void) {
-    // ½«¹ö³öÆÁÄ»µÄ¶¥ÐÐ±£´æµ½ scrollback
+    // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä»ï¿½Ä¶ï¿½ï¿½Ð±ï¿½ï¿½æµ½ scrollback
     for (size_t x = 0; x < VGA_WIDTH; x++) {
         scrollback[sb_start][x] = terminal_buffer[x];
     }
@@ -110,12 +112,12 @@ void terminal_scroll(void) {
 }
 
 void terminal_putchar(char c) {
-    /* ²¶»ñÄ£Ê½£ºÊä³öÐ´Èë»º³å£¬²»Ð´ÆÁÄ» */
+    /* ï¿½ï¿½ï¿½ï¿½Ä£Ê½ï¿½ï¿½ï¿½ï¿½ï¿½Ð´ï¿½ë»ºï¿½å£¬ï¿½ï¿½Ð´ï¿½ï¿½Ä» */
     if (g_capture_buf) {
         if (g_capture_len < g_capture_max - 1) {
             g_capture_buf[g_capture_len++] = c;
         }
-        /* ²¶»ñÄ£Ê½ÏÂÈÔ¸üÐÂÐÐÁÐ×´Ì¬£¬±£Ö¤ÃüÁîÖ´ÐÐºó¹â±êÎ»ÖÃÕýÈ· */
+        /* ï¿½ï¿½ï¿½ï¿½Ä£Ê½ï¿½ï¿½ï¿½Ô¸ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½×´Ì¬ï¿½ï¿½ï¿½ï¿½Ö¤ï¿½ï¿½ï¿½ï¿½Ö´ï¿½Ðºï¿½ï¿½ï¿½Î»ï¿½ï¿½ï¿½ï¿½È· */
         if (c == '\n') {
             terminal_column = 0;
             if (terminal_row < VGA_HEIGHT - 1) terminal_row++;
@@ -184,12 +186,14 @@ void terminal_writestring(const char* data) {
 }
 
 void terminal_set_cursor(size_t row, size_t col) {
+    if (row >= VGA_HEIGHT) row = VGA_HEIGHT - 1;
+    if (col >= VGA_WIDTH) col = VGA_WIDTH - 1;
     uint16_t pos = (uint16_t)(row * VGA_WIDTH + col);
     outb(0x3D4, 0x0F);
     outb(0x3D5, (uint8_t)(pos & 0xFF));
     outb(0x3D4, 0x0E);
     outb(0x3D5, (uint8_t)((pos >> 8) & 0xFF));
-    // ¸üÐÂÄÚ²¿±äÁ¿
+    // ï¿½ï¿½ï¿½ï¿½ï¿½Ú²ï¿½ï¿½ï¿½ï¿½ï¿½
     terminal_row = row;
     terminal_column = col;
 }
@@ -205,7 +209,7 @@ size_t terminal_get_row(void) {
     return terminal_row;
 }
 
-// ½« scrollback ÖÐ¡¸ÏòÉÏ¹ö¶¯ k ÐÐ¡¹ºóµÄÒ»ÆÁÄÚÈÝäÖÈ¾µ½ÆÁÄ»
+// ï¿½ï¿½ scrollback ï¿½Ð¡ï¿½ï¿½ï¿½ï¿½Ï¹ï¿½ï¿½ï¿½ k ï¿½Ð¡ï¿½ï¿½ï¿½ï¿½Ò»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½È¾ï¿½ï¿½ï¿½ï¿½Ä»
 static void render_scrollback(int k) {
     for (int y = 0; y < VGA_HEIGHT; y++) {
         int seq = sb_count - k + y;

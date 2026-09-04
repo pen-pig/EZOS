@@ -4,52 +4,54 @@
 #include "types.h"
 
 #define KEYBOARD_BUFFER_SIZE 256
-static int keyboard_buffer[KEYBOARD_BUFFER_SIZE];  // ´æ´¢ int£¬Ö§³ÖĞéÄâ¼üÂë
+static int keyboard_buffer[KEYBOARD_BUFFER_SIZE];  // ï¿½æ´¢ intï¿½ï¿½Ö§ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 static int buffer_start = 0;
 static int buffer_end = 0;
 
-static int shift_pressed = 0;
+static int left_shift = 0;
+static int right_shift = 0;
+static int alt_down = 0;      /* å·¦/å³ Alt æŒ‰ä¸‹çŠ¶æ€ï¼ˆAlt+Tab çª—å£åˆ‡æ¢ç”¨ï¼‰ */
 
-/* µÈ´ı 8042 ÊäÈë»º³å¿ÉĞ´£¨IBF Çå¿Õ£© */
+/* ï¿½È´ï¿½ 8042 ï¿½ï¿½ï¿½ë»ºï¿½ï¿½ï¿½Ğ´ï¿½ï¿½IBF ï¿½ï¿½Õ£ï¿½ */
 static void kb_wait_write(void) {
     int timeout = 100000;
     while (--timeout > 0 && (inb(0x64) & 0x02)) ;
 }
 
-/* µÈ´ı 8042 Êä³ö»º³å¿É¶Á£¨OBF ÖÃÎ»£© */
+/* ï¿½È´ï¿½ 8042 ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½É¶ï¿½ï¿½ï¿½OBF ï¿½ï¿½Î»ï¿½ï¿½ */
 static void kb_wait_read(void) {
     int timeout = 100000;
     while (--timeout > 0 && !(inb(0x64) & 0x01)) ;
 }
 
-/* ÆôÓÃ 8042 ¼üÅÌ IRQ£¨ÃüÁî×Ö½Ú bit0=1£©£¬²¢Çå¿ÕÖÍÁô scancode */
+/* ï¿½ï¿½ï¿½ï¿½ 8042 ï¿½ï¿½ï¿½ï¿½ IRQï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö½ï¿½ bit0=1ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ scancode */
 void keyboard_init(void) {
     uint8_t status;
 
-    /* ¶Áµ±Ç°ÃüÁî×Ö½Ú */
+    /* ï¿½ï¿½ï¿½ï¿½Ç°ï¿½ï¿½ï¿½ï¿½ï¿½Ö½ï¿½ */
     kb_wait_write();
     outb(0x64, 0x20);
     kb_wait_read();
     status = inb(0x60);
 
-    /* ÖÃÎ» bit0£º¼üÅÌÖĞ¶ÏÊ¹ÄÜ£¨¶Á-¸Ä-Ğ´£¬±£ÁôÊó±ê bit1 µÈÆäËüÎ»£© */
+    /* ï¿½ï¿½Î» bit0ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ğ¶ï¿½Ê¹ï¿½Ü£ï¿½ï¿½ï¿½-ï¿½ï¿½-Ğ´ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ bit1 ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Î»ï¿½ï¿½ */
     status |= 0x01;
     kb_wait_write();
     outb(0x64, 0x60);
     kb_wait_write();
     outb(0x60, status);
 
-    /* Çå¿ÕÖÍÁô scancode£¨·ÀÖ¹³õÊ¼»¯ÆÚ¼ä»ıÑ¹µÄ°´¼üÎÛÈ¾»º³åÇø£© */
+    /* ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ scancodeï¿½ï¿½ï¿½ï¿½Ö¹ï¿½ï¿½Ê¼ï¿½ï¿½ï¿½Ú¼ï¿½ï¿½Ñ¹ï¿½Ä°ï¿½ï¿½ï¿½ï¿½ï¿½È¾ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ */
     while ((inb(0x64) & 0x01)) {
         inb(0x60);
     }
 
-    /* È·±£¼üÅÌ½Ó¿ÚÆôÓÃ */
+    /* È·ï¿½ï¿½ï¿½ï¿½ï¿½Ì½Ó¿ï¿½ï¿½ï¿½ï¿½ï¿½ */
     kb_wait_write();
     outb(0x64, 0xAE);
 }
 
-/* Õï¶Ï£º¼üÅÌÖĞ¶Ïµ÷ÓÃ¼ÆÊı£¨data ¶ÎÈ«¾Ö£¬¹© QEMU monitor ¶ÁÄÚ´æÑéÖ¤£© */
+/* ï¿½ï¿½Ï£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ğ¶Ïµï¿½ï¿½Ã¼ï¿½ï¿½ï¿½ï¿½ï¿½data ï¿½ï¿½È«ï¿½Ö£ï¿½ï¿½ï¿½ QEMU monitor ï¿½ï¿½ï¿½Ú´ï¿½ï¿½ï¿½Ö¤ï¿½ï¿½ */
 volatile uint32_t kb_irq_count = 0;
 volatile uint32_t kb_last_scancode = 0;
 
@@ -59,6 +61,16 @@ static const char scancode_to_ascii_base[] = {
     0,  'a','s','d','f','g','h','j','k','l',';','\'','`',
     0,  '\\','z','x','c','v','b','n','m',',','.','/', 0,
     '*', 0, ' ', 0,
+    /* 0x3B..0x44: F1..F10ï¼ˆç”± switch æ˜ å°„ä¸º KEY_F1..KEY_F10ï¼Œè¡¨ç½® 0ï¼‰ */
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    /* 0x45 NumLock, 0x46 ScrollLock */
+    0, 0,
+    /* 0x47..0x53: å°é”®ç›˜ 7 - 5 + 1 0 .ï¼ˆæ–¹å‘/PgUp/PgDn ç”± switch å¤„ç†ï¼‰ */
+    '7', 0, 0, '-', 0, '5', 0, '+', '1', 0, 0, '0', '.',
+    /* 0x54..0x56: æœªç”¨ */
+    0, 0, 0,
+    /* 0x57 F11, 0x58 F12ï¼ˆç”± switch æ˜ å°„ï¼‰ */
+    0, 0,
 };
 
 static const char scancode_to_ascii_shift[] = {
@@ -67,6 +79,11 @@ static const char scancode_to_ascii_shift[] = {
     0,  'A','S','D','F','G','H','J','K','L',':','"','~',
     0,  '|','Z','X','C','V','B','N','M','<','>','?', 0,
     '*', 0, ' ', 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0,
+    '7', 0, 0, '-', 0, '5', 0, '+', '1', 0, 0, '0', '.',
+    0, 0, 0,
+    0, 0,
 };
 
 void keyboard_handler(void) {
@@ -74,28 +91,52 @@ void keyboard_handler(void) {
     uint8_t scancode = inb(0x60);
     kb_last_scancode = scancode;
 
-    if (scancode == 0x2A || scancode == 0x36) {       // Shift °´ÏÂ
-        shift_pressed = 1;
+    if (scancode == 0x2A || scancode == 0x36) {       // Shift ï¿½ï¿½ï¿½ï¿½
+        left_shift = (scancode == 0x2A) ? 1 : left_shift;
+        right_shift = (scancode == 0x36) ? 1 : right_shift;
         outb(0x20, 0x20);
         return;
-    } else if (scancode == 0xAA || scancode == 0xB6) { // Shift ÊÍ·Å
-        shift_pressed = 0;
+    } else if (scancode == 0xAA || scancode == 0xB6) { // Shift ï¿½Í·ï¿½
+        left_shift = (scancode == 0xAA) ? 0 : left_shift;
+        right_shift = (scancode == 0xB6) ? 0 : right_shift;
+        outb(0x20, 0x20);
+        return;
+    } else if (scancode == 0x38) {   // Alt ï¿½ï¿½ï¿½ï¿½
+        alt_down = 1;
+        outb(0x20, 0x20);
+        return;
+    } else if (scancode == 0xB8) {   // Alt ï¿½Í·ï¿½
+        alt_down = 0;
         outb(0x20, 0x20);
         return;
     }
 
-    if (!(scancode & 0x80)) { // °´ÏÂÊÂ¼ş
+    if (!(scancode & 0x80)) { // ï¿½ï¿½ï¿½ï¿½ï¿½Â¼ï¿½
         int key = 0;
+        int shifted = (left_shift || right_shift);
         switch (scancode) {
-            case 0x48: key = shift_pressed ? KEY_PGUP : KEY_UP; break;
-            case 0x50: key = shift_pressed ? KEY_PGDN : KEY_DOWN; break;
+            case 0x0F: key = alt_down ? KEY_ALT_TAB : '\t'; break;   /* Tabï¼šAlt æŒ‰ä¸‹æ—¶ä¸ºçª—å£åˆ‡æ¢ */
+            case 0x48: key = shifted ? KEY_PGUP : KEY_UP; break;
+            case 0x50: key = shifted ? KEY_PGDN : KEY_DOWN; break;
             case 0x4B: key = KEY_LEFT; break;
             case 0x4D: key = KEY_RIGHT; break;
             case 0x49: key = KEY_PGUP; break;
             case 0x51: key = KEY_PGDN; break;
+            case 0x3B: key = KEY_F1; break;
+            case 0x3C: key = KEY_F2; break;
+            case 0x3D: key = KEY_F3; break;
+            case 0x3E: key = KEY_F4; break;
+            case 0x3F: key = KEY_F5; break;
+            case 0x40: key = KEY_F6; break;
+            case 0x41: key = KEY_F7; break;
+            case 0x42: key = KEY_F8; break;
+            case 0x43: key = KEY_F9; break;
+            case 0x44: key = KEY_F10; break;
+            case 0x57: key = KEY_F11; break;
+            case 0x58: key = KEY_F12; break;
             default:
                 if (scancode < sizeof(scancode_to_ascii_base)) {
-                    if (shift_pressed) {
+                    if (shifted) {
                         key = (unsigned char)scancode_to_ascii_shift[scancode];
                     } else {
                         key = (unsigned char)scancode_to_ascii_base[scancode];

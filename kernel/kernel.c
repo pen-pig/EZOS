@@ -5,13 +5,14 @@
 #include "types.h"
 #include "ata.h"
 #include "shell.h"
-#include "exfat.h"
+#include "fs.h"
 #include "mouse.h"
 #include "port.h"
 #include "desktop.h"
 #include "gfxwin.h"
+#include "gfx.h"
 
-// ¼òµ¥³¤¶Èº¯Êı£¬¹©×Ô¶¯¸ñÊ½»¯Ê¾ÀıÊ¹ÓÃ
+// ï¿½òµ¥³ï¿½ï¿½Èºï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ô¶ï¿½ï¿½ï¿½Ê½ï¿½ï¿½Ê¾ï¿½ï¿½Ê¹ï¿½ï¿½
 static size_t my_strlen(const char *s) {
     size_t len = 0;
     while (s[len]) len++;
@@ -20,12 +21,15 @@ static size_t my_strlen(const char *s) {
 
 static void klog(const char *msg);
 
-/* ´øÁ½¸öÊı×ÖµÄÈÕÖ¾ĞĞ¸ñÊ½»¯£¨h1/h2 Îª 1 Ê±Ê®Áù½øÖÆÊä³ö£¬·ñÔòÊ®½øÖÆ£© */
+/* ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Öµï¿½ï¿½ï¿½Ö¾ï¿½Ğ¸ï¿½Ê½ï¿½ï¿½ï¿½ï¿½h1/h2 Îª 1 Ê±Ê®ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê®ï¿½ï¿½ï¿½Æ£ï¿½?*/
 static void klogf(const char *s1, uint32_t v1, int h1,
                   const char *s2, uint32_t v2, int h2, const char *s3) {
-    char line[80];
+    /* line ç¼“å†² 96 å­—èŠ‚ï¼›æ‰€æœ‰å†™å…¥ï¼ˆå«æ•°å­—ï¼‰ç»Ÿä¸€ï¿½?sizeof(line)-1 ä¸ºä¸Šç•Œï¼Œ
+     * é¿å…æ•°å­—éƒ¨åˆ†æ— ç•Œå†™å…¥è¶Šè¿‡æœ«å°¾ï¼Œä¹Ÿä¿è¯æœ€åä¸€ä½ç•™ï¿½?'\0'ï¿½?*/
+    char line[96];
     int n = 0;
-    while (*s1 && n < 60) line[n++] = *s1++;
+    const int lim = (int)sizeof(line) - 1;
+    while (*s1 && n < lim) line[n++] = *s1++;
     char t[16];
     int m = 0;
     if (v1 == 0) t[m++] = '0';
@@ -34,8 +38,8 @@ static void klogf(const char *s1, uint32_t v1, int h1,
         else    t[m++] = (char)('0' + v1 % 10);
         v1 = h1 ? (v1 >> 4) : (v1 / 10);
     }
-    while (m) line[n++] = t[--m];
-    while (*s2 && n < 60) line[n++] = *s2++;
+    while (m && n < lim) line[n++] = t[--m];
+    while (*s2 && n < lim) line[n++] = *s2++;
     m = 0;
     if (v2 == 0) t[m++] = '0';
     while (v2) {
@@ -43,13 +47,13 @@ static void klogf(const char *s1, uint32_t v1, int h1,
         else    t[m++] = (char)('0' + v2 % 10);
         v2 = h2 ? (v2 >> 4) : (v2 / 10);
     }
-    while (m) line[n++] = t[--m];
-    while (*s3 && n < 60) line[n++] = *s3++;
+    while (m && n < lim) line[n++] = t[--m];
+    while (*s3 && n < lim) line[n++] = *s3++;
     line[n] = '\0';
     klog(line);
 }
 
-/* µ¥¸öÊ®Áù½øÖÆÊıµÄÈÕÖ¾ĞĞ */
+/* ï¿½ï¿½ï¿½ï¿½Ê®ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö¾ï¿½ï¿½ */
 static void klog_hex32(const char *prefix, uint32_t val, const char *suffix) {
     char line[80];
     int n = 0;
@@ -67,9 +71,9 @@ static void klog_hex32(const char *prefix, uint32_t val, const char *suffix) {
     klog(line);
 }
 
-/* Í¨¹ı RTC CMOS ¼Ä´æÆ÷ÕæÊµÌ½²âÄÚ´æ´óĞ¡£º
- * reg 0x15/0x16 ³£¹æÄÚ´æ KB£¨µÍ/¸ß×Ö½Ú£©£¬reg 0x17/0x18 À©Õ¹ÄÚ´æ KB£¬
- * À©Õ¹ÄÚ´æÎª 16 Î»×Ö¶Î£¬ÉÏÏŞ 65535K£¨Ô¼ 64MB£©¡£¶ÁÊ±½ûÓÃ NMI¡£ */
+/* Í¨ï¿½ï¿½ RTC CMOS ï¿½Ä´ï¿½ï¿½ï¿½ï¿½ï¿½ÊµÌ½ï¿½ï¿½ï¿½Ú´ï¿½ï¿½Ğ¡ï¿½ï¿½?
+ * reg 0x15/0x16 ï¿½ï¿½ï¿½ï¿½ï¿½Ú´ï¿½ KBï¿½ï¿½ï¿½ï¿½/ï¿½ï¿½ï¿½Ö½Ú£ï¿½ï¿½ï¿½reg 0x17/0x18 ï¿½ï¿½Õ¹ï¿½Ú´ï¿½ KBï¿½ï¿½
+ * ï¿½ï¿½Õ¹ï¿½Ú´ï¿½Îª 16 Î»ï¿½Ö¶Î£ï¿½ï¿½ï¿½ï¿½ï¿½ 65535Kï¿½ï¿½Ô¼ 64MBï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê±ï¿½ï¿½ï¿½ï¿½ NMIï¿½ï¿½ */
 static uint16_t cmos_read16(uint8_t reg) {
     outb(0x70, reg | 0x80);
     uint16_t lo = inb(0x71);
@@ -93,7 +97,7 @@ static void kput_uint3(uint32_t v) {
     terminal_putchar((char)('0' + v % 10));
 }
 
-/* Ëø´æ¶ÁÈ¡ PIT channel 0 µ±Ç°¼ÆÊı£¨·ÖÆµ 1193£¬µ¹¼ÆÊı 1193..0£© */
+/* ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½?PIT channel 0 ï¿½ï¿½Ç°ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Æµ 1193ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ 1193..0ï¿½ï¿½ */
 static uint16_t pit_read_counter(void) {
     outb(0x43, 0x00);            /* latch channel 0 */
     uint8_t lo = inb(0x40);
@@ -101,18 +105,18 @@ static uint16_t pit_read_counter(void) {
     return (uint16_t)(lo | (hi << 8));
 }
 
-/* ÕæÊµÎ¢ÃëÊ±ÖÓ£¨Linux dmesg ·ç¸ñ£©£º
- * Ãë²¿·Ö = PIT 1000Hz tick£»Î¢Ãë²¿·Ö = PIT ×ÔÓÉÔËĞĞ¼ÆÊı£¨Ã¿¼ÆÊı 1/1193182s ¡Ö 0.838us£© */
+/* ï¿½ï¿½ÊµÎ¢ï¿½ï¿½Ê±ï¿½Ó£ï¿½Linux dmesg ï¿½ï¿½ñ£©£ï¿½?
+ * ï¿½ë²¿ï¿½ï¿½ = PIT 1000Hz tickï¿½ï¿½Î¢ï¿½ë²¿ï¿½ï¿½ = PIT ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ğ¼ï¿½ï¿½ï¿½ï¿½ï¿½Ã¿ï¿½ï¿½ï¿½ï¿½ 1/1193182s ï¿½ï¿½ 0.838usï¿½ï¿½ */
 static uint32_t pit_usec(void) {
     uint32_t c = pit_read_counter();
     if (c > 1193) c = 1193;
-    uint32_t elapsed = 1193 - c;           /* µ±Ç° tick ÄÚÒÑ×ß¼ÆÊı */
+    uint32_t elapsed = 1193 - c;           /* ï¿½ï¿½Ç° tick ï¿½ï¿½ï¿½ï¿½ï¿½ß¼ï¿½ï¿½ï¿½ */
     return g_pit_ticks * 1000u + (elapsed * 838u) / 1000u;
 }
 
-/* dmesg ·ç¸ñÊ±¼ä´Á£º[    0.000000] £¨Ãë¿í4ÓÒ¶ÔÆë + 6 Î»ÕæÊµÎ¢Ãë£© */
+/* dmesg ï¿½ï¿½ï¿½Ê±ï¿½ï¿½ï¿½ï¿½ï¿½[    0.000000] ï¿½ï¿½ï¿½ï¿½ï¿½?ï¿½Ò¶ï¿½ï¿½ï¿½ + 6 Î»ï¿½ï¿½ÊµÎ¢ï¿½ë£© */
 static void klog_prefix(void) {
-    uint32_t us = pit_usec();              /* ÕæÊµ¾­¹ıÎ¢Ãë */
+    uint32_t us = pit_usec();              /* ï¿½ï¿½Êµï¿½ï¿½ï¿½ï¿½Î¢ï¿½ï¿½ */
     uint32_t sec = us / 1000000u;
     uint32_t usec = us % 1000000u;
     terminal_putchar('[');
@@ -142,7 +146,7 @@ static void klog_fail(const char *msg) {
     terminal_writestring(" [FAIL]\n");
 }
 
-/* Ê®½øÖÆµ¥ÖµÈÕÖ¾ĞĞ */
+/* Ê®ï¿½ï¿½ï¿½Æµï¿½Öµï¿½ï¿½Ö¾ï¿½ï¿½ */
 static void klog_dec32(const char *prefix, uint32_t val, const char *suffix) {
     char line[80];
     int n = 0;
@@ -157,8 +161,8 @@ static void klog_dec32(const char *prefix, uint32_t val, const char *suffix) {
     klog(line);
 }
 
-/* RTC CMOS ¶ÁÈ¡£¨NMI ½ûÓÃ£©£¬BCD ½âÂë¡£¼Ä´æÆ÷£º0x00 Ãë 0x02 ·Ö 0x04 Ê±
- * 0x07 ÈÕ 0x08 ÔÂ 0x09 Äê£¨ºóÁ½Î»£©£¬Óë gfxwin ÈÎÎñÀ¸Ê±ÖÓÒ»ÖÂ¡£ */
+/* RTC CMOS ï¿½ï¿½È¡ï¿½ï¿½NMI ï¿½ï¿½ï¿½Ã£ï¿½ï¿½ï¿½BCD ï¿½ï¿½ï¿½ë¡£ï¿½Ä´ï¿½ï¿½ï¿½ï¿½ï¿½0x00 ï¿½ï¿½ 0x02 ï¿½ï¿½ 0x04 Ê±
+ * 0x07 ï¿½ï¿½ 0x08 ï¿½ï¿½ 0x09 ï¿½ê£¨ï¿½ï¿½ï¿½ï¿½Î»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ gfxwin ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê±ï¿½ï¿½Ò»ï¿½Â¡ï¿½ */
 static uint8_t rtc_read(uint8_t reg) {
     outb(0x70, reg | 0x80);
     return inb(0x71);
@@ -167,7 +171,7 @@ static uint8_t rtc_bcd(uint8_t v) {
     return (uint8_t)((v & 0x0F) + ((v >> 4) * 10));
 }
 
-/* Êä³ö RTC ÕæÊµÈÕÆÚÊ±¼ä£¨UTC+8£¬Óë gfxwin ÈÎÎñÀ¸Ê±ÖÓÒ»ÖÂ£©£¬prefix ×Ô´øÊÀ¼Í */
+/* ï¿½ï¿½ï¿½?RTC ï¿½ï¿½Êµï¿½ï¿½ï¿½ï¿½Ê±ï¿½ä£¨UTC+8ï¿½ï¿½ï¿½ï¿½ gfxwin ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê±ï¿½ï¿½Ò»ï¿½Â£ï¿½ï¿½ï¿½prefix ï¿½Ô´ï¿½ï¿½ï¿½ï¿½ï¿½ */
 static void klog_rtc_time(const char *prefix) {
     uint8_t sec  = rtc_bcd(rtc_read(0x00));
     uint8_t min  = rtc_bcd(rtc_read(0x02));
@@ -178,7 +182,7 @@ static void klog_rtc_time(const char *prefix) {
     char buf[64];
     int n = 0;
     const char *p = prefix;
-    while (*p) buf[n++] = *p++;
+    while (*p && n < (int)sizeof(buf) - 20) buf[n++] = *p++;
     buf[n++] = (char)('0' + year / 10); buf[n++] = (char)('0' + year % 10);
     buf[n++] = '-';
     buf[n++] = (char)('0' + mon / 10); buf[n++] = (char)('0' + mon % 10);
@@ -194,7 +198,7 @@ static void klog_rtc_time(const char *prefix) {
     klog(buf);
 }
 
-/* CPUID Ì½²â£¨ÕæÊµ£©£º³§ÉÌ×Ö·û´®¡¢×î´óÒ¶×Ó¡¢ÌØÕ÷Î» */
+/* CPUID Ì½ï¿½â£¨ï¿½ï¿½Êµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò¶ï¿½Ó¡ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½?*/
 static void klog_cpuinfo(void) {
     uint32_t eax, ebx, ecx, edx;
     uint32_t efl;
@@ -223,7 +227,7 @@ static void klog_cpuinfo(void) {
         p = "', max CPUID leaf ";
         while (*p && n < 60) line[n++] = *p++;
         uint32_t ml = max_leaf;
-        char t[8]; int m = 0;
+        char t[12]; int m = 0;
         if (ml == 0) t[m++] = '0';
         while (ml) { t[m++] = (char)('0' + ml % 10); ml /= 10; }
         while (m) line[n++] = t[--m];
@@ -253,9 +257,9 @@ static void klog_cpuinfo(void) {
 }
 
 void kernel_main(void) {
-    /* ½ûÓÃ±¾µØ APIC£ºEZOS Ê¹ÓÃ´«Í³ 8259 PIC ÖĞ¶ÏÂ·ÓÉ¡£
-     * QEMU Ä¬ÈÏ LAPIC enabled ÇÒ LVT0(ExtINT) masked£¬»áÍÌµô PIC µÄ
-     * ¼üÅÌ/Êó±êÖĞ¶ÏÇëÇó£»¹Ø±Õ LAPIC ºó LINT0 »Ö¸´Îª INTR Òı½ÅÖ±Í¨ PIC¡£ */
+    /* ï¿½ï¿½ï¿½Ã±ï¿½ï¿½ï¿½ APICï¿½ï¿½EZOS Ê¹ï¿½Ã´ï¿½Í³ 8259 PIC ï¿½Ğ¶ï¿½Â·ï¿½É¡ï¿½
+     * QEMU Ä¬ï¿½ï¿½ LAPIC enabled ï¿½ï¿½ LVT0(ExtINT) maskedï¿½ï¿½ï¿½ï¿½ï¿½Ìµï¿½ PIC ï¿½ï¿½
+     * ï¿½ï¿½ï¿½ï¿½/ï¿½ï¿½ï¿½ï¿½Ğ¶ï¿½ï¿½ï¿½ï¿½ó£»¹Ø±ï¿½?LAPIC ï¿½ï¿½ LINT0 ï¿½Ö¸ï¿½Îª INTR ï¿½ï¿½ï¿½ï¿½Ö±Í¨ PICï¿½ï¿½ */
     {
         uint32_t lo, hi;
         asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0x1B));
@@ -264,11 +268,11 @@ void kernel_main(void) {
     }
 
     terminal_initialize();
-
+    gfx_text_font_init();     /* unify text-mode font with GUI/OCR font table */
 
     klog("EZOS Kernel 0.9.0 loaded at 0x10000, i686 protected mode");
-    klog("Boot: 512 sectors kernel image read by BIOS INT 13h AH=42h (64-sector batches)");
-    klog("Boot: A20 gate enabled via port 0x92");
+    klog("Boot: 512 sectors kernel image read by BIOS INT 13h AH=42h (64-sector batches, 3 retries)");
+    klog("Boot: A20 gate enabled (BIOS int 15h / port 0x92 / KBC fallback)");
     klog("Boot: GDT 3 descriptors (null/code/data, DPL=0); no TSS, no user-mode yet");
     klog("VGA text mode: 80x25 active");
     klog("APIC: local APIC disabled via MSR 0x1B, IRQ routing via legacy 8259 PIC");
@@ -276,18 +280,18 @@ void kernel_main(void) {
     idt_init();
     isr_install();
     irq_install();
-    pit_init();               /* 1000Hz ÏµÍ³Ê±ÖÓ£º´ËºóÈÕÖ¾Ê±¼ä´ÁÎªÕæÊµ¾­¹ıÊ±¼ä */
+    pit_init();               /* 1000Hz ÏµÍ³Ê±ï¿½Ó£ï¿½ï¿½Ëºï¿½ï¿½ï¿½Ö¾Ê±ï¿½ï¿½ï¿½Îªï¿½ï¿½Êµï¿½ï¿½ï¿½ï¿½Ê±ï¿½ï¿½?*/
     asm volatile("sti");
     klog_ok("PIT: system timer 1000Hz (channel 0 rate generator)");
-    klog_rtc_time("RTC: boot time 20");   /* ÕæÊµÈÕÆÚÊ±¼ä£¨CMOS BCD, UTC+8£© */
+    klog_rtc_time("RTC: boot time 20");   /* ï¿½ï¿½Êµï¿½ï¿½ï¿½ï¿½Ê±ï¿½ä£¨CMOS BCD, UTC+8ï¿½ï¿½ */
     klog_ok("IDT: 256 gates installed");
     klog_ok("PIC: IRQ0-15 remapped to INT 0x20-0x2f, IRQ0/1/12 enabled");
     klog("ISR: exception stubs not yet installed (isr_install is a stub)");
 
-    /* CPU£ºÕæÊµ CPUID Ì½²â */
+    /* CPUï¿½ï¿½ï¿½ï¿½Êµ CPUID Ì½ï¿½ï¿½ */
     klog_cpuinfo();
 
-    /* ÄÚ´æÌ½²â£ºRTC CMOS ÕæÊµ¶ÁÊı£¬·ÇĞé¹¹ */
+    /* ï¿½Ú´ï¿½Ì½ï¿½â£ºRTC CMOS ï¿½ï¿½Êµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½é¹¹ */
     {
         uint16_t conv = cmos_read16(0x15);
         uint16_t ext  = cmos_read16(0x17);
@@ -295,49 +299,47 @@ void kernel_main(void) {
         klog_dec32("Memory: total ", (uint32_t)conv + ext, "K");
     }
 
-    /* ATA ´ÅÅÌ£ºÕæÊµÌ½²âÖ÷´ÓÅÌ LBA0 */
+    /* ATA ï¿½ï¿½ï¿½Ì£ï¿½ï¿½ï¿½ÊµÌ½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ LBA0 */
     uint8_t mbr[512];
-    klog("ATA: PIO mode, ports 0x1F0-0x1F7/0x3F6, probing primary master/slave (LBA0 read)...");
-    if (ata_read_sector(0, 0, mbr) == 0) {
-        if (mbr[510] == 0x55 && mbr[511] == 0xAA)
-            klog_ok("ATA: primary master detected (MBR signature valid)");
+    klog("ATA: PIO mode, probing 4 drives (0x1F0 primary / 0x170 secondary bus)");
+    for (uint8_t d = 0; d < 4; d++) {
+        if (!ata_drive_present(d)) {
+            klog_dec32("ATA: drive ", d, " absent");
+            continue;
+        }
+        if (ata_read_sector(d, 0, mbr) == 0 && mbr[510] == 0x55 && mbr[511] == 0xAA)
+            klog_dec32("ATA: drive ", d, " present (MBR signature valid)");
         else
-            klog_ok("ATA: primary master detected (no MBR signature)");
-    } else {
-        klog_fail("ATA: primary master not present / read error");
-    }
-    if (ata_read_sector(1, 0, mbr) == 0) {
-        if (mbr[510] == 0x55 && mbr[511] == 0xAA)
-            klog_ok("ATA: primary slave detected (MBR signature valid)");
-        else
-            klog_ok("ATA: primary slave detected (no MBR signature)");
-    } else {
-        klog_fail("ATA: primary slave not present / read error");
+            klog_dec32("ATA: drive ", d, " present (no MBR signature)");
     }
 
-    int ret = exfat_init();
+    int ret = fs_init();
     if (ret == -2) {
-        klog("exFAT: no filesystem on slave, auto-formatting...");
-        if (exfat_format() == 0) {
-            klog_ok("exFAT: formatted, creating README.TXT");
+        klog("FS: no filesystem on data drive, auto-formatting exFAT...");
+        if (fs_format() == 0) {
+            klog_ok("FS: formatted, creating README.TXT");
             const char *example = "Hello from EZOS exFAT!\n";
-            exfat_create_file("README.TXT", (const uint8_t*)example, my_strlen(example));
+            fs_create_file("README.TXT", (const uint8_t*)example, my_strlen(example));
         } else {
-            klog_fail("exFAT: auto-format failed");
+            klog_fail("FS: auto-format failed");
         }
     } else if (ret == 0) {
-        klog_ok("exFAT: filesystem ready on slave (drive 1)");
+        klog_prefix();
+        terminal_writestring("FS: filesystem ready (");
+        terminal_writestring(fs_type_name());
+        terminal_writestring(") [ OK ]\n");
     } else {
-        klog_fail("exFAT: init error (ATA read / VBR parse failed)");
+        klog_fail("FS: no disk (all ATA drives absent)");
     }
 
-    /* exFAT ¾í²ÎÊı£¨ÕæÊµ VBR Öµ£¬´øÊ±¼ä´ÁÈÕÖ¾£© */
+    /* FS volume info from the live mount (fs.c unified layer) */
     {
-        const exfat_info_t *ei = exfat_get_info();
-        klogf("exFAT: volume ", (uint32_t)ei->volume_length, 0, " sectors, ", ei->cluster_count, 0, " clusters");
-        klogf("exFAT: ", ei->bytes_per_sector, 0, "B/sector, ", ei->sectors_per_cluster, 0, " sector(s)/cluster");
-        klogf("exFAT: FAT@", ei->fat_offset, 0, ", heap@", ei->cluster_heap_offset, 0, "");
-        klog_dec32("exFAT: root dir cluster ", ei->root_dir_cluster, "");
+        const fs_info_t *fi = fs_get_info();
+        if (fi->type != FS_NONE) {
+            klogf("FS: on ATA drive ", fi->drive, 0, ", volume LBA ", fi->part_start, 0, "");
+            klogf("FS: volume ", fi->volume_sectors, 0, " sectors, ", fi->cluster_count, 0, " clusters");
+            klogf("FS: ", fi->bytes_per_sector, 0, "B/sector, ", fi->sectors_per_cluster, 0, " sector(s)/cluster");
+        }
     }
 
     keyboard_init();
@@ -349,8 +351,8 @@ void kernel_main(void) {
         klog("PS/2 mouse: not detected, keyboard only");
     }
 
-    /* VBE Í¼ĞÎÄ£Ê½£º¶ÁÈ¡ boot.asm ÊµÄ£Ê½Ì½²â½á¹û£¨0x5000 ½á¹¹£©¡£
-     * ÓÃ»§Ì¬ gw_start() ²ÅÕæÕı¼¤»î LFB£»´Ë´¦½ö±¨¸æÕæÊµÌ½²â×´Ì¬¡£ */
+    /* VBE Í¼ï¿½ï¿½Ä£Ê½ï¿½ï¿½ï¿½ï¿½È¡ boot.asm ÊµÄ£Ê½Ì½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½0x5000 ï¿½á¹¹ï¿½ï¿½ï¿½ï¿½
+     * ï¿½Ã»ï¿½Ì¬ gw_start() ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ LFBï¿½ï¿½ï¿½Ë´ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ÊµÌ½ï¿½ï¿½×´Ì¬ï¿½ï¿½ */
     {
         uint32_t lfb  = *(volatile uint32_t*)0x5000;
         uint16_t vxr  = *(volatile uint16_t*)0x5004;
@@ -364,7 +366,7 @@ void kernel_main(void) {
             klog("VBE: no LFB mode probed, will fallback to VGA 0x13 320x200x256");
         }
     }
-    /* ±£ÁôÆô¶¯ÈÕÖ¾²»ÇåÆÁ£ºbanner Ö±½Ó¸úÔÚ verbose boot log Ö®ºó */
+    /* ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö¾ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½banner Ö±ï¿½Ó¸ï¿½ï¿½ï¿½ verbose boot log Ö®ï¿½ï¿½ */
     //ascii art
 	terminal_writestring("\n");
     terminal_writestring("  _____   ______  _____   _____\n");
@@ -376,20 +378,13 @@ void kernel_main(void) {
     terminal_writestring("\n");
 //	klog_ok("EZOS Kernel Shell - type 'help' for commands, 'exit' to continue boot.");
 
-    /* ===== Ö÷Ñ­»·£ºÄÚºË shell -> exit -> User Shell -> desktop Í¼ĞÎ×ÀÃæ -> ·µ»Ø User Shell -> exit »ØÄÚºË shell ===== */
+    /* ===== ï¿½ï¿½Ñ­ï¿½ï¿½ï¿½ï¿½shell -> exit -> Í¼ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ -> ï¿½Ë³ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ shell ===== */
     for (;;) {
-        /* kernel-mode shell first (no gui/desktop/games in command table) */
         shell_run();
 
-        /* exit -> user-mode: User Shell£¨·ÇÍ¼ĞÎ×ÀÃæ£¬ĞèÊäÈë desktop ½øÈë£© */
+        /* exit Ö±ï¿½Ó½ï¿½ï¿½ï¿½Í¼ï¿½ï¿½ï¿½ï¿½ï¿½æ£¨ï¿½ï¿½ï¿½Ù¾ï¿½ï¿½ï¿½ User Shellï¿½ï¿½ */
         terminal_writestring("\n");
-        klog("user-mode: entering User Shell (type 'desktop' to launch graphical desktop)");
-        shell_set_user_mode(1);
-        shell_run();
-
-        /* User Shell exit (desktop ÃüÁî·µ»Øºó shell_run ¼ÌĞø£¬²»×ßµ½ÕâÀï) -> back to kernel shell */
-        shell_set_user_mode(0);
-        terminal_writestring("\n");
-        klog("user shell exited, returning to kernel shell");
+        klog("entering graphical desktop - quit from start menu to return to shell");
+        gw_start();
     }
 }

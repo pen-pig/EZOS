@@ -7,10 +7,23 @@
 #define KEY_RIGHT -4
 #define KEY_PGUP  -5
 #define KEY_PGDN  -6
+#define KEY_F1    -7
+#define KEY_F2    -8
+#define KEY_F3    -9
+#define KEY_F4    -10
+#define KEY_F5    -11
+#define KEY_F6    -12
+#define KEY_F7    -13
+#define KEY_F8    -14
+#define KEY_F9    -15
+#define KEY_F10   -16
+#define KEY_F11   -17
+#define KEY_F12   -18
+#define KEY_ALT_TAB -19   /* Alt+Tab ç»„åˆé”®ï¼šçª—å£åˆ‡æ¢ï¼ˆgw_handle_key æ¶ˆè´¹ï¼‰ */
 
 void keyboard_init(void);
 void keyboard_handler(void);
-int keyboard_getchar(void);   // ·µ»Ø int£¬Ö§³ÖĞéÄâ¼üÂë
+int keyboard_getchar(void);   // ï¿½ï¿½ï¿½ï¿½ intï¿½ï¿½Ö§ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 void irq1_handler(void);
 
 #endif

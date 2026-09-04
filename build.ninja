@@ -1,0 +1,89 @@
+# ===================== 多线程构建说明 =====================
+# 用法：ninja -f build.ninja -j$(NUMBER_OF_PROCESSORS) os-image.bin
+#   或：ninja -f build.ninja -j8 run
+# ninja 默认单线程，-j N 指定并行任务数；bat 脚本已自动传 -j%NUMBER_OF_PROCESSORS%
+# ===================== ????? =====================
+BIN_DIR = D:/MyOS/tools/i686-elf-tools-windows/bin
+ASM     = D:/MyOS/tools/NASM/nasm.exe
+QEMU    = D:/MyOS/tools/qemu-portable-20241220/qemu-system-x86_64.exe
+
+CC      = $BIN_DIR/i686-elf-gcc.exe
+LD      = $BIN_DIR/i686-elf-ld.exe
+OBJCOPY = $BIN_DIR/i686-elf-objcopy.exe
+
+# ===================== ?????? =====================
+CFLAGS  = -ffreestanding -O2 -Wall -Wextra -Ikernel -MMD
+LDFLAGS = -m elf_i386 -T linker.ld --oformat binary -e _start
+
+# ===================== ???? =====================
+rule asm_bin
+    command = $ASM -f bin $in -o $out
+    description = NASM(bin) $in
+
+rule asm_elf
+    command = $ASM -f elf32 $in -o $out
+    description = NASM(elf) $in
+
+rule cc
+    command = $CC $CFLAGS -c $in -o $out
+    description = CC $in
+    depfile = $out.d
+    deps = gcc
+
+rule link
+    command = $LD $LDFLAGS -o $out $in
+    description = LINK $out
+
+rule objcopy_pad
+    command = $OBJCOPY -I binary -O binary --pad-to 262144 $in $out
+    description = PAD $out
+
+rule make_os_image
+    command = cmd /c copy /b boot\boot.bin + kernel.bin os-image.bin >nul
+    description = BUILD os-image.bin
+
+rule make_disk
+    command = cmd /c python temp/gen_diskimg.py disk.img
+    description = CHECK DISK IMAGE
+
+rule run_qemu
+    command = $QEMU -vga std -drive format=raw,file=os-image.bin -drive format=raw,file=disk.img
+    description = RUN EZOS
+
+# ===================== ???? =====================
+build boot/boot.bin: asm_bin boot/boot.asm
+build boot/kernel_entry.o: asm_elf boot/kernel_entry.asm
+
+build kernel/kernel.o: cc kernel/kernel.c
+build kernel/tty.o: cc kernel/tty.c
+build kernel/idt.o: cc kernel/idt.c
+build kernel/isr.o: cc kernel/isr.c
+build kernel/keyboard.o: cc kernel/keyboard.c
+build kernel/ata.o: cc kernel/ata.c
+build kernel/shell.o: cc kernel/shell.c
+build kernel/shell_extra.o: cc kernel/shell_extra.c
+build kernel/exfat.o: cc kernel/exfat.c
+build kernel/fat.o: cc kernel/fat.c
+build kernel/fs.o: cc kernel/fs.c
+build kernel/gfx.o: cc kernel/gfx.c
+build kernel/gui.o: cc kernel/gui.c
+build kernel/mouse.o: cc kernel/mouse.c
+build kernel/gfxwin.o: cc kernel/gfxwin.c
+build kernel/desktop.o: cc kernel/desktop.c
+build kernel/games.o: cc kernel/games.c
+build kernel/hiscore.o: cc kernel/hiscore.c
+
+build kernel_raw.bin: link boot/kernel_entry.o kernel/kernel.o kernel/tty.o kernel/idt.o kernel/isr.o kernel/keyboard.o kernel/ata.o kernel/shell.o kernel/shell_extra.o kernel/exfat.o kernel/fat.o kernel/fs.o kernel/gfx.o kernel/gui.o kernel/mouse.o kernel/gfxwin.o kernel/desktop.o kernel/games.o kernel/hiscore.o
+
+build kernel.bin: objcopy_pad kernel_raw.bin
+
+build os-image.bin: make_os_image boot/boot.bin kernel.bin
+
+build disk_img_check: make_disk
+
+build run: run_qemu os-image.bin disk_img_check
+
+default run
+
+build clean: phony
+    command = cmd /c del /q boot\boot.bin boot\kernel_entry.o kernel\*.o kernel\*.d kernel_raw.bin kernel.bin os-image.bin 2>nul

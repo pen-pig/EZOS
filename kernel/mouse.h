@@ -12,5 +12,6 @@ int mouse_get_buttons(void); // bit0=左键, bit1=右键, bit2=中键（按下�
 unsigned long mouse_packet_count(void); // [DEBUG] 完整包计数
 void mouse_raw_trace(unsigned char *out, unsigned long *cnt); // [DEBUG] 最近2原始字节+总数
 void mouse_set_sensitivity(int mul256); // 鼠标灵敏度：256=1.0x，可调 32..2048
+void mouse_warp(int x, int y);          // 直接设置指针位置（GUI 启动时按实际分辨率居中）
 
 #endif

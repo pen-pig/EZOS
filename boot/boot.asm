@@ -2,8 +2,8 @@
 [org 0x7c00]
 [bits 16]
 
-KERNEL_OFFSET equ 0x10000     ; ÄÚºË¼ÓÔØµØÖ·
-KERNEL_SECTORS equ 512        ; ÄÚºË×ÜÉÈÇøÊý£¨256KB£¬Óë build ½Å±¾ --pad-to 262144 ¶ÔÓ¦£©
+KERNEL_OFFSET equ 0x10000     ; ï¿½ÚºË¼ï¿½ï¿½Øµï¿½Ö·
+KERNEL_SECTORS equ 512        ; ï¿½Úºï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½256KBï¿½ï¿½ï¿½ï¿½ build ï¿½Å±ï¿½ --pad-to 262144 ï¿½ï¿½Ó¦ï¿½ï¿½
 
 start:
     xor ax, ax
@@ -45,38 +45,47 @@ print_string_16:
     ret
 
 disk_load:
-    ; À©Õ¹¶ÁÑ­»·£¨AH=42h£©£º×Ü¶Á KERNEL_SECTORS ÉÈÇø£¬Ã¿Åú×î¶à 64 ÉÈÇø£¬
-    ; ±ÜÃâµ¥´Î DAP ³¬¹ý BIOS ÏÞÖÆ¡£
-    ; Èë¿Ú£ºDL = Çý¶¯Æ÷ºÅ
-    mov bx, KERNEL_SECTORS      ; Ê£ÓàÉÈÇøÊý
-    xor cx, cx                  ; ÒÑ¶ÁÉÈÇøÊý
+    ; ï¿½ï¿½Õ¹ï¿½ï¿½Ñ­ï¿½ï¿½ï¿½ï¿½AH=42hï¿½ï¿½ï¿½ï¿½ï¿½Ü¶ï¿½ KERNEL_SECTORS ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ã¿ï¿½ï¿½ï¿½ï¿½ï¿½ 64 ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+    ; ï¿½ï¿½ï¿½âµ¥ï¿½ï¿½ DAP ï¿½ï¿½ï¿½ï¿½ BIOS ï¿½ï¿½ï¿½Æ¡ï¿½
+    ; ï¿½ï¿½Ú£ï¿½DL = ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+    mov bx, KERNEL_SECTORS      ; Ê£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+    xor ecx, ecx                  ; ï¿½Ñ¶ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 .load_loop:
     test bx, bx
     jz .done
-    ; ±¾´Î¶ÁÈ¡Êý = min(bx, 64)
+    ; ï¿½ï¿½ï¿½Î¶ï¿½È¡ï¿½ï¿½ = min(bx, 64)
     mov ax, bx
     cmp ax, 64
     jle .batch_ok
     mov ax, 64
 .batch_ok:
     mov word [dap_sectors], ax
-    ; LBA = 1 + cx£¨Ìø¹ý boot ÉÈÇø£©
+    ; LBA = 1 + cxï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ boot ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
     mov eax, ecx
     inc eax
     mov dword [dap_lba], eax
-    ; ¶ÎµØÖ· = (0x10000 + cx*512) >> 4£¬Æ«ÒÆ = 0
+    ; ï¿½Îµï¿½Ö· = (0x10000 + cx*512) >> 4ï¿½ï¿½Æ«ï¿½ï¿½ = 0
     mov eax, ecx
     shl eax, 9
     add eax, 0x10000
     shr eax, 4
     mov word [dap_segment], ax
     mov word [dap_offset], 0
-    ; µ÷ÓÃ BIOS
+    ; ï¿½ï¿½ï¿½ï¿½ BIOS
+    mov bp, 3                   ; 3 attempts per batch
+.retry:
     mov si, dap
     mov ah, 0x42
+    mov dl, [BOOT_DRIVE]
     int 0x13
-    jc disk_error
-    ; ¸üÐÂÒÑ¶Á/Ê£Óà
+    jnc .batch_done
+    dec bp
+    jz disk_error
+    xor ah, ah                  ; reset disk system (DL kept), retry batch
+    int 0x13
+    jmp .retry
+.batch_done:
+    ; ï¿½ï¿½ï¿½ï¿½ï¿½Ñ¶ï¿½/Ê£ï¿½ï¿½
     mov ax, word [dap_sectors]
     add cx, ax
     sub bx, ax
@@ -85,16 +94,16 @@ disk_load:
     ret
 
 dap:
-    db 0x10                  ; DAP ½á¹¹´óÐ¡
-    db 0x00                  ; ±£Áô
+    db 0x10                  ; DAP ï¿½á¹¹ï¿½ï¿½Ð¡
+    db 0x00                  ; ï¿½ï¿½ï¿½ï¿½
 dap_sectors:
-    dw 0                     ; ±¾ÅúÉÈÇøÊý
+    dw 0                     ; ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 dap_offset:
-    dw 0                     ; Æ«ÒÆ
+    dw 0                     ; Æ«ï¿½ï¿½
 dap_segment:
-    dw 0                     ; ¶Î£¨ÎïÀí = segment<<4 + offset£©
+    dw 0                     ; ï¿½Î£ï¿½ï¿½ï¿½ï¿½ï¿½ = segment<<4 + offsetï¿½ï¿½
 dap_lba:
-    dq 0                     ; ÆðÊ¼ LBA£¨¶¯Ì¬¼ÆËã£¬Ìø¹ý boot ÉÈÇø£©
+    dq 0                     ; ï¿½ï¿½Ê¼ LBAï¿½ï¿½ï¿½ï¿½Ì¬ï¿½ï¿½ï¿½ã£¬ï¿½ï¿½ï¿½ï¿½ boot ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 
 disk_error:
     mov si, MSG_DISK_ERROR
@@ -102,20 +111,20 @@ disk_error:
     jmp $
 
 ; ------------------------------------------------------------------
-; set_vbe: VBE ¶à·Ö±æÂÊ×ÔÊÊÓ¦Ì½²â£¨16bpp LFB£©
-;   1) 0x4F00 ¼ì²é VBE BIOS ´æÔÚ + 'VESA' Ç©Ãû
-;   2) 0x4F01 °´·Ö±æÂÊ´Ó´óµ½Ð¡ÒÀ´ÎÌ½²â±ê×¼ 16bpp VBE Ä£Ê½£º
+; set_vbe: VBE ï¿½ï¿½Ö±ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ó¦Ì½ï¿½â£¨16bpp LFBï¿½ï¿½
+;   1) 0x4F00 ï¿½ï¿½ï¿½ VBE BIOS ï¿½ï¿½ï¿½ï¿½ + 'VESA' Ç©ï¿½ï¿½
+;   2) 0x4F01 ï¿½ï¿½ï¿½Ö±ï¿½ï¿½Ê´Ó´ï¿½Ð¡ï¿½ï¿½ï¿½ï¿½Ì½ï¿½ï¿½ï¿½×¼ 16bpp VBE Ä£Ê½ï¿½ï¿½
 ;      1280x1024(0x11A) -> 1024x768(0x117) -> 800x600(0x115)
-;      -> 640x480(0x110)¡£Ã¿¸öÄ£Ê½ÒªÇó£º
-;      attributes bit7 (LFB) ÖÃÎ»¡¢XRES/YRES ·ÇÁã¡¢BPP==16¡¢
-;      PhysBasePtr ·ÇÁã£»ÃüÖÐµÚÒ»¸ö¼´Îª×î´ó¿ÉÓÃ·Ö±æÂÊ¡£
-;   success: 0x5000 Ð´Èë½á¹¹ { dword LFB; word XRES; word YRES; byte BPP }
-;   failure: 0x5000 Ð´Èë 0£¨ÄÚºË»ØÍË VGA 0x13 320x200£©
-;   NOTE: ¿ÌÒâ²»µ÷ÓÃ 0x4F02 ¼¤»îÄ£Ê½£¬±£³ÖÎÄ±¾Ä£Ê½¹©ÄÚºË shell Ê¹ÓÃ£¬
-;         ±ÜÃâÔçÆÚÎÄ±¾Êä³öÔÚ LFB Æ½ÃæÉÏ²»¿É¼û£»gfx_init ÔÚ±£»¤Ä£Ê½
-;         Í¨¹ý VBE_DISPI ¼Ä´æÆ÷°´Ì½²â·Ö±æÂÊ¼¤»î¡£
-;   buffers: VBEInfoBlock / mode info ¹²ÓÃÊµÄ£Ê½ 0x6000
-;            £¨mode info ºóÐ´Èë»á¸²¸Ç VBEInfoBlock£¬ÎÞ°­£©
+;      -> 640x480(0x110)ï¿½ï¿½Ã¿ï¿½ï¿½Ä£Ê½Òªï¿½ï¿½
+;      attributes bit7 (LFB) ï¿½ï¿½Î»ï¿½ï¿½XRES/YRES ï¿½ï¿½ï¿½ã¡¢BPP==16ï¿½ï¿½
+;      PhysBasePtr ï¿½ï¿½ï¿½ã£»ï¿½ï¿½ï¿½Ðµï¿½Ò»ï¿½ï¿½ï¿½ï¿½Îªï¿½ï¿½ï¿½ï¿½ï¿½Ã·Ö±ï¿½ï¿½Ê¡ï¿½
+;   success: 0x5000 Ð´ï¿½ï¿½á¹¹ { dword LFB; word XRES; word YRES; byte BPP }
+;   failure: 0x5000 Ð´ï¿½ï¿½ 0ï¿½ï¿½ï¿½ÚºË»ï¿½ï¿½ï¿½ VGA 0x13 320x200ï¿½ï¿½
+;   NOTE: ï¿½ï¿½ï¿½â²»ï¿½ï¿½ï¿½ï¿½ 0x4F02 ï¿½ï¿½ï¿½ï¿½Ä£Ê½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä±ï¿½Ä£Ê½ï¿½ï¿½ï¿½Úºï¿½ shell Ê¹ï¿½Ã£ï¿½
+;         ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä±ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ LFB Æ½ï¿½ï¿½ï¿½Ï²ï¿½ï¿½É¼ï¿½ï¿½ï¿½gfx_init ï¿½Ú±ï¿½ï¿½ï¿½Ä£Ê½
+;         Í¨ï¿½ï¿½ VBE_DISPI ï¿½Ä´ï¿½ï¿½ï¿½ï¿½ï¿½Ì½ï¿½ï¿½Ö±ï¿½ï¿½Ê¼ï¿½ï¿½î¡£
+;   buffers: VBEInfoBlock / mode info ï¿½ï¿½ï¿½ï¿½ÊµÄ£Ê½ 0x6000
+;            ï¿½ï¿½mode info ï¿½ï¿½Ð´ï¿½ï¿½á¸²ï¿½ï¿½ VBEInfoBlockï¿½ï¿½ï¿½Þ°ï¿½ï¿½ï¿½
 ; ------------------------------------------------------------------
 set_vbe:
     pusha
@@ -184,14 +193,39 @@ set_vbe:
     popa
     ret
 
-; ±ê×¼ VBE 16bpp Ä£Ê½±í£¬°´·Ö±æÂÊ´Ó´óµ½Ð¡ÅÅÁÐ£¬0 ½áÎ²
+; ï¿½ï¿½×¼ VBE 16bpp Ä£Ê½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö±ï¿½ï¿½Ê´Ó´ï¿½Ð¡ï¿½ï¿½ï¿½Ð£ï¿½0 ï¿½ï¿½Î²
+; standard VESA 16bpp modes, largest first, 0 terminated
+; (0x115 is 24bpp and 0x110 is 15bpp - both rejected by BPP==16 check)
 vbe_modes:
-    dw 0x011A, 0x0117, 0x0115, 0x0110, 0
+    dw 0x011A, 0x0117, 0x0114, 0x0111, 0
 
+; A20 enable with triple fallback: BIOS int 15h -> port 0x92 -> keyboard ctrl
+; (port 0x92 alone fails on legacy machines whose BIOS gates A20 via KBC)
 enable_a20:
-    in al, 0x92
-    or al, 2
+    mov ax, 0x2401              ; 1) BIOS: enable A20 (modern machines)
+    int 0x15
+    jnc .done
+    in al, 0x92                 ; 2) fast A20 via chipset port 0x92
+    test al, 2                  ;    already enabled?
+    jnz .done
+    or al, 2                    ;    set A20 only, keep bit0 (fast reset)
     out 0x92, al
+    call .kbc_wait              ; 3) keyboard controller fallback (legacy)
+    mov al, 0xD1                ;    write output port command
+    out 0x64, al
+    call .kbc_wait
+    mov al, 0xDF                ;    enable A20 + peripherals
+    out 0x60, al
+.done:
+    ret
+.kbc_wait:                      ; wait KBC input buffer empty (with timeout)
+    xor cx, cx
+.kbc_spin:
+    in al, 0x64
+    test al, 2
+    jz .kbc_ok
+    loop .kbc_spin
+.kbc_ok:
     ret
 
 BOOT_DRIVE db 0

@@ -3,7 +3,7 @@
 #include "types.h"
 #include "tty.h"
 #include "keyboard.h"
-#include "exfat.h"
+#include "fs.h"
 #include "gfxwin.h"
 #include "shell.h"
 #include "vga_font.h"
@@ -23,7 +23,7 @@ static inline void io_wait(void) {
     outb(0x80, 0);
 }
 
-/* VGA 8x16 нд╠╬вжлЕ╣д╠ё╢Ф/╩ж╦╢ё╗plane 2ё╘ё╛╫Б╬Ж GUI║Знд╠╬дёй╫гп╩╩╨СвжлЕ╠╩фф╩╣ */
+/* VGA 8x16 О©╫д╠О©╫О©╫О©╫О©╫О©╫д╠О©╫О©╫О©╫/О©╫ж╦О©╫О©╫О©╫plane 2О©╫О©╫О©╫О©╫О©╫О©╫О©╫ GUIО©╫О©╫О©╫д╠О©╫дёй╫О©╫п╩О©╫О©╫О©╫О©╫О©╫О©╫Е╠╩О©╫ф╩О©╫ */
 static void gfx_save_font(void);
 static void gfx_restore_font(void);
 
@@ -125,17 +125,17 @@ static const uint8_t builtin_font[][8] = {
     [0x7C] = {0x18,0x18,0x18,0x00,0x18,0x18,0x18,0x00}, // |
     [0x7D] = {0x07,0x0C,0x0C,0x38,0x0C,0x0C,0x07,0x00}, // }
     [0x7E] = {0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00}, // ~
-};// Е┬┤Ф█╒О©?? 320x200x256 Е⌡╬Е╫╒Ф╗║Е╪▐О╪┬VGA Ф╗║Е╪▐ 0x13О©??
+};// Е┬┤Ф█╒О©╫?? 320x200x256 Е⌡╬Е╫╒Ф╗║Е╪▐О╪┬VGA Ф╗║Е╪▐ 0x13О©╫??
 void gfx_init(void) {
-    gfx_save_font();   /* VBE гп╩╩г╟╠ё╢Фнд╠╬дёй╫ 8x16 вжлЕё╗plane2ё╘ё╛╧╘ gfx_restore_text ╩╧т╜ */
-    /* boot.asm О©╫О©╫О©╫О©╫й╣дёй╫О©╫О©╫О©? VBE О©╫О©╫ж╠О©╫О©╫О©╫л╫О©╫Б╡╒п╢О©╫О©? 0x5000 О©╫А╧╧О©╫О©╫
+    gfx_save_font();   /* VBE О©╫п╩О©╫г╟О©╫О©╫О©╫О©╫О©╫д╠О©╫дёй╫ 8x16 О©╫О©╫О©╫Её╗plane2О©╫О©╫О©╫О©╫О©╫О©╫ gfx_restore_text О©╫О©╫т╜ */
+    /* boot.asm О©╫О©╫О©╫О©╫й╣дёй╫О©╫О©╫О©╫? VBE О©╫О©╫ж╠О©╫О©╫О©╫л╫О©╫Б╡╒п╢О©╫О©╫? 0x5000 О©╫А╧╧О©╫О©╫
      *   0x5000: dword LFB О©╫О©╫О©╫О©╫О©╫О©╫ж╥О©╫О©╫0 = О©╫ч©О©╫О©╫О©╫дёй╫О©╫О©╫О©╫О©╫О©╫О©╫ VGA 0x13О©╫О©╫
      *   0x5004: word  XRES
      *   0x5006: word  YRES
      *   0x5008: byte  BPPО©╫О©╫16 = 16bpp RGB565О©╫О©╫
      * О©╫к╢О©╫О©╫О©╫О©╫ы╟О©╫ hypervisor г©О©╫О©╫О©╫О©╫О©╫Цё╨QEMU TCG/Microsoft Hv О©╫х╩О©╫О©╫О©╫О©╫О©╫
      * -vga std й╣О©╫О©╫ж╖О©╫О©╫ Bochs VBEО©╫О©╫О©╫О©╫О©╫О©╫ boot.asm О©╫О©╫л╫О©╫О©╫О©╫О©╫О©╫О©╫О©╫и║О©╫
-     * О©╫О©╫й╣О©╫О©╫О©╫О©╫О©╫О©╫О©╫О©╫О©╫О©╫б╥О©? VBE_DISPI ID л╫О©╫О©╫п╣О©╫О©╫О©╫ID О©╫О©╫ 0xB0C0 О©╫е╩О©╫О©╫О©╫ VGA 0x13О©╫О©╫О©╫О©╫ */
+     * О©╫О©╫й╣О©╫О©╫О©╫О©╫О©╫О©╫О©╫О©╫О©╫О©╫б╥О©╫? VBE_DISPI ID л╫О©╫О©╫п╣О©╫О©╫О©╫ID О©╫О©╫ 0xB0C0 О©╫е╩О©╫О©╫О©╫ VGA 0x13О©╫О©╫О©╫О©╫ */
     uint32_t lfb  = *(volatile uint32_t*)0x5000;
     uint16_t vxr  = *(volatile uint16_t*)0x5004;
     uint16_t vyr  = *(volatile uint16_t*)0x5006;
@@ -245,7 +245,7 @@ void gfx_init(void) {
     outb(0x3C0, 0x3F); outb(0x3C0, 0x00);
     outb(0x3C0, 0x20);
     outb(0x3C4, 0x00); outb(0x3C5, 0x03);  // resume sequencer (clear sync reset)
-    /* И┤█Г╫╝ VGA Х╟┐Х┴╡Ф²©Д╦╨И╩≤Х?╓Ф√┤Ф°?Х┴╡О╪▄И≤╡Ф?╒Е⌡╬Е╫╒Ф╗║Е╪▐Х╟┐Х┴╡Ф²©Ф╠║Ф÷⌠Ф√┤Ф°╛Ф≤╬Г╓╨ */
+    /* И┤█Г╫╝ VGA Х╟┐Х┴╡Ф²©Д╦╨И╩≤О©╫?О©╫Ф√┤О©╫?Х┴╡О╪▄И≤╡О©╫?О©╫Е⌡╬Е╫╒Ф╗║Е╪▐Х╟┐Х┴╡Ф²©Ф╠║Ф÷⌠Ф√┤Ф°╛Ф≤╬Г╓╨ */
     outb(0x3C8, 0x00);
     for (int _i = 0; _i < 16; _i++) {
         static const uint8_t _pr[16] = {0,0,170,170,0,0,170,170,85,85,255,255,85,85,255,255};
@@ -253,70 +253,36 @@ void gfx_init(void) {
         static const uint8_t _pb[16] = {0,0,0,0,170,170,170,170,85,85,85,85,255,255,255,255};
         outb(0x3C9, _pr[_i]); outb(0x3C9, _pg[_i]); outb(0x3C9, _pb[_i]);
     }
-    /* Е┘┴Ф═┤Е╫╒Г┼╤Ф│╒Е?█Д╦╨Ф√┤Ф°╛Ф╗║Е╪▐ */
+    /* Е┘┴Ф═┤Е╫╒Г┼╤Ф│╒О©╫?О©╫Д╦╨Ф√┤Ф°╛Ф╗║Е╪▐ */
     outb(0x3D4, 0x0A); outb(0x3D5, 0x0E);
     outb(0x3D4, 0x0B); outb(0x3D5, 0x0F);
 
 }
 
-// Ф│?О©??? 80x25 Ф√┤Ф°╛Ф╗║Е╪▐
-void gfx_dump_regs_dbg_line(int line)
-{
-    volatile uint8_t* vm = (volatile uint8_t*)(0xB8000 + (line & 1) * 160);
-    static const char hexd[] = "0123456789ABCDEF";
-    uint8_t v[48];
-    int i, k = 0;
-    for (i = 0; i <= 0x18; i++) { outb(0x3D4, i); v[k++] = inb(0x3D5); }
-    v[k++] = inb(0x3CC);
-    for (i = 0; i <= 0x04; i++) { outb(0x3C4, i); v[k++] = inb(0x3C5); }
-    for (i = 0; i <= 0x08; i++) { outb(0x3CE, i); v[k++] = inb(0x3CF); }
-    inb(0x3DA);
-    outb(0x3C0, 0x10 | 0x20); v[k++] = inb(0x3C1);
-    outb(0x3C0, 0x12 | 0x20); v[k++] = inb(0x3C1);
-    outb(0x3C0, 0x20);
-    for (i = 0; i < 40 && i * 4 + 3 < 160; i++) {
-        vm[i*4+0] = hexd[v[i] >> 4];
-        vm[i*4+1] = 0x07;
-        vm[i*4+2] = hexd[v[i] & 0x0F];
-        vm[i*4+3] = 0x07;
-    }
-}
 
-void gfx_dump_regs_dbg(void)
-{
-    gfx_dump_regs_dbg_line(0);
-}
-
-/* ╫ЬхКм╪пндёй╫г╟╣Всцё╨╟я VGA 8x16 нд╠╬вжлЕё╗plane 2ё╛SeaBIOS ря╪стьё╘╤ахКдз╢Ф║ё
- * GUI фз╪Д 0xA0000 ф╫цФ╠╩ LFB/bank сЁиД╦╡╦гё╛вжлЕкФж╝╠╩фф╩╣ё╛╥╣╩ьнд╠╬дёй╫пК╩╧т╜║ё */
+/* О©╫О©╫О©╫О©╫м╪О©╫О©╫дёй╫г╟О©╫О©╫О©╫цёО©╫О©╫О©╫ VGA 8x16 О©╫д╠О©╫О©╫О©╫О©╫Её╗plane 2О©╫О©╫SeaBIOS О©╫я╪О©╫О©╫ьёО©╫О©╫О©╫О©╫О©╫О©╫з╢Ф║ё
+ * GUI О©╫з╪О©╫ 0xA0000 ф╫О©╫Ф╠╩ LFB/bank сЁО©╫Д╦╡О©╫гёО©╫О©╫О©╫О©╫О©╫О©╫О©╫ж╝О©╫О©╫О©╫ф╩О©╫О©╫О©╫О©╫О©╫О©╫О©╫О©╫д╠О©╫дёй╫О©╫К╩╧т╜О©╫О©╫ */
 static uint8_t g_vga_font[256 * 16];
 static int g_vga_font_saved = 0;
 
 static void gfx_save_font(void) {
     if (g_vga_font_saved) return;
-    outb(0x3CE, 0x06); outb(0x3CF, 0x05);  /* GC6 misc: odd/even off -> оъпт╤аф╫цФ */
-    outb(0x3CE, 0x05); outb(0x3CF, 0x00);  /* GC5: read mode 0 */
-    outb(0x3CE, 0x04); outb(0x3CF, 0x02);  /* GC4: read map plane 2 */
-    {
-        volatile uint8_t *fp = (volatile uint8_t*)0xA0000;
-        int n, j;
-        for (n = 0; n < 256; n++)
-            for (j = 0; j < 16; j++)
-                g_vga_font[n * 16 + j] = fp[n * 32 + j];
-    }
-    outb(0x3CE, 0x04); outb(0x3CF, 0x00);  /* read map plane 0 */
-    outb(0x3CE, 0x06); outb(0x3CF, 0x0E);  /* GC6 misc: ╩ьнд╠╬дёй╫ */
-    outb(0x3CE, 0x05); outb(0x3CF, 0x10);  /* GC5: read mode 1 */
+    /* Use the built-in 8x16 font instead of reading plane 2 back:
+     * while the sequencer is still in odd/even (text) mode, CPU reads
+     * from 0xA0000 interleave plane 0 (char codes) with plane 2 (font),
+     * producing garbage. Program the known-good font on restore. */
+    for (int i = 0; i < 256 * 16; i++)
+        g_vga_font[i] = vga_font_8x16[i];
     g_vga_font_saved = 1;
 }
 
-/* нд╠╬дёй╫╩ж╦╢й╠╣Всцё╨╟я╠ё╢Ф╣д 8x16 вжлЕп╢╩ь plane 2ё╛гЕ╣Тм╪пн╫в╤нп╢хК╣д╡паТвжпн║ё */
+/* О©╫д╠О©╫дёй╫О©╫ж╦О©╫й╠О©╫О©╫О©╫цёО©╫О©╫я╠О©╫О©╫О©╫О©╫ 8x16 О©╫О©╫О©╫О©╫п╢О©╫О©╫ plane 2О©╫О©╫О©╫О©╫О©╫м╪О©╫н╫в╤О©╫п╢О©╫О©╫д╡О©╫О©╫О©╫О©╫О©╫О©╫н║О©╫ */
 static void gfx_restore_font(void) {
     if (!g_vga_font_saved) return;
-    outb(0x3C4, 0x04); outb(0x3C5, 0x04);  /* SC4: odd/even off */
+    outb(0x3C4, 0x04); outb(0x3C5, 0x06);  /* SC4: odd/even off + extended memory */
     outb(0x3C4, 0x02); outb(0x3C5, 0x04);  /* SC2: map mask plane 2 */
     outb(0x3CE, 0x05); outb(0x3CF, 0x00);  /* GC5: write mode 0 */
-    outb(0x3CE, 0x06); outb(0x3CF, 0x04);  /* GC6: м╪пнф╫цФп╢дёй╫ */
+    outb(0x3CE, 0x06); outb(0x3CF, 0x04);  /* GC6: м╪О©╫О©╫ф╫О©╫О©╫п╢дёй╫ */
     {
         volatile uint8_t *fp = (volatile uint8_t*)0xA0000;
         int n, j;
@@ -324,11 +290,21 @@ static void gfx_restore_font(void) {
             for (j = 0; j < 16; j++)
                 fp[n * 32 + j] = g_vga_font[n * 16 + j];
     }
-    outb(0x3CE, 0x04); outb(0x3CF, 0x02);  /* read map plane 2 */
+    outb(0x3CE, 0x04); outb(0x3CF, 0x00);  /* GC4: read map plane 0 */
     outb(0x3CE, 0x05); outb(0x3CF, 0x10);  /* GC5: read mode 1 */
-    outb(0x3CE, 0x06); outb(0x3CF, 0x0E);  /* GC6: нд╠╬дёй╫ */
-    outb(0x3C4, 0x02); outb(0x3C5, 0x0F);  /* SC2: map mask х╚╡©ф╫цФ */
-    outb(0x3C4, 0x04); outb(0x3C5, 0x03);  /* SC4: odd/evenё╗нд╠╬дёй╫ё╘ */
+    outb(0x3CE, 0x06); outb(0x3CF, 0x0E);  /* GC6: О©╫д╠О©╫дёй╫ */
+    outb(0x3C4, 0x02); outb(0x3C5, 0x03);  /* SC2: mask plane 0/1 only - protect font plane 2 */
+    outb(0x3C4, 0x04); outb(0x3C5, 0x03);  /* SC4: odd/evenО©╫О©╫О©╫д╠О©╫дёй╫О©╫О©╫ */
+}
+
+/* Load the built-in 8x16 font into VGA plane 2 at boot, before any text
+ * output. SeaBIOS's default ROM font differs from vga_font_8x16 on several
+ * glyphs (f/t/0/F/T...), which made text-mode rendering inconsistent with
+ * both the GUI font and the E2E test OCR table. Programming our font from
+ * the start keeps text mode, GUI rendering and the OCR font identical. */
+void gfx_text_font_init(void) {
+    gfx_save_font();
+    gfx_restore_font();
 }
 
 void gfx_restore_text(void) {
@@ -359,16 +335,16 @@ void gfx_restore_text(void) {
     outb(0x3D4, 0x09); outb(0x3D5, 0x4F);
     outb(0x3D4, 0x0A); outb(0x3D5, 0x0D);
     outb(0x3D4, 0x0B); outb(0x3D5, 0x0E);
-    outb(0x3D4, 0x0C); outb(0x3D5, 0x00);   /* start_addr = 0x0000ё╨нд╠╬дёй╫от╢Ф╢с 0xB8000 фП */
-    outb(0x3D4, 0x0D); outb(0x3D5, 0x00);   /* ╬и╣д 0xC000 Ё╛ЁЖ 32KB рЁ(0x8000)ё╛оЮ╣╠сз╟яотй╬фП╣Ц
-                                               ж╦╣╫Ёб╬и VRAM/м╪пн╡паТиоё╛╥╣╩ьнд╠╬дёй╫╨СуШфа╡йи╚лУ */
+    outb(0x3D4, 0x0C); outb(0x3D5, 0x00);   /* start_addr = 0x0000О©╫О©╫О©╫д╠О©╫дёй╫О©╫т╢О©╫О©╫ 0xB8000 О©╫О©╫ */
+    outb(0x3D4, 0x0D); outb(0x3D5, 0x00);   /* О©╫и╣О©╫ 0xC000 О©╫О©╫О©╫О©╫ 32KB рЁ(0x8000)О©╫О©╫О©╫Ю╣╠О©╫з╟О©╫О©╫О©╫й╬О©╫О©╫О©╫
+                                               ж╦О©╫О©╫О©╫б╬О©╫ VRAM/м╪О©╫н╡О©╫О©╫О©╫О©╫оёО©╫О©╫О©╫О©╫О©╫О©╫д╠О©╫дёй╫О©╫О©╫О©╫О©╫О©╫О©╫О©╫О©╫и╚О©╫О©╫ */
     outb(0x3D4, 0x0E); outb(0x3D5, 0x00);
     outb(0x3D4, 0x0F); outb(0x3D5, 0x00);
     outb(0x3D4, 0x10); outb(0x3D5, 0x9C);
     outb(0x3D4, 0x11); outb(0x3D5, 0x8E);   /* V Retrace End (О©╫д╠О©╫дёй╫) */
     outb(0x3D4, 0x12); outb(0x3D5, 0x8F);
     outb(0x3D4, 0x13); outb(0x3D5, 0x28);
-    outb(0x3D4, 0x14); outb(0x3D5, 0x00);
+    outb(0x3D4, 0x14); outb(0x3D5, 0x1F);  /* CR14: underline location (mode 3 value) */
     outb(0x3D4, 0x15); outb(0x3D5, 0x96);
     outb(0x3D4, 0x16); outb(0x3D5, 0xB9);
     outb(0x3D4, 0x17); outb(0x3D5, 0xA3);   /* Mode Control (О©╫д╠О©╫дёй╫) */
@@ -402,7 +378,7 @@ void gfx_restore_text(void) {
     outb(0x3C0, 0x0D); outb(0x3C0, 0x0D);
     outb(0x3C0, 0x0E); outb(0x3C0, 0x0E);
     outb(0x3C0, 0x0F); outb(0x3C0, 0x0F);
-    outb(0x3C0, 0x10); outb(0x3C0, 0x08);  // Mode Control: text mode (AG=0)
+    outb(0x3C0, 0x10); outb(0x3C0, 0x0C);  // Mode Control: text + line-graphics + blink
     outb(0x3C0, 0x11); outb(0x3C0, 0x00);  // Overscan: black
     outb(0x3C0, 0x12); outb(0x3C0, 0x0F);  // Color Plane Enable
     outb(0x3C0, 0x13); outb(0x3C0, 0x00);  // PEL Panning
@@ -440,7 +416,7 @@ void gfx_set_palette(void) {
     static const uint8_t std_g[16] = {0,0,170,170,0,0,170,170,85,85,255,255,85,85,255,255};
     static const uint8_t std_b[16] = {0,170,0,170,0,170,0,170,85,255,85,255,85,255,85,255};
     if (gfx_bpp == 2) {
-        /* VBE 16bpp: О©╫О©╫ RGB565 О©╫О©╫О©╫р╠О©╫О©╫О©╫О©╫О©╫и╚О©╫О©╫О©╫О©╫ -> О©╫О©╫О©? */
+        /* VBE 16bpp: О©╫О©╫ RGB565 О©╫О©╫О©╫р╠О©╫О©╫О©╫О©╫О©╫и╚О©╫О©╫О©╫О©╫ -> О©╫О©╫О©╫? */
         for (int i = 0; i < 256; i++) {
             uint8_t r, g, b;
             if (i < 16) {
@@ -484,7 +460,7 @@ void gfx_set_palette(void) {
     }
 }
 
-//// О©?? VGA Е╜≈Д╫⌠ ROM Х╞╩Е▐√ 8x8 Е╜≈Д╫⌠
+//// О©╫?? VGA Е╜≈Д╫⌠ ROM Х╞╩Е▐√ 8x8 Е╜≈Д╫⌠
 //void gfx_load_font(void) {
 //    outb(0x3CE, 0x04); outb(0x3CF, 0x02);
 //    outb(0x3CE, 0x05); outb(0x3CF, 0x00);
@@ -505,7 +481,7 @@ void gfx_load_font(void) {
             font8x8[i][j] = builtin_font[i][j];
         }
     }
-    // О©╫О©╫О©╫О©╫О©╫ж╥О©╫О©╫О©╫О©╫н?О©╫О©╫
+    // О©╫О©╫О©╫О©╫О©╫ж╥О©╫О©╫О©╫О©╫О©╫?О©╫О©╫
     for (int i = 128; i < 256; i++) {
         for (int j = 0; j < 8; j++) {
             font8x8[i][j] = 0;
@@ -559,7 +535,7 @@ void gfx_draw_text(int x, int y, const char *s, uint8_t fg, uint8_t bg) {
 }
 
 /* О©╫О©╫О©╫О©╫О©╫О©╫О©╫е╢О©╫О©╫О©╫О©╫жёО©╫ц©О©╫О©╫ 8x8 О©╫О©╫О©╫О©╫О©╫О©╫О©╫ь╩О©╫О©╫О©╫ scale x scale О©╫О©╫О©╫ь©Иё╗scale>=1О©╫О©╫О©╫О©╫
- * О©╫О©╫О©╫з╣м╥ж╠О©╫О©╫йёО©╫320x200О©╫О©╫О©╫б╣д╢О©╫О©╫О©╫О©?/м╪О©╫О©╫О©╫О©╫О©╫фёО©╫2x О©╫О©╫ 16px О©╫ъ║О©╫ */
+ * О©╫О©╫О©╫з╣м╥ж╠О©╫О©╫йёО©╫320x200О©╫О©╫О©╫б╣д╢О©╫О©╫О©╫О©╫?/м╪О©╫О©╫О©╫О©╫О©╫фёО©╫2x О©╫О©╫ 16px О©╫ъ║О©╫ */
 void gfx_draw_text_scaled(int x, int y, const char *s, uint8_t fg, int bg, int scale) {
     if (scale < 1) scale = 1;
     while (*s) {
@@ -575,7 +551,7 @@ void gfx_draw_text_scaled(int x, int y, const char *s, uint8_t fg, int bg, int s
                         }
                     }
                 } else if (bg >= 0) {
-                    /* О©╫О©╫О©╫О©╫О©╫О©╫О©╫ьёО©╫bg < 0 О©╫О©╫й╬м╦О©╫О©╫О©╫О©╫О©╫О©╫О©╫О©╫г╟О©╫О©╫О©╫О©╫О©╫О©╫О©╫О©╫О©╫О©╫О©╫и?/О©╫О©╫О©╫О©╫О©╫О©╫О©╫О©╫и╚О©╫О©╫р╩О©╫б╡О©╫О©╫О©╫О©╫с╠О©╫ */
+                    /* О©╫О©╫О©╫О©╫О©╫О©╫О©╫ьёО©╫bg < 0 О©╫О©╫й╬м╦О©╫О©╫О©╫О©╫О©╫О©╫О©╫О©╫г╟О©╫О©╫О©╫О©╫О©╫О©╫О©╫О©╫О©╫О©╫О©╫О©╫?/О©╫О©╫О©╫О©╫О©╫О©╫О©╫О©╫и╚О©╫О©╫р╩О©╫б╡О©╫О©╫О©╫О©╫с╠О©╫ */
                     for (int dy = 0; dy < scale; dy++) {
                         for (int dx = 0; dx < scale; dx++) {
                             gfx_putpixel(x + col * scale + dx, y + row * scale + dy, (uint8_t)bg);
@@ -651,7 +627,6 @@ int gfx_eval(const char *s, int *ok) {
 }
 
 void gfx_menu(void) {
-    gfx_dump_regs_dbg();   // DBG: dump BIOS text-mode registers to B8000 before switching
     gfx_init();
     gfx_set_palette();
     gfx_load_font();
@@ -710,8 +685,9 @@ void gfx_menu(void) {
                     char tmp[16];
                     int tl = 0;
                     int neg = 0;
-                    if (rv < 0) { neg = 1; rv = -rv; }
-                    while (rv > 0) { tmp[tl++] = '0' + (rv % 10); rv /= 10; }
+                    uint32_t u = (rv < 0) ? (uint32_t)(-(rv + 1)) + 1u : (uint32_t)rv;
+                    if (rv < 0) neg = 1;
+                    while (u > 0) { tmp[tl++] = (char)('0' + (int)(u % 10)); u /= 10; }
                     if (neg) res[rl++] = '-';
                     while (tl > 0) res[rl++] = tmp[--tl];
                 }
@@ -737,7 +713,7 @@ void gfx_menu(void) {
             gfx_draw_text(20, 16, "Viewer", 0x0F, 0x00);
             gfx_draw_text(20, 32, "Shows README.TXT content:", 0x07, 0x00);
             static uint8_t vbuf[512];
-            int vn = exfat_read_file("README.TXT", vbuf, 512);
+            int vn = fs_read_file("README.TXT", vbuf, 512);
             if (vn > 0) {
                 int line = 0;
                 int col = 0;
@@ -783,8 +759,8 @@ void gfx_menu(void) {
             else if (c == 27) { running = 0; }
         } else if (page == 1) {
             if (c == 27) { page = 0; }
-            else if (c == KEY_UP) { if (calc_sel >= 4) calc_sel -= 4; }
-            else if (c == KEY_DOWN) { if (calc_sel < 16) calc_sel += 4; }
+            else if (c == KEY_UP) { if (calc_sel > 0) calc_sel--; }
+            else if (c == KEY_DOWN) { if (calc_sel < 19) calc_sel++; }
             else if (c == KEY_LEFT) { if (calc_sel % 4 > 0) calc_sel--; }
             else if (c == KEY_RIGHT) { if (calc_sel % 4 < 3) calc_sel++; }
             else if (c == '\n') {
@@ -825,6 +801,6 @@ void gfx_menu(void) {
     }
 
     gfx_restore_text();
-    terminal_initialize();   // О©╫ч╦О©╫О©╫О©╫О©╫кЁО©╫м╪О©╫О©╫дёй╫О©╫О©╫О©╫О©╫О©╫О©╫ь╫О©╫О©╫д╠О©╫О©╫у╤кёО©╫О©╫О©╫г╟О©╫О©? TEMP-DBG в╒О©╫м╣О©╫О©╫б╨О©╫О©╫О©╫О©╫О©╫
+    terminal_initialize();   // О©╫ч╦О©╫О©╫О©╫О©╫кЁО©╫м╪О©╫О©╫дёй╫О©╫О©╫О©╫О©╫О©╫О©╫ь╫О©╫О©╫д╠О©╫О©╫у╤кёО©╫О©╫О©╫г╟О©╫О©╫? TEMP-DBG в╒О©╫м╣О©╫О©╫б╨О©╫О©╫О©╫О©╫О©╫
 }
 

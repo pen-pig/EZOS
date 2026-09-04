@@ -16,7 +16,7 @@
 #include "keyboard.h"
 #include "types.h"
 #include "port.h"
-#include "exfat.h"
+#include "fs.h"
 
 /* ==================================================================
  * 1. ezos_console 适配层：把 EZOS tty / 键盘桥接为轻量 console 接口
@@ -107,7 +107,9 @@ static int x_strcasecmp(const char *a, const char *b) {
 static int x_atoi(const char *s) {
     int result = 0;
     while (*s >= '0' && *s <= '9') {
-        result = result * 10 + (*s - '0');
+        int d = *s - '0';
+        if (result > (2147483647 - d) / 10) return 2147483647;  /* 溢出钳制 */
+        result = result * 10 + d;
         s++;
     }
     return result;
@@ -249,6 +251,9 @@ void cmd_sysinfo(const char *args) {
     uint8_t hour = x_bcd2dec(x_cmos_read(0x04));
     uint8_t minute = x_bcd2dec(x_cmos_read(0x02));
     uint8_t second = x_bcd2dec(x_cmos_read(0x00));
+    if (hour > 23) hour = 0;          /* clamp invalid CMOS values */
+    if (minute > 59) minute = 0;
+    if (second > 59) second = 0;
     ezos_console_write("Time    : ");
     if (hour < 10) ezos_console_putchar('0');
     ezos_console_print_dec(hour);
@@ -263,6 +268,8 @@ void cmd_sysinfo(const char *args) {
     uint8_t year = x_bcd2dec(x_cmos_read(0x09));
     uint8_t month = x_bcd2dec(x_cmos_read(0x08));
     uint8_t day = x_bcd2dec(x_cmos_read(0x07));
+    if (month < 1 || month > 12) month = 1;   /* clamp invalid CMOS values */
+    if (day < 1 || day > 31) day = 1;
     ezos_console_write("Date    : ");
     ezos_console_print_dec(year + 2000);
     ezos_console_putchar('-');
@@ -299,10 +306,10 @@ static void x_type_common(const char *args, int which_mode) {
         ezos_console_write(which_mode ? ": aliased command\n" : " is an alias\n");
         return;
     }
-    if (exfat_init() == 0) {
+    if (fs_init() == 0) {
         /* 检查当前目录是否存在同名文件 */
         char dummy[1];
-        if (exfat_get_file_size(name) > 0) {
+        if (fs_get_file_size(name) > 0) {
             ezos_console_write(name);
             ezos_console_write(which_mode ? ": external file\n" : " is a file in cwd\n");
             return;
@@ -434,13 +441,15 @@ void cmd_unalias(const char *args) {
 }
 
 /* sleep: RDTSC 忙等延时（近似，QEMU 下按 ~1GHz TSC 估算） */
-static void x_delay_ticks(uint32_t ticks) {
+static void x_delay_ticks(uint64_t ticks) {
+    uint64_t elapsed = 0;
     uint32_t start;
     __asm__ __volatile__("rdtsc" : "=a"(start) : : "edx");
-    while (1) {
+    while (elapsed < ticks) {
         uint32_t now;
         __asm__ __volatile__("rdtsc" : "=a"(now) : : "edx");
-        if (now - start >= ticks) break;
+        elapsed += (uint32_t)(now - start);
+        start = now;
     }
 }
 
@@ -451,7 +460,7 @@ void cmd_sleep(const char *args) {
         return;
     }
     if (ms > 60000) ms = 60000;
-    x_delay_ticks((uint32_t)ms * 1000000u);  /* 约 1ms/1e6 ticks（QEMU 近似） */
+    x_delay_ticks((uint64_t)ms * 1000000ull);  /* 约 1ms/1e6 ticks（QEMU 近似） */
     ezos_console_write("Done (");
     ezos_console_print_dec(ms);
     ezos_console_write(" ms).\n");

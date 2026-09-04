@@ -21,12 +21,24 @@
 #include "types.h"
 #include "tty.h"
 #include "keyboard.h"
+#include "shell.h"
+#include "hiscore.h"
+#include "isr.h"
 
 /* ---- ezos_console 适配层（定义于 shell_extra.c） ---- */
 extern void ezos_console_putchar(char c);
 extern void ezos_console_write(const char *s);
 extern void ezos_console_print_dec(uint32_t num);
 extern int  ezos_console_readline(char *buf, int maxlen);
+
+/* 高分行输出：破纪录时提示 New best!，随后显示当前最佳（磁盘持久化） */
+static void games_score_line(int game, int value) {
+    if (hiscore_update(game, value))
+        ezos_console_write("New best!\n");
+    ezos_console_write("Best: ");
+    ezos_console_print_dec((uint32_t)hiscore_get(game));
+    ezos_console_write("\n");
+}
 
 /* ==================================================================
  * GUI 桌面模式适配层（gfxwin.c 桌面图标启动游戏）
@@ -91,11 +103,12 @@ static void games_putc(char c) {
     if (!g_gfx) { real_putchar(c); return; }
     if (c == '\n') {
         g_gpos = (g_gpos / 80 + 1) * 80;
+        if (g_gpos >= 24 * 80) games_gfx_scroll();
     } else {
+        if (g_gpos >= 24 * 80) games_gfx_scroll();
         g_gbuf[g_gpos] = c;
         g_gpos++;
     }
-    if (g_gpos >= 24 * 80) games_gfx_scroll();
 }
 
 static void games_write(const char *s) {
@@ -120,12 +133,14 @@ static void games_clear_gfx(void) {
 
 static void games_set_cursor_gfx(size_t r, size_t c) {
     if (!g_gfx) { real_term_set_cursor(r, c); return; }
+    if (r >= 24 || c >= 80) return;   /* 行列越界：忽略，防止 g_gpos 越界 */
     g_gpos = (int)(r * 80 + c);
     if (g_gpos > 24 * 80) g_gpos = 24 * 80 - 1;
 }
 
 static void games_clear_line_gfx(size_t r) {
     if (!g_gfx) { real_term_clear_line(r); return; }
+    if (r >= 24) return;              /* 行越界：忽略，防止 g_gbuf 越界写 */
     for (int c = 0; c < 80; c++) g_gbuf[(int)r * 80 + c] = ' ';
 }
 
@@ -153,7 +168,7 @@ static int games_readline_gfx(char *buf, int maxlen) {
         }
         if (c == 0x08 && n > 0) {
             n--;
-            if (g_gpos > 0) {
+            if (g_gpos > 0 && (g_gpos % 80) != 0) {
                 g_gpos--;
                 g_gbuf[g_gpos] = ' ';
             }
@@ -201,7 +216,9 @@ static uint32_t games_rdtsc(void) {
 static int games_atoi(const char *s) {
     int result = 0;
     while (*s >= '0' && *s <= '9') {
-        result = result * 10 + (*s - '0');
+        int d = *s - '0';
+        if (result > (0x7FFFFFFF - d) / 10) break;   /* 溢出：停止解析 */
+        result = result * 10 + d;
         s++;
     }
     return result;
@@ -259,6 +276,7 @@ static void game_guess(void) {
             ezos_console_write("Correct! You win in ");
             ezos_console_print_dec((uint32_t)tries);
             ezos_console_write(" tries.\n");
+            games_score_line(1, tries);
             break;
         } else if (guess < secret) {
             ezos_console_write("Too low.\n");
@@ -395,20 +413,30 @@ static void game_tic(void) {
             } else {
                 int c = keyboard_getchar();
                 if (c == 0) { games_yield(); continue; }
+                if (c == 'q' || c == 'Q' || c == 0x1B) break;   /* Q/Esc 中途退出 */
                 if (c < '1' || c > '9') continue;
                 pos = c - '1';
             }
             if (tic_board[pos] != ' ') { games_yield(); continue; }
             tic_board[pos] = 'X';
+            beep(880, 40);            /* 玩家落子 */
             games_yield();
             if (tic_winner() == 1) break;
             if (tic_full()) break;
             int ai = tic_ai_move();
             if (ai < 0 || ai > 8 || tic_board[ai] != ' ') break;
             tic_board[ai] = 'O';
+            beep(560, 40);            /* AI 落子 */
             games_yield();
             if (tic_winner() == 2) break;
             if (tic_full()) break;
+        }
+        /* 终局音效：玩家胜上扬、AI 胜下沉、平局短促 */
+        {
+            int wr = tic_winner();
+            if (wr == 1) beep(1200, 150);
+            else if (wr == 2) beep(220, 250);
+            else beep(700, 80);
         }
         games_yield();   /* 终局画面 */
         while (keyboard_getchar() != 0) { }
@@ -549,25 +577,26 @@ static void game_snake(void) {
             if (snake_body[i][0] == nx && snake_body[i][1] == ny) { alive = 0; break; }
         }
         if (!alive) break;
-        for (int i = snake_len - 1; i > 0; i--) {
+        for (int i = snake_len; i > 0; i--) {
             snake_body[i][0] = snake_body[i - 1][0];
             snake_body[i][1] = snake_body[i - 1][1];
         }
         snake_body[0][0] = nx; snake_body[0][1] = ny;
         if (nx == food_x && ny == food_y) {
-            snake_body[snake_len][0] = snake_body[snake_len - 1][0];
-            snake_body[snake_len][1] = snake_body[snake_len - 1][1];
             snake_len++;
+            beep(700, 30);           /* 吃到食物 */
             if (snake_len >= SNAKE_MAX) { alive = 0; break; }
             snake_spawn_food();
         }
         snake_render();
     }
     if (!alive) {
+        beep(220, 250);              /* 游戏结束 */
         snake_alive = 0;
         ezos_console_write("Game Over! Score: ");
         ezos_console_print_dec((uint32_t)(snake_len - 3));
         ezos_console_write("\n");
+        games_score_line(3, snake_len - 3);
     } else {
         snake_alive = 0;
         ezos_console_write("Quit.\n");
@@ -739,6 +768,7 @@ static void game_2048(void) {
             break;
         }
     }
+    games_score_line(4, (int)g2048_score);
     ezos_console_write("Press Enter to return...\n");
     char buf[8];
     games_readline(buf, sizeof(buf));
@@ -854,6 +884,7 @@ static void game_minesweeper(void) {
     ms_lose = 0;
     ms_left = MS_W * MS_H - 10;
     ms_cx = 4; ms_cy = 4;
+    uint32_t ms_t0 = g_pit_ticks;   /* 通关计时（高分=最快秒数） */
     if (g_gfx) {
         /* GUI 图形模式：方向键导航 + Enter 翻开 + F 插旗 + Q 退出 */
         games_yield();   /* 首绘 */
@@ -881,6 +912,8 @@ static void game_minesweeper(void) {
             if (ms_left == 0) break;
         }
         games_yield();   /* 终局画面（雷/胜利） */
+        if (!ms_lose && ms_left == 0)
+            games_score_line(5, (int)((g_pit_ticks - ms_t0) / 1000));
         while (keyboard_getchar() != 0) { }
         while (keyboard_getchar() == 0) games_yield();
         return;
@@ -927,6 +960,7 @@ static void game_minesweeper(void) {
         ms_render();
         if (ms_left == 0) {
             ezos_console_write("You win!\n");
+            games_score_line(5, (int)((g_pit_ticks - ms_t0) / 1000));
             break;
         }
     }
@@ -1073,17 +1107,24 @@ static void game_memory(void) {
     if (g_gfx) {
         /* GUI 图形模式：方向键导航 + Enter 翻牌，不匹配自动翻回 */
         int first = -1;
+        int won = 0;
         games_yield();   /* 首绘 */
         while (matched < 8) {
             int act = mem_poll_key_gfx();
             if (act == 0 || act == 1) continue;      /* 移动由 yield 重绘 */
             if (act == 3) break;                     /* 退出 */
             int idx = mem_cy * MEM_COLS + mem_cx;
-            if (mem_face[idx] || mem_show[idx]) { games_yield(); continue; }
+            if (mem_face[idx]) { games_yield(); continue; }
+            if (first == idx) {          /* 再次点击第一张牌：取消选择 */
+                mem_show[idx] = 0;
+                first = -1;
+                games_yield();
+                continue;
+            }
+            if (mem_show[idx]) { games_yield(); continue; }
             mem_flips++;
             mem_show[idx] = mem_cards[idx];
             if (first < 0) { first = idx; games_yield(); continue; }
-            if (first == idx) { mem_show[idx] = 0; first = -1; games_yield(); continue; }
             games_yield();   /* 显示第二张 */
             if (mem_cards[first] == mem_cards[idx]) {
                 mem_face[first] = 1; mem_face[idx] = 1;
@@ -1102,7 +1143,9 @@ static void game_memory(void) {
                 first = -1;
             }
         }
+        won = (matched >= 8);
         games_yield();
+        if (won) games_score_line(7, mem_flips);
         while (keyboard_getchar() != 0) { }
         while (keyboard_getchar() == 0) games_yield();
         return;
@@ -1122,14 +1165,21 @@ static void game_memory(void) {
             continue;
         }
         int idx = r * MEM_COLS + c;
-        if (mem_face[idx] || mem_show[idx]) {
+        if (mem_face[idx]) {
+            ezos_console_write("Already open\n");
+            continue;
+        }
+        if (first == idx) {              /* 再次输入第一张牌：取消选择 */
+            mem_show[idx] = 0;
+            continue;
+        }
+        if (mem_show[idx]) {
             ezos_console_write("Already open\n");
             continue;
         }
         mem_flips++;
         mem_show[idx] = mem_cards[idx];
         if (first < 0) continue;
-        if (first == idx) { mem_show[idx] = 0; continue; }
         mem_render();
         if (mem_cards[first] == mem_cards[idx]) {
             mem_face[first] = 1;
@@ -1146,9 +1196,14 @@ static void game_memory(void) {
         }
     }
     mem_render();
-    ezos_console_write("You win in ");
-    ezos_console_print_dec((uint32_t)mem_flips);
-    ezos_console_write(" flips!\n");
+    if (matched >= 8) {
+        ezos_console_write("You win in ");
+        ezos_console_print_dec((uint32_t)mem_flips);
+        ezos_console_write(" flips!\n");
+        games_score_line(7, mem_flips);
+    } else {
+        ezos_console_write("Quit.\n");   /* 中途退出不算胜利（修复：原来也打印 You win） */
+    }
     ezos_console_write("Press Enter to return...\n");
     games_readline(buf, sizeof(buf));
 }

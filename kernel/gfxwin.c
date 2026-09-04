@@ -16,6 +16,7 @@
  */
 
 #include "gfx.h"
+#include "port.h"
 
 #define TERM_ROWS 24
 #define TERM_COLS 80
@@ -24,16 +25,17 @@ extern void system_shutdown(void);
 extern void system_reboot(void);
 extern int shell_exec_line(const char *line);
 extern void terminal_set_gfx_hook(void (*fn)(const char *));
-extern void shell_set_user_mode(int on);
+#include "shell.h"
 #include "gfxwin.h"
-#include "port.h"
 #include "mouse.h"
 #include "keyboard.h"
-#include "exfat.h"
+#include "fs.h"
 #include "games.h"
+#include "isr.h"
 
 /* 前置声明：定义顺序在调用之后（gw_spawn_app / gw_demo 使用） */
 void gw_redraw_region(int x, int y, int w, int h);
+static void gw_draw_window_body(gw_window_t *w, int with_content);
 static void term_print(const char *s);
 static void term_draw(gw_window_t *w);
 static void term_key(gw_window_t *w, int key);
@@ -41,6 +43,22 @@ static void term_newline(void);
 static void term_prompt(void);
 static int term_nrows;
 static int gw_launch_game(int idx);
+static gw_window_t *gw_spawn_app(int idx);
+
+/* ---- 应用清单（提前定义：桌面图标 / Dock / 开始菜单共用） ---- */
+#define GW_APP_FILES    0
+#define GW_APP_NOTEPAD  1
+#define GW_APP_SYSINFO  2
+#define GW_APP_CLOCK    3
+#define GW_APP_SETTINGS 4
+#define GW_APP_ABOUT    5
+#define GW_APP_TERMINAL 6
+#define GW_APP_PAINT    7
+#define GW_APP_COUNT    8
+
+static const char *gw_app_names[GW_APP_COUNT] = {
+    "File Manager", "Notepad", "System Info", "Clock", "Settings", "About EZOS", "Terminal", "Paint"
+};
 static void gw_game_yield(void);
 
 /* ==================================================================
@@ -52,21 +70,6 @@ static int gw_strlen(const char *s)
     int n = 0;
     while (s[n]) n++;
     return n;
-}
-
-/* [DEBUG-MOUSE] 临时：十进制整数转字符串（用于任务栏坐标标定，验证后移除） */
-static void gw_itoa(int v, char *buf)
-{
-    int n = 0, i;
-    char tmp[12];
-    int neg = 0;
-    if (v < 0) { neg = 1; v = -v; }
-    if (v == 0) tmp[n++] = '0';
-    while (v) { tmp[n++] = '0' + (v % 10); v /= 10; }
-    i = 0;
-    if (neg) buf[i++] = '-';
-    while (n > 0) buf[i++] = tmp[--n];
-    buf[i] = 0;
 }
 
 static uint8_t gw_cmos_read(uint8_t reg)
@@ -179,6 +182,8 @@ static void gw_fill(int x, int y, int w, int h, uint32_t rgb)
 static void gw_fill_vgrad(int x, int y, int w, int h, uint32_t top, uint32_t bot)
 {
     if (h <= 0) return;
+    if (w <= 0) return;
+    if (h == 1) { gw_fill(x, y, w, 1, top); return; }   /* h==1 时 h-1 为 0，避免除零 */
     int tr = (int)((top >> 16) & 0xFF), tg = (int)((top >> 8) & 0xFF), tb = (int)(top & 0xFF);
     int br = (int)((bot >> 16) & 0xFF), bg = (int)((bot >> 8) & 0xFF), bb = (int)(bot & 0xFF);
     for (int j = 0; j < h; j++) {
@@ -266,6 +271,7 @@ struct gw_theme {
     const char *name;
     uint32_t accent;   /* 16bpp 标题栏色 */
     uint32_t bg_rgb;   /* 16bpp 内容底 */
+    uint8_t style;     /* 0=Win10 风格（底部任务栏） 1=GNOME 风格（顶部栏） */
 };
 
 void gw_win10_palette(void)
@@ -275,12 +281,12 @@ void gw_win10_palette(void)
         { 0x00, 0x16, 0x27 }, /* F1 #005A9E */
         { 0x0F, 0x26, 0x3A }, /* F2 #3C9BE8 */
         { 0x3C, 0x3C, 0x3C }, /* F3 #F3F3F3 */
-        { 0x37, 0x37, 0x37 }, /* F4 #E1E1E1 */
-        { 0x32, 0x32, 0x32 }, /* F5 #CDCDCD */
-        { 0x25, 0x25, 0x25 }, /* F6 #999999 */
-        { 0x39, 0x04, 0x08 }, /* F7 #E81123 */
-        { 0x10, 0x10, 0x10 }, /* F8 #202020 */
-        { 0x20, 0x20, 0x20 }, /* F9 #404040 */
+        { 0x38, 0x38, 0x38 }, /* F4 #E1E1E1 */
+        { 0x33, 0x33, 0x33 }, /* F5 #CDCDCD */
+        { 0x26, 0x26, 0x26 }, /* F6 #999999 */
+        { 0x3A, 0x04, 0x08 }, /* F7 #E81123 */
+        { 0x08, 0x08, 0x08 }, /* F8 #202020 */
+        { 0x10, 0x10, 0x10 }, /* F9 #404040 */
     };
     outb(0x3C8, 0xF0);
     for (int i = 0; i < 10; i++) {
@@ -290,37 +296,65 @@ void gw_win10_palette(void)
     }
 }
 
-static struct gw_theme gw_themes[6] = {
+#define GW_THEME_COUNT 7
+static struct gw_theme gw_themes[GW_THEME_COUNT] = {
     { GW_C_BLUE_DARK, 0x0F, GW_C_GRAY_BORDER, 0x0F, GW_C_GRAY_SLIDER,
-      GW_C_BLUE, 0x0F, 0x00, "Win10 Blue", 0x0078D7u, 0xF3F3F3u },
+      GW_C_BLUE, 0x0F, 0x00, "Win10 Blue", 0x0078D7u, 0xF3F3F3u, 0 },
     { 0x00, 0x08, 0x00, 0x07, 0x08,
-      GW_C_BLUE, 0x0F, 0x0F, "Win10 Dark", 0x0078D7u, 0x1E1E1Eu },
+      GW_C_BLUE, 0x0F, 0x0F, "Win10 Dark", 0x0078D7u, 0x1E1E1Eu, 0 },
     { GW_C_GRAY_BORDER, 0x0F, GW_C_GRAY_BORDER, 0x0F, GW_C_GRAY_SLIDER,
-      GW_C_BLUE, 0x0F, 0x00, "Win10 Light", 0x0078D7u, 0xFFFFFFu },
+      GW_C_BLUE, 0x0F, 0x00, "Win10 Light", 0x0078D7u, 0xFFFFFFu, 0 },
     { 0x08, 0x0F, GW_C_GRAY_BORDER, 0x0F, GW_C_GRAY_SLIDER,
-      0x08, 0x0F, 0x00, "Win10 Gray", 0x6E6E6Eu, 0xEFEFEFu },
+      0x08, 0x0F, 0x00, "Win10 Gray", 0x6E6E6Eu, 0xEFEFEFu, 0 },
     { 0x00, 0x00, 0x0F, 0x0F, 0x0F,
-      0x0F, 0x00, 0x0F, "Win10 Contrast", 0x000000u, 0xFFFFFFu },
+      0x0F, 0x00, 0x0F, "Win10 Contrast", 0x000000u, 0xFFFFFFu, 0 },
     { 0x01, 0x0F, GW_C_GRAY_BORDER, 0x0F, GW_C_GRAY_SLIDER,
-      0x1F, 0x0F, 0x00, "Win10 Aqua", 0x00B7C3u, 0xF0FBFBu },
+      0x1F, 0x0F, 0x00, "Win10 Aqua", 0x00B7C3u, 0xF0FBFBu, 0 },
+    /* Ubuntu GNOME：顶部黑栏 + Activities + 居中时钟，Ubuntu 橙强调 */
+    { 0x00, 0x0F, GW_C_GRAY_BORDER, 0x0F, GW_C_GRAY_SLIDER,
+      0x08, 0x0F, 0x00, "Ubuntu GNOME", 0xE95420u, 0xF7F7F7u, 1 },
 };
 
 static struct gw_theme *gw_cur_theme = &gw_themes[0];
 static uint32_t gw_accent = 0x0078D7u;
 static uint32_t gw_bg_rgb = 0xF3F3F3u;
+static int gw_theme_sel = 0;     /* 持久化的主题选择（跨 GUI 会话保持） */
+static int gw_dirty;             /* 前置声明：gw_set_theme 里置脏，定义在桌面层 */
+static int gw_gui_active = 0;    /* gw_demo 主循环运行中标志 */
 
 void gw_set_theme(int index)
 {
     if (index < 0) index = 0;
-    if (index >= 6) index = 5;
+    if (index >= GW_THEME_COUNT) index = GW_THEME_COUNT - 1;
+    gw_theme_sel = index;
     gw_cur_theme = &gw_themes[index];
     gw_accent = gw_cur_theme->accent;
     gw_bg_rgb = gw_cur_theme->bg_rgb;
+    /* 8bpp 回退：F0/F1/F2 槽位刷新为当前主题强调色系（16bpp 无影响） */
+    {
+        uint32_t a = gw_cur_theme->accent;
+        outb(0x3C8, 0xF0);
+        outb(0x3C9, (uint8_t)((a >> 16) & 0xFF) >> 2);
+        outb(0x3C9, (uint8_t)((a >> 8) & 0xFF) >> 2);
+        outb(0x3C9, (uint8_t)(a & 0xFF) >> 2);
+        uint32_t d = (a * 3) / 4;   /* 暗一档 */
+        outb(0x3C8, 0xF1);
+        outb(0x3C9, (uint8_t)((d >> 16) & 0xFF) >> 2);
+        outb(0x3C9, (uint8_t)((d >> 8) & 0xFF) >> 2);
+        outb(0x3C9, (uint8_t)(d & 0xFF) >> 2);
+        uint32_t l = a + (0xFFFFFFu - a) / 3;   /* 亮一档 */
+        outb(0x3C8, 0xF2);
+        outb(0x3C9, (uint8_t)((l >> 16) & 0xFF) >> 2);
+        outb(0x3C9, (uint8_t)((l >> 8) & 0xFF) >> 2);
+        outb(0x3C9, (l & 0xFF) >> 2);
+    }
+    /* GUI 运行中切主题（Settings 点击 / shell theme 命令）：请求整屏重绘 */
+    if (gw_gui_active) gw_dirty = 1;
 }
-int gw_theme_count(void) { return 6; }
+int gw_theme_count(void) { return GW_THEME_COUNT; }
 const char *gw_theme_name(int index)
 {
-    if (index < 0 || index >= 6) return NULL;
+    if (index < 0 || index >= GW_THEME_COUNT) return NULL;
     return gw_themes[index].name;
 }
 
@@ -403,6 +437,73 @@ static void gw_cursor_restore_bg(void)
 }
 
 /* ==================================================================
+ * 游戏窗口双缓冲
+ * ------------------------------------------------------------------
+ * 游戏轮询循环调用 yield 的频率极高（每次无键可读都会 yield），旧实现
+ * 每次 yield 都直接在可见帧缓冲上"整窗清背景 -> 重绘"，无垂直同步时
+ * 扫描线恰好扫到清空阶段就看到整窗闪白，高速循环下表现为持续闪动看不清。
+ * 双缓冲：先把整窗画进离屏缓冲，再一次性顺序搬回 LFB（扫描线最多看到
+ * 一次完整新画面，不再出现清空阶段的空白）。
+ *
+ * 缓冲放在固定物理地址 16MB 处：内核加载于 0x10000、镜像仅 256KB，
+ * 若用 .bss 大数组会跨到 VGA 显存区（0xA0000）损坏硬件区域；
+ * 16MB 是 QEMU 默认内存内无人使用的空闲 DRAM。上限 1600x1200。
+ * ================================================================== */
+#define GW_BB_ADDR   0x1000000u    /* 16MB 空闲 DRAM */
+#define GW_BB_CAP    (1600u * 1200u)
+#define GW_BB_FPS_MS 16            /* 重绘节流：约 60FPS */
+
+static uint16_t *g_gw_bb = (uint16_t*)GW_BB_ADDR;
+static uint8_t *g_gw_real_fb = NULL;
+static uint32_t gw_game_last_draw_ms = 0;
+
+/* 进入离屏绘制：成功返回 1 并把 gfx_fb 切到后备缓冲，调用方随后用常规
+ * gw_ 与 gfx_ 系列接口以屏幕坐标绘制，绘制函数本身无需任何改动。
+ * 失败（8bpp 回退或分辨率超限）返回 0，调用方走旧直绘路径。 */
+static int gw_bb_begin(void)
+{
+    if (gfx_bpp != 2) return 0;
+    if ((uint32_t)GFX_W * (uint32_t)GFX_H > GW_BB_CAP) return 0;
+    g_gw_real_fb = gfx_fb;
+    gfx_fb = (uint8_t*)g_gw_bb;
+    return 1;
+}
+
+/* 退出离屏绘制，把 (x,y,w,h) 区域从后备缓冲一次性搬回真实 LFB */
+static void gw_bb_end(int x, int y, int w, int h)
+{
+    gfx_fb = g_gw_real_fb;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > GFX_W) w = GFX_W - x;
+    if (y + h > GFX_H) h = GFX_H - y;
+    if (w <= 0 || h <= 0) return;
+    uint16_t *dst = (uint16_t*)gfx_fb + (uint32_t)y * GFX_W + x;
+    uint16_t *src = g_gw_bb + (uint32_t)y * GFX_W + x;
+    for (int j = 0; j < h; j++) {
+        for (int i = 0; i < w; i++)
+            dst[(uint32_t)j * GFX_W + i] = src[(uint32_t)j * GFX_W + i];
+    }
+}
+
+/* 光标 16x16 是否完全落在窗口矩形内（决定画进离屏缓冲还是 blit 后直绘） */
+static int gw_cursor_in_win(gw_window_t *w, int mx, int my)
+{
+    return (mx >= w->x && my >= w->y &&
+            mx + 16 <= w->x + w->w && my + 16 <= w->y + w->h);
+}
+
+/* 旧光标（背景缓存位置）是否完全落在窗口内：
+ * 在窗口内则 blit 会覆盖其像素，无需手工擦除 */
+static int gw_cursor_old_in_win(gw_window_t *w)
+{
+    return (gw_cursor_bg_valid &&
+            gw_cursor_bg_x >= w->x && gw_cursor_bg_y >= w->y &&
+            gw_cursor_bg_x + 16 <= w->x + w->w &&
+            gw_cursor_bg_y + 16 <= w->y + w->h);
+}
+
+/* ==================================================================
  * 窗口表
  * ================================================================== */
 static gw_window_t gw_windows[GW_MAX_WINDOWS];
@@ -413,7 +514,8 @@ void gw_init(void)
     for (int i = 0; i < GW_MAX_WINDOWS; i++)
         gw_windows[i].used = 0;
     gw_focused_wnd = NULL;
-    gw_cur_theme = &gw_themes[0];
+    /* 恢复上次选择的主题（而非每次回桌面都重置为 Win10 Blue） */
+    gw_cur_theme = &gw_themes[gw_theme_sel];
     gw_accent = gw_cur_theme->accent;
     gw_bg_rgb = gw_cur_theme->bg_rgb;
 }
@@ -435,18 +537,56 @@ static int gw_taskbar_h(void)
     return 18;
 }
 
+/* ---- 主题布局几何：GNOME 主题任务栏在顶部，Win10 主题在底部 ---- */
+static int gw_theme_gnome(void) { return gw_cur_theme->style == 1; }
+
+/* 任务栏所在 y 起点（顶栏=0，底栏=GFX_H-th） */
+static int gw_taskbar_y(void)
+{
+    return gw_theme_gnome() ? 0 : GFX_H - gw_taskbar_h();
+}
+
+/* 鼠标是否在任务栏区域内 */
+static int gw_in_taskbar(int my)
+{
+    return gw_theme_gnome() ? (my < gw_taskbar_h())
+                            : (my >= GFX_H - gw_taskbar_h());
+}
+
+/* 桌面可用区（图标/窗口的活动范围） */
+static int gw_scale_x(int v);   /* 前置声明（定义在下方） */
+static int gw_desktop_top(void)    { return gw_theme_gnome() ? gw_taskbar_h() : 0; }
+static int gw_desktop_bottom(void) { return gw_theme_gnome() ? GFX_H : GFX_H - gw_taskbar_h(); }
+/* 桌面左右边界：GNOME 主题有左侧 Ubuntu Dock，窗口/图标不得进入 */
+static int gw_dock_w(void)         { return gw_theme_gnome() ? gw_scale_x(52) : 0; }
+static int gw_desktop_left(void)   { return gw_dock_w(); }
+static int gw_desktop_right(void)  { return GFX_W; }
+
+/* 任务栏上开始按钮右边界（其左为 Activities/start 按钮） */
+static int gw_tb_btn_x0(void) { return gw_theme_gnome() ? 92 : 48; }
+
 static int gw_scale_x(int v) { return GFX_W * v / 640; }
 static int gw_scale_y(int v) { return GFX_H * v / 480; }
+
+/* 开始菜单几何：Win10 从底栏上弹，GNOME 从顶栏下拉（绘制与命中检测共用） */
+static void gw_menu_rect(int *mx0, int *my0, int *mw, int *mh)
+{
+    int th = gw_taskbar_h();
+    *mw = gw_scale_x(300);
+    *mh = gw_desktop_bottom() - gw_desktop_top() - gw_scale_y(8);
+    *mx0 = gw_scale_x(6) + gw_desktop_left();   /* GNOME：避开左侧 Dock */
+    *my0 = gw_theme_gnome() ? th + 2 : GFX_H - th - *mh - 2;
+}
 
 gw_window_t *gw_create(const char *title, int x, int y, int w, int h, int flags)
 {
     if (w < gw_scale_x(120)) w = gw_scale_x(120);
     if (h < gw_scale_y(90)) h = gw_scale_y(90);
-    int max_h = GFX_H - gw_taskbar_h() - 4;
+    int max_h = gw_desktop_bottom() - 4;
     if (y + h > max_h) y = max_h - h;
-    if (y < 0) y = 0;
-    if (x + w > GFX_W - 4) x = GFX_W - w - 4;
-    if (x < 0) x = 0;
+    if (y < gw_desktop_top()) y = gw_desktop_top();
+    if (x + w > gw_desktop_right() - 4) x = gw_desktop_right() - w - 4;
+    if (x < gw_desktop_left()) x = gw_desktop_left();
     for (int i = 0; i < GW_MAX_WINDOWS; i++) {
         if (gw_windows[i].used) continue;
         gw_window_t *wnd = &gw_windows[i];
@@ -459,10 +599,14 @@ gw_window_t *gw_create(const char *title, int x, int y, int w, int h, int flags)
         wnd->flags = flags;
         wnd->moving = 0;
         wnd->minimized = 0;
+        wnd->maximized = 0;
+        wnd->save_x = x; wnd->save_y = y; wnd->save_w = w; wnd->save_h = h;
         wnd->draw = NULL; wnd->key = NULL; wnd->click = NULL; wnd->mousedown = NULL;
         wnd->user = NULL;
         int n = 0;
-        while (title[n] && n < GW_TITLE_MAX - 1) { wnd->title[n] = title[n]; n++; }
+        if (title) {
+            while (title[n] && n < GW_TITLE_MAX - 1) { wnd->title[n] = title[n]; n++; }
+        }
         wnd->title[n] = 0;
         gw_bring_front(wnd);
         return wnd;
@@ -483,6 +627,10 @@ void gw_minimize(gw_window_t *w)
     if (!w) return;
     w->hidden = 1;
     w->minimized = 1;
+    if (gw_focused_wnd == w) {
+        gw_focused_wnd = NULL;
+        w->focused = 0;
+    }
 }
 
 void gw_restore(gw_window_t *w)
@@ -493,10 +641,34 @@ void gw_restore(gw_window_t *w)
     gw_bring_front(w);
 }
 
+/* 最大化/还原切换：双击标题栏触发。
+ * 最大化 = 铺满桌面可用区（顶栏/底栏/Dock 之间的区域），还原 = 恢复保存的几何 */
+void gw_toggle_max(gw_window_t *w)
+{
+    if (!w) return;
+    if (!w->maximized) {
+        w->save_x = w->x; w->save_y = w->y;
+        w->save_w = w->w; w->save_h = w->h;
+        w->x = gw_desktop_left();
+        w->y = gw_desktop_top();
+        w->w = gw_desktop_right() - gw_desktop_left();
+        w->h = gw_desktop_bottom() - gw_desktop_top();
+        w->maximized = 1;
+    } else {
+        w->x = w->save_x; w->y = w->save_y;
+        w->w = w->save_w; w->h = w->save_h;
+        w->maximized = 0;
+    }
+    w->inner_w = w->w - 2;
+    w->inner_h = w->h - GW_TITLE_H - 1;
+    gw_bring_front(w);
+    gw_dirty = 1;
+}
+
 gw_window_t *gw_focused(void) { return gw_focused_wnd; }
 
 int gw_ox(gw_window_t *w) { return w->x + 1; }
-int gw_oy(gw_window_t *w) { return w->y + GW_TITLE_H; }
+int gw_oy(gw_window_t *w) { return w->y + GW_TITLE_H + 1; }
 
 /* ==================================================================
  * 窗口绘制
@@ -534,11 +706,21 @@ static int gw_title_btn_hit(gw_window_t *w, int mx, int my)
 static void gw_draw_window(gw_window_t *w)
 {
     int x = w->x, y = w->y, ww = w->w, hh = w->h;
-    int mx = mouse_get_x(), my = mouse_get_y();
 
-    /* 阴影（右下 3px 半透明黑） */
+    /* 阴影（右下 3px 半透明黑）——需读 LFB 原像素做 alpha 混合，
+     * 双缓冲路径（离屏）不能画，单独拆出 */
     gw_fill_rgba(x + 3, y + hh - 2, ww, 3, 0x000000u, 80);
     gw_fill_rgba(x + ww - 2, y + 3, 3, hh - 3, 0x000000u, 80);
+
+    gw_draw_window_body(w, 1);
+}
+
+/* 窗口主体：边框/标题栏/内容（with_content=0 时只画窗框和底色，
+ * 供游戏双缓冲路径先铺窗框再覆盖游戏画面） */
+static void gw_draw_window_body(gw_window_t *w, int with_content)
+{
+    int x = w->x, y = w->y, ww = w->w, hh = w->h;
+    int mx = mouse_get_x(), my = mouse_get_y();
 
     /* 边框 */
     gw_frame(x, y, ww, hh, CLR_BORDER);
@@ -577,7 +759,7 @@ static void gw_draw_window(gw_window_t *w)
     /* 内容区背景 */
     gw_fill(x + 1, y + GW_TITLE_H + 1, ww - 2, hh - GW_TITLE_H - 1, gw_bg_rgb);
 
-    if (w->draw && !w->hidden)
+    if (with_content && w->draw && !w->hidden)
         w->draw(w);
 }
 
@@ -592,17 +774,17 @@ int gw_start_menu_open(void) { return gw_start_menu_active; }
 static int gw_dirty = 1;
 static int gw_taskbar_dirty = 0;   /* 任务栏局部重绘请求（时钟分钟变化/交互时用） */
 
-/* 桌面图标：4 个系统应用 + 7 个游戏，正方形图标框、随分辨率网格自适应 */
-#define GW_DESK_ICONS 11
+/* 桌面图标：5 个系统应用 + 7 个游戏，正方形图标框、随分辨率网格自适应 */
+#define GW_DESK_ICONS 12
 static const char *gw_desktop_icon_names[GW_DESK_ICONS] = {
-    "This PC", "Recycle Bin", "Notepad", "Terminal",
+    "This PC", "Recycle Bin", "Notepad", "Terminal", "Paint",
     "Guess", "TicTac", "Snake", "2048", "Mines", "RPS", "Memory"
 };
 /* app>=0 启动应用；app==-1 启动 games 游戏（编号取 game 列） */
-static int gw_desktop_icon_app[GW_DESK_ICONS] = { 0, 0, 1, 6, -1, -1, -1, -1, -1, -1, -1 };
-static int gw_desktop_icon_game[GW_DESK_ICONS] = { 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7 };
+static int gw_desktop_icon_app[GW_DESK_ICONS] = { 0, 0, 1, 6, 7, -1, -1, -1, -1, -1, -1, -1 };
+static int gw_desktop_icon_game[GW_DESK_ICONS] = { 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7 };
 static uint32_t gw_desktop_icon_col[GW_DESK_ICONS] = {
-    0x0078D7u, 0x8A9BA8u, 0xF5B800u, 0x00CC44u,
+    0x0078D7u, 0x8A9BA8u, 0xF5B800u, 0x00CC44u, 0xE95420u,
     0xFF6A00u, 0x9C27B0u, 0x4CAF50u, 0xFF9800u, 0x607D8Bu, 0xE91E63u, 0x3F51B5u
 };
 
@@ -613,14 +795,67 @@ static int gw_desktop_icon_rect(int idx, int *ix, int *iy, int *iw, int *ih)
     int box = icon_sz + 26;                              /* 正方形（图标 40 + 名称区 26） */
     int gap = gw_scale_x(8);
     int cols = 4;
-    int x0 = gw_scale_x(8);
-    int y0 = gw_scale_y(10);
+    int x0 = gw_scale_x(8) + gw_desktop_left();          /* GNOME：避开左侧 Dock */
+    int y0 = gw_desktop_top() + gw_scale_y(10);          /* GNOME 顶栏下移，避开顶部栏 */
     int row = idx / cols, col = idx % cols;
     *ix = x0 + col * (box + gap);
     *iy = y0 + row * (box + gap);
     *iw = box; *ih = box;
-    if (*iy + box > GFX_H - gw_taskbar_h()) return 0;
+    if (*iy + box > gw_desktop_bottom()) return 0;
     return 1;
+}
+
+/* ---- Ubuntu Dock（GNOME 主题左侧竖排应用栏） ---- */
+static uint32_t gw_dock_col[GW_APP_COUNT] = {
+    0x0078D7u, 0xF5B800u, 0x607D8Bu, 0xE91E63u, 0x4CAF50u, 0x9C27B0u, 0x00CC44u, 0xFF6A00u
+};
+/* Dock 第 idx 个应用图标矩形（640x480 基准：52 宽栏内 36 图标，间距 48；
+ * 小分辨率自动压缩间距/图标，保证 8 个图标放得下） */
+static int gw_dock_icon_rect(int idx, int *ix, int *iy, int *isz)
+{
+    if (idx < 0 || idx >= GW_APP_COUNT) return 0;
+    int w = gw_dock_w();
+    int avail = gw_desktop_bottom() - gw_desktop_top() - gw_scale_y(12) - 4;
+    int sp = gw_scale_y(48);
+    if (sp < 20) sp = 20;
+    if (sp * GW_APP_COUNT > avail) sp = avail / GW_APP_COUNT;
+    int sz = gw_scale_x(36);
+    if (sz > sp - 6) sz = sp - 6;
+    if (sz < 8) sz = 8;
+    *isz = sz;
+    *ix = (w - sz) / 2;
+    *iy = gw_desktop_top() + gw_scale_y(12) + idx * sp + (sp - sz) / 4;
+    if (*iy + sz > gw_desktop_bottom() - 2) return 0;
+    return 1;
+}
+static int gw_dock_running(int app)
+{
+    for (int i = 0; i < GW_MAX_WINDOWS; i++)
+        if (gw_windows[i].used && (unsigned long)gw_windows[i].user == (unsigned long)app)
+            return 1;
+    return 0;
+}
+static void gw_draw_dock(void)
+{
+    int w = gw_dock_w();
+    if (w <= 0) return;
+    int mx = mouse_get_x(), my = mouse_get_y();
+    /* 栏体：深色半透明 + 右缘阴影线 */
+    gw_fill_rgba(0, gw_desktop_top(), w, GFX_H - gw_desktop_top(), 0x1D1D1Du, 235);
+    gw_fill(w - 1, gw_desktop_top(), 1, GFX_H - gw_desktop_top(), 0x0A0A0Au);
+    for (int i = 0; i < GW_APP_COUNT; i++) {
+        int ix, iy, sz;
+        if (!gw_dock_icon_rect(i, &ix, &iy, &sz)) break;
+        int hov = (mx >= ix && mx < ix + sz && my >= iy && my < iy + sz);
+        if (hov) gw_fill_rgba(ix - 2, iy - 2, sz + 4, sz + 4, 0xFFFFFFu, 30);
+        gw_fill(ix, iy, sz, sz, gw_dock_col[i]);
+        gw_frame(ix, iy, sz, sz, 0x333333u);
+        char ch[2] = { gw_app_names[i][0], 0 };
+        int ts = (sz >= 28) ? 2 : 1;                     /* 小分辨率退回 1x 字 */
+        gfx_draw_text_scaled(ix + (sz - 8 * ts) / 2, iy + (sz - 8 * ts) / 2, ch, 0x0F, -1, ts);
+        if (gw_dock_running(i))                          /* 运行指示：图标下方橙色圆点 */
+            gw_fill(ix + sz / 2 - 2, iy + sz + 2, 4, 4, 0xE95420u);
+    }
 }
 
 /* 名称按空格拆最多两行（1x 字体每行最多 10 字符，正方形框内可容纳） */
@@ -664,97 +899,178 @@ static void gw_draw_desktop_icon(int idx, int mx, int my)
         gfx_draw_text(ix + (iw - w2 * 8) / 2, ny + 9, l2, 0x0F, -1);
 }
 
+/* 整数平方根（牛顿法，freestanding 无 libm） */
+static long gw_isqrt(long v)
+{
+    if (v <= 0) return 0;
+    long x = v, y = (x + 1) / 2;
+    while (y < x) { x = y; y = (x + v / x) / 2; }
+    return x;
+}
+
 void gw_draw_desktop(void)
 {
-    /* Win10 默认深蓝渐变壁纸 */
-    gw_fill_vgrad(0, 0, GFX_W, GFX_H, 0x0C7BD5u, 0x063B66u);
-    /* 右下角水印 */
-    gfx_draw_text(GFX_W - gw_scale_x(60), GFX_H - gw_taskbar_h() - 12, "EZOS", 0x0F, 0x0B);
-    /* 桌面图标 */
     int mx = mouse_get_x(), my = mouse_get_y();
+
+    if (gw_theme_gnome()) {
+        /* Ubuntu 壁纸：aubergine 紫渐变 + 右下角橙色圆环（Ubuntu logo 风） */
+        gw_fill_vgrad(0, 0, GFX_W, GFX_H, 0x2C001Eu, 0x5E2750u);
+        int cx = GFX_W, cy = GFX_H;
+        long r1 = (long)GFX_W * 5 / 8;            /* 橙环外半径 */
+        long r2 = r1 - gw_scale_x(44);            /* 橙环内半径 */
+        long r12 = r1 * r1, r22 = r2 * r2;
+        for (int y = cy - (int)r1; y < cy; y++) { /* 圆心在右下角，只画屏内四分之一 */
+            if (y < 0) continue;
+            long dy = (long)(cy - y);
+            long rem1 = r12 - dy * dy;
+            if (rem1 <= 0) continue;
+            int hw1 = (int)gw_isqrt(rem1);        /* 橙盘行内半宽 */
+            int x0 = (int)cx - hw1;
+            if (x0 < 0) x0 = 0;
+            gw_fill(x0, y, (int)cx - x0, 1, 0xE95420u);
+            /* 内圆挖回壁纸渐变色（该行 vgrad 插值色） */
+            long rem2 = r22 - dy * dy;
+            if (rem2 > 0) {
+                int hw2 = (int)gw_isqrt(rem2);
+                int xi0 = (int)cx - hw2;
+                if (xi0 < 0) xi0 = 0;
+                if ((int)cx - xi0 > 0) {
+                    /* 行色 = lerp(top, bottom, y/(GFX_H-1))，与 vgrad 一致 */
+                    int a = y * 255 / (GFX_H - 1), ia = 255 - a;
+                    int tr = 0x2C, tg = 0x00, tb = 0x1E;
+                    int br = 0x5E, bg = 0x27, bb = 0x50;
+                    uint32_t c = (uint32_t)(((tr * ia + br * a) / 255) << 16)
+                               | (uint32_t)(((tg * ia + bg * a) / 255) << 8)
+                               | (uint32_t)(((tb * ia + bb * a) / 255));
+                    gw_fill(xi0, y, (int)cx - xi0, 1, c);
+                }
+            }
+        }
+    } else {
+        /* Win10 默认深蓝渐变壁纸 */
+        gw_fill_vgrad(0, 0, GFX_W, GFX_H, 0x0C7BD5u, 0x063B66u);
+    }
+    /* 右下角水印 */
+    gfx_draw_text(GFX_W - gw_scale_x(60), gw_desktop_bottom() - 12, "EZOS", 0x0F, 0x0B);
+    /* Ubuntu Dock（GNOME 主题） */
+    gw_draw_dock();
+    /* 桌面图标 */
     for (int i = 0; i < GW_DESK_ICONS; i++)
         gw_draw_desktop_icon(i, mx, my);
 }
 
-/* 任务栏 */
+/* 任务栏窗口按钮矩形：按绘制顺序返回第 btn_idx 个按钮的窗口与 x 宽度。
+ * 覆盖所有已用窗口（含最小化）；与 gw_draw_taskbar 绘制顺序一致，
+ * 供绘制与点击命中检测共用。返回 0 = 无此按钮 */
+static int gw_taskbar_btn_rect(int btn_idx, gw_window_t **pw, int *bx_out, int *tw_out)
+{
+    int bx = gw_tb_btn_x0();
+    /* GNOME 顶栏时钟居中：按钮区不得越过中央时钟左侧 */
+    int bx_max = gw_theme_gnome() ? GFX_W / 2 - gw_scale_x(60) : GFX_W - 90;
+    int n = 0;
+    for (int i = 0; i < GW_MAX_WINDOWS; i++) {
+        gw_window_t *w = &gw_windows[i];
+        if (!w->used) continue;
+        int tw = 8 + gw_strlen(w->title) * 8 + 8;
+        if (tw > gw_scale_x(180)) tw = gw_scale_x(180);
+        if (bx + tw > bx_max) break;
+        if (n == btn_idx) {
+            *pw = w; *bx_out = bx; *tw_out = tw;
+            return 1;
+        }
+        bx += tw + 4;
+        n++;
+    }
+    return 0;
+}
+
+/* 任务栏 / GNOME 顶栏 */
 void gw_draw_taskbar(void)
 {
     int th = gw_taskbar_h();
-    int ty = GFX_H - th;
-    /* 深色半透明底 */
-    gw_fill_rgba(0, ty, GFX_W, th, CLR_TASKBAR, 235);
-    gw_fill(0, ty, GFX_W, 1, 0x3A3A3Au);
+    int ty = gw_taskbar_y();
     int mx = mouse_get_x(), my = mouse_get_y();
 
-    /* 开始按钮：文字 start */
-    if (mx >= 4 && mx < 48 && my >= ty && my < GFX_H) {
-        gw_fill_rgba(4, ty + 1, 44, th - 2, 0xFFFFFFu, 26);
-        if (gw_start_menu_active) gw_fill_rgba(4, ty + 1, 44, th - 2, 0xFFFFFFu, 40);
+    if (gw_theme_gnome()) {
+        /* GNOME 顶栏：纯黑底 + 底边阴影线 */
+        gw_fill(0, ty, GFX_W, th, 0x000000u);
+        gw_fill(0, ty + th - 1, GFX_W, 1, 0x0A0A0Au);
+    } else {
+        /* Win10 底部任务栏：深色半透明底 */
+        gw_fill_rgba(0, ty, GFX_W, th, CLR_TASKBAR, 235);
+        gw_fill(0, ty, GFX_W, 1, 0x3A3A3Au);
     }
-    gfx_draw_text(6, ty + (th - 8) / 2, "start", 0x0F, GW_C_TASKBAR);
 
-    /* 任务按钮：非隐藏窗口 */
-    int bx = 48;
-    for (int i = 0; i < GW_MAX_WINDOWS; i++) {
-        gw_window_t *w = &gw_windows[i];
-        if (!w->used || w->hidden) continue;
-        int tw = 8 + gw_strlen(w->title) * 8 + 8;
-        if (tw > gw_scale_x(180)) tw = gw_scale_x(180);
-        if (bx + tw > GFX_W - 90) break;
-        int hov = (mx >= bx && mx < bx + tw && my >= ty);
-        if (w->focused) {
+    /* 开始按钮：Win10 "start" / GNOME "Activities" */
+    int bw = gw_tb_btn_x0() - 8;
+    int in_tb = gw_in_taskbar(my);
+    if (mx >= 4 && mx < 4 + bw && in_tb) {
+        if (gw_theme_gnome()) {
+            gw_fill_rgba(4, ty + 1, bw, th - 2, gw_start_menu_active ? 0xE95420u : 0xFFFFFFu,
+                         gw_start_menu_active ? 110 : 26);
+        } else {
+            gw_fill_rgba(4, ty + 1, bw, th - 2, 0xFFFFFFu, 26);
+            if (gw_start_menu_active) gw_fill_rgba(4, ty + 1, bw, th - 2, 0xFFFFFFu, 40);
+        }
+    }
+    gfx_draw_text(6, ty + (th - 8) / 2, gw_theme_gnome() ? "Activities" : "start",
+                  0x0F, GW_C_TASKBAR);
+
+    /* 任务按钮：所有窗口（最小化的暗显，可点击恢复） */
+    for (int btn = 0; ; btn++) {
+        gw_window_t *w;
+        int bx, tw;
+        if (!gw_taskbar_btn_rect(btn, &w, &bx, &tw)) break;
+        int hov = (mx >= bx && mx < bx + tw && in_tb);
+        if (w->focused && !w->hidden) {
             gw_fill(bx, ty + 1, tw, th - 2, 0x2A2A2Au);
-            gw_fill(bx, ty + th - 3, tw, 3, CLR_TASKBAR_AC);
+            /* 聚焦窗口：底边主题强调色指示条 */
+            gw_fill(bx, ty + th - 3, tw, 3, gw_accent);
+        } else if (w->hidden) {
+            gw_fill_rgba(bx, ty + 1, tw, th - 2, 0x000000u, 110);   /* 最小化：暗显 */
         } else if (hov) {
             gw_fill_rgba(bx, ty + 1, tw, th - 2, 0xFFFFFFu, 28);
         }
-        gfx_draw_text(bx + 8, ty + (th - 8) / 2, w->title, 0x0F, w->focused ? 0x08 : GW_C_TASKBAR);
-        bx += tw + 4;
+        gfx_draw_text(bx + 8, ty + (th - 8) / 2, w->title,
+                      w->hidden ? 0x08 : 0x0F,
+                      w->focused ? 0x08 : GW_C_TASKBAR);
     }
 
-    /* 时钟（右侧）HH:MM + 小通知图标 */
+    /* 时钟 HH:MM + 小通知图标（GNOME 居中，Win10 靠右） */
     uint8_t hour = (uint8_t)((gw_bcd(gw_cmos_read(0x04)) + 8) % 24);   /* UTC+8 */
     uint8_t minute = (uint8_t)gw_bcd(gw_cmos_read(0x02));
+    if (minute > 59) minute = 0;   /* CMOS 无效值（BCD 0xFF -> 105）clamp */
     char tbuf[8];
     tbuf[0] = '0' + hour / 10; tbuf[1] = '0' + hour % 10;
     tbuf[2] = ':';
     tbuf[3] = '0' + minute / 10; tbuf[4] = '0' + minute % 10;
     tbuf[5] = 0;
-    int tx = GFX_W - 52;
-    /* 通知区小图标 */
-    gw_fill(GFX_W - 24, ty + (th - 12) / 2, 12, 12, 0x2A2A2Au);
-    gw_frame(GFX_W - 24, ty + (th - 12) / 2, 12, 12, 0x555555u);
-    gw_fill(GFX_W - 19, ty + (th - 12) / 2 + 3, 4, 2, 0xAAAAAAu);
-    gw_fill(GFX_W - 19, ty + (th - 12) / 2 + 7, 4, 2, 0xAAAAAAu);
+    int tx = gw_theme_gnome() ? (GFX_W - 5 * 8) / 2 : GFX_W - 52;
+    if (!gw_theme_gnome()) {
+        /* 通知区小图标（仅 Win10 底栏） */
+        gw_fill(GFX_W - 24, ty + (th - 12) / 2, 12, 12, 0x2A2A2Au);
+        gw_frame(GFX_W - 24, ty + (th - 12) / 2, 12, 12, 0x555555u);
+        gw_fill(GFX_W - 19, ty + (th - 12) / 2 + 3, 4, 2, 0xAAAAAAu);
+        gw_fill(GFX_W - 19, ty + (th - 12) / 2 + 7, 4, 2, 0xAAAAAAu);
+    } else {
+        /* GNOME 右侧状态区：电量小块 */
+        gw_frame(GFX_W - 28, ty + (th - 10) / 2, 16, 10, 0x9A9A9Au);
+        gw_fill(GFX_W - 27, ty + (th - 10) / 2 + 1, 10, 8, 0x57C871u);
+        gw_fill(GFX_W - 12, ty + (th - 10) / 2 + 3, 2, 4, 0x9A9A9Au);
+    }
     gfx_draw_text(tx, ty + (th - 8) / 2, tbuf, 0x0F, GW_C_TASKBAR);
 }
 
 /* ==================================================================
- * 应用清单
+ * 开始菜单
  * ================================================================== */
-#define GW_APP_FILES    0
-#define GW_APP_NOTEPAD  1
-#define GW_APP_SYSINFO  2
-#define GW_APP_CLOCK    3
-#define GW_APP_SETTINGS 4
-#define GW_APP_ABOUT    5
-#define GW_APP_TERMINAL 6
-#define GW_APP_COUNT    7
-
-static const char *gw_app_names[GW_APP_COUNT] = {
-    "File Manager", "Notepad", "System Info", "Clock", "Settings", "About EZOS", "Terminal"
-};
-
-
 /* 开始菜单 */
 static int gw_menu_hover = -1;
 
 void gw_draw_start_menu(void)
 {
-    int th = gw_taskbar_h();
-    int mw = gw_scale_x(300);
-    int mh = GFX_H - th - gw_scale_y(8);
-    int mx0 = gw_scale_x(6), my0 = GFX_H - th - mh - 2;
+    int mw, mh, mx0, my0;
+    gw_menu_rect(&mx0, &my0, &mw, &mh);
     int mx = mouse_get_x(), my = mouse_get_y();
 
     /* 菜单底（深色半透明）+ 阴影 */
@@ -762,8 +1078,11 @@ void gw_draw_start_menu(void)
     gw_fill_rgba(mx0 + 3, my0 + mh - 2, mw, 3, 0x000000u, 90);
     gw_fill_rgba(mx0 + mw - 2, my0 + 3, 3, mh - 3, 0x000000u, 90);
 
-    /* 顶部用户区 */
-    gw_fill_vgrad(mx0, my0, mw, gw_scale_y(50), 0x0C7BD5u, 0x063B66u);
+    /* 顶部用户区（GNOME：Ubuntu 橙→紫渐变；Win10：蓝渐变） */
+    if (gw_theme_gnome())
+        gw_fill_vgrad(mx0, my0, mw, gw_scale_y(50), 0xE95420u, 0x77216Fu);
+    else
+        gw_fill_vgrad(mx0, my0, mw, gw_scale_y(50), 0x0C7BD5u, 0x063B66u);
     gw_fill(mx0 + 8, my0 + gw_scale_y(8), 24, 24, 0x3C3C3Cu);
     gw_frame(mx0 + 8, my0 + gw_scale_y(8), 24, 24, 0x555555u);
     gfx_draw_text(mx0 + 40, my0 + gw_scale_y(15), "EZOS User", 0x0F, 0x0B);
@@ -772,13 +1091,14 @@ void gw_draw_start_menu(void)
     int row_h = gw_scale_y(34);
     int list_y = my0 + gw_scale_y(54);
     int lw = mw - gw_scale_x(64);
+    uint32_t hov_rgb = gw_theme_gnome() ? 0xE95420u : 0xFFFFFFu;   /* hover 高亮色 */
     gw_menu_hover = -1;
-    for (int i = 0; i < 7; i++) {
+    for (int i = 0; i < GW_APP_COUNT; i++) {
         int ry = list_y + i * row_h;
         if (ry + row_h > my0 + mh - gw_scale_y(60)) break;
         int hov = (mx >= mx0 + 2 && mx < mx0 + lw && my >= ry && my < ry + row_h);
         if (hov) {
-            gw_fill_rgba(mx0 + 2, ry, lw - 4, row_h, 0xFFFFFFu, 30);
+            gw_fill_rgba(mx0 + 2, ry, lw - 4, row_h, hov_rgb, 30);
             gw_menu_hover = i;
         }
         /* 应用图标：彩色方块 + 首字母 */
@@ -789,6 +1109,8 @@ void gw_draw_start_menu(void)
         else if (i == 3) { icc = 0x1E8E3Eu; }
         else if (i == 4) { icc = 0x767676u; }
         else if (i == 5) { icc = 0x00CC44u; }
+        else if (i == 6) { icc = 0x2A2A2Au; }
+        else if (i == 7) { icc = 0xE95420u; }
         gw_fill(mx0 + 8, ry + (row_h - 18) / 2, 18, 18, icc);
         gw_fill(mx0 + 11, ry + (row_h - 18) / 2 + 4, 12, 10, 0xFFFFFFu);
         gfx_draw_text(mx0 + 33, ry + (row_h - 8) / 2, gw_app_names[i], 0x0F, hov ? 0x08 : GW_C_TASKBAR);
@@ -797,11 +1119,11 @@ void gw_draw_start_menu(void)
     }
 
     /* 底部：返回终端（点击退出 GUI 回内核 shell） */
-    int ry7 = list_y + 7 * row_h;
+    int ry7 = list_y + GW_APP_COUNT * row_h;
     if (ry7 + row_h <= my0 + mh - gw_scale_y(60)) {
         int hov7 = (mx >= mx0 + 2 && mx < mx0 + lw && my >= ry7 && my < ry7 + row_h);
         if (hov7) {
-            gw_fill_rgba(mx0 + 2, ry7, lw - 4, row_h, 0xFFFFFFu, 30);
+            gw_fill_rgba(mx0 + 2, ry7, lw - 4, row_h, hov_rgb, 30);
             gw_menu_hover = 6;
         }
         gw_fill(mx0 + 8, ry7 + (row_h - 18) / 2, 18, 18, 0x444444u);
@@ -814,7 +1136,7 @@ void gw_draw_start_menu(void)
     if (ry8 + row_h <= my0 + mh - gw_scale_y(60)) {
         int hov8 = (mx >= mx0 + 2 && mx < mx0 + lw && my >= ry8 && my < ry8 + row_h);
         if (hov8) {
-            gw_fill_rgba(mx0 + 2, ry8, lw - 4, row_h, 0xFFFFFFu, 30);
+            gw_fill_rgba(mx0 + 2, ry8, lw - 4, row_h, hov_rgb, 30);
             gw_menu_hover = 8;
         }
         gw_fill(mx0 + 8, ry8 + (row_h - 18) / 2, 18, 18, 0xFFB900u);
@@ -827,7 +1149,7 @@ void gw_draw_start_menu(void)
     if (ry9 + row_h <= my0 + mh - gw_scale_y(60)) {
         int hov9 = (mx >= mx0 + 2 && mx < mx0 + lw && my >= ry9 && my < ry9 + row_h);
         if (hov9) {
-            gw_fill_rgba(mx0 + 2, ry9, lw - 4, row_h, 0xFFFFFFu, 30);
+            gw_fill_rgba(mx0 + 2, ry9, lw - 4, row_h, hov_rgb, 30);
             gw_menu_hover = 9;
         }
         gw_fill(mx0 + 8, ry9 + (row_h - 18) / 2, 18, 18, 0xE81123u);
@@ -844,7 +1166,7 @@ void gw_draw_start_menu(void)
         int ry = sy0 + i * sh;
         if (ry + sh > my0 + mh - gw_scale_y(60)) break;   /* 与鼠标处理一致：仅绘制可视行 */
         int hov = (mx >= sx && mx < sx + sw && my >= ry && my < ry + sh);
-        if (hov) gw_fill_rgba(sx, ry, sw, sh, 0xFFFFFFu, 30);
+        if (hov) gw_fill_rgba(sx, ry, sw, sh, hov_rgb, 30);
         if (i == 0) {
             gw_draw_circle(sx + sw / 2, ry + sh / 2, 6, 0xCCCCCCu);
             gw_fill(sx + sw / 2 - 2, ry + sh / 2 - 2, 4, 4, 0x1B1B1Bu);
@@ -884,10 +1206,10 @@ static void gw_dirty_from_mouse(int mx, int my, int th)
 {
     if (gw_start_menu_active) {
         gw_draw_start_menu();
-        if (my >= GFX_H - th) gw_taskbar_dirty = 1;
+        if (gw_in_taskbar(my)) gw_taskbar_dirty = 1;
         return;
     }
-    if (my >= GFX_H - th) {
+    if (gw_in_taskbar(my)) {
         gw_last_in_taskbar = 1;
         gw_taskbar_dirty = 1;
         return;
@@ -940,7 +1262,7 @@ static void about_draw(gw_window_t *w);
 /* ==================================================================
  * 应用：文件管理器（exFAT）
  * ================================================================== */
-static exfat_dir_entry_t fm_entries[40];
+static fs_dir_entry_t fm_entries[40];
 static int fm_count = 0;
 static int fm_scroll = 0;
 static int fm_sel = 0;
@@ -952,33 +1274,33 @@ static int fm_file_scroll = 0;
 
 static void fm_refresh(void)
 {
-    fm_count = exfat_read_dir(fm_entries, 40);
+    fm_count = fs_read_dir(fm_entries, 40);
     if (fm_count < 0) fm_count = 0;
-    if (fm_scroll > fm_count) fm_scroll = 0;
-    if (fm_sel > fm_count) fm_sel = 0;
+    if (fm_scroll >= fm_count) fm_scroll = 0;
+    if (fm_sel >= fm_count) fm_sel = 0;
 }
 
 static void fm_enter(int idx)
 {
     if (idx < 0 || idx >= fm_count) return;
-    exfat_dir_entry_t *e = &fm_entries[idx];
+    fs_dir_entry_t *e = &fm_entries[idx];
     if (gw_strlen(e->name) == 2 && e->name[0] == '.' && e->name[1] == '.') {
-        exfat_change_dir("..");
+        fs_change_dir("..");
         fm_refresh();
         fm_scroll = 0; fm_sel = 0;
         return;
     }
     if (e->is_dir) {
-        if (exfat_change_dir(e->name) == 0) {
+        if (fs_change_dir(e->name) == 0) {
             fm_refresh();
             fm_scroll = 0; fm_sel = 0;
         }
         return;
     }
     /* 文件：读取内容进查看模式 */
-    uint32_t sz = exfat_get_file_size(e->name);
+    uint32_t sz = fs_get_file_size(e->name);
     if (sz > 2047) sz = 2047;
-    int ok = exfat_read_file(e->name, fm_file_buf, sz);
+    int ok = fs_read_file(e->name, fm_file_buf, sz);
     if (ok == 0) {
         fm_file_len = (int)sz;
         fm_file_scroll = 0;
@@ -995,7 +1317,7 @@ static void fm_back(void)
         fm_mode = 0;
         fm_file_len = 0;
     } else {
-        exfat_change_dir("..");
+        fs_change_dir("..");
         fm_refresh();
     }
 }
@@ -1009,7 +1331,7 @@ static void files_draw(gw_window_t *w)
     if (fm_mode == 0) {
         /* 地址栏 */
         gw_fill(ox, oy, iw, 16, 0x0078D7u);
-        gfx_draw_text(ox + 3, oy + 4, exfat_cwd_path(), 0x0F, GW_C_BLUE);
+        gfx_draw_text(ox + 3, oy + 4, fs_cwd_path(), 0x0F, GW_C_BLUE);
         int row_h = 16;
         int vis = (ih - 18) / row_h;
         if (vis < 1) vis = 1;
@@ -1019,7 +1341,7 @@ static void files_draw(gw_window_t *w)
             int idx = fm_scroll + r;
             if (idx >= fm_count) break;
             int ry = oy + 18 + r * row_h;
-            exfat_dir_entry_t *e = &fm_entries[idx];
+            fs_dir_entry_t *e = &fm_entries[idx];
             int hover = (mx >= ox && mx < ox + iw && my >= ry && my < ry + row_h);
             if (idx == fm_sel) {
                 gw_fill(ox, ry, iw, row_h, CLR_BLUE_SEL);
@@ -1132,6 +1454,66 @@ static void files_key(gw_window_t *w, int key)
 static char np_buf[NP_ROWS][NP_COLS + 1];
 static int np_row = 0, np_col = 0, np_scroll = 0;
 static int np_menu = 0;   /* 0=无菜单 1=File 2=Edit */
+static char np_fname[13] = "NOTE.TXT";   /* 当前文件名（8.3，exFAT 根目录） */
+static int np_dirty = 0;                 /* 有未保存修改 */
+
+/* 把文本缓冲载入记事本（Files 打开 .TXT / Open 菜单共用）。
+ * \n 换行、\r 忽略、控制字符替换为空格；超行/超宽截断。 */
+static void np_load_text(const char *name, const char *buf, int len)
+{
+    for (int r = 0; r < NP_ROWS; r++) np_buf[r][0] = 0;
+    int r = 0, c = 0;
+    for (int i = 0; i < len && r < NP_ROWS; i++) {
+        char ch = buf[i];
+        if (ch == '\r') continue;
+        if (ch == '\n') { r++; c = 0; continue; }
+        if ((unsigned char)ch < 32) ch = ' ';
+        if (c < NP_COLS) { np_buf[r][c++] = ch; np_buf[r][c] = 0; }
+    }
+    np_row = 0; np_col = 0; np_scroll = 0; np_dirty = 0;
+    int n = 0;
+    while (name[n] && n < 12) { np_fname[n] = name[n]; n++; }
+    np_fname[n] = 0;
+    /* 同步窗口标题 */
+    for (int i = 0; i < GW_MAX_WINDOWS; i++) {
+        gw_window_t *w = &gw_windows[i];
+        if (w->used && (unsigned long)w->user == GW_APP_NOTEPAD) {
+            int k = 0;
+            const char *p = "Notepad - ";
+            while (p[k] && k < GW_TITLE_MAX - 1) { w->title[k] = p[k]; k++; }
+            int j = 0;
+            while (np_fname[j] && k < GW_TITLE_MAX - 1) w->title[k++] = np_fname[j++];
+            w->title[k] = 0;
+        }
+    }
+}
+
+/* 保存：np_buf 序列化（每行追加 \n）后 exfat_create_file 覆盖写 */
+static void np_save(void)
+{
+    static uint8_t sbuf[NP_ROWS * (NP_COLS + 1) + 1];
+    int n = 0;
+    int lim = (int)sizeof(sbuf) - 1;
+    for (int r = 0; r < NP_ROWS; r++) {
+        for (int c = 0; np_buf[r][c] && n < lim; c++) sbuf[n++] = (uint8_t)np_buf[r][c];
+        if (n < lim) sbuf[n++] = '\n';
+    }
+    if (fs_create_file(np_fname, sbuf, (uint32_t)n) == 0)
+        np_dirty = 0;
+}
+
+/* 打开：读当前文件名文件载入（失败提示保留原内容） */
+static int np_open(void)
+{
+    static uint8_t rbuf[NP_ROWS * (NP_COLS + 1) + 1];
+    uint32_t sz = fs_get_file_size(np_fname);
+    if (sz == 0) return 0;                       /* 文件不存在 */
+    if (sz > sizeof(rbuf) - 1) sz = sizeof(rbuf) - 1;
+    if (fs_read_file(np_fname, rbuf, sz) != 0) return 0;
+    rbuf[sz] = 0;
+    np_load_text(np_fname, (const char *)rbuf, (int)sz);
+    return 1;
+}
 
 static void notepad_draw(gw_window_t *w)
 {
@@ -1142,6 +1524,15 @@ static void notepad_draw(gw_window_t *w)
     gw_fill(ox, oy + 14, iw, 1, 0xD0D0D0u);
     gfx_draw_text(ox + 4, oy + 3, "File", 0x00, np_menu == 1 ? 0x0E : 0x0F);
     gfx_draw_text(ox + 36, oy + 3, "Edit", 0x00, np_menu == 2 ? 0x0E : 0x0F);
+    /* 菜单栏右侧：文件名 + 修改标记 */
+    {
+        char fb[18];
+        int n = 0;
+        while (np_fname[n] && n < 12) { fb[n] = np_fname[n]; n++; }
+        if (np_dirty && n < 17) fb[n++] = '*';
+        fb[n] = 0;
+        gfx_draw_text(ox + iw - 8 * n - 4, oy + 3, fb, np_dirty ? 0x0E : 0x07, 0x0F);
+    }
     /* 文本区（先画，下拉菜单必须在其上，否则菜单被文本区背景覆盖） */
     gw_fill(ox, oy + 15, iw, ih - 15, CLR_EDIT_BG);
     int row_h = 10;
@@ -1163,11 +1554,13 @@ static void notepad_draw(gw_window_t *w)
     /* 下拉菜单（最后画，置顶显示） */
     if (np_menu == 1) {
         int my0 = oy + 14;
-        gw_fill(ox + 2, my0, 90, 2 * 16 + 2, 0xF0F0F0u);
+        gw_fill(ox + 2, my0, 90, 4 * 16 + 2, 0xF0F0F0u);
         gw_fill(ox + 2, my0, 90, 1, 0xD0D0D0u);
-        gw_fill(ox + 2, my0 + 32, 90, 1, 0xD0D0D0u);
-        gfx_draw_text(ox + 10, my0 + 4, "New", 0x00, 0x0F);
-        gfx_draw_text(ox + 10, my0 + 20, "Clear", 0x00, 0x0F);
+        gw_fill(ox + 2, my0 + 4 * 16, 90, 1, 0xD0D0D0u);
+        gfx_draw_text(ox + 10, my0 + 4,  "New",  0x00, 0x0F);
+        gfx_draw_text(ox + 10, my0 + 20, "Open", 0x00, 0x0F);
+        gfx_draw_text(ox + 10, my0 + 36, "Save", 0x00, 0x0F);
+        gfx_draw_text(ox + 10, my0 + 52, "Clear", 0x00, 0x0F);
     } else if (np_menu == 2) {
         int my0 = oy + 14;
         gw_fill(ox + 2, my0, 90, 2 * 16 + 2, 0xF0F0F0u);
@@ -1180,7 +1573,8 @@ static void notepad_draw(gw_window_t *w)
 
 static void notepad_key(gw_window_t *w, int key)
 {
-    (void)w;
+    int vis = (w->inner_h - 15) / 10;
+    if (vis < 1) vis = 1;
     if (key >= 32 && key < 127 && np_col < NP_COLS) {
         char *line = np_buf[np_row];
         int len = gw_strlen(line);
@@ -1205,12 +1599,12 @@ static void notepad_key(gw_window_t *w, int key)
         if (np_row < NP_ROWS - 1) {
             np_row++;
             np_col = 0;
-            if (np_row >= np_scroll + 10) np_scroll = np_row - 9;
+            if (np_row >= np_scroll + vis) np_scroll = np_row - vis + 1;
         }
     } else if (key == KEY_UP) {
         if (np_row > 0) { np_row--; if (np_row < np_scroll) np_scroll = np_row; }
     } else if (key == KEY_DOWN) {
-        if (np_row < NP_ROWS - 1) { np_row++; if (np_row >= np_scroll + 10) np_scroll = np_row - 9; }
+        if (np_row < NP_ROWS - 1) { np_row++; if (np_row >= np_scroll + vis) np_scroll = np_row - vis + 1; }
     } else if (key == KEY_LEFT) {
         if (np_col > 0) np_col--;
         else if (np_row > 0) { np_row--; np_col = gw_strlen(np_buf[np_row]); }
@@ -1231,11 +1625,22 @@ static void notepad_click(gw_window_t *w, int lx, int ly)
         else np_menu = 0;
         return;
     }
-    /* 下拉菜单项（宽 90 高 2*16） */
-    if (np_menu == 1 && lx >= 2 && lx < 92 && ly >= 14 && ly < 48) {
+    /* File 下拉菜单项（宽 90，4 项 x 16，与绘制高度 4*16+2 一致） */
+    if (np_menu == 1 && lx >= 2 && lx < 92 && ly >= 14 && ly < 14 + 4 * 16 + 2) {
         int item = (ly - 14) / 16;
-        if (item == 0) { np_row = 0; np_col = 0; np_scroll = 0; }
-        else if (item == 1) { for (int r = 0; r < NP_ROWS; r++) np_buf[r][0] = 0; np_row = 0; np_col = 0; np_scroll = 0; }
+        if (item == 0) {   /* New：清空并回到 NOTE.TXT */
+            for (int r = 0; r < NP_ROWS; r++) np_buf[r][0] = 0;
+            np_row = 0; np_col = 0; np_scroll = 0;
+            np_load_text("NOTE.TXT", "", 0);
+        } else if (item == 1) {   /* Open：读当前文件名（失败保留原内容） */
+            np_open();
+        } else if (item == 2) {   /* Save：序列化后 exFAT 覆盖写 */
+            np_save();
+        } else if (item == 3) {   /* Clear：仅清空缓冲，文件不变 */
+            for (int r = 0; r < NP_ROWS; r++) np_buf[r][0] = 0;
+            np_row = 0; np_col = 0; np_scroll = 0;
+            np_dirty = 1;
+        }
         np_menu = 0;
         return;
     }
@@ -1247,6 +1652,207 @@ static void notepad_click(gw_window_t *w, int lx, int ly)
         return;
     }
     np_menu = 0;   /* 点击其他区域：关闭菜单 */
+}
+
+/* ==================================================================
+ * 应用：画板（Paint）
+ * ================================================================== */
+#define PT_CW    240            /* 画布宽（实际像素） */
+#define PT_CH    160            /* 画布高 */
+#define PT_TB_W  26             /* 左侧工具栏宽 */
+#define PT_COLS  16             /* 调色板颜色数 */
+
+static uint8_t pt_canvas[PT_CW * PT_CH];       /* 画布：调色板索引（bss） */
+static const uint32_t pt_rgb[PT_COLS] = {
+    0x000000u, 0xFFFFFFu, 0xD80000u, 0xF5A800u, 0xF5E100u, 0x00A800u,
+    0x00C8C8u, 0x0055D4u, 0xC800C8u, 0x8A4B00u, 0x606060u, 0xB8B8B8u,
+    0x0A5A0Au, 0x101080u, 0x7020A0u, 0xFF90C8u
+};
+static int pt_color = 0;        /* 当前颜色索引 */
+static int pt_brush = 0;        /* 笔刷号 0/1/2 -> 直径 1/2/4 */
+static const int pt_brush_d[3] = { 1, 2, 4 };
+static int pt_eraser = 0;       /* 橡皮：画白色 */
+static int pt_init = 0;         /* 画布初始化标记 */
+static int pt_last_x = -1, pt_last_y = -1;   /* 上一笔位置（画布坐标，-1=提笔） */
+
+/* 找到 Paint 窗口（单实例） */
+static gw_window_t *pt_win(void)
+{
+    for (int i = 0; i < GW_MAX_WINDOWS; i++)
+        if (gw_windows[i].used &&
+            (unsigned long)gw_windows[i].user == (unsigned long)GW_APP_PAINT)
+            return &gw_windows[i];
+    return NULL;
+}
+
+/* 画布坐标 -> 屏幕坐标（内容区逻辑坐标：画布左上角在 (PT_TB_W+3, 3)） */
+#define PT_CX0  (PT_TB_W + 3)
+#define PT_CY0  3
+
+/* 画一个笔刷点：写画布 + 直写屏幕（拖画即时反馈，不经全屏重绘） */
+static void pt_plot(int cx, int cy)
+{
+    if (cx < 0 || cy < 0 || cx >= PT_CW || cy >= PT_CH) return;
+    int idx = pt_eraser ? 1 : pt_color;   /* 1=白色 */
+    int d = pt_brush_d[pt_brush];
+    gw_window_t *w = pt_win();
+    if (!w) return;
+    int sx = gw_ox(w) + PT_CX0, sy = gw_oy(w) + PT_CY0;
+    int r = d / 2;
+    for (int j = -r; j <= (d - 1 - r); j++) {
+        for (int i = -r; i <= (d - 1 - r); i++) {
+            int px = cx + i, py = cy + j;
+            if (px < 0 || py < 0 || px >= PT_CW || py >= PT_CH) continue;
+            pt_canvas[py * PT_CW + px] = (uint8_t)idx;
+            gw_px(sx + px, sy + py, pt_rgb[idx]);
+        }
+    }
+}
+
+/* 画布坐标 Bresenham 连线（拖动画出连续笔画） */
+static void pt_line(int x0, int y0, int x1, int y1)
+{
+    int dx = x1 > x0 ? x1 - x0 : x0 - x1;
+    int dy = y1 > y0 ? y1 - y0 : y0 - y1;
+    int sx = x0 < x1 ? 1 : -1;
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx - dy;
+    for (;;) {
+        pt_plot(x0, y0);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 > -dy) { err -= dy; x0 += sx; }
+        if (e2 < dx)  { err += dx; y0 += sy; }
+    }
+}
+
+static void paint_draw(gw_window_t *w)
+{
+    int ox = gw_ox(w), oy = gw_oy(w);
+    int ih = w->inner_h;
+
+    /* 工具栏底 + 分隔线 */
+    gw_fill(ox, oy, PT_TB_W, ih, 0xE8E8E8u);
+    gw_fill(ox + PT_TB_W, oy, 1, ih, 0xC8C8C8u);
+
+    /* 16 色块：2 列 x 8 行，8x8 间距 10 */
+    for (int i = 0; i < PT_COLS; i++) {
+        int cx = ox + 3 + (i % 2) * 10;
+        int cy = oy + 3 + (i / 2) * 10;
+        gw_fill(cx, cy, 8, 8, pt_rgb[i]);
+        if (i == pt_color && !pt_eraser)
+            gw_frame(cx - 1, cy - 1, 10, 10, 0x0078D7u);
+    }
+
+    /* 笔刷粗细：3 个按钮（直径 1/2/4 的示意点） */
+    for (int i = 0; i < 3; i++) {
+        int by = oy + 85 + i * 12;
+        gw_fill(ox + 3, by, 20, 11, 0xF3F3F3u);
+        gw_frame(ox + 3, by, 20, 11, 0xC8C8C8u);
+        int d = pt_brush_d[i];
+        int mxp = ox + 13 - d / 2, myp = by + 5 - d / 2;
+        gw_fill(mxp, myp, d, d, 0x333333u);
+        if (i == pt_brush) gw_frame(ox + 2, by - 1, 22, 13, 0x0078D7u);
+    }
+
+    /* 橡皮 / 清空按钮 */
+    {
+        int by = oy + 85 + 3 * 12 + 2;
+        gw_fill(ox + 3, by, 20, 11, pt_eraser ? 0x0078D7u : 0xF3F3F3u);
+        gw_frame(ox + 3, by, 20, 11, 0xC8C8C8u);
+        gfx_draw_text(ox + 8, by + 2, "E", pt_eraser ? 0x0F : 0x00,
+                      pt_eraser ? (uint8_t)GW_C_BLUE : (uint8_t)0x0F);
+        by += 13;
+        gw_fill(ox + 3, by, 20, 11, 0xF3F3F3u);
+        gw_frame(ox + 3, by, 20, 11, 0xC8C8C8u);
+        gfx_draw_text(ox + 8, by + 2, "C", 0x00, 0x0F);
+    }
+
+    /* 画布边框 + 整幅 blit（重绘时从画布恢复） */
+    gw_frame(ox + PT_TB_W + 2, oy + 2, PT_CW + 2, PT_CH + 2, 0x808080u);
+    int x0 = ox + PT_CX0, y0 = oy + PT_CY0;
+    for (int y = 0; y < PT_CH; y++) {
+        for (int x = 0; x < PT_CW; x++) {
+            uint32_t rgb = pt_rgb[pt_canvas[y * PT_CW + x]];
+            if (gfx_bpp == 2)
+                ((uint16_t*)gfx_fb)[(y0 + y) * GFX_W + x0 + x] =
+                    gw_rgb565((uint8_t)(rgb >> 16), (uint8_t)(rgb >> 8), (uint8_t)rgb);
+            else
+                gfx_putpixel(x0 + x, y0 + y, gw_idx_near(rgb));
+        }
+    }
+}
+
+/* 工具栏命中：lx<PT_TB_W。返回 1=已处理 */
+static int pt_toolbar_click(int lx, int ly)
+{
+    if (lx >= PT_TB_W) return 0;
+    if (ly >= 3 && ly < 3 + 8 * 10) {          /* 色块区 */
+        int row = (ly - 3) / 10, col = (lx - 3) / 10;
+        if (col >= 0 && col < 2 && lx >= 3 && lx < 3 + 2 * 10) {
+            pt_color = row * 2 + col;
+            if (pt_color >= PT_COLS) pt_color = PT_COLS - 1;
+            pt_eraser = 0;
+            return 1;
+        }
+    }
+    if (ly >= 85 && ly < 85 + 3 * 12) {        /* 笔刷区 */
+        pt_brush = (ly - 85) / 12;
+        if (pt_brush > 2) pt_brush = 2;
+        return 1;
+    }
+    if (ly >= 85 + 3 * 12 + 2 && ly < 85 + 3 * 12 + 2 + 11) {
+        pt_eraser = !pt_eraser;                /* E：橡皮开关 */
+        return 1;
+    }
+    if (ly >= 85 + 3 * 12 + 2 + 13 && ly < 85 + 3 * 12 + 2 + 13 + 11) {
+        for (int i = 0; i < PT_CW * PT_CH; i++) pt_canvas[i] = 1;   /* C：清空为白 */
+        gw_dirty = 1;
+        return 1;
+    }
+    return 1;   /* 工具栏空白：吞掉点击 */
+}
+
+static void paint_mousedown(gw_window_t *w, int lx, int ly)
+{
+    (void)w;
+    if (pt_toolbar_click(lx, ly)) { pt_last_x = -1; return; }
+    pt_last_x = lx - PT_CX0;
+    pt_last_y = ly - PT_CY0;
+    pt_plot(pt_last_x, pt_last_y);
+}
+
+static void paint_mousemove(gw_window_t *w, int lx, int ly)
+{
+    (void)w;
+    if (!(mouse_get_buttons() & 1)) {   /* 未按左键：提笔 */
+        pt_last_x = -1;
+        return;
+    }
+    if (lx < PT_TB_W) { pt_last_x = -1; return; }   /* 拖进工具栏：断笔 */
+    int cx = lx - PT_CX0, cy = ly - PT_CY0;
+    if (pt_last_x < 0) {              /* 从画布外按下后拖入：从当前点起笔 */
+        pt_last_x = cx; pt_last_y = cy;
+        pt_plot(cx, cy);
+        return;
+    }
+    pt_line(pt_last_x, pt_last_y, cx, cy);
+    pt_last_x = cx; pt_last_y = cy;
+}
+
+static void paint_key(gw_window_t *w, int key)
+{
+    (void)w;
+    if (key == 'c' || key == 'C') {
+        for (int i = 0; i < PT_CW * PT_CH; i++) pt_canvas[i] = 1;
+        gw_dirty = 1;
+    } else if (key == 'e' || key == 'E') {
+        pt_eraser = !pt_eraser;
+        gw_dirty = 1;
+    } else if (key >= '1' && key <= '3') {
+        pt_brush = key - '1';
+        gw_dirty = 1;
+    }
 }
 
 /* ==================================================================
@@ -1341,6 +1947,41 @@ static void sysinfo_draw(gw_window_t *w)
         (void)conv;
         y += 24;
     }
+    /* 运行时长（PIT 毫秒计数 -> mm:ss，每秒自动刷新） */
+    {
+        uint32_t up = g_pit_ticks / 1000;
+        char buf[40];
+        int n = 0;
+        const char *p = "Uptime: ";
+        while (*p && n < 39) buf[n++] = *p++;
+        uint32_t mm = up / 60, ss = up % 60;
+        if (mm > 0) {
+            if (mm >= 100) { buf[n++] = '0' + (mm / 100) % 10; mm %= 100; }
+            if (mm >= 10) buf[n++] = '0' + (mm / 10) % 10;
+            buf[n++] = '0' + mm % 10;
+            buf[n++] = 'm';
+        }
+        buf[n++] = '0' + (ss / 10) % 10;
+        buf[n++] = '0' + ss % 10;
+        buf[n++] = 's';
+        buf[n] = 0;
+        gfx_draw_text(ox + 4, y, buf, 0x00, 0x0F);
+        y += 12;
+    }
+    /* 打开窗口数 */
+    {
+        char buf[40];
+        int n = 0;
+        const char *p = "Windows open: ";
+        while (*p && n < 39) buf[n++] = *p++;
+        int cnt = 0;
+        for (int i = 0; i < GW_MAX_WINDOWS; i++)
+            if (gw_windows[i].used && !gw_windows[i].hidden) cnt++;
+        buf[n++] = '0' + cnt;
+        buf[n] = 0;
+        gfx_draw_text(ox + 4, y, buf, 0x00, 0x0F);
+        y += 12;
+    }
     /* 其余静态行 */
     for (int i = 4; i < 10; i++) {
         gfx_draw_text(ox + 4, y, lines[i], 0x00, 0x0F);
@@ -1365,6 +2006,13 @@ static void clock_draw(gw_window_t *w)
     uint8_t second = (uint8_t)gw_bcd(gw_cmos_read(0x00));
     uint8_t day = (uint8_t)gw_bcd(gw_cmos_read(0x07));
     uint8_t month = (uint8_t)gw_bcd(gw_cmos_read(0x08));
+    /* CMOS 无效值（如全 0xFF，BCD 解码可到 105）clamp 到合法范围，
+     * 防止 second/minute 超过 59 越界读 gw_sin128/gw_cos128（仅 60 项） */
+    if (hour > 23) hour = 0;
+    if (minute > 59) minute = 0;
+    if (second > 59) second = 0;
+    if (day < 1 || day > 31) day = 1;
+    if (month < 1 || month > 12) month = 1;
 
     gw_draw_circle(cx, cy, r, 0x333333u);
     gw_draw_circle(cx, cy, r - 1, 0x333333u);
@@ -1417,7 +2065,7 @@ static void settings_draw(gw_window_t *w)
     gfx_draw_text(ox + 4, oy + 4, "Settings", 0x00, 0x0F);
     gfx_draw_text(ox + 4, oy + 18, "Theme (click to switch):", 0x00, 0x0F);
     int row_h = 18;
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < GW_THEME_COUNT; i++) {
         int ry = oy + 30 + i * row_h;
         const char *nm = gw_theme_name(i);
         int hover = (mx >= ox && mx < ox + iw && my >= ry && my < ry + row_h);
@@ -1431,9 +2079,9 @@ static void settings_draw(gw_window_t *w)
             gfx_draw_text(ox + 6, ry + 5, nm, 0x00, 0x0F);
         }
     }
-    int mrow = 30 + 6 * row_h + 18;
-    gfx_draw_text(ox + 4, oy + 30 + 6 * row_h + 6, "Resolution: auto-adaptive", 0x07, 0x0F);
-    gfx_draw_text(ox + 4, oy + 30 + 6 * row_h + 18, "Mouse speed (click to cycle):", 0x07, 0x0F);
+    int mrow = 30 + GW_THEME_COUNT * row_h + 18;
+    gfx_draw_text(ox + 4, oy + 30 + GW_THEME_COUNT * row_h + 6, "Resolution: auto-adaptive", 0x07, 0x0F);
+    gfx_draw_text(ox + 4, oy + 30 + GW_THEME_COUNT * row_h + 18, "Mouse speed (click to cycle):", 0x07, 0x0F);
     {
         char mb[24];
         int v = settings_mspeed / 64 - 1;
@@ -1450,13 +2098,13 @@ static void settings_click(gw_window_t *w, int lx, int ly)
 {
     (void)w;
     int row = (ly - 30) / 18;
-    if (row >= 0 && row < 6) {
+    if (row >= 0 && row < GW_THEME_COUNT) {
         settings_theme = row;
         gw_set_theme(row);
         return;
     }
     /* 鼠标速度行：y = 30 + 6*18 起 36px 高（覆盖条带与文字，避免点击文字无反应） */
-    if (ly >= 30 + 6 * 18 && ly < 30 + 6 * 18 + 36) {
+    if (ly >= 30 + GW_THEME_COUNT * 18 && ly < 30 + GW_THEME_COUNT * 18 + 36) {
         settings_mspeed += 64;
         if (settings_mspeed > 448) settings_mspeed = 64;
         mouse_set_sensitivity(settings_mspeed);
@@ -1498,6 +2146,7 @@ static gw_window_t *gw_spawn_app(int idx)
     case GW_APP_CLOCK:    ww = gw_scale_x(200); wh = gw_scale_y(240); break;
     case GW_APP_SETTINGS: ww = gw_scale_x(340); wh = gw_scale_y(300); break;
     case GW_APP_ABOUT:    ww = gw_scale_x(320); wh = gw_scale_y(180); break;
+    case GW_APP_PAINT:    ww = PT_TB_W + PT_CW + 8; wh = PT_CH + GW_TITLE_H + 7; break;
     default: break;
     }
     gw_window_t *w = gw_create(title, wx, wy, ww, wh, flags);
@@ -1527,12 +2176,20 @@ static gw_window_t *gw_spawn_app(int idx)
     case GW_APP_TERMINAL:
         w->draw = term_draw;
         w->key = term_key;
-        shell_set_user_mode(1);   /* Terminal 即用户 shell */
         if (term_nrows == 0) {
             term_print("EZOS Terminal - type 'help' for commands");
             term_newline();
         }
         term_prompt();   /* 打印 "> " 提示符，输入从提示符后开始 */
+        break;
+    case GW_APP_PAINT:
+        w->draw = paint_draw; w->key = paint_key;
+        w->mousedown = paint_mousedown; w->mousemove = paint_mousemove;
+        if (!pt_init) {   /* 首次启动：画布初始化为白色 */
+            for (int i = 0; i < PT_CW * PT_CH; i++) pt_canvas[i] = 1;
+            pt_init = 1;
+        }
+        pt_last_x = -1;
         break;
     default:
         break;
@@ -1564,10 +2221,8 @@ static int gw_quit = 0;
 static int gw_start_menu_mouse(int mx, int my, int buttons)
 {
     if (!gw_start_menu_active) return 0;
-    int th = gw_taskbar_h();
-    int mw = gw_scale_x(300);
-    int mh = GFX_H - th - gw_scale_y(8);
-    int mx0 = gw_scale_x(6), my0 = GFX_H - th - mh - 2;
+    int mw, mh, mx0, my0;
+    gw_menu_rect(&mx0, &my0, &mw, &mh);
     if (mx < mx0 || mx >= mx0 + mw || my < my0 || my >= my0 + mh) {
         /* 点击菜单外：关闭菜单（若点击任务栏由桌面层处理，这里交给调用方） */
         return 0;
@@ -1580,17 +2235,17 @@ static int gw_start_menu_mouse(int mx, int my, int buttons)
     if (mx < mx0 + lw) {
         int i = (my - list_y) / row_h;
         /* 与绘制一致：仅响应已绘制的行，避免小分辨率下菜单未绘制的底部区域误触关机/重启 */
-        int max_row = 9;
+        int max_row = GW_APP_COUNT + 2;
         if (i >= 0 && i <= max_row && my >= list_y &&
             list_y + (i + 1) * row_h <= my0 + mh - gw_scale_y(60)) {
             gw_start_menu_active = 0;
-            if (i < 7)
-                gw_launch_app(i);   /* 0..6 应用（含 Terminal=6） */
-            else if (i == 7)
+            if (i < GW_APP_COUNT)
+                gw_launch_app(i);   /* 0..7 应用（含 Terminal=6、Paint=7） */
+            else if (i == GW_APP_COUNT)
                 gw_quit = 1;   /* 返回终端：退出 GUI 回内核 shell */
-            else if (i == 8)
+            else if (i == GW_APP_COUNT + 1)
                 system_reboot();   /* 重启：键盘控制器 8042 复位 */
-            else if (i == 9)
+            else if (i == GW_APP_COUNT + 2)
                 system_shutdown();   /* 关机：ACPI 电源事件 */
         }
     } else {
@@ -1618,12 +2273,11 @@ int gw_handle_desktop_mouse(int mx, int my, int buttons)
      * 避免第二次点击被上一次的按下状态吞掉（开关开始菜单/最小化恢复失效的根因） */
     static int prev_btn = 0;
     static int tbtn_prev = 0;
-    int th = gw_taskbar_h();
-    if (my >= GFX_H - th) {
+    if (gw_in_taskbar(my)) {
         /* 开始菜单内优先 */
         if (gw_start_menu_mouse(mx, my, buttons)) return 1;
         /* 开始按钮（优先于“任务栏其他区域关闭菜单”，避免按住 start 时菜单被误关） */
-        if (mx < 48) {
+        if (mx < gw_tb_btn_x0()) {
             if ((buttons & 1) && !(prev_btn & 1))
                 gw_start_menu_active = !gw_start_menu_active;
             prev_btn = buttons;
@@ -1633,23 +2287,19 @@ int gw_handle_desktop_mouse(int mx, int my, int buttons)
         if (gw_start_menu_active && (buttons & 1))
             gw_start_menu_active = 0;
         prev_btn = 0;   /* 不在开始按钮上：清除按下状态 */
-        /* 任务按钮 */
-        int bx = 48;
-        for (int i = 0; i < GW_MAX_WINDOWS; i++) {
-            gw_window_t *w = &gw_windows[i];
-            if (!w->used || w->hidden) continue;
-            int tw = 8 + gw_strlen(w->title) * 8 + 8;
-            if (tw > gw_scale_x(180)) tw = gw_scale_x(180);
-            if (bx + tw > GFX_W - 90) break;
+        /* 任务按钮：与 gw_draw_taskbar 绘制顺序一致（含最小化窗口），
+         * 点击聚焦窗口=最小化，点击非聚焦/最小化窗口=恢复置顶 */
+        for (int btn = 0; ; btn++) {
+            gw_window_t *w; int bx, tw;
+            if (!gw_taskbar_btn_rect(btn, &w, &bx, &tw)) break;
             if (mx >= bx && mx < bx + tw) {
                 if ((buttons & 1) && !(tbtn_prev & 1)) {
-                    if (w->focused) gw_minimize(w);
-                    else gw_restore(w);
+                    if (w->focused && !w->hidden) gw_minimize(w);
+                    else { gw_restore(w); gw_bring_front(w); }
                 }
                 tbtn_prev = buttons;
                 return 1;
             }
-            bx += tw + 4;
         }
         tbtn_prev = 0;   /* 不在任务按钮上：清除按下状态 */
         /* 时钟区：无操作 */
@@ -1658,6 +2308,22 @@ int gw_handle_desktop_mouse(int mx, int my, int buttons)
     /* 鼠标不在任务栏：复位按钮状态 */
     prev_btn = 0;
     tbtn_prev = 0;
+    /* Ubuntu Dock（GNOME 主题）：左侧竖排应用图标，点击启动/恢复 */
+    if (gw_theme_gnome() && mx < gw_dock_w() && my >= gw_desktop_top()) {
+        static int dock_prev = 0;
+        if ((buttons & 1) && !(dock_prev & 1)) {
+            for (int i = 0; i < GW_APP_COUNT; i++) {
+                int ix, iy, sz;
+                if (!gw_dock_icon_rect(i, &ix, &iy, &sz)) break;
+                if (mx >= ix && mx < ix + sz && my >= iy && my < iy + sz) {
+                    gw_launch_app(i);
+                    break;
+                }
+            }
+        }
+        dock_prev = buttons;
+        return 1;
+    }
     return 0;
 }
 
@@ -1671,13 +2337,36 @@ void gw_handle_mouse(int mx, int my, int buttons)
     int released = !(buttons & 1) && (last_btn & 1);
 
     /* 开始菜单打开时：菜单区域点击优先交给菜单处理（应用项 / 返回终端 / 设置 / 电源） */
-    if (gw_start_menu_active && my < GFX_H - gw_taskbar_h()) {
+    if (gw_start_menu_active && !gw_in_taskbar(my)) {
         if (gw_start_menu_mouse(mx, my, buttons)) { last_btn = buttons; return; }
         if (pressed) gw_start_menu_active = 0;   /* 点击菜单外桌面（按下沿）：关闭菜单 */
     }
 
-    /* 桌面图标点击（被窗口覆盖的图标不参与，避免窗口区域点击被图标截走） */
-    if (my < GFX_H - gw_taskbar_h()) {
+    /* 任务栏区域：开始按钮开关菜单 + 窗口按钮切换（聚焦窗口点击=最小化，
+     * 非聚焦/最小化窗口点击=恢复置顶） */
+    if (gw_in_taskbar(my)) {
+        if (pressed) {
+            if (mx >= 4 && mx < gw_tb_btn_x0()) {
+                gw_start_menu_active = !gw_start_menu_active;
+            } else {
+                for (int btn = 0; ; btn++) {
+                    gw_window_t *w; int bx, tw;
+                    if (!gw_taskbar_btn_rect(btn, &w, &bx, &tw)) break;
+                    if (mx >= bx && mx < bx + tw) {
+                        if (w->focused && !w->hidden) gw_minimize(w);
+                        else { gw_restore(w); gw_bring_front(w); }
+                        break;
+                    }
+                }
+            }
+            gw_dirty = 1;
+        }
+        last_btn = buttons;
+        return;
+    }
+
+    /* 桌面图标双击启动（被窗口覆盖的图标不参与，避免窗口区域点击被图标截走） */
+    if (!gw_in_taskbar(my)) {
         int hit_icon = 0;
         for (int i = 0; i < GW_DESK_ICONS; i++) {
             int ix, iy, iw, ih;
@@ -1686,10 +2375,20 @@ void gw_handle_mouse(int mx, int my, int buttons)
                 if (gw_icon_covered(ix, iy, iw, ih)) continue;   /* 被窗口覆盖：跳过图标，交给窗口命中 */
                 hit_icon = 1;
                 if (pressed) {
-                    if (gw_desktop_icon_app[i] >= 0)
-                        gw_launch_app(gw_desktop_icon_app[i]);
-                    else
-                        gw_launch_game(gw_desktop_icon_game[i]);
+                    /* 双击判定：400ms 内两次按下同一图标才启动 */
+                    static uint32_t last_ico_tick = 0;
+                    static int last_ico_idx = -1;
+                    uint32_t now = g_pit_ticks;
+                    if (i == last_ico_idx && now - last_ico_tick < 400) {
+                        last_ico_idx = -1;
+                        if (gw_desktop_icon_app[i] >= 0)
+                            gw_launch_app(gw_desktop_icon_app[i]);
+                        else
+                            gw_launch_game(gw_desktop_icon_game[i]);
+                    } else {
+                        last_ico_idx = i;
+                        last_ico_tick = now;
+                    }
                 }
                 break;
             }
@@ -1742,6 +2441,20 @@ void gw_handle_mouse(int mx, int my, int buttons)
     }
 
     if (my < hit->y + GW_TITLE_H) {
+        /* 标题栏双击：最大化/还原（400ms 内两次按下同一窗口标题栏） */
+        static uint32_t last_title_tick = 0;
+        static gw_window_t *last_title_wnd = NULL;
+        if (pressed) {
+            uint32_t now = g_pit_ticks;
+            if (hit == last_title_wnd && now - last_title_tick < 400) {
+                gw_toggle_max(hit);
+                last_title_wnd = NULL;   /* 防三击连触发 */
+                last_btn = buttons;
+                return;
+            }
+            last_title_tick = now;
+            last_title_wnd = hit;
+        }
         /* 标题栏拖动：实时跟随——拖动中直接更新窗口位置，主循环合并区域重绘 */
         if (buttons & 1) {
             if (!hit->moving) {
@@ -1751,15 +2464,15 @@ void gw_handle_mouse(int mx, int my, int buttons)
                 hit->ghost_x = hit->x;   /* 记录上一帧位置，供主循环区域重绘 */
                 hit->ghost_y = hit->y;
             }
-            if (!(hit->flags & GW_F_MOVABLE)) {
+            if (!(hit->flags & GW_F_MOVABLE) || hit->maximized) {
                 hit->moving = 0;
             } else {
                 int nx = mx - hit->move_dx;
                 int ny = my - hit->move_dy;
-                if (nx < 0) nx = 0;
-                if (ny < 0) ny = 0;
-                if (ny + hit->h > GFX_H - gw_taskbar_h()) ny = GFX_H - gw_taskbar_h() - hit->h;
-                if (nx + hit->w > GFX_W) nx = GFX_W - hit->w;
+                if (ny + hit->h > gw_desktop_bottom()) ny = gw_desktop_bottom() - hit->h;
+                if (nx + hit->w > gw_desktop_right()) nx = gw_desktop_right() - hit->w;
+                if (nx < gw_desktop_left()) nx = gw_desktop_left();
+                if (ny < gw_desktop_top()) ny = gw_desktop_top();
                 hit->x = nx;   /* 实时跟随：窗口本体随鼠标移动 */
                 hit->y = ny;
                 /* 边界钳制后按新位置重校准偏移，保证鼠标不会滑出标题栏导致拖动中断 */
@@ -1781,11 +2494,29 @@ void gw_handle_mouse(int mx, int my, int buttons)
     } else if (released) {
         if (hit->click) hit->click(hit, mx - gw_ox(hit), my - gw_oy(hit));
     }
+    /* 内容区鼠标移动回调（Paint 拖画：每帧调用，回调内自行读按键状态） */
+    if (hit->mousemove)
+        hit->mousemove(hit, mx - gw_ox(hit), my - gw_oy(hit));
     last_btn = buttons;
 }
 
 void gw_handle_key(int key)
 {
+    /* Alt+Tab：循环切换到下一个可见窗口 */
+    if (key == KEY_ALT_TAB) {
+        int start = 0;
+        for (int i = 0; i < GW_MAX_WINDOWS; i++)
+            if (gw_focused_wnd == &gw_windows[i]) { start = i; break; }
+        for (int k = 1; k <= GW_MAX_WINDOWS; k++) {
+            gw_window_t *w = &gw_windows[(start + k) % GW_MAX_WINDOWS];
+            if (w->used && !w->hidden) {
+                if (w != gw_focused_wnd) gw_bring_front(w);
+                gw_dirty = 1;
+                return;
+            }
+        }
+        return;
+    }
     if (!gw_focused_wnd) {
         /* 桌面调试热键（排障复现用，正式版可移除）：
          * m=开/关开始菜单  t=打开Terminal  s=Snake  d=2048  q=退出GUI回终端 */
@@ -1830,8 +2561,10 @@ void gw_scrollbar(int x, int y, int h, int thumb_y, int thumb_h, uint8_t color)
     (void)color;
     gw_fill(x, y, 6, h, 0xE8E8E8u);
     if (thumb_h < 8) thumb_h = 8;
+    if (thumb_h > h) thumb_h = h;
     if (thumb_y < 0) thumb_y = 0;
     if (thumb_y + thumb_h > h) thumb_y = h - thumb_h;
+    if (thumb_y < 0) thumb_y = 0;
     gw_fill(x + 1, y + thumb_y, 4, thumb_h, 0xB0B0B0u);
 }
 
@@ -1976,10 +2709,69 @@ int term_dbg_caret(void) { return term_caret; }
 static char term_input[TERM_COLS + 1];   /* 独立输入行缓冲（避免滚动/参数空格导致命令错乱） */
 static int  term_input_len = 0;
 
+/* 命令历史（GUI 终端）：回车提交入栈，Up/Down 翻阅 */
+#define TERM_HIST_MAX 16
+static char term_hist[TERM_HIST_MAX][TERM_COLS + 1];
+static int  term_hist_count = 0;
+static int  term_hist_idx = -1;          /* -1 = 正在编辑新输入 */
+
+static void term_scroll_if_full(void);   /* 前向声明：定义在本组函数之后 */
+
 static void term_input_reset(void)
 {
     term_input_len = 0;
     term_input[0] = 0;
+}
+
+/* 历史入栈（跳过空行与连续重复；满则整体上移一行） */
+static void term_hist_push(const char *line)
+{
+    int len = 0;
+    while (line[len]) len++;
+    if (len == 0) return;
+    if (term_hist_count > 0) {
+        const char *last = term_hist[term_hist_count - 1];
+        int same = 1;
+        for (int i = 0; i <= len; i++) {
+            if (last[i] != line[i]) { same = 0; break; }
+        }
+        if (same) return;
+    }
+    if (term_hist_count < TERM_HIST_MAX) {
+        term_hist_count++;
+    } else {
+        for (int i = 0; i < TERM_HIST_MAX - 1; i++) {
+            for (int j = 0; j <= TERM_COLS; j++) term_hist[i][j] = term_hist[i + 1][j];
+        }
+    }
+    char *dst = term_hist[term_hist_count - 1];
+    for (int i = 0; i < len && i < TERM_COLS; i++) dst[i] = line[i];
+    dst[len > TERM_COLS ? TERM_COLS : len] = 0;
+}
+
+/* 擦除当前输入行字符（输入限长保证不换行），光标回到提示符后 */
+static void term_input_erase(void)
+{
+    while (term_input_len > 0) {
+        term_input_len--;
+        term_caret--;
+        term_buf[term_caret] = ' ';
+    }
+    term_input[0] = 0;
+}
+
+/* 用历史行替换当前输入（重绘进终端缓冲） */
+static void term_input_set(const char *s)
+{
+    term_input_erase();
+    while (*s && term_input_len < TERM_COLS - 3) {
+        term_scroll_if_full();
+        term_input[term_input_len++] = *s;
+        term_buf[term_caret++] = *s;
+        s++;
+    }
+    term_input[term_input_len] = 0;
+    term_nrows = term_caret / TERM_COLS + 1;
 }
 
 /* 打印 shell 提示符并清空输入缓冲 */
@@ -2000,16 +2792,21 @@ static void term_newline(void)
     term_nrows = term_caret / TERM_COLS + 1;
 }
 
+static void term_scroll_if_full(void)
+{
+    if (term_caret >= TERM_ROWS * TERM_COLS) {
+        for (int _ti = 0; _ti < (TERM_ROWS - 1) * TERM_COLS; _ti++)
+            term_buf[_ti] = term_buf[_ti + TERM_COLS];
+        term_caret -= TERM_COLS;
+    }
+}
+
 static void term_print(const char *s)
 {
     while (*s) {
         if (*s == '\n') { term_newline(); s++; continue; }
+        term_scroll_if_full();   /* 写入前滚动，防止 term_buf[1920] 越界写 */
         term_buf[term_caret++] = *s++;
-        if (term_caret >= TERM_ROWS * TERM_COLS) {
-            for (int _ti = 0; _ti < (TERM_ROWS - 1) * TERM_COLS; _ti++)
-                term_buf[_ti] = term_buf[_ti + TERM_COLS];
-            term_caret -= TERM_COLS;
-        }
     }
     term_nrows = term_caret / TERM_COLS + 1;
 }
@@ -2029,6 +2826,8 @@ static void term_draw(gw_window_t *w)
     int cw = 8, ch = 16;
     int cols = (w->inner_w - 8) / cw;
     int rows = (w->inner_h - 8) / ch;
+    if (cols < 0) cols = 0;
+    if (rows < 0) rows = 0;
     if (cols > TERM_COLS) cols = TERM_COLS;
     if (rows > TERM_ROWS) rows = TERM_ROWS;
     int start = 0;
@@ -2039,11 +2838,12 @@ static void term_draw(gw_window_t *w)
         int src_row = start + r;
         if (src_row >= term_nrows) break;
         for (int c = 0; c < cols; c++) {
-            char ch2 = term_buf[src_row * TERM_COLS + c];
-            if (ch2 == 0) ch2 = ' ';
-            /* 终端 Win10 配色：白底 + 黑字（透明背景绘制，
-             * 避免每个字符格被填成黑块导致“彩条/竖线”） */
-            gfx_draw_text_scaled(x + c * cw, y + r * ch, &ch2, 0x00, -1, 1);
+            char ch2[2];
+            ch2[0] = term_buf[src_row * TERM_COLS + c];
+            if (ch2[0] == 0) ch2[0] = ' ';
+            ch2[1] = 0;   /* NUL-terminate: gfx_draw_text_scaled stops at NUL */
+            /* Win10 palette: white bg + black fg (transparent bg draw) */
+            gfx_draw_text_scaled(x + c * cw, y + r * ch, ch2, 0x00, -1, 1);
         }
     }
     /* 光标 */
@@ -2064,30 +2864,71 @@ static void term_key(gw_window_t *w, int key)
         for (int i = 0; i < len; i++) line[i] = term_input[i];
         line[len] = 0;
         term_newline();
-        if (len > 0) shell_exec_line(line);
+        if (len > 0) {
+            term_hist_push(line);
+            shell_exec_line(line);
+        }
         term_newline();
         term_prompt();
+        term_hist_idx = -1;
     } else if (key == 0x08) {  /* Backspace */
-        if (term_input_len > 0) {
+        if (term_input_len > 0 && term_caret > 0 && term_caret % TERM_COLS != 0) {
             term_input_len--;
             term_input[term_input_len] = 0;
-            if (term_caret > 0 && term_caret % TERM_COLS != 0) {
-                term_caret--;
-                term_buf[term_caret] = ' ';
+            term_caret--;
+            term_buf[term_caret] = ' ';
+        }
+    } else if (key == KEY_UP) {        /* 历史上一条（更早） */
+        if (term_hist_count > 0 && term_hist_idx < term_hist_count - 1) {
+            term_hist_idx++;
+            term_input_set(term_hist[term_hist_count - 1 - term_hist_idx]);
+        }
+    } else if (key == KEY_DOWN) {      /* 历史下一条（更新） */
+        if (term_hist_idx > 0) {
+            term_hist_idx--;
+            term_input_set(term_hist[term_hist_count - 1 - term_hist_idx]);
+        } else if (term_hist_idx == 0) {
+            term_hist_idx = -1;
+            term_input_erase();
+        }
+    } else if (key == '\t') {          /* Tab 补全第一个词（命令名） */
+        if (term_input_len > 0) {
+            int has_space = 0;
+            for (int i = 0; i < term_input_len; i++) {
+                if (term_input[i] == ' ') { has_space = 1; break; }
+            }
+            if (!has_space) {
+                char full[TERM_COLS + 1];
+                const char *matches[12];
+                int r = shell_complete_command(term_input, full, sizeof(full), matches, 12);
+                if (r == 1) {
+                    term_input_set(full);
+                } else if (r >= 2) {
+                    /* 先保存当前输入（term_input_set 会清空源缓冲） */
+                    char keep[TERM_COLS + 1];
+                    for (int i = 0; i <= term_input_len; i++) keep[i] = term_input[i];
+                    term_newline();
+                    term_print("  ");
+                    for (int i = 0; i < r && i < 12; i++) {
+                        term_print(matches[i]);
+                        term_print(" ");
+                    }
+                    term_newline();
+                    term_prompt();
+                    term_input_set(keep);
+                }
             }
         }
     } else if (key >= 0x20 && key < 0x7F) {
-        if (term_input_len < TERM_COLS) {
+        /* 限长 TERM_COLS-3：提示符 "> " 2 格 + 余量，保证输入行不折行
+         * （历史回填/退格擦除均按单行处理） */
+        if (term_input_len < TERM_COLS - 3) {
             term_input[term_input_len++] = (char)key;
             term_input[term_input_len] = 0;
+            term_scroll_if_full();   /* scroll before write: prevent term_buf[1920] overflow */
+            term_buf[term_caret++] = (char)key;
+            term_nrows = term_caret / TERM_COLS + 1;
         }
-        term_buf[term_caret++] = (char)key;
-        if (term_caret >= TERM_ROWS * TERM_COLS) {
-            for (int _ti = 0; _ti < (TERM_ROWS - 1) * TERM_COLS; _ti++)
-                term_buf[_ti] = term_buf[_ti + TERM_COLS];
-            term_caret -= TERM_COLS;
-        }
-        term_nrows = term_caret / TERM_COLS + 1;
     }
 }
 
@@ -2147,6 +2988,7 @@ static void gw_game_draw_tic(gw_window_t *w)
                                      (b == 'X') ? 0x0C : 0x09, scale);
         }
     }
+    gfx_draw_text(x0, y0 + ih - 12, "1-9/click: move   Q: quit", 0x08, 0);
 }
 
 static void gw_game_draw_snake(gw_window_t *w)
@@ -2154,7 +2996,7 @@ static void gw_game_draw_snake(gw_window_t *w)
     int x0 = w->x + 4, y0 = w->y + GW_TITLE_H + 4;
     int iw = w->inner_w - 8, ih = w->inner_h - 8;
     int cell = (iw / 20 < ih / 10) ? iw / 20 : ih / 10;
-    if (cell < 3) cell = 3;
+    if (cell < 1) cell = 1;
     int bw = cell * 20, bh = cell * 10;
     int ox = x0 + (iw - bw) / 2, oy = y0 + (ih - bh) / 2;
     gw_fill(ox - 2, oy - 2, bw + 4, bh + 4, 0x202020);
@@ -2218,7 +3060,7 @@ static void gw_game_draw_ms(gw_window_t *w)
     int x0 = w->x + 4, y0 = w->y + GW_TITLE_H + 4;
     int iw = w->inner_w - 8, ih = w->inner_h - 8;
     int cell = (iw / 9 < ih / 9) ? iw / 9 : ih / 9;
-    if (cell < 6) cell = 6;
+    if (cell < 1) cell = 1;
     int bw = cell * 9, bh = cell * 9;
     int ox = x0 + (iw - bw) / 2, oy = y0 + (ih - bh) / 2;
     gw_fill(ox - 2, oy - 2, bw + 4, bh + 4, 0x606060);
@@ -2328,7 +3170,7 @@ static void gw_game_draw_menu(gw_window_t *w, int sel)
         "4  2048", "5  Minesweeper", "6  Rock-Paper-Scissors", "7  Memory"
     };
     int row_h = (ih - 60) / 7;
-    if (row_h < 12) row_h = 12;
+    if (row_h < 1) row_h = 1;
     for (int i = 0; i < 7; i++) {
         int ry = y0 + 40 + i * row_h;
         if (i + 1 == sel) {
@@ -2411,8 +3253,10 @@ static int gw_game_mouse_cell(gw_window_t *tw, int kind, int *a, int *b)
 /* 上一帧鼠标按钮状态（点击沿检测用，文件级） */
 static int g_game_mbtn_prev = 0;
 
-/* 游戏 GUI yield 回调：图形游戏整窗清背景后覆盖绘制，并处理鼠标点击；
- * 猜数字(1) 走文本缓冲由 term_draw 渲染 */
+/* 游戏 GUI yield 回调：处理鼠标点击沿 + 双缓冲整窗重绘（含 60FPS 节流）；
+ * 猜数字(1) 走文本缓冲由 term_draw 渲染。
+ * 旧实现在可见帧缓冲上"清背景->重绘"且每次 yield 都执行（轮询频率极高），
+ * 无垂直同步时表现为游戏窗口持续闪动看不清 —— 双缓冲后彻底消除。 */
 static void gw_game_yield(void)
 {
     gw_window_t *tw = NULL;
@@ -2425,7 +3269,7 @@ static void gw_game_yield(void)
     if (!tw) return;
     int kind = games_gfx_kind();
     if (kind == 1) {
-        /* 文本游戏（猜数字）：同步缓冲后由终端渲染 */
+        /* 文本游戏（猜数字）：同步缓冲，绘制交给下方统一重绘 */
         char *gb = games_gfx_buf();
         for (int r = 0; r < TERM_ROWS; r++) {
             for (int c = 0; c < TERM_COLS; c++) {
@@ -2435,11 +3279,9 @@ static void gw_game_yield(void)
         }
         term_caret = games_gfx_pos();
         term_nrows = TERM_ROWS;
-        term_draw(tw);
-        return;
-    }
-    /* 鼠标点击沿检测：左键=1 右键=2，命中游戏区写入 games 轮询队列 */
-    {
+    } else {
+        /* 鼠标点击沿检测：左键=1 右键=2，命中游戏区写入 games 轮询队列。
+         * 必须每次 yield 执行（不受节流限制），否则快速点击可能丢沿 */
         int bt = mouse_get_buttons();
         int edge = 0;
         if ((bt & 1) && !(g_game_mbtn_prev & 1)) edge = 1;
@@ -2451,13 +3293,57 @@ static void gw_game_yield(void)
                 games_set_mouse(a, b, edge);
         }
     }
-    /* 图形游戏：先整窗清背景，再覆盖绘制画面，消除文本残留黑条纹 */
-    gw_fill(tw->x + 4, tw->y + GW_TITLE_H + 4, tw->inner_w - 8, tw->inner_h - 8, 0xF0F0F0);
-    gw_game_draw(tw);
-    /* 游戏期间 games_play 阻塞在主循环外，主循环末尾的光标绘制不执行；
-     * 这里每帧补画光标，否则图形游戏内看不到鼠标指针。下一帧整窗清背景
-     * 会先覆盖旧光标，因此无需背景缓存也不会有残影。 */
-    gw_cursor_draw(mouse_get_x(), mouse_get_y());
+
+    /* 帧率节流：距上帧不足 16ms 跳过重绘（游戏输入轮询在上面已处理） */
+    uint32_t now = g_pit_ticks;
+    if ((uint32_t)(now - gw_game_last_draw_ms) < GW_BB_FPS_MS) return;
+    gw_game_last_draw_ms = now;
+
+    int mx = mouse_get_x(), my = mouse_get_y();
+    int cur_in_win = gw_cursor_in_win(tw, mx, my);
+    int old_in_win = gw_cursor_old_in_win(tw);
+
+    /* 先擦除旧光标：旧位置在窗口外时 blit 不会覆盖它，需手工恢复背景；
+     * 必须在保存新位置背景（gw_cursor_save_bg）之前完成，否则旧背景缓存被新位置覆盖 */
+    if (!old_in_win)
+        gw_cursor_restore_bg();
+
+    if (gw_bb_begin()) {
+        /* 1. 新帧画进离屏缓冲（较慢）：期间 LFB 仍显示上一帧（含光标），
+         *    光标持续可见。旧实现先擦光标再慢慢绘制，绘制耗时一旦接近
+         *    帧周期，光标在两次重绘之间几乎无可见时间——这正是
+         *    "游戏内看不到鼠标"的根因 */
+        if (kind == 1) {
+            gw_draw_window_body(tw, 1);          /* 窗框 + 终端文本内容 */
+        } else {
+            gw_draw_window_body(tw, 0);          /* 窗框 + 内容底色 */
+            gw_fill(tw->x + 4, tw->y + GW_TITLE_H + 4,
+                    tw->inner_w - 8, tw->inner_h - 8, 0xF0F0F0);
+            gw_game_draw(tw);
+        }
+        /* 2. 光标完全在窗口内：画进离屏缓冲，随 blit 原子上屏
+         *    （不存在独立的擦除阶段，光标零间隙可见） */
+        if (cur_in_win) {
+            gw_cursor_save_bg(mx, my);           /* 保存离屏缓冲中光标下背景 */
+            gw_cursor_draw(mx, my);
+        }
+        gw_bb_end(tw->x, tw->y, tw->w, tw->h);
+        /* 3. 光标（部分）在窗口外：blit 后直绘，背景从 LFB 保存 */
+        if (!cur_in_win) {
+            gw_cursor_save_bg(mx, my);
+            gw_cursor_draw(mx, my);
+        }
+    } else {
+        /* 8bpp 回退 / 分辨率超限：维持旧直绘路径 */
+        if (kind == 1) {
+            term_draw(tw);
+        } else {
+            gw_fill(tw->x + 4, tw->y + GW_TITLE_H + 4,
+                    tw->inner_w - 8, tw->inner_h - 8, 0xF0F0F0);
+            gw_game_draw(tw);
+        }
+        gw_cursor_draw(mx, my);
+    }
 }
 
 /* 运行单个游戏（idx 1..7），复用 Terminal 窗口宿主；不打印提示符，
@@ -2476,6 +3362,8 @@ static int gw_run_game(int idx)
     if (!tw) return 0;
     games_set_gfx(1, gw_game_yield);
     term_input_reset();           /* 游戏期间终端输入缓冲失效，先清空 */
+    gw_game_last_draw_ms = 0;     /* 进入游戏立即绘制首帧 */
+    g_game_mbtn_prev = mouse_get_buttons();   /* 消化启动点击，防止幻影点击传入游戏 */
     games_play(idx);              /* 阻塞运行，yield 驱动重绘；游戏内部读键盘 */
     games_set_gfx(0, NULL);
     /* 游戏结束不回到终端：直接关闭宿主窗口回桌面 */
@@ -2506,10 +3394,36 @@ static int gw_game_menu(void)
     games_set_gfx(1, gw_game_yield);
     term_input_reset();
     int sel = 1;
+    gw_game_last_draw_ms = 0;   /* 菜单进入立即绘制首帧 */
     for (;;) {
-        gw_game_draw_menu(tw, sel);
-        /* 菜单循环同样阻塞在主循环外，补画光标否则看不到指针 */
-        gw_cursor_draw(mouse_get_x(), mouse_get_y());
+        /* 忙等循环：节流 + 双缓冲重绘，消除菜单高速直绘造成的闪动。
+         * 光标画进离屏缓冲随 blit 原子上屏（同 gw_game_yield，见其注释） */
+        uint32_t now = g_pit_ticks;
+        if ((uint32_t)(now - gw_game_last_draw_ms) >= GW_BB_FPS_MS) {
+            gw_game_last_draw_ms = now;
+            int mx = mouse_get_x(), my = mouse_get_y();
+            int cur_in_win = gw_cursor_in_win(tw, mx, my);
+            int old_in_win = gw_cursor_old_in_win(tw);
+            /* 先擦除旧光标（窗口外不会被 blit 覆盖），再保存/绘制新位置背景 */
+            if (!old_in_win)
+                gw_cursor_restore_bg();
+            if (gw_bb_begin()) {
+                gw_draw_window_body(tw, 0);
+                gw_game_draw_menu(tw, sel);
+                if (cur_in_win) {
+                    gw_cursor_save_bg(mx, my);
+                    gw_cursor_draw(mx, my);
+                }
+                gw_bb_end(tw->x, tw->y, tw->w, tw->h);
+                if (!cur_in_win) {
+                    gw_cursor_save_bg(mx, my);
+                    gw_cursor_draw(mx, my);
+                }
+            } else {
+                gw_game_draw_menu(tw, sel);
+                gw_cursor_draw(mx, my);
+            }
+        }
         int c = keyboard_getchar();
         if (c == 0) continue;
         if (c == 'q' || c == 'Q' || c == 0x1B) break;
@@ -2532,6 +3446,7 @@ int gw_launch_gui_game(int idx)
 
 void gw_demo(void)
 {
+    gw_gui_active = 1;
     gw_init();
     gw_win10_palette();
     gw_quit = 0;
@@ -2617,6 +3532,17 @@ void gw_demo(void)
         if (sec_changed && !taskbar_redrawn) {
             gw_draw_taskbar();
         }
+        /* 系统监视器：SysInfo 窗口打开时每秒刷新（运行时长/窗口数动态变化） */
+        if (sec_changed) {
+            for (int i = 0; i < GW_MAX_WINDOWS; i++) {
+                gw_window_t *w = &gw_windows[i];
+                if (w->used && !w->hidden &&
+                    (unsigned long)w->user == (unsigned long)GW_APP_SYSINFO) {
+                    gw_dirty = 1;
+                    break;
+                }
+            }
+        }
 
         gw_cursor_save_bg(mx, my);
         gw_cursor_draw(mx, my);
@@ -2632,8 +3558,10 @@ void gw_demo(void)
      * 行列状态与屏幕脱节，表现为"显示不完整 + 按键出竖线 + clear 无效"。 */
     terminal_set_gfx_hook(NULL);
     gfx_restore_text();
-    /* 回内核 shell：切回内核模式提示语（Terminal 打开时置了用户模式） */
-    shell_set_user_mode(0);
+    /* Terminal 里敲过 exit 会置 shell_exit_flag：清除残留，
+     * 否则回文本模式后下一次 shell_run 立即返回又弹回桌面 */
+    shell_exit_clear();
+    gw_gui_active = 0;
 }
 
 /* gw_start: 初始化图形模式，播放开机动画，进入窗口 GUI */
@@ -2642,6 +3570,9 @@ void gw_start(void)
     gfx_init();
     gfx_set_palette();
     gfx_load_font();
+    /* mouse_init 在内核启动早期执行（当时 GFX 仍是 320x200 默认值），
+     * 进入实际分辨率桌面后把指针重新居中 */
+    mouse_warp(GFX_W / 2, GFX_H / 2);
     gw_boot_anim();
     gw_demo();
 }
