@@ -88,6 +88,16 @@ i686-elf-gcc %CFLAGS% -c kernel\fat.c -o kernel\fat.o
 if errorlevel 1 goto error
 i686-elf-gcc %CFLAGS% -c kernel\fs.c -o kernel\fs.o
 if errorlevel 1 goto error
+i686-elf-gcc %CFLAGS% -c kernel\ext4.c -o kernel\ext4.o
+if errorlevel 1 goto error
+i686-elf-gcc %CFLAGS% -c kernel\ntfs.c -o kernel\ntfs.o
+if errorlevel 1 goto error
+i686-elf-gcc %CFLAGS% -c kernel\f2fs.c -o kernel\f2fs.o
+if errorlevel 1 goto error
+i686-elf-gcc %CFLAGS% -c kernel\erofs.c -o kernel\erofs.o
+if errorlevel 1 goto error
+i686-elf-gcc %CFLAGS% -c kernel\div64.c -o kernel\div64.o
+if errorlevel 1 goto error
 i686-elf-gcc %CFLAGS% -c kernel\gfx.c -o kernel\gfx.o
 if errorlevel 1 goto error
 i686-elf-gcc %CFLAGS% -c kernel\gui.c -o kernel\gui.o
@@ -104,11 +114,11 @@ i686-elf-gcc %CFLAGS% -c kernel\hiscore.c -o kernel\hiscore.o
 if errorlevel 1 goto error
 
 echo [4/6] linking kernel...
-i686-elf-ld %LDFLAGS% -o kernel_raw.bin boot\kernel_entry.o kernel\kernel.o kernel\tty.o kernel\idt.o kernel\isr.o kernel\keyboard.o kernel\ata.o kernel\shell.o kernel\shell_extra.o kernel\exfat.o kernel\fat.o kernel\fs.o kernel\gfx.o kernel\gui.o kernel\mouse.o kernel\gfxwin.o kernel\desktop.o kernel\games.o kernel\hiscore.o
+i686-elf-ld %LDFLAGS% -o kernel_raw.bin boot\kernel_entry.o kernel\kernel.o kernel\tty.o kernel\idt.o kernel\isr.o kernel\keyboard.o kernel\ata.o kernel\shell.o kernel\shell_extra.o kernel\exfat.o kernel\fat.o kernel\fs.o kernel\ext4.o kernel\ntfs.o kernel\f2fs.o kernel\erofs.o kernel\div64.o kernel\gfx.o kernel\gui.o kernel\mouse.o kernel\gfxwin.o kernel\desktop.o kernel\games.o kernel\hiscore.o
 if errorlevel 1 goto error
 
-echo [5/6] padding kernel to 256KB...
-i686-elf-objcopy -I binary -O binary --pad-to 262144 kernel_raw.bin kernel.bin
+echo [5/6] padding kernel to 384KB...
+i686-elf-objcopy -I binary -O binary --pad-to 393216 kernel_raw.bin kernel.bin
 if errorlevel 1 goto error
 
 echo [6/6] generating system image...

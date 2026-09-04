@@ -647,7 +647,7 @@ static void cmd_help(const char *args) {
     terminal_writestring("  cat <file> - read file content (exFAT)\n");
     terminal_writestring("  write <file> <content> - create file with content\n");
     terminal_writestring("  rm <file>  - delete file\n");
-    terminal_writestring("  format     - format slave disk as exFAT\n");
+    terminal_writestring("  format [fs] - format slave disk: exfat|fat12|fat16|fat32\n");
     terminal_writestring("  grep <pattern> <file> - print lines containing pattern\n");
     terminal_writestring("  wc <file>  - count lines/words/characters\n");
     terminal_writestring("  head <file> [n] - show first n lines (default 10)\n");
@@ -1110,12 +1110,29 @@ static void cmd_rm(const char *args) {
 }
 
 static void cmd_format(const char *args) {
-    (void)args;
-    if (fs_format() != 0) {
+    while (*args == ' ') args++;
+    int type = FS_EXFAT;
+    if (args[0] != '\0') {
+        if (my_strcasecmp(args, "exfat") == 0) {
+            type = FS_EXFAT;
+        } else if (my_strcasecmp(args, "fat12") == 0) {
+            type = FS_FAT12;
+        } else if (my_strcasecmp(args, "fat16") == 0) {
+            type = FS_FAT16;
+        } else if (my_strcasecmp(args, "fat32") == 0) {
+            type = FS_FAT32;
+        } else {
+            terminal_writestring("Usage: format [exfat|fat12|fat16|fat32]\n");
+            return;
+        }
+    }
+    if (fs_format(type) != 0) {
         terminal_writestring("Format failed.\n");
     } else {
-        terminal_writestring("Disk formatted as exFAT.\n");
-        // fs_format succeeds with exFAT mounted; no re-init needed
+        terminal_writestring("Disk formatted as ");
+        terminal_writestring(fs_type_name());
+        terminal_writestring(".\n");
+        // fs_format succeeds with the new FS mounted; no re-init needed
     }
 }
 
