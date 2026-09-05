@@ -316,7 +316,7 @@ void kernel_main(void) {
     int ret = fs_init();
     if (ret == -2) {
         klog("FS: no filesystem on data drive, auto-formatting exFAT...");
-        if (fs_format() == 0) {
+        if (fs_format(FS_EXFAT) == 0) {
             klog_ok("FS: formatted, creating README.TXT");
             const char *example = "Hello from EZOS exFAT!\n";
             fs_create_file("README.TXT", (const uint8_t*)example, my_strlen(example));

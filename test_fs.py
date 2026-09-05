@@ -131,6 +131,96 @@ def run_nodisk_variant():
         vm.close()
 
 
+def gen_blank_img(path, size=76 * 1024 * 1024):
+    """空白测试盘（sparse）：覆盖 FAT32 布局的 64MB 分区 + MBR"""
+    with open(path, 'wb') as f:
+        f.truncate(size)
+
+
+def run_format_variant():
+    print("\n===== 变体 format: format 命令选文件系统 =====")
+    img = "disk_fmt.img"
+    gen_blank_img(img)          # 每次重新生成，避免上次残留状态
+    vm = Vm(["os-image.bin", img], "format")
+    try:
+        # 1) format fat32 -> 挂载 FAT32 -> 写读
+        t = norm(vm.sh("format fat32", 3.0))
+        check("format fat32 成功", "formatted as fat32" in t,
+              t.replace('\n', ' ')[:160])
+        t = norm(vm.sh("df"))
+        check("df 报告 fat32", "fat32" in t, t.replace('\n', ' ')[:160])
+        t = norm(vm.sh("write fmt.txt hello format"))
+        check("fat32 write", "successfully" in t, t[:160])
+        t = norm(vm.sh("cat fmt.txt"))
+        check("fat32 cat", "hello format" in t, t[:160])
+
+        # 2) format fat16 -> 清盘验证 -> 写读
+        t = norm(vm.sh("format fat16", 3.0))
+        check("format fat16 成功", "formatted as fat16" in t, t[:160])
+        vm.sh("clear", 0.8)
+        t = norm(vm.sh("ls"))
+        check("format 后旧文件清除", "fmt.txt" not in t,
+              t.replace('\n', ' ')[:160])
+        t = norm(vm.sh("write a.txt second try"))
+        check("fat16 write", "successfully" in t, t[:160])
+        t = norm(vm.sh("cat a.txt"))
+        check("fat16 cat", "second try" in t, t[:160])
+
+        # 3) format fat12 -> 写读
+        t = norm(vm.sh("format fat12", 3.0))
+        check("format fat12 成功", "formatted as fat12" in t, t[:160])
+        t = norm(vm.sh("write b.txt third one"))
+        check("fat12 write", "successfully" in t, t[:160])
+        t = norm(vm.sh("cat b.txt"))
+        check("fat12 cat", "third one" in t, t[:160])
+
+        # 4) format 无参数默认 exFAT
+        t = norm(vm.sh("format", 3.0))
+        check("format 默认 exfat", "formatted as exfat" in t, t[:160])
+        t = norm(vm.sh("df"))
+        check("df 报告 exfat", "exfat" in t, t.replace('\n', ' ')[:160])
+
+        # 5) 只读文件系统不可格式化 -> Usage
+        t = norm(vm.sh("format ext4"))
+        check("format ext4 拒绝", "usage" in t, t[:160])
+
+        # 6) exit 进桌面
+        vm.q.type_text("exit\n"); time.sleep(3.0)
+        vm.shot("fsreg_format_desk.ppm")
+        w, h = load_size("fsreg_format_desk.ppm")
+        check("format 变体进桌面", w >= 640 and h >= 480, f"{w}x{h}")
+    finally:
+        vm.close()
+
+
+def run_ro_variant():
+    """只读文件系统（ext4）：挂载/读/列目录正常，写操作被拒"""
+    print("\n===== 变体 ro-ext4: 只读文件系统 =====")
+    img = "disk_ext4.img"
+    subprocess.run([sys.executable, "temp/gen_diskimg.py", img, "ext4"],
+                   check=True)
+    vm = Vm(["os-image.bin", img], "roext4")
+    try:
+        t = norm(vm.sh("df"))
+        check("df 挂载 ext4", "ext4" in t, t.replace('\n', ' ')[:160])
+        t = norm(vm.sh("ls"))
+        check("ls 含 README.TXT", "readme.txt" in t, t.replace('\n', ' ')[:160])
+        check("ls 含长名文件", "long file name test.txt" in t,
+              t.replace('\n', ' ')[:160])
+        t = norm(vm.sh("cat readme.txt"))
+        check("cat 读文件内容", "welcome to ezos" in t, t[:160])
+        t = norm(vm.sh("write newfile.txt hi"))
+        check("write 只读拒绝", "failed" in t, t[:160])
+        t = norm(vm.sh("rm readme.txt"))
+        check("rm 只读拒绝", "failed" in t, t[:160])
+        vm.q.type_text("exit\n"); time.sleep(3.0)
+        vm.shot("fsreg_roext4_desk.ppm")
+        w, h = load_size("fsreg_roext4_desk.ppm")
+        check("ro 变体进桌面", w >= 640 and h >= 480, f"{w}x{h}")
+    finally:
+        vm.close()
+
+
 def main():
     for name, fstype in [("exfat", "exfat"), ("fat32", "fat32"),
                          ("fat16", "fat16"), ("fat12", "fat12")]:
@@ -140,6 +230,8 @@ def main():
             subprocess.run([sys.executable, "temp/gen_diskimg.py", img, name],
                            check=True)
         run_fs_variant(name, img, fstype)
+    run_format_variant()
+    run_ro_variant()
     run_nodisk_variant()
 
     print(f"\n========== 结果: {len(PASS)} passed, {len(FAIL)} failed ==========")

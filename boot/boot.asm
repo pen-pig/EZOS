@@ -3,7 +3,7 @@
 [bits 16]
 
 KERNEL_OFFSET equ 0x10000     ; �ں˼��ص�ַ
-KERNEL_SECTORS equ 512        ; �ں�����������256KB���� build �ű� --pad-to 262144 ��Ӧ��
+KERNEL_SECTORS equ 768        ; �ں�����������384KB���� build �ű� --pad-to 393216 ��Ӧ��
 
 start:
     xor ax, ax
@@ -45,7 +45,7 @@ print_string_16:
     ret
 
 disk_load:
-    ; ��չ��ѭ����AH=42h�����ܶ� KERNEL_SECTORS ������ÿ����� 64 ������
+    ; ��չ��ѭ����AH=42h�����ܶ� KERNEL_SECTORS ������ÿ�����?64 ������
     ; ���ⵥ�� DAP ���� BIOS ���ơ�
     ; ��ڣ�DL = ��������
     mov bx, KERNEL_SECTORS      ; ʣ��������
@@ -111,20 +111,20 @@ disk_error:
     jmp $
 
 ; ------------------------------------------------------------------
-; set_vbe: VBE ��ֱ�������Ӧ̽�⣨16bpp LFB��
-;   1) 0x4F00 ��� VBE BIOS ���� + 'VESA' ǩ��
-;   2) 0x4F01 ���ֱ��ʴӴ�С����̽���׼ 16bpp VBE ģʽ��
+; set_vbe: VBE ��ֱ�������Ӧ̽��?6bpp LFB��
+;   1) 0x4F00 ���?VBE BIOS ���� + 'VESA' ǩ��
+;   2) 0x4F01 ���ֱ��ʴӴ�С����̽����?16bpp VBE ģʽ��
 ;      1280x1024(0x11A) -> 1024x768(0x117) -> 800x600(0x115)
 ;      -> 640x480(0x110)��ÿ��ģʽҪ��
 ;      attributes bit7 (LFB) ��λ��XRES/YRES ���㡢BPP==16��
 ;      PhysBasePtr ���㣻���е�һ����Ϊ�����÷ֱ��ʡ�
-;   success: 0x5000 д��ṹ { dword LFB; word XRES; word YRES; byte BPP }
+;   success: 0x5000 д���?{ dword LFB; word XRES; word YRES; byte BPP }
 ;   failure: 0x5000 д�� 0���ں˻��� VGA 0x13 320x200��
 ;   NOTE: ���ⲻ���� 0x4F02 ����ģʽ�������ı�ģʽ���ں� shell ʹ�ã�
-;         ���������ı������ LFB ƽ���ϲ��ɼ���gfx_init �ڱ���ģʽ
-;         ͨ�� VBE_DISPI �Ĵ�����̽��ֱ��ʼ��
+;         ���������ı������?LFB ƽ���ϲ��ɼ���gfx_init �ڱ���ģʽ
+;         ͨ�� VBE_DISPI �Ĵ�����̽��ֱ��ʼ���?
 ;   buffers: VBEInfoBlock / mode info ����ʵģʽ 0x6000
-;            ��mode info ��д��Ḳ�� VBEInfoBlock���ް���
+;            ��mode info ��д��Ḳ��?VBEInfoBlock���ް���
 ; ------------------------------------------------------------------
 set_vbe:
     pusha

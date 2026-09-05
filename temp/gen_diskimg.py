@@ -478,6 +478,151 @@ def make_fsinfo(p):
     return bytes(fs)
 
 
+# ==================== ext4（只读，1024B 块） ====================
+# 布局与 kernel/ext4.c 解析路径对齐：
+#   卷块 0 全零；块 1 superblock；块 2 GDT；块 3-6 inode 表（32 inodes x 128B）；
+#   块 7 根目录（线性）；块 8 README.TXT（extent 映射）；块 9 LFN 文件（旧式直接块）。
+# 一个 extent 文件 + 一个 legacy 文件，同时覆盖 e4_map_extent 与 e4_map_legacy。
+# refs: e2fsprogs lib/ext2fs/ext2_fs.h 字段偏移；Linux fs/ext4/磁盘格式。
+
+EXT4_DISK_SECTORS = 4096          # 2MB 磁盘
+EXT4_VOL_BLOCKS = 1024            # 1MB 卷（1024 x 1KB）
+
+
+def make_ext4_sb(p):
+    sb = bytearray(1024)
+    struct.pack_into('<I', sb, 0, 32)                    # s_inodes_count
+    struct.pack_into('<I', sb, 4, p['vol_blocks'])       # s_blocks_count_lo
+    struct.pack_into('<I', sb, 12, p['free_blocks'])     # s_free_blocks_count_lo
+    struct.pack_into('<I', sb, 16, 32 - p['used_inodes'])  # s_free_inodes_count
+    struct.pack_into('<I', sb, 20, 1)                    # s_first_data_block（1K 块恒 1）
+    struct.pack_into('<I', sb, 24, 0)                    # s_log_block_size = 0（1024B）
+    struct.pack_into('<I', sb, 28, 0)                    # s_log_cluster_size
+    struct.pack_into('<I', sb, 32, 8192)                 # s_blocks_per_group
+    struct.pack_into('<I', sb, 36, 8192)                 # s_clusters_per_group
+    struct.pack_into('<I', sb, 40, 32)                   # s_inodes_per_group
+    struct.pack_into('<H', sb, 56, 0xEF53)               # s_magic
+    struct.pack_into('<I', sb, 76, 1)                    # s_rev_level = dynamic
+    struct.pack_into('<I', sb, 84, 11)                   # s_first_ino
+    struct.pack_into('<H', sb, 88, 128)                  # s_inode_size
+    struct.pack_into('<I', sb, 96, 0x0002)               # incompat: FILETYPE
+    struct.pack_into('<I', sb, 100, 0x0000)              # ro_compat
+    struct.pack_into('<H', sb, 282, 0)                   # s_desc_size（非 64bit -> 32B）
+    return bytes(sb)
+
+
+def make_ext4_inode(mode, size, flags, blocks_512, payload):
+    """payload: i_block 区 60 字节内容（extent 头或块指针数组前缀）"""
+    ino = bytearray(128)
+    struct.pack_into('<H', ino, 0, mode)
+    struct.pack_into('<I', ino, 4, size)
+    struct.pack_into('<I', ino, 28, blocks_512)          # i_blocks_lo（512B 扇区计）
+    struct.pack_into('<I', ino, 32, flags)
+    ino[40:40 + len(payload)] = payload
+    return bytes(ino)
+
+
+def make_ext4_extent_root(first_blk, nblks):
+    """i_block 内 depth-0 extent 树：header + 1 个 extent 项"""
+    b = bytearray(60)
+    struct.pack_into('<H', b, 0, 0xF30A)                 # eh_magic
+    struct.pack_into('<H', b, 2, 1)                      # eh_entries
+    struct.pack_into('<H', b, 4, 4)                      # eh_max
+    struct.pack_into('<H', b, 6, 0)                      # eh_depth
+    struct.pack_into('<I', b, 12 + 0, 0)                 # ee_block（逻辑块 0）
+    struct.pack_into('<H', b, 12 + 4, nblks)             # ee_len
+    struct.pack_into('<H', b, 12 + 6, 0)                 # ee_start_hi
+    struct.pack_into('<I', b, 12 + 8, first_blk)         # ee_start_lo
+    return bytes(b)
+
+
+def make_ext4_dirent(ino, name, ftype, rec_len=None):
+    if isinstance(name, str):
+        name = name.encode()
+    if rec_len is None:
+        rec_len = (8 + len(name) + 3) & ~3
+    e = bytearray(rec_len)
+    struct.pack_into('<I', e, 0, ino)
+    struct.pack_into('<H', e, 4, rec_len)
+    e[6] = len(name)
+    e[7] = ftype
+    e[8:8 + len(name)] = name
+    return bytes(e)
+
+
+def gen_ext4(path):
+    BLK = 1024
+    vol_blocks = EXT4_VOL_BLOCKS
+    img = bytearray(EXT4_DISK_SECTORS * 512)
+
+    def wblk(blk, data):
+        off = PART_START * 512 + blk * BLK
+        img[off:off + len(data)] = data
+
+    readme = b"Welcome to EZOS!\nThis is the ext4 data disk.\n"
+    lfn_data = b"Long filename (LFN) test file on ext4.\n"
+
+    # 固定布局
+    GDT_BLK, ITABLE_BLK, ROOT_BLK = 2, 3, 7
+    README_BLK, LFN_BLK = 8, 9
+    used_blocks = 10                                    # 块 1..9（SB/GDT/ITAB4/ROOT/2 文件）
+    p = {'vol_blocks': vol_blocks, 'free_blocks': vol_blocks - used_blocks,
+         'used_inodes': 4}
+
+    # MBR：单主分区 0x83，LBA 1 起
+    img[0:512] = make_mbr(0x83, EXT4_DISK_SECTORS - 1)
+
+    # 块 1：superblock；块 2：GDT（bg_inode_table_lo = 3）
+    wblk(1, make_ext4_sb(p))
+    gd = bytearray(32)
+    struct.pack_into('<I', gd, 0, 10)                   # bg_block_bitmap_lo
+    struct.pack_into('<I', gd, 4, 11)                   # bg_inode_bitmap_lo
+    struct.pack_into('<I', gd, 8, ITABLE_BLK)           # bg_inode_table_lo
+    wblk(GDT_BLK, bytes(gd))
+
+    # inode 表（块 3-6）：ino2 根目录 / ino3 README(extent) / ino4 LFN(legacy)
+    itab = bytearray(4 * BLK)
+
+    def put_ino(n, data):
+        itab[(n - 1) * 128:(n - 1) * 128 + 128] = data
+
+    # 根目录：旧式直接块（i_block[0]=ROOT_BLK），大小 1 块
+    ib = bytearray(60)
+    struct.pack_into('<I', ib, 0, ROOT_BLK)
+    put_ino(2, make_ext4_inode(0x41ED, BLK, 0, BLK // 512, bytes(ib)))
+    # README.TXT：extent 映射（EXT4_EXTENTS_FL）
+    put_ino(3, make_ext4_inode(0x81A4, len(readme), 0x80000,
+                               (BLK + 511) // 512, make_ext4_extent_root(README_BLK, 1)))
+    # LFN 长名文件：旧式直接块
+    ib2 = bytearray(60)
+    struct.pack_into('<I', ib2, 0, LFN_BLK)
+    put_ino(4, make_ext4_inode(0x81A4, len(lfn_data), 0,
+                               (BLK + 511) // 512, bytes(ib2)))
+    for i in range(4):
+        wblk(ITABLE_BLK + i, bytes(itab[i * BLK:(i + 1) * BLK]))
+
+    # 块 7：根目录（线性，无 htree：EXT4_INDEX_FL 不置位）
+    root = bytearray(BLK)
+    off = 0
+    for d in (make_ext4_dirent(2, b'.', 2, 12),
+              make_ext4_dirent(2, b'..', 2, 12),
+              make_ext4_dirent(3, b'README.TXT', 1),
+              make_ext4_dirent(4, b'long file name test.txt', 1)):
+        root[off:off + len(d)] = d
+        off += len(d)
+    # 尾部空白条目：inode=0（驱动跳过）
+    struct.pack_into('<H', root, off + 4, BLK - off)    # rec_len 覆盖剩余空间
+    wblk(ROOT_BLK, bytes(root))
+
+    wblk(README_BLK, readme)
+    wblk(LFN_BLK, lfn_data)
+
+    with open(path, 'wb') as f:
+        f.write(img)
+    print("OK %s: %d bytes ext4 (1KB blocks, %d blocks, extent+legacy files: "
+          "README.TXT + '%s')" % (path, len(img), vol_blocks, LFN_NAME))
+
+
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else "disk.img"
     fstype = (sys.argv[2] if len(sys.argv) > 2 else "exfat").lower()
@@ -489,8 +634,10 @@ def main():
         gen_fat(path, 16)
     elif fstype in ("fat32", "32"):
         gen_fat(path, 32)
+    elif fstype in ("ext4", "ext2", "ext"):
+        gen_ext4(path)
     else:
-        print("unknown fs type: %s (exfat|fat12|fat16|fat32)" % fstype)
+        print("unknown fs type: %s (exfat|fat12|fat16|fat32|ext4)" % fstype)
         sys.exit(1)
 
 
