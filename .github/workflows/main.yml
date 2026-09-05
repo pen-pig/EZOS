@@ -12,6 +12,7 @@
 name: build-and-release
 
 on:
+  workflow_dispatch:        # 手动触发：Actions 页点 Run workflow，可指定分支
   push:
     branches: [ main, dev ]
     tags: [ 'v*' ]
