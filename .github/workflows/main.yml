@@ -1,0 +1,85 @@
+# ============================================================
+# EZOS GitHub Actions workflow
+#   - push 到 main / dev         : 构建 + QEMU 冒烟测试
+#   - PR 到 main                 : 构建 + QEMU 冒烟测试（合并守门）
+#   - 打 tag v*                  : 构建 + 冒烟 + 打包发布到 GitHub Release
+#
+# 工具链：Ubuntu apt 轻量方案（nasm + gcc-multilib + qemu-system-x86），
+# 不下载 800MB 的第三方 i686-elf 包；64 位除法由 dev 分支自带的
+# kernel/div64.c 提供 __udivdi3/__umoddi3，无 libgcc 也能链接通过。
+# 构建细节统一收敛在 ci/build.sh（padding 从 boot.asm 自动推导）。
+# ============================================================
+name: build-and-release
+
+on:
+  push:
+    branches: [ main, dev ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build & smoke test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            nasm gcc-multilib qemu-system-x86 python3 zip
+          gcc --version | head -1
+          nasm -v
+          qemu-system-x86_64 --version | head -1
+
+      - name: Build kernel image
+        run: bash ci/build.sh
+
+      - name: Generate data disk
+        run: python3 temp/gen_diskimg.py disk.img
+
+      - name: Smoke test in QEMU
+        run: |
+          set +e
+          timeout 12 qemu-system-x86_64 -machine pc -vga std -m 128 \
+            -drive format=raw,file=os-image.bin \
+            -drive format=raw,file=disk.img \
+            -display none -no-reboot
+          rc=$?
+          set -e
+          if [ "$rc" -eq 124 ]; then
+            echo "SMOKE_OK: system stayed up 12s (boot OK, no triple fault)"
+          elif [ "$rc" -eq 0 ]; then
+            echo "SMOKE_PASS: QEMU exited cleanly"
+          else
+            echo "SMOKE_FAIL: QEMU crashed with rc=$rc within 12s"
+            exit 1
+          fi
+          ls -l os-image.bin disk.img
+
+      # ---------- 以下仅在打 tag（v*）时执行：打包并发布 Release ----------
+      - name: Assemble release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          mkdir -p dist
+          cp os-image.bin disk.img dist/
+          cp temp/gen_diskimg.py dist/
+          cp release/setup_and_run.bat release/setup_and_run.sh dist/
+          # 附上构建配置清单，方便用户在真机复现
+          cp linker.ld dist/ 2>/dev/null || true
+          cp boot/boot.asm dist/ 2>/dev/null || true
+          zip -r "EZOS-${GITHUB_REF_NAME}.zip" dist
+          ls -lh "EZOS-${GITHUB_REF_NAME}.zip"
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: EZOS-*.zip
+          generate_release_notes: true
