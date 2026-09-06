@@ -1,17 +1,20 @@
 /*
- * f2fs.c - F2FS 只读驱动
+ * f2fs.c - F2FS 驱动（读 + 写）
  *
- * 支持范围（只读，4KB 块）：
+ * 支持范围（4KB 块）：
  *   - 双 CP pack 校验（CRC32，init=F2FS_SUPER_MAGIC）取高版本
  *   - NAT 查找：CP NAT journal 优先，回退 NAT 区块（含版本位图偏移）
  *   - inline data（i_addr[1] 起）与 inline dentry
  *   - 常规文件：直接块 + 一级/二级间接节点链（grub_get_node_path）
  *   - 常规目录：dentry block 位图遍历
+ *   - 写入：create/delete/mkdir + format（见文件尾"写入支持"注释）
  *   - 不支持：压缩（LZO/LZ4）、加密、符号链接、cp_payload 布局
  *
  * refs:
  *   - GRUB grub-core/fs/f2fs.c (GPLv3+) - 全部解析流程与磁盘布局常量
  *   - Linux include/uapi/linux/f2fs.h - superblock/checkpoint/node 结构
+ *   - Linux fs/f2fs/{namei.c,node.c,dir.c,checkpoint.c} + f2fs-tools
+ *     mkfs/f2fs_format.c - 写入与格式化布局参考
  */
 #include "f2fs.h"
 #include "ata.h"
@@ -142,6 +145,7 @@ static uint32_t f2_total_blocks;        /* block_count */
 static uint32_t f2_start_cp;            /* 选中的 CP pack 起始块 */
 static uint32_t f2_sit_bytes;           /* SIT 位图字节数（cp_payload>0 时为 0） */
 static uint8_t  f2_cp_payload_flag;     /* superblock cp_payload>0 */
+static uint8_t  f2_natbuf_loaded;       /* NAT 单块缓存有效标志（写路径） */
 static f2fs_info_t f2_info;
 
 /* CP 副本（持久）、NAT journal 副本、节点/NAT/目录块暂存 */
@@ -153,6 +157,9 @@ static uint8_t f2_node[F2FS_BLKSIZE] F2_HIBUF;   /* 当前解析节点 */
 static uint8_t f2_child[F2FS_BLKSIZE] F2_HIBUF;  /* 枚举子节点（隔离于 f2_node） */
 static uint8_t f2_blk[F2FS_BLKSIZE] F2_HIBUF;    /* NAT 块 / 间接节点链暂存 */
 static uint8_t f2_dblk[F2FS_BLKSIZE] F2_HIBUF;   /* 非 inline 目录块 */
+static uint8_t f2_wnode[F2FS_BLKSIZE] F2_HIBUF;  /* 写路径子节点 */
+static uint8_t f2_natbuf[F2FS_BLKSIZE] F2_HIBUF; /* 写路径 NAT 单块缓存 */
+static uint8_t f2_fmt[F2FS_BLKSIZE] F2_HIBUF;    /* format 通用 4KB 暂存 */
 
 static void f2_read_secs(uint32_t lba, uint8_t *buf, uint32_t nsecs) {
     for (uint32_t i = 0; i < nsecs; i++)
@@ -509,11 +516,9 @@ int f2fs_read_file(const char *path, uint8_t *buffer, uint32_t max_size) {
         if (pb == 0) {
             for (uint32_t i = 0; i < chunk; i++) buffer[done + i] = 0;
         } else {
-            f2_read_secs(f2_part_lba + pb * F2FS_BLK_SECS,
-                         buffer + done, F2FS_BLK_SECS);
-            if (chunk < F2FS_BLKSIZE) {
-                /* 搬移：尾部截断（buffer 已整块读入，无需搬移） */
-            }
+            /* 经 f2_dblk 中转：尾部截断块不能整块直读进 buffer（防越界） */
+            f2_read_block(pb, f2_dblk);
+            for (uint32_t i = 0; i < chunk; i++) buffer[done + i] = f2_dblk[i];
         }
         done += F2FS_BLKSIZE;
     }
@@ -564,6 +569,7 @@ uint32_t f2fs_get_file_clusters(const char *path) {
 int f2fs_mount(uint8_t drive, uint32_t part_start) {
     uint8_t sb[F2FS_BLKSIZE];
     f2_mounted = 0;
+    f2_natbuf_loaded = 0;
 
     /* superblock @1024（GRUB F2FS_SUPER_OFFSET） */
     f2_drive = drive;
@@ -630,3 +636,477 @@ int f2fs_mount(uint8_t drive, uint32_t part_start) {
 }
 
 const f2fs_info_t *f2fs_get_info(void) { return &f2_info; }
+
+/* ============================================================
+ * 写入支持
+ * refs: Linux fs/f2fs/{namei.c,node.c,dir.c,checkpoint.c,segment.c}
+ *       f2fs-tools mkfs/f2fs_format.c - format 布局参考
+ *
+ * 简化设计（与本驱动读路径自洽，不自诩产品级）：
+ *   - 写入仅支持"本驱动 format 出的小卷"模型：
+ *     目录全为 inline dentry、NAT 单块（nid < 455）、
+ *     nat bitmap 全 0（恒用 NAT 第一副本）、空 NAT journal
+ *   - 分配器：nid 由 NAT 空项扫描分配；main 区块用 CP 内私有
+ *     bump 游标（CP 偏移 0x140，读路径不读该字段）
+ *   - 文件：size <= MAX_INLINE_DATA(3488) 用 inline data；
+ *     更大用直接块 i_addr[0..]（上限 923 块）
+ *   - 删除：清 NAT 项 + 摘 dentry；数据块不回收（重格式化释放）
+ *   - 每次写操作同步 CP valid_* 计数并重算 CRC（只更新 pack0）
+ * ============================================================ */
+
+static void f2_write_secs(uint32_t lba, const uint8_t *buf, uint32_t nsecs) {
+    for (uint32_t i = 0; i < nsecs; i++)
+        ata_write_sector(f2_drive, lba + i, buf + i * 512);
+}
+
+/* 写 4KB 块 blkaddr（卷内块号） */
+static void f2_write_block(uint32_t blkaddr, const uint8_t *buf) {
+    f2_write_secs(f2_part_lba + blkaddr * F2FS_BLK_SECS, buf, F2FS_BLK_SECS);
+}
+
+static void f2_wr16(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+}
+static void f2_wr32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+static void f2_wr64(uint8_t *p, uint64_t v) {
+    f2_wr32(p, (uint32_t)v);
+    f2_wr32(p + 4, (uint32_t)(v >> 32));
+}
+
+/* 本驱动私有：bump 分配游标存放在 CP 头块 0x140（nat bitmap 实际
+ * 只用 1 字节，0x140 处于 bitmap 数组内但读路径永不触碰） */
+#define CP_OFF_ALLOC_CURSOR    0x140
+
+/* ---------- NAT 单块缓存（nid 0..454 全部落在 NAT 第一块） ---------- */
+static int f2_natcache_load(void) {
+    if (!f2_natbuf_loaded) {
+        f2_read_block(f2_nat_blkaddr, f2_natbuf);
+        f2_natbuf_loaded = 1;
+    }
+    return 0;
+}
+
+static uint32_t f2_natcache_addr(uint32_t nid) {
+    return rd32(f2_natbuf + (nid % NAT_ENTRY_PER_BLOCK) * NAT_ENTRY_SIZE + 5);
+}
+
+static void f2_natcache_set(uint32_t nid, uint32_t blkaddr) {
+    uint8_t *e = f2_natbuf + (nid % NAT_ENTRY_PER_BLOCK) * NAT_ENTRY_SIZE;
+    e[0] = 0;                      /* version */
+    f2_wr32(e + 1, nid);           /* ino */
+    f2_wr32(e + 5, blkaddr);       /* block_addr */
+}
+
+static void f2_natcache_clear(uint32_t nid) {
+    uint8_t *e = f2_natbuf + (nid % NAT_ENTRY_PER_BLOCK) * NAT_ENTRY_SIZE;
+    for (int i = 0; i < NAT_ENTRY_SIZE; i++) e[i] = 0;
+}
+
+static void f2_natcache_save(void) {
+    f2_write_block(f2_nat_blkaddr, f2_natbuf);
+}
+
+/* 分配一个空闲 nid（NAT 空项扫描；nid>=455 超出单块 NAT 模型） */
+static uint32_t f2_alloc_nid(void) {
+    if (f2_natcache_load() != 0) return 0;
+    for (uint32_t nid = 4; nid < NAT_ENTRY_PER_BLOCK; nid++)
+        if (f2_natcache_addr(nid) == 0) return nid;
+    return 0;
+}
+
+/* bump 分配一个 main 区块；失败返回 0 */
+static uint32_t f2_alloc_block(void) {
+    uint32_t cur = rd32(f2_cp + CP_OFF_ALLOC_CURSOR);
+    if (cur == 0) cur = f2_main_blkaddr + 1;   /* 兼容游标未初始化的卷 */
+    if (cur <= f2_main_blkaddr || cur >= f2_total_blocks) return 0;
+    f2_wr32(f2_cp + CP_OFF_ALLOC_CURSOR, cur + 1);
+    return cur;
+}
+
+/* CP 计数同步 + CRC 重算 + pack0 写回 */
+static void f2_cp_commit(int d_blocks, int d_nodes, int d_inodes) {
+    f2_wr64(f2_cp + CP_OFF_VALID_BLOCKS,
+            (uint64_t)((int64_t)rd64(f2_cp + CP_OFF_VALID_BLOCKS) + d_blocks));
+    f2_wr32(f2_cp + CP_OFF_VALID_NODES,
+            (uint32_t)((int)rd32(f2_cp + CP_OFF_VALID_NODES) + d_nodes));
+    f2_wr32(f2_cp + CP_OFF_VALID_INODES,
+            (uint32_t)((int)rd32(f2_cp + CP_OFF_VALID_INODES) + d_inodes));
+    f2_wr32(f2_cp + CP_OFF_CKSUM_OFF, CHECKSUM_OFFSET);
+    f2_wr32(f2_cp + CHECKSUM_OFFSET, f2_crc32(f2_cp, CHECKSUM_OFFSET));
+    f2_write_block(f2_start_cp, f2_cp);
+    f2_info.used_clusters = (uint32_t)rd64(f2_cp + CP_OFF_VALID_BLOCKS);
+}
+
+/* ---------- inline dentry 操作（父目录节点在 f2_node） ---------- */
+static uint8_t *f2_inline_base(uint8_t *node) {
+    return node + INO_OFF_ADDR + 4;
+}
+
+typedef struct {
+    int      slot;
+    uint32_t ino;
+    uint16_t name_len;
+    uint8_t  ftype;
+} f2_dentry_hit;
+
+static int f2_inline_find(uint8_t *node, const char *name, f2_dentry_hit *out) {
+    uint8_t *base = f2_inline_base(node);
+    uint8_t *bitmap = base;
+    uint8_t *dentry = base + INLINE_DENTRY_BITMAP_SIZE + INLINE_RESERVED_SIZE;
+    uint8_t *filename = dentry + NR_INLINE_DENTRY * SIZE_OF_DIR_ENTRY;
+
+    for (int i = 0; i < NR_INLINE_DENTRY;) {
+        if (!(bitmap[i >> 3] & (1u << (i & 7)))) { i++; continue; }
+        uint8_t *de = dentry + (uint32_t)i * SIZE_OF_DIR_ENTRY;
+        uint16_t name_len = rd16(de + 8);
+        if (name_len == 0 || name_len > F2FS_MAX_NAME) { i++; continue; }
+        char dn[256];
+        for (uint16_t k = 0; k < name_len; k++)
+            dn[k] = (char)filename[(uint32_t)i * F2FS_SLOT_LEN + k];
+        dn[name_len] = 0;
+        if (f2_name_eq(dn, name)) {
+            if (out) {
+                out->slot = i;
+                out->ino = rd32(de + 4);
+                out->name_len = name_len;
+                out->ftype = de[10];
+            }
+            return 0;
+        }
+        i += (name_len + F2FS_SLOT_LEN - 1) / F2FS_SLOT_LEN;
+    }
+    return -1;
+}
+
+/* 插入 dentry；返回起始 slot，失败 -1 */
+static int f2_inline_insert(uint8_t *node, const char *name,
+                            uint32_t ino, uint8_t ftype) {
+    uint32_t name_len = 0;
+    while (name[name_len]) name_len++;
+    if (name_len == 0 || name_len > F2FS_MAX_NAME) return -1;
+    uint32_t slots = (name_len + F2FS_SLOT_LEN - 1) / F2FS_SLOT_LEN;
+
+    uint8_t *base = f2_inline_base(node);
+    uint8_t *bitmap = base;
+    uint8_t *dentry = base + INLINE_DENTRY_BITMAP_SIZE + INLINE_RESERVED_SIZE;
+    uint8_t *filename = dentry + NR_INLINE_DENTRY * SIZE_OF_DIR_ENTRY;
+
+    for (uint32_t i = 0; i + slots <= NR_INLINE_DENTRY; i++) {
+        int ok = 1;
+        for (uint32_t k = 0; k < slots; k++)
+            if (bitmap[(i + k) >> 3] & (1u << ((i + k) & 7))) { ok = 0; break; }
+        if (!ok) continue;
+        for (uint32_t k = 0; k < slots; k++) {
+            uint32_t b = i + k;
+            bitmap[b >> 3] |= (uint8_t)(1u << (b & 7));
+        }
+        uint8_t *de = dentry + i * SIZE_OF_DIR_ENTRY;
+        f2_wr32(de, 0);                    /* hash（读路径不校验） */
+        f2_wr32(de + 4, ino);
+        f2_wr16(de + 8, (uint16_t)name_len);
+        de[10] = ftype;
+        for (uint32_t k = 0; k < name_len; k++)
+            filename[i * F2FS_SLOT_LEN + k] = (uint8_t)name[k];
+        return (int)i;
+    }
+    return -1;
+}
+
+static void f2_inline_remove(uint8_t *node, const f2_dentry_hit *hit) {
+    uint8_t *base = f2_inline_base(node);
+    uint8_t *bitmap = base;
+    uint8_t *dentry = base + INLINE_DENTRY_BITMAP_SIZE + INLINE_RESERVED_SIZE;
+    uint8_t *filename = dentry + NR_INLINE_DENTRY * SIZE_OF_DIR_ENTRY;
+    uint32_t slots = (hit->name_len + F2FS_SLOT_LEN - 1) / F2FS_SLOT_LEN;
+
+    for (uint32_t k = 0; k < slots && hit->slot + k < NR_INLINE_DENTRY; k++) {
+        uint32_t b = (uint32_t)hit->slot + k;
+        bitmap[b >> 3] &= (uint8_t)~(1u << (b & 7));
+    }
+    uint8_t *de = dentry + (uint32_t)hit->slot * SIZE_OF_DIR_ENTRY;
+    for (int k = 0; k < SIZE_OF_DIR_ENTRY; k++) de[k] = 0;
+    uint8_t *fn = filename + (uint32_t)hit->slot * F2FS_SLOT_LEN;
+    for (uint32_t k = 0; k < slots * F2FS_SLOT_LEN; k++) fn[k] = 0;
+}
+
+/* ---------- 路径拆分：父目录节点读入 f2_node ---------- */
+static int f2_split_path(const char *path, uint32_t *parent_nid,
+                         char *fname, uint32_t fname_cap) {
+    const char *slash = 0;
+    const char *p = path;
+    while (*p) { if (*p == '/') slash = p; p++; }
+    if (!slash) return -1;
+
+    const char *n = slash + 1;
+    uint32_t nlen = 0;
+    while (n[nlen] && n[nlen] != '/') nlen++;
+    if (nlen == 0 || nlen >= fname_cap) return -1;
+    for (uint32_t i = 0; i < nlen; i++) fname[i] = n[i];
+    fname[nlen] = 0;
+
+    if (slash == path) {
+        if (f2_read_node(f2_root_ino, f2_node) != 0) return -1;
+        *parent_nid = f2_root_ino;
+    } else {
+        char ppath[256];
+        uint32_t plen = (uint32_t)(slash - path);
+        if (plen >= 256) return -1;
+        for (uint32_t i = 0; i < plen; i++) ppath[i] = path[i];
+        ppath[plen] = 0;
+        int is_dir;
+        uint32_t pin = f2_resolve(ppath, &is_dir, 0);
+        if (pin == 0 || !is_dir) return -1;
+        *parent_nid = pin;
+    }
+    /* 写入模型仅支持 inline dentry 目录 */
+    if (!(f2_node[INO_OFF_INLINE] & F2FS_INLINE_DENTRY)) return -1;
+    return 0;
+}
+
+/* 按 dentry 命中删除子节点：清 NAT 项 + 摘 dentry + 计数回收 */
+static int f2_remove_child(uint32_t parent_nid, const f2_dentry_hit *hit) {
+    if (hit->ino < 3 || hit->ino >= NAT_ENTRY_PER_BLOCK) return -1;
+
+    int dblk = 1;    /* 节点块本身 */
+    if (hit->ftype == F2FS_FT_REG_FILE &&
+        f2_read_node(hit->ino, f2_wnode) == 0 &&
+        !(f2_wnode[INO_OFF_INLINE] & F2FS_INLINE_DATA)) {
+        uint64_t sz = rd64(f2_wnode + INO_OFF_SIZE);
+        dblk += (int)((sz + F2FS_BLKSIZE - 1) / F2FS_BLKSIZE);
+    }
+
+    uint32_t pblk = f2_natcache_addr(parent_nid);
+    if (pblk == 0 || pblk < f2_main_blkaddr) return -1;
+
+    f2_natcache_clear(hit->ino);
+    f2_natcache_save();
+    f2_inline_remove(f2_node, hit);
+    f2_write_block(pblk, f2_node);
+    f2_cp_commit(-dblk, -1, -1);
+    return 0;
+}
+
+/* ---------- 对外写入 API ---------- */
+int f2fs_create_file(const char *name, const uint8_t *data, uint32_t size) {
+    uint32_t parent;
+    char fname[256];
+    if (f2_split_path(name, &parent, fname, sizeof(fname)) != 0) return -1;
+    if (f2_natcache_load() != 0) return -1;
+
+    /* create-or-replace：旧文件先删（同名目录则失败） */
+    f2_dentry_hit hit;
+    if (f2_inline_find(f2_node, fname, &hit) == 0) {
+        if (hit.ftype == F2FS_FT_DIR) return -1;
+        if (f2_remove_child(parent, &hit) != 0) return -1;
+    }
+
+    uint32_t nid = f2_alloc_nid();
+    if (nid == 0) return -1;
+    uint32_t blk = f2_alloc_block();
+    if (blk == 0) return -1;
+
+    /* 构造子节点 */
+    for (uint32_t i = 0; i < F2FS_BLKSIZE; i++) f2_wnode[i] = 0;
+    f2_wr16(f2_wnode + INO_OFF_MODE, 0x81A4);        /* regular 0644 */
+    f2_wr64(f2_wnode + INO_OFF_SIZE, size);
+    f2_wr32(f2_wnode + INO_OFF_PINO, parent);
+    uint32_t dblk = 1;
+    if (size <= MAX_INLINE_DATA) {
+        f2_wnode[INO_OFF_INLINE] = F2FS_INLINE_DATA | F2FS_DATA_EXIST;
+        for (uint32_t i = 0; i < size; i++)
+            f2_wnode[INO_OFF_ADDR + 4 + i] = data[i];
+        f2_wr64(f2_wnode + INO_OFF_BLOCKS, F2FS_BLK_SECS);
+    } else {
+        uint32_t nblk = (size + F2FS_BLKSIZE - 1) / F2FS_BLKSIZE;
+        if (nblk > DEF_ADDRS_PER_INODE) return -1;   /* 超出直接块模型 */
+        for (uint32_t b = 0; b < nblk; b++) {
+            uint32_t db = f2_alloc_block();
+            if (db == 0) return -1;
+            f2_wr32(f2_wnode + INO_OFF_ADDR + b * 4, db);
+            for (uint32_t i = 0; i < F2FS_BLKSIZE; i++) f2_dblk[i] = 0;
+            uint32_t chunk = size - b * F2FS_BLKSIZE;
+            if (chunk > F2FS_BLKSIZE) chunk = F2FS_BLKSIZE;
+            for (uint32_t i = 0; i < chunk; i++)
+                f2_dblk[i] = data[b * F2FS_BLKSIZE + i];
+            f2_write_block(db, f2_dblk);
+        }
+        f2_wr64(f2_wnode + INO_OFF_BLOCKS, (uint64_t)(nblk + 1) * F2FS_BLK_SECS);
+        dblk += nblk;
+    }
+    f2_write_block(blk, f2_wnode);
+
+    f2_natcache_set(nid, blk);
+    f2_natcache_save();
+
+    if (f2_inline_insert(f2_node, fname, nid, F2FS_FT_REG_FILE) < 0)
+        return -1;
+    uint32_t pblk = f2_natcache_addr(parent);
+    if (pblk == 0 || pblk < f2_main_blkaddr) return -1;
+    f2_write_block(pblk, f2_node);
+
+    f2_cp_commit((int)dblk, 1, 1);
+    return 0;
+}
+
+int f2fs_delete_file(const char *name) {
+    uint32_t parent;
+    char fname[256];
+    if (f2_split_path(name, &parent, fname, sizeof(fname)) != 0) return -1;
+    if (f2_natcache_load() != 0) return -1;
+
+    f2_dentry_hit hit;
+    if (f2_inline_find(f2_node, fname, &hit) != 0) return -1;
+    if (hit.ftype != F2FS_FT_REG_FILE) return -1;    /* 目录用 rmdir 语义，不支持 */
+    return f2_remove_child(parent, &hit);
+}
+
+int f2fs_mkdir(const char *name) {
+    uint32_t parent;
+    char fname[256];
+    if (f2_split_path(name, &parent, fname, sizeof(fname)) != 0) return -1;
+    if (f2_natcache_load() != 0) return -1;
+
+    f2_dentry_hit hit;
+    if (f2_inline_find(f2_node, fname, &hit) == 0) return -1;   /* 已存在 */
+
+    uint32_t nid = f2_alloc_nid();
+    if (nid == 0) return -1;
+    uint32_t blk = f2_alloc_block();
+    if (blk == 0) return -1;
+
+    /* 目录节点：空 inline dentry */
+    for (uint32_t i = 0; i < F2FS_BLKSIZE; i++) f2_wnode[i] = 0;
+    f2_wr16(f2_wnode + INO_OFF_MODE, 0x41ED);        /* dir 0755 */
+    f2_wr64(f2_wnode + INO_OFF_SIZE, F2FS_BLKSIZE);
+    f2_wr64(f2_wnode + INO_OFF_BLOCKS, F2FS_BLK_SECS);
+    f2_wr32(f2_wnode + INO_OFF_PINO, parent);
+    f2_wnode[INO_OFF_INLINE] = F2FS_INLINE_DENTRY;
+    f2_write_block(blk, f2_wnode);
+
+    f2_natcache_set(nid, blk);
+    f2_natcache_save();
+
+    if (f2_inline_insert(f2_node, fname, nid, F2FS_FT_DIR) < 0)
+        return -1;
+    uint32_t pblk = f2_natcache_addr(parent);
+    if (pblk == 0 || pblk < f2_main_blkaddr) return -1;
+    f2_write_block(pblk, f2_node);
+
+    f2_cp_commit(1, 1, 1);
+    return 0;
+}
+
+/* ---------- 格式化 ----------
+ * 2MB 卷 / 4KB 块 / 64 块段（256KB）：
+ *   块 0     : SB（偏移 1024）
+ *   块 1     : CP pack0（ver=1 奇数 -> start_cp = cp_blkaddr）
+ *   块 2     : NAT journal（空，n=0）
+ *   块 65    : CP pack1（与 pack0 同版本，mount 恒选 pack0）
+ *   块 128   : SIT（读路径不使用）
+ *   块 192   : NAT 第一副本（本卷 nid 全部 < 455）
+ *   块 256   : SSA（读路径不使用）
+ *   块 320.. : main 区（块 320 = 根目录节点，inline dentry）
+ */
+int f2fs_format(uint8_t drive) {
+    if (drive > 3) return -1;
+
+    const uint32_t part_start = 1;
+    const uint32_t vol_blocks = 512;      /* 2MB */
+    const uint32_t bps = 64;              /* 256KB 段 */
+    const uint32_t cp0 = 1;
+    const uint32_t journal_blk = cp0 + 1;
+    const uint32_t sit_blk = 128;
+    const uint32_t nat_blk = 192;
+    const uint32_t ssa_blk = 256;
+    const uint32_t main_blk = 320;
+    const uint32_t root_nid = 3;
+
+    /* format 期间 f2_write_block 需要驱动器/分区状态 */
+    f2_mounted = 0;
+    f2_natbuf_loaded = 0;
+    f2_drive = drive;
+    f2_part_lba = part_start;
+
+    /* MBR：分区 0x83 @LBA1（与 ext4_format 一致） */
+    static uint8_t mbr[512];
+    for (int i = 0; i < 512; i++) mbr[i] = 0;
+    mbr[447] = 0x00; mbr[448] = 0x02; mbr[449] = 0x00;
+    mbr[450] = 0x83;
+    mbr[451] = 0x00; mbr[452] = 0x3F; mbr[453] = 0xFF;
+    f2_wr32(mbr + 454, part_start);
+    f2_wr32(mbr + 458, vol_blocks * F2FS_BLK_SECS - 1);
+    mbr[510] = 0x55; mbr[511] = 0xAA;
+    if (ata_write_sector(drive, 0, mbr) != 0) return -1;
+
+    /* SB（块 0，偏移 1024 起 = 扇区 part_start+2；前 1024 保留区为 0，
+     * mount 在同一偏移读取，见 f2fs_mount 的 f2_read_secs(part_start+2)） */
+    uint8_t *sb = f2_fmt + 1024;
+    for (uint32_t i = 0; i < F2FS_BLKSIZE; i++) f2_fmt[i] = 0;
+    f2_wr32(sb + SB_OFF_MAGIC, F2FS_SUPER_MAGIC);
+    f2_wr32(sb + SB_OFF_LOG_SEC, 9);        /* 512B 扇区 */
+    f2_wr32(sb + SB_OFF_LOG_SPB, 3);        /* 8 扇区/块 = 4KB */
+    f2_wr32(sb + SB_OFF_LOG_BLK, F2FS_BLK_BITS);
+    f2_wr32(sb + SB_OFF_LOG_BPS, 6);        /* 64 块/段 */
+    f2_wr64(sb + SB_OFF_BLOCK_COUNT, vol_blocks);
+    f2_wr32(sb + SB_OFF_CP_BLKADDR, cp0);
+    f2_wr32(sb + SB_OFF_SIT_BLKADDR, sit_blk);
+    f2_wr32(sb + SB_OFF_NAT_BLKADDR, nat_blk);
+    f2_wr32(sb + SB_OFF_SSA_BLKADDR, ssa_blk);
+    f2_wr32(sb + SB_OFF_MAIN_BLKADDR, main_blk);
+    f2_wr32(sb + SB_OFF_ROOT_INO, root_nid);
+    f2_wr32(sb + SB_OFF_CP_PAYLOAD, 0);
+    f2_write_block(0, f2_fmt);
+
+    /* CP pack（双份同版本 1） */
+    uint8_t *cp = f2_fmt;
+    for (uint32_t i = 0; i < F2FS_BLKSIZE; i++) cp[i] = 0;
+    f2_wr64(cp + CP_OFF_VER, 1);
+    f2_wr64(cp + CP_OFF_USER_BLOCKS, vol_blocks - main_blk);
+    f2_wr64(cp + CP_OFF_VALID_BLOCKS, 1);           /* 根节点块 */
+    f2_wr32(cp + CP_OFF_CKPT_FLAGS, CP_COMPACT_SUM_FLAG);
+    f2_wr32(cp + CP_OFF_PACK_TOTAL, 1);
+    f2_wr32(cp + CP_OFF_PACK_START_SUM, 1);         /* journal @ cp0+1 */
+    f2_wr32(cp + CP_OFF_VALID_NODES, 1);
+    f2_wr32(cp + CP_OFF_VALID_INODES, 1);
+    f2_wr32(cp + CP_OFF_SIT_VER_BYTES, 0);          /* nat bitmap 紧随 0xC0 */
+    f2_wr32(cp + CP_OFF_NAT_VER_BYTES, 0);
+    f2_wr32(cp + CP_OFF_CKSUM_OFF, CHECKSUM_OFFSET);
+    f2_wr32(cp + CP_OFF_ALLOC_CURSOR, main_blk + 1);
+    f2_wr32(cp + CHECKSUM_OFFSET, f2_crc32(cp, CHECKSUM_OFFSET));
+    f2_write_block(cp0, cp);
+    f2_write_block(cp0 + bps, cp);
+
+    /* NAT journal 块（空 journal：n=0，NAT 查找走 NAT 区块） */
+    uint8_t *jnl = f2_fmt;
+    for (uint32_t i = 0; i < F2FS_BLKSIZE; i++) jnl[i] = 0;
+    f2_write_block(journal_blk, jnl);
+
+    /* NAT 块：root nid -> main_blk */
+    uint8_t *nat = f2_fmt;
+    for (uint32_t i = 0; i < F2FS_BLKSIZE; i++) nat[i] = 0;
+    {
+        uint8_t *e = nat + root_nid * NAT_ENTRY_SIZE;
+        e[0] = 0;                        /* version */
+        f2_wr32(e + 1, root_nid);        /* ino */
+        f2_wr32(e + 5, main_blk);        /* block_addr */
+    }
+    f2_write_block(nat_blk, nat);
+
+    /* 根目录节点（空 inline dentry） */
+    uint8_t *root = f2_fmt;
+    for (uint32_t i = 0; i < F2FS_BLKSIZE; i++) root[i] = 0;
+    f2_wr16(root + INO_OFF_MODE, 0x41ED);
+    f2_wr64(root + INO_OFF_SIZE, F2FS_BLKSIZE);
+    f2_wr64(root + INO_OFF_BLOCKS, F2FS_BLK_SECS);
+    f2_wr32(root + INO_OFF_PINO, root_nid);
+    root[INO_OFF_INLINE] = F2FS_INLINE_DENTRY;
+    f2_write_block(main_blk, root);
+
+    /* 挂载验证 */
+    f2_natbuf_loaded = 0;
+    if (f2fs_mount(drive, part_start) != 0) return -1;
+    return 0;
+}

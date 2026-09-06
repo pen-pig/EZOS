@@ -15,6 +15,9 @@ static char cwd_path[256] = "/";           // 当前工作目录路径字符串
 static uint32_t dir_stack[32];             // 目录栈（父目录簇），dir_stack[0] 恒为根
 static int dir_depth = 0;                  // 当前目录深度（根=0）
 
+/* 大缓冲放高内存段 .bss.hi（1MB+，见 linker.ld）：低 640KB 区留给栈/小数据 */
+#define XF_HIBUF __attribute__((section(".bss.hi")))
+
 static int my_upper_char(char c) {
     if (c >= 'a' && c <= 'z') return c - 'a' + 'A';
     return c;
@@ -197,7 +200,7 @@ static uint32_t exfat_extend_dir(uint32_t dir_cluster) {
     if (exfat_write_fat_entry(cur, new_cl) != 0) return 0;
     // 清空新簇
     uint32_t cluster_size = exfat_info.bytes_per_sector * exfat_info.sectors_per_cluster;
-    static uint8_t zero[512 * 16];
+    static uint8_t zero[512 * 16] XF_HIBUF;
     for (uint32_t i = 0; i < cluster_size; i++) zero[i] = 0;
     if (exfat_write_cluster(new_cl, zero) != 0) return 0;
     exfat_bitmap_set(new_cl, 1);
@@ -291,7 +294,7 @@ static int exfat_parse_entry_set(const uint8_t *entry, uint8_t *out) {
 
 // 在指定目录链中查找名字匹配的目录项，输出合并结构，返回偏移；未找到返回 -1
 static int exfat_find_entry(uint32_t dir_cluster, const char *name, uint8_t *out_entry) {
-    static uint8_t dir_data[512 * 16];
+    static uint8_t dir_data[512 * 16] XF_HIBUF;
     uint8_t *buffer = dir_data;
     uint32_t cluster_size = exfat_info.bytes_per_sector * exfat_info.sectors_per_cluster;
 
@@ -563,7 +566,7 @@ int exfat_mkdir(const char *name) {
     exfat_bitmap_set(new_cluster, 1);
 
     uint32_t cluster_size = exfat_info.bytes_per_sector * exfat_info.sectors_per_cluster;
-    static uint8_t sub_dir[512 * 16];
+    static uint8_t sub_dir[512 * 16] XF_HIBUF;
     for (uint32_t i = 0; i < cluster_size; i++) sub_dir[i] = 0;
     if (exfat_write_cluster(new_cluster, sub_dir) != 0) goto restore;
 
@@ -837,7 +840,7 @@ int exfat_init(void) {
 
     // 从根目录 0x81 条目解析 Allocation Bitmap 簇号（不再硬编码簇3）
     {
-        static uint8_t root_dir_buf[512 * 16];
+        static uint8_t root_dir_buf[512 * 16] XF_HIBUF;
         uint32_t n = exfat_read_dir_chain(exfat_info.root_dir_cluster, root_dir_buf, 16);
         uint32_t cluster_size = exfat_info.bytes_per_sector * exfat_info.sectors_per_cluster;
         for (uint32_t off = 0; off < n * cluster_size; off += 32) {
@@ -864,7 +867,7 @@ const exfat_info_t *exfat_get_info(void) {
 int exfat_list_root(void) {
     if (!exfat_ready) return -1;
 
-    static uint8_t root_cluster_data[512 * 16];
+    static uint8_t root_cluster_data[512 * 16] XF_HIBUF;
     uint8_t *buffer = root_cluster_data;
 
     uint32_t cluster = exfat_cwd_cluster();
@@ -914,7 +917,7 @@ int exfat_list_root(void) {
 int exfat_read_dir(exfat_dir_entry_t *entries, int max_entries) {
     if (!exfat_ready) return -1;
 
-    static uint8_t dir_data[512 * 16];
+    static uint8_t dir_data[512 * 16] XF_HIBUF;
     uint8_t *buffer = dir_data;
 
     uint32_t cluster = exfat_cwd_cluster();
@@ -1008,7 +1011,7 @@ int exfat_read_file(const char *name, uint8_t *buffer, uint32_t max_size) {
     uint32_t bytes_read = 0;
     uint32_t current_cluster = file_start_cluster;
     while (bytes_read < file_size && bytes_read < max_size) {
-        static uint8_t cluster_data[512 * 16];
+        static uint8_t cluster_data[512 * 16] XF_HIBUF;
         if (exfat_read_cluster(current_cluster, cluster_data) != 0) return -1;
         uint32_t to_copy = file_size - bytes_read;
         if (to_copy > cluster_size) to_copy = cluster_size;
@@ -1038,7 +1041,7 @@ int exfat_create_file(const char *name, const uint8_t *data, uint32_t size) {
     if (exfat_find_entry(exfat_cwd_cluster(), name, exist_entry) >= 0) return -1;
 
     uint32_t root_cluster = exfat_cwd_cluster();
-    static uint8_t root_cluster_data[512 * 16];
+    static uint8_t root_cluster_data[512 * 16] XF_HIBUF;
     uint8_t *root_buffer = root_cluster_data;
     uint32_t dir_clusters = exfat_read_dir_chain(root_cluster, root_buffer, 16);
     if (dir_clusters == 0) return -1;
@@ -1125,7 +1128,7 @@ int exfat_create_file(const char *name, const uint8_t *data, uint32_t size) {
 int exfat_delete_file(const char *name) {
     if (!exfat_ready) return -1;
 
-    static uint8_t root_cluster_data[512 * 16];
+    static uint8_t root_cluster_data[512 * 16] XF_HIBUF;
     uint8_t *root_buffer = root_cluster_data;
     uint32_t root_cluster = exfat_cwd_cluster();
     uint32_t cluster_size = exfat_info.bytes_per_sector * exfat_info.sectors_per_cluster;
@@ -1158,7 +1161,7 @@ int exfat_delete_file(const char *name) {
                     if ((merged[1] & EXFAT_ATTR_DIRECTORY) != 0) {
                         // 检查目录是否为空：读其第一簇，看是否有有效条目
                         uint32_t sub = *((uint32_t*)(merged + EXFAT_MERGED_CLUSTER_OFF));
-                        static uint8_t sub_buf[512 * 16];
+                        static uint8_t sub_buf[512 * 16] XF_HIBUF;
                         if (sub >= 2 && sub < exfat_info.cluster_count + 2) {
                             uint32_t sub_clusters = exfat_read_dir_chain(sub, sub_buf, 16);
                             uint32_t sub_total = sub_clusters * cluster_size;

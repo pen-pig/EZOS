@@ -1,11 +1,12 @@
 /*
- * ntfs.h - NTFS 只读驱动
+ * ntfs.h - NTFS 驱动（读 + 写）
  *
  * refs:
  *   - GRUB grub-core/fs/ntfs.c + include/grub/ntfs.h (GPLv3+)
  *     fixup / run list / INDEX_ROOT / INDEX_ALLOCATION 解析逻辑
  *   - NTFS.com 与 flatcap linux-ntfs 文档（磁盘结构字段偏移）
  *     https://flatcap.github.io/linux-ntfs/ntfs/
+ *   - ntfs-3g ntfsprogs/mkntfs.c - 格式化布局参考
  */
 #ifndef NTFS_H
 #define NTFS_H
@@ -33,5 +34,14 @@ uint32_t ntfs_get_file_size(const char *path);
 int      ntfs_read_dir(const char *path, fs_dir_entry_t *entries, int max_entries);
 int      ntfs_is_dir(const char *path);       /* 1=目录 0=文件 -1=不存在 */
 uint32_t ntfs_get_file_clusters(const char *path);
+
+/* 写入 API（create-or-replace 语义，与 exfat_/fat_ 一致） */
+int      ntfs_create_file(const char *name, const uint8_t *data, uint32_t size);
+int      ntfs_delete_file(const char *name);
+int      ntfs_mkdir(const char *name);
+
+/* 格式化：在 drive 上创建 NTFS 卷（4KB 簇，驻留 INDEX_ROOT 小目录模型）
+ * 并挂载；0=成功 */
+int      ntfs_format(uint8_t drive);
 
 #endif

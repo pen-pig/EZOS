@@ -200,12 +200,16 @@ static int fs_is_fat(void) {
     return fs_type_cur == FS_FAT12 || fs_type_cur == FS_FAT16 || fs_type_cur == FS_FAT32;
 }
 
+/* 绝对路径型驱动（ext4/NTFS/F2FS/EROFS）：cwd 由本层拼接，驱动收绝对路径 */
 static int fs_is_ro(void) {
     return fs_type_cur == FS_EXT4 || fs_type_cur == FS_NTFS ||
            fs_type_cur == FS_F2FS || fs_type_cur == FS_EROFS;
 }
 
-int fs_is_readonly(void) { return fs_is_ro(); }
+/* 真只读卷：仅 EROFS（ROM 文件系统，按设计无写入者；ext4/NTFS/F2FS 已支持写） */
+int fs_is_readonly(void) {
+    return fs_type_cur == FS_EROFS;
+}
 
 int fs_init(void) {
     if (fs_type_cur != FS_NONE) return 0;    /* 已挂载：幂等返回，保留 cwd */
@@ -269,8 +273,14 @@ int fs_format(int fs_type) {
     } else if (fs_type == FS_FAT12 || fs_type == FS_FAT16 || fs_type == FS_FAT32) {
         /* fat_format 写 MBR/BPB/FAT/根目录后立即挂载（含 cwd 重置） */
         if (fat_format(fs_preferred_drive, fs_type) != fs_type) return -1;
+    } else if (fs_type == FS_EXT4) {
+        if (ext4_format(fs_preferred_drive) != 0) return -1;
+    } else if (fs_type == FS_NTFS) {
+        if (ntfs_format(fs_preferred_drive) != 0) return -1;
+    } else if (fs_type == FS_F2FS) {
+        if (f2fs_format(fs_preferred_drive) != 0) return -1;
     } else {
-        /* ext4/NTFS/F2FS/EROFS 为只读驱动，不支持格式化 */
+        /* EROFS 为只读 ROM 文件系统，不支持格式化 */
         return -1;
     }
     fs_type_cur = fs_type;
@@ -340,6 +350,34 @@ static uint32_t ro_used_clusters(void) {
     case FS_F2FS:  return f2fs_get_info()->used_clusters;
     case FS_EROFS: return erofs_get_info()->used_clusters;
     default:       return 0;
+    }
+}
+
+/* 绝对路径型驱动的写入分发（EROFS 只读，走 default 拒绝） */
+static int ro_create_file(const char *path, const uint8_t *data, uint32_t size) {
+    switch (fs_type_cur) {
+    case FS_EXT4:  return ext4_create_file(path, data, size);
+    case FS_NTFS:  return ntfs_create_file(path, data, size);
+    case FS_F2FS:  return f2fs_create_file(path, data, size);
+    default:       return -1;
+    }
+}
+
+static int ro_delete_file(const char *path) {
+    switch (fs_type_cur) {
+    case FS_EXT4:  return ext4_delete_file(path);
+    case FS_NTFS:  return ntfs_delete_file(path);
+    case FS_F2FS:  return f2fs_delete_file(path);
+    default:       return -1;
+    }
+}
+
+static int ro_mkdir(const char *path) {
+    switch (fs_type_cur) {
+    case FS_EXT4:  return ext4_mkdir(path);
+    case FS_NTFS:  return ntfs_mkdir(path);
+    case FS_F2FS:  return f2fs_mkdir(path);
+    default:       return -1;
     }
 }
 
@@ -428,13 +466,23 @@ int fs_create_file(const char *name, const uint8_t *data, uint32_t size) {
         fat_delete_file(name);
         return fat_create_file(name, data, size);
     }
-    return -1;      /* 只读文件系统：拒绝写入 */
+    if (fs_is_ro()) {
+        char full[512];
+        if (fs_ro_abs(name, full, sizeof(full)) != 0) return -1;
+        return ro_create_file(full, data, size);   /* 驱动内部含 replace 语义 */
+    }
+    return -1;      /* EROFS：拒绝写入 */
 }
 
 int fs_delete_file(const char *name) {
     if (fs_type_cur == FS_EXFAT) return exfat_delete_file(name);
     if (fs_is_fat()) return fat_delete_file(name);
-    return -1;      /* 只读文件系统：拒绝删除 */
+    if (fs_is_ro()) {
+        char full[512];
+        if (fs_ro_abs(name, full, sizeof(full)) != 0) return -1;
+        return ro_delete_file(full);
+    }
+    return -1;      /* EROFS：拒绝删除 */
 }
 
 int fs_list_root(void) {
@@ -474,7 +522,12 @@ int fs_change_dir(const char *name) {
 int fs_mkdir(const char *name) {
     if (fs_type_cur == FS_EXFAT) return exfat_mkdir(name);
     if (fs_is_fat()) return fat_mkdir(name);
-    return -1;      /* 只读文件系统：拒绝建目录 */
+    if (fs_is_ro()) {
+        char full[512];
+        if (fs_ro_abs(name, full, sizeof(full)) != 0) return -1;
+        return ro_mkdir(full);
+    }
+    return -1;      /* EROFS：拒绝建目录 */
 }
 
 const char *fs_cwd_path(void) {

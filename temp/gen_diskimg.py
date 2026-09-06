@@ -565,7 +565,8 @@ def gen_ext4(path):
     # 固定布局
     GDT_BLK, ITABLE_BLK, ROOT_BLK = 2, 3, 7
     README_BLK, LFN_BLK = 8, 9
-    used_blocks = 10                                    # 块 1..9（SB/GDT/ITAB4/ROOT/2 文件）
+    BBMP_BLK, IBMP_BLK = 10, 11
+    used_blocks = 12                        # 块 0..11（SB/GDT/ITAB4/ROOT/2 文件/2 位图）
     p = {'vol_blocks': vol_blocks, 'free_blocks': vol_blocks - used_blocks,
          'used_inodes': 4}
 
@@ -575,9 +576,11 @@ def gen_ext4(path):
     # 块 1：superblock；块 2：GDT（bg_inode_table_lo = 3）
     wblk(1, make_ext4_sb(p))
     gd = bytearray(32)
-    struct.pack_into('<I', gd, 0, 10)                   # bg_block_bitmap_lo
-    struct.pack_into('<I', gd, 4, 11)                   # bg_inode_bitmap_lo
+    struct.pack_into('<I', gd, 0, BBMP_BLK)             # bg_block_bitmap_lo
+    struct.pack_into('<I', gd, 4, IBMP_BLK)             # bg_inode_bitmap_lo
     struct.pack_into('<I', gd, 8, ITABLE_BLK)           # bg_inode_table_lo
+    struct.pack_into('<I', gd, 12, vol_blocks - used_blocks)  # bg_free_blocks_count
+    struct.pack_into('<H', gd, 16, 32 - p['used_inodes'])    # bg_free_inodes_count
     wblk(GDT_BLK, bytes(gd))
 
     # inode 表（块 3-6）：ino2 根目录 / ino3 README(extent) / ino4 LFN(legacy)
@@ -616,6 +619,15 @@ def gen_ext4(path):
 
     wblk(README_BLK, readme)
     wblk(LFN_BLK, lfn_data)
+
+    # 块 10：块位图（0..11 已用）；块 11：inode 位图（inode 1..4 已用）
+    bbmp = bytearray(BLK)
+    for i in range(used_blocks):
+        bbmp[i // 8] |= 1 << (i % 8)
+    wblk(BBMP_BLK, bytes(bbmp))
+    ibmp = bytearray(BLK)
+    ibmp[0] = 0x0F                           # inode 1..4
+    wblk(IBMP_BLK, bytes(ibmp))
 
     with open(path, 'wb') as f:
         f.write(img)

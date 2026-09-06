@@ -1,7 +1,10 @@
-# test_fs.py - 文件系统回归测试：exFAT / FAT32 / FAT16 / FAT12 / 无盘 五组
+# test_fs.py - 文件系统回归测试：exFAT / FAT32 / FAT16 / FAT12 / 无盘 / format / ext4-RW
 # 每组：QEMU 启动 -> df 报 FS 类型 -> ls 见 README + LFN 长名 -> cat 读内容
 #       -> write 创建/覆盖 -> ls -> rm 删除 -> mkdir/cd/pwd 目录操作 -> exit 进桌面
-# 验证：fs.c 统一分发层 + fat.c 新驱动 + exfat.c 原驱动 + 无盘降级
+# format 变体：format {fat32,fat16,fat12,exfat,ext4,ntfs,f2fs} 后写读删验证
+# ext4-rw 变体：生成镜像上的 ext4 挂载 + 读 + 写入/覆盖/删除/目录
+#     （EROFS 保持只读；ntfs/f2fs 无镜像生成器，经 format 变体覆盖）
+# 验证：fs.c 统一分发层 + fat.c/exfat.c/ext4.c/ntfs.c/f2fs.c 驱动 + 无盘降级
 # 注意：QMP type_text 仅支持小写字母/数字/空格，文件名匹配大小写不敏感
 import subprocess, sys, time, os, re
 from test_features import ocr_text, Qmp
@@ -180,11 +183,43 @@ def run_format_variant():
         t = norm(vm.sh("df"))
         check("df 报告 exfat", "exfat" in t, t.replace('\n', ' ')[:160])
 
-        # 5) 只读文件系统不可格式化 -> Usage
-        t = norm(vm.sh("format ext4"))
-        check("format ext4 拒绝", "usage" in t, t[:160])
+        # 5) format ext4 -> 写读删
+        t = norm(vm.sh("format ext4", 8.0))
+        check("format ext4 成功", "formatted as ext4" in t, t[:160])
+        t = norm(vm.sh("df"))
+        check("df 报告 ext4", "ext4" in t, t.replace('\n', ' ')[:160])
+        t = norm(vm.sh("write ext4.txt ext4 rw test"))
+        check("ext4 write", "successfully" in t, t[:160])
+        t = norm(vm.sh("cat ext4.txt"))
+        check("ext4 cat", "ext4 rw test" in t, t[:160])
+        t = norm(vm.sh("rm ext4.txt"))
+        check("ext4 rm", "deleted" in t, t[:160])
 
-        # 6) exit 进桌面
+        # 6) format ntfs -> 写读删
+        t = norm(vm.sh("format ntfs", 8.0))
+        check("format ntfs 成功", "formatted as ntfs" in t, t[:160])
+        t = norm(vm.sh("df"))
+        check("df 报告 ntfs", "ntfs" in t, t.replace('\n', ' ')[:160])
+        t = norm(vm.sh("write ntfs.txt ntfs rw test"))
+        check("ntfs write", "successfully" in t, t[:160])
+        t = norm(vm.sh("cat ntfs.txt"))
+        check("ntfs cat", "ntfs rw test" in t, t[:160])
+        t = norm(vm.sh("rm ntfs.txt"))
+        check("ntfs rm", "deleted" in t, t[:160])
+
+        # 7) format f2fs -> 写读删
+        t = norm(vm.sh("format f2fs", 8.0))
+        check("format f2fs 成功", "formatted as f2fs" in t, t[:160])
+        t = norm(vm.sh("df"))
+        check("df 报告 f2fs", "f2fs" in t, t.replace('\n', ' ')[:160])
+        t = norm(vm.sh("write f2fs.txt f2fs rw test"))
+        check("f2fs write", "successfully" in t, t[:160])
+        t = norm(vm.sh("cat f2fs.txt"))
+        check("f2fs cat", "f2fs rw test" in t, t[:160])
+        t = norm(vm.sh("rm f2fs.txt"))
+        check("f2fs rm", "deleted" in t, t[:160])
+
+        # 8) exit 进桌面
         vm.q.type_text("exit\n"); time.sleep(3.0)
         vm.shot("fsreg_format_desk.ppm")
         w, h = load_size("fsreg_format_desk.ppm")
@@ -193,13 +228,13 @@ def run_format_variant():
         vm.close()
 
 
-def run_ro_variant():
-    """只读文件系统（ext4）：挂载/读/列目录正常，写操作被拒"""
-    print("\n===== 变体 ro-ext4: 只读文件系统 =====")
+def run_ext4_variant():
+    """ext4 读写（生成镜像）：挂载/读/列目录 + 写入/覆盖/删除/目录操作"""
+    print("\n===== 变体 ext4-rw: ext4 读写文件系统 =====")
     img = "disk_ext4.img"
     subprocess.run([sys.executable, "temp/gen_diskimg.py", img, "ext4"],
                    check=True)
-    vm = Vm(["os-image.bin", img], "roext4")
+    vm = Vm(["os-image.bin", img], "ext4rw")
     try:
         t = norm(vm.sh("df"))
         check("df 挂载 ext4", "ext4" in t, t.replace('\n', ' ')[:160])
@@ -209,14 +244,32 @@ def run_ro_variant():
               t.replace('\n', ' ')[:160])
         t = norm(vm.sh("cat readme.txt"))
         check("cat 读文件内容", "welcome to ezos" in t, t[:160])
-        t = norm(vm.sh("write newfile.txt hi"))
-        check("write 只读拒绝", "failed" in t, t[:160])
-        t = norm(vm.sh("rm readme.txt"))
-        check("rm 只读拒绝", "failed" in t, t[:160])
+
+        # 写入（create-or-replace）+ 覆盖验证
+        t = norm(vm.sh("write newfile.txt hello ext4"))
+        check("ext4 write 创建", "successfully" in t, t[:160])
+        t = norm(vm.sh("write newfile.txt second life"))
+        check("ext4 write 覆盖", "successfully" in t, t[:160])
+        raw = vm.sh("cat newfile.txt")
+        tail = norm(' '.join([ln for ln in raw.split('\n') if ln.strip()][-3:]))
+        check("ext4 cat 覆盖内容", "second life" in tail and "hello ext4" not in tail,
+              tail[:160])
+
+        # 删除
+        t = norm(vm.sh("rm newfile.txt"))
+        check("ext4 rm 删除", "deleted" in t, t[:160])
+
+        # 目录操作
+        t = norm(vm.sh("mkdir docs"))
+        t = norm(vm.sh("cd docs"))
+        t = norm(vm.sh("pwd"))
+        check("ext4 mkdir/cd/pwd", "docs" in t, t.replace('\n', ' ')[:160])
+
+        vm.q.type_text("cd /\n"); time.sleep(0.8)
         vm.q.type_text("exit\n"); time.sleep(3.0)
-        vm.shot("fsreg_roext4_desk.ppm")
-        w, h = load_size("fsreg_roext4_desk.ppm")
-        check("ro 变体进桌面", w >= 640 and h >= 480, f"{w}x{h}")
+        vm.shot("fsreg_ext4rw_desk.ppm")
+        w, h = load_size("fsreg_ext4rw_desk.ppm")
+        check("ext4-rw 变体进桌面", w >= 640 and h >= 480, f"{w}x{h}")
     finally:
         vm.close()
 
@@ -231,7 +284,7 @@ def main():
                            check=True)
         run_fs_variant(name, img, fstype)
     run_format_variant()
-    run_ro_variant()
+    run_ext4_variant()
     run_nodisk_variant()
 
     print(f"\n========== 结果: {len(PASS)} passed, {len(FAIL)} failed ==========")
