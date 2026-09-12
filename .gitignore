@@ -39,6 +39,8 @@ disk.img.bak_std
 gui_2*.c
 .ninja_deps
 .ninja_log
+.ninja_lock
+.workbuddy/
 build_auto.ninja
 build_log.txt
 comp_err.txt
@@ -52,6 +54,7 @@ tmp/
 *.temp
 *.png
 *.ppm
+shot_*.ppm
 *.bmp
 *.jpg
 *.jpeg
