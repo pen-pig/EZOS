@@ -44,8 +44,8 @@ done
 CFLAGS="-ffreestanding -O2 -Wall -Wextra -Ikernel"
 LDFLAGS="-m elf_i386 -T linker.ld --oformat binary -e _start"
 
-OBJS="boot/kernel_entry.o kernel/kernel.o kernel/tty.o kernel/idt.o kernel/isr.o kernel/keyboard.o kernel/ata.o kernel/shell.o kernel/shell_extra.o kernel/exfat.o kernel/gfx.o kernel/gui.o kernel/mouse.o kernel/gfxwin.o kernel/desktop.o kernel/games.o kernel/hiscore.o"
-SRCS="kernel/kernel.c kernel/tty.c kernel/idt.c kernel/isr.c kernel/keyboard.c kernel/ata.c kernel/shell.c kernel/shell_extra.c kernel/exfat.c kernel/gfx.c kernel/gui.c kernel/mouse.c kernel/gfxwin.c kernel/desktop.c kernel/games.c kernel/hiscore.c"
+OBJS="boot/kernel_entry.o kernel/kernel.o kernel/tty.o kernel/idt.o kernel/isr.o kernel/keyboard.o kernel/ata.o kernel/shell.o kernel/shell_extra.o kernel/exfat.o kernel/fat.o kernel/fs.o kernel/ext4.o kernel/ntfs.o kernel/f2fs.o kernel/erofs.o kernel/refs.o kernel/div64.o kernel/gfx.o kernel/gui.o kernel/mouse.o kernel/gfxwin.o kernel/desktop.o kernel/games.o kernel/hiscore.o"
+SRCS="kernel/kernel.c kernel/tty.c kernel/idt.c kernel/isr.c kernel/keyboard.c kernel/ata.c kernel/shell.c kernel/shell_extra.c kernel/exfat.c kernel/fat.c kernel/fs.c kernel/ext4.c kernel/ntfs.c kernel/f2fs.c kernel/erofs.c kernel/refs.c kernel/div64.c kernel/gfx.c kernel/gui.c kernel/mouse.c kernel/gfxwin.c kernel/desktop.c kernel/games.c kernel/hiscore.c"
 
 clean() {
     echo "正在清理构建产物..."
@@ -96,4 +96,4 @@ echo "正在重建 disk.img（exFAT 布局）..."
 "$PYTHON" "$(dirname "$0")/temp/gen_diskimg.py" disk.img
 
 echo "正在启动 QEMU..."
-"$QEMU" -vga std -drive format=raw,file=os-image.bin -drive format=raw,file=disk.img
+"$QEMU" -icount shift=auto -vga std -drive format=raw,file=os-image.bin -drive format=raw,file=disk.img

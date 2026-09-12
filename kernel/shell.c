@@ -249,6 +249,7 @@ static const command_t commands[] = {
     {"alias",    cmd_alias},
     {"unalias",  cmd_unalias},
     {"sleep",    cmd_sleep},
+    {"uptime",   cmd_uptime},
     {"mem",      cmd_mem},
     {0, 0}
 };
@@ -647,7 +648,7 @@ static void cmd_help(const char *args) {
     terminal_writestring("  cat <file> - read file content (exFAT)\n");
     terminal_writestring("  write <file> <content> - create file with content\n");
     terminal_writestring("  rm <file>  - delete file\n");
-    terminal_writestring("  format [fs] - format slave disk: exfat|fat12|fat16|fat32|ext4|ntfs|f2fs\n");
+    terminal_writestring("  format [fs] - format slave disk: exfat|fat12|fat16|fat32|ext4|ntfs|f2fs|refs\n");
     terminal_writestring("  grep <pattern> <file> - print lines containing pattern\n");
     terminal_writestring("  wc <file>  - count lines/words/characters\n");
     terminal_writestring("  head <file> [n] - show first n lines (default 10)\n");
@@ -1127,8 +1128,10 @@ static void cmd_format(const char *args) {
             type = FS_NTFS;
         } else if (my_strcasecmp(args, "f2fs") == 0) {
             type = FS_F2FS;
+        } else if (my_strcasecmp(args, "refs") == 0) {
+            type = FS_REFS;
         } else {
-            terminal_writestring("Usage: format [exfat|fat12|fat16|fat32|ext4|ntfs|f2fs]\n");
+            terminal_writestring("Usage: format [exfat|fat12|fat16|fat32|ext4|ntfs|f2fs|refs]\n");
             return;
         }
     }

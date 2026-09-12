@@ -55,5 +55,5 @@ if not exist "disk.img" (
 )
 
 echo [INFO] Booting EZOS in QEMU...
-qemu-system-x86_64 -vga std -m 128 -drive format=raw,file=os-image.bin -drive format=raw,file=disk.img
+qemu-system-x86_64 -icount shift=auto -vga std -m 128 -drive format=raw,file=os-image.bin -drive format=raw,file=disk.img
 endlocal

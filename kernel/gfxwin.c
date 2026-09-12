@@ -54,10 +54,12 @@ static gw_window_t *gw_spawn_app(int idx);
 #define GW_APP_ABOUT    5
 #define GW_APP_TERMINAL 6
 #define GW_APP_PAINT    7
-#define GW_APP_COUNT    8
+#define GW_APP_BROWSER  8
+#define GW_APP_COUNT    9
 
 static const char *gw_app_names[GW_APP_COUNT] = {
-    "File Manager", "Notepad", "System Info", "Clock", "Settings", "About EZOS", "Terminal", "Paint"
+    "File Manager", "Notepad", "System Info", "Clock", "Settings", "About EZOS", "Terminal", "Paint",
+    "Browser"
 };
 static void gw_game_yield(void);
 
@@ -578,6 +580,22 @@ static void gw_menu_rect(int *mx0, int *my0, int *mw, int *mh)
     *my0 = gw_theme_gnome() ? th + 2 : GFX_H - th - *mh - 2;
 }
 
+/* 开始菜单行高：默认 34px，行数多（应用+返回/重启/关机）放不下时自动压缩，
+ * 保证最后一项（关机）在 640x480 也可点；绘制与点击命中共用同一结果 */
+static int gw_menu_row_h(void)
+{
+    int mw, mh, mx0, my0;
+    gw_menu_rect(&mx0, &my0, &mw, &mh);
+    int row_h = gw_scale_y(34);
+    int list_y = gw_scale_y(54);
+    int need = GW_APP_COUNT + 3;
+    int min_h = gw_scale_y(22);
+    while (row_h > min_h &&
+           list_y + need * row_h > mh - gw_scale_y(60))
+        row_h--;
+    return row_h;
+}
+
 gw_window_t *gw_create(const char *title, int x, int y, int w, int h, int flags)
 {
     if (w < gw_scale_x(120)) w = gw_scale_x(120);
@@ -774,18 +792,18 @@ int gw_start_menu_open(void) { return gw_start_menu_active; }
 static int gw_dirty = 1;
 static int gw_taskbar_dirty = 0;   /* 任务栏局部重绘请求（时钟分钟变化/交互时用） */
 
-/* 桌面图标：5 个系统应用 + 7 个游戏，正方形图标框、随分辨率网格自适应 */
-#define GW_DESK_ICONS 12
+/* 桌面图标：5 个系统应用 + 7 个游戏 + 浏览器（追加末尾，既有索引不变） */
+#define GW_DESK_ICONS 13
 static const char *gw_desktop_icon_names[GW_DESK_ICONS] = {
     "This PC", "Recycle Bin", "Notepad", "Terminal", "Paint",
-    "Guess", "TicTac", "Snake", "2048", "Mines", "RPS", "Memory"
+    "Guess", "TicTac", "Snake", "2048", "Mines", "RPS", "Memory", "Browser"
 };
 /* app>=0 启动应用；app==-1 启动 games 游戏（编号取 game 列） */
-static int gw_desktop_icon_app[GW_DESK_ICONS] = { 0, 0, 1, 6, 7, -1, -1, -1, -1, -1, -1, -1 };
-static int gw_desktop_icon_game[GW_DESK_ICONS] = { 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7 };
+static int gw_desktop_icon_app[GW_DESK_ICONS] = { 0, 0, 1, 6, 7, -1, -1, -1, -1, -1, -1, -1, 8 };
+static int gw_desktop_icon_game[GW_DESK_ICONS] = { 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 0 };
 static uint32_t gw_desktop_icon_col[GW_DESK_ICONS] = {
     0x0078D7u, 0x8A9BA8u, 0xF5B800u, 0x00CC44u, 0xE95420u,
-    0xFF6A00u, 0x9C27B0u, 0x4CAF50u, 0xFF9800u, 0x607D8Bu, 0xE91E63u, 0x3F51B5u
+    0xFF6A00u, 0x9C27B0u, 0x4CAF50u, 0xFF9800u, 0x607D8Bu, 0xE91E63u, 0x3F51B5u, 0x00A2E8u
 };
 
 /* 正方形图标框：box = 图标 + 名称区，4 列网格，随 GFX_W/GFX_H 缩放 */
@@ -807,7 +825,8 @@ static int gw_desktop_icon_rect(int idx, int *ix, int *iy, int *iw, int *ih)
 
 /* ---- Ubuntu Dock（GNOME 主题左侧竖排应用栏） ---- */
 static uint32_t gw_dock_col[GW_APP_COUNT] = {
-    0x0078D7u, 0xF5B800u, 0x607D8Bu, 0xE91E63u, 0x4CAF50u, 0x9C27B0u, 0x00CC44u, 0xFF6A00u
+    0x0078D7u, 0xF5B800u, 0x607D8Bu, 0xE91E63u, 0x4CAF50u, 0x9C27B0u, 0x00CC44u, 0xFF6A00u,
+    0x00A2E8u
 };
 /* Dock 第 idx 个应用图标矩形（640x480 基准：52 宽栏内 36 图标，间距 48；
  * 小分辨率自动压缩间距/图标，保证 8 个图标放得下） */
@@ -1088,7 +1107,7 @@ void gw_draw_start_menu(void)
     gfx_draw_text(mx0 + 40, my0 + gw_scale_y(15), "EZOS User", 0x0F, 0x0B);
 
     /* 应用列表 */
-    int row_h = gw_scale_y(34);
+    int row_h = gw_menu_row_h();   /* 与点击命中共用，小屏自动压缩 */
     int list_y = my0 + gw_scale_y(54);
     int lw = mw - gw_scale_x(64);
     uint32_t hov_rgb = gw_theme_gnome() ? 0xE95420u : 0xFFFFFFu;   /* hover 高亮色 */
@@ -2052,6 +2071,307 @@ static void clock_draw(gw_window_t *w)
 }
 
 /* ==================================================================
+ * 应用：浏览器（ezos://dino —— 只内置谷歌小恐龙离线游戏）
+ *
+ * 窗口 = Chrome 风格工具栏（导航按钮 + 地址栏 + 刷新）+ 白色页面区；
+ * 页面内跑小恐龙跑酷：空格/上键/点击跳跃、下键蹲下（切换），
+ * 仙人掌障碍、计分 + 最高分（会话内）、速度随分数递增。
+ * 动画由 gw_demo 主循环的帧泵驱动（仅窗口聚焦时 ~60FPS 双缓冲重绘，
+ * 与 gw_game_yield 同思路；物理步进按 g_pit_ticks 实际毫秒推进）。
+ * ================================================================== */
+#define BR_STATE_IDLE 0
+#define BR_STATE_RUN  1
+#define BR_STATE_OVER 2
+
+#define BR_TOOLBAR_H  24
+#define BR_DINO_COLS  12
+#define BR_DINO_ROWS  14
+#define BR_PX         2          /* 恐龙像素放大倍数 */
+
+static int br_state = BR_STATE_IDLE;
+static int br_duck;              /* 蹲下标记（下键切换，跳跃时自动解除） */
+static int br_dino_y;            /* 离地高度（0=落地，向上为正） */
+static int br_dino_vy;           /* 垂直速度 px/步 */
+static int br_score;             /* 分数（整数，每 100 提速） */
+static int br_hi;                /* 会话最高分 */
+static int br_speed;             /* 地面卷动速度 px/步 */
+static int br_run_frm;           /* 奔跑腿部动画帧（0/1） */
+static uint32_t br_last_ms;      /* 上次物理推进时刻（g_pit_ticks） */
+static uint32_t br_seed = 12345; /* 障碍间距 LCG */
+
+/* 12x14 T-Rex 像素位图（MSB=左列；行 0-5 头、6-13 身体，尾在左） */
+static const uint16_t br_dino_bits[BR_DINO_ROWS] = {
+    0x07C, 0x07E, 0x07E, 0x07C, 0x07E, 0x07C,
+    0x0F8, 0x1F8, 0x3F8, 0x7F8, 0x7F8, 0x7F0, 0x3F0, 0x3E0
+};
+
+/* 仙人掌障碍（kind：0=单株小 1=双株小 2=单株大） */
+#define BR_OBS_N 4
+static int br_obs_used[BR_OBS_N];
+static int br_obs_x[BR_OBS_N];
+static int br_obs_kind[BR_OBS_N];
+static int br_spawn_gap;         /* 距下一株出生的滚动像素数 */
+
+static int br_cloud_x[2];        /* 两朵云（页面相对坐标） */
+static int br_ground_off;        /* 地面碎石滚动偏移 */
+static int br_page_w = 440;      /* 页面区宽度（browser_draw 每帧刷新，出生点用） */
+
+static uint32_t br_rand(void)
+{
+    br_seed = br_seed * 1103515245u + 12345u;
+    return br_seed >> 16;
+}
+
+static void br_reset(void)
+{
+    br_duck = 0;
+    br_dino_y = 0;
+    br_dino_vy = 0;
+    br_score = 0;
+    br_speed = 3;
+    br_run_frm = 0;
+    for (int i = 0; i < BR_OBS_N; i++) br_obs_used[i] = 0;
+    br_spawn_gap = 300;
+    br_cloud_x[0] = 180;
+    br_cloud_x[1] = 400;
+    br_ground_off = 0;
+    br_state = BR_STATE_RUN;
+}
+
+/* 跳跃 / 开始 / 重开（空格、上键、页面点击共用） */
+static void br_action(void)
+{
+    if (br_state == BR_STATE_IDLE || br_state == BR_STATE_OVER) {
+        br_reset();
+        return;
+    }
+    if (br_dino_y == 0) {
+        br_dino_vy = 11;
+        br_duck = 0;
+    }
+}
+
+static void br_step(void)
+{
+    /* 垂直运动 */
+    br_dino_y += br_dino_vy;
+    br_dino_vy -= 1;
+    if (br_dino_y <= 0) { br_dino_y = 0; br_dino_vy = 0; }
+
+    /* 滚动 */
+    br_ground_off = (br_ground_off + br_speed) % 24;
+    for (int i = 0; i < 2; i++) {
+        br_cloud_x[i] -= br_speed / 3 + 1;
+        if (br_cloud_x[i] < -40) br_cloud_x[i] = 300 + (int)(br_rand() % 200);
+    }
+
+    /* 障碍推进与出生 */
+    for (int i = 0; i < BR_OBS_N; i++)
+        if (br_obs_used[i]) {
+            br_obs_x[i] -= br_speed;
+            if (br_obs_x[i] < -40) br_obs_used[i] = 0;
+        }
+    br_spawn_gap -= br_speed;
+    if (br_spawn_gap <= 0) {
+        for (int i = 0; i < BR_OBS_N; i++) {
+            if (!br_obs_used[i]) {
+                br_obs_used[i] = 1;
+                br_obs_x[i] = br_page_w + 30;   /* 从页面右侧屏外进入 */
+                br_obs_kind[i] = (int)(br_rand() % 3);
+                break;
+            }
+        }
+        br_spawn_gap = 240 + (int)(br_rand() % 260) + br_speed * 10;
+    }
+
+    /* 计分与提速 */
+    br_score++;
+    if (br_score % 100 == 0 && br_speed < 10) br_speed++;
+    br_run_frm ^= 1;
+
+    /* 碰撞：恐龙横带 [40+5, 40+24-5]，底部离地 br_dino_y；
+     * 仙人掌横带 [x+2, x+w-2]、竖向占 [0, h]（贴地）。
+     * 竖向重叠 = 恐龙底部低于仙人掌顶（留 2px 容差；仙人掌均贴地，蹲下不豁免） */
+    int dx0 = 40 + 5, dx1 = 40 + 24 - 5;
+    for (int i = 0; i < BR_OBS_N; i++) {
+        if (!br_obs_used[i]) continue;
+        int ow = br_obs_kind[i] == 0 ? 8 : (br_obs_kind[i] == 1 ? 16 : 12);
+        int oh = br_obs_kind[i] == 2 ? 24 : 16;
+        int ox0 = br_obs_x[i] + 2, ox1 = br_obs_x[i] + ow - 2;
+        if (dx1 >= ox0 && dx0 <= ox1 && br_dino_y < oh - 2) {
+            if (br_score > br_hi) br_hi = br_score;
+            br_state = BR_STATE_OVER;
+            return;
+        }
+    }
+}
+
+/* 画恐龙：mode 0=站立 1/2=奔跑两帧；duck=纵向压扁 */
+static void br_draw_dino(int x, int gy)
+{
+    uint32_t c = 0x535353u;
+    int sy = br_duck ? 1 : BR_PX;   /* 蹲下：行高减半 */
+    int y0 = gy - br_dino_y - BR_DINO_ROWS * (br_duck ? 1 : BR_PX);
+    for (int r = 0; r < BR_DINO_ROWS; r++) {
+        uint16_t bits = br_dino_bits[r];
+        int yy = y0 + r * sy;
+        int rh = br_duck ? 1 : BR_PX;
+        for (int cidx = 0; cidx < BR_DINO_COLS; cidx++) {
+            if (bits & (1u << (BR_DINO_COLS - 1 - cidx)))
+                gw_fill(x + cidx * BR_PX, yy, BR_PX, rh, c);
+        }
+    }
+    /* 眼睛（白点） */
+    gw_fill(x + 10 * BR_PX, y0 + 1 * (br_duck ? 1 : BR_PX), BR_PX, br_duck ? 1 : BR_PX, 0xFFFFFFu);
+    /* 腿（身体下方 2 行像素）：空中/站立双腿着地，奔跑两帧交替 */
+    int lh = br_duck ? 1 : BR_PX;
+    int ly0 = y0 + BR_DINO_ROWS * (br_duck ? 1 : BR_PX);
+    if (br_dino_y > 0 || br_state != BR_STATE_RUN) {
+        gw_fill(x + 6 * BR_PX, ly0, BR_PX, lh, c);
+        gw_fill(x + 9 * BR_PX, ly0, BR_PX, lh, c);
+    } else if (br_run_frm == 0) {
+        gw_fill(x + 6 * BR_PX, ly0, BR_PX, lh, c);
+        gw_fill(x + 9 * BR_PX, ly0, BR_PX, lh, c);
+        gw_fill(x + 9 * BR_PX, ly0 + lh, BR_PX, lh, c);
+    } else {
+        gw_fill(x + 6 * BR_PX, ly0, BR_PX, lh, c);
+        gw_fill(x + 6 * BR_PX, ly0 + lh, BR_PX, lh, c);
+        gw_fill(x + 9 * BR_PX, ly0, BR_PX, lh, c);
+    }
+}
+
+/* 画仙人掌（页面相对 x，贴地） */
+static void br_draw_cactus(int x, int gy, int kind)
+{
+    uint32_t c = 0x535353u;
+    if (kind == 2) {                 /* 大单株 12x24 */
+        gw_fill(x + 4, gy - 24, 4, 24, c);
+        gw_fill(x, gy - 18, 3, 3, c);
+        gw_fill(x, gy - 18, 2, 10, c);
+        gw_fill(x + 9, gy - 20, 3, 3, c);
+        gw_fill(x + 10, gy - 20, 2, 12, c);
+    } else if (kind == 1) {          /* 双株小 16x16 */
+        for (int k = 0; k < 2; k++) {
+            int bx = x + k * 9;
+            gw_fill(bx + 3, gy - 16, 3, 16, c);
+            gw_fill(bx, gy - 11, 2, 8, c);
+            gw_fill(bx + 6, gy - 12, 2, 8, c);
+        }
+    } else {                          /* 单株小 8x16 */
+        gw_fill(x + 3, gy - 16, 3, 16, c);
+        gw_fill(x, gy - 11, 2, 8, c);
+        gw_fill(x + 6, gy - 12, 2, 8, c);
+    }
+}
+
+static void browser_draw(gw_window_t *w)
+{
+    int ox = gw_ox(w), oy = gw_oy(w);
+    int iw = w->inner_w, ih = w->inner_h;
+
+    /* ---- Chrome 风格工具栏 ---- */
+    gw_fill(ox, oy, iw, BR_TOOLBAR_H, 0xDEE1E6u);
+    gfx_draw_text(ox + 6, oy + 8, "<", 0x08, (uint8_t)0x0F);
+    gfx_draw_text(ox + 20, oy + 8, ">", 0x0F, (uint8_t)0x0F);
+    int ab_w = iw - 64;
+    if (ab_w > 40) {
+        gw_fill(ox + 36, oy + 4, ab_w, 16, 0xFFFFFFu);
+        gw_frame(ox + 36, oy + 4, ab_w, 16, 0xC8C8C8u);
+        /* 小锁（https 意象） */
+        gw_fill(ox + 42, oy + 11, 6, 5, 0x535353u);
+        gw_fill(ox + 43, oy + 8, 4, 1, 0x535353u);
+        gw_fill(ox + 43, oy + 9, 1, 2, 0x535353u);
+        gw_fill(ox + 46, oy + 9, 1, 2, 0x535353u);
+        gfx_draw_text(ox + 52, oy + 8, "ezos://dino", 0x00, 0x0F);
+    }
+    gfx_draw_text(ox + iw - 20, oy + 8, "R", 0x08, (uint8_t)0x0F);
+    gw_fill(ox, oy + BR_TOOLBAR_H, iw, 1, 0xB8BCC4u);
+
+    /* ---- 页面区（白底） ---- */
+    int px0 = ox, py0 = oy + BR_TOOLBAR_H + 1;
+    int pw = iw, ph = ih - BR_TOOLBAR_H - 1;
+    br_page_w = pw;
+    gw_fill(px0, py0, pw, ph, 0xFFFFFFu);
+    int gy = py0 + ph - 24;            /* 地面线（脚底基准） */
+
+    /* 物理推进：仅聚焦时按真实毫秒步进（16ms/步），失焦即暂停。
+     * dt 上限 250ms：慢渲染（如 QEMU TCG 单帧 >16ms）允许每帧追赶，
+     * 游戏速度保持墙钟正确；长时间暂停恢复也最多追 250ms（无跳变） */
+    uint32_t now = g_pit_ticks;
+    if (br_state == BR_STATE_RUN && w->focused) {
+        uint32_t dt = now - br_last_ms;
+        if (dt > 250) dt = 250;
+        while (dt >= 16) { br_step(); dt -= 16; if (br_state != BR_STATE_RUN) break; }
+    }
+    br_last_ms = now;
+
+    /* 地面线 + 滚动碎石 */
+    gw_fill(px0, gy, pw, 1, 0x535353u);
+    for (int x = -br_ground_off; x < pw; x += 24)
+        gw_fill(px0 + x + 4, gy + 6, 8, 1, 0xA8A8A8u);
+
+    /* 云 */
+    for (int i = 0; i < 2; i++) {
+        int cx = br_cloud_x[i], cy = py0 + 24 + i * 18;
+        gw_fill(px0 + cx, cy, 18, 4, 0xC8C8C8u);
+        gw_fill(px0 + cx + 5, cy - 3, 8, 3, 0xC8C8C8u);
+    }
+
+    /* 分数（右上角，Chrome 样式 HI xxxxx xxxxx） */
+    {
+        char buf[24];
+        int n = 0;
+        const char *p = "HI ";
+        while (*p) buf[n++] = *p++;
+        int hi = br_hi / 10, sc = br_score / 10;
+        for (int d = 10000; d >= 1; d /= 10) buf[n++] = (char)('0' + (hi / d) % 10);
+        buf[n++] = ' ';
+        for (int d = 10000; d >= 1; d /= 10) buf[n++] = (char)('0' + (sc / d) % 10);
+        buf[n] = 0;
+        gfx_draw_text(px0 + pw - n * 8 - 8, py0 + 8, buf, 0x07, 0x0F);
+    }
+
+    /* 恐龙固定横坐标 40（页面相对） */
+    br_draw_dino(px0 + 40, gy);
+
+    /* 障碍 */
+    for (int i = 0; i < BR_OBS_N; i++)
+        if (br_obs_used[i])
+            br_draw_cactus(px0 + br_obs_x[i], gy, br_obs_kind[i]);
+
+    /* 状态提示 */
+    if (br_state == BR_STATE_IDLE) {
+        const char *s = "Press SPACE or click to play";
+        gfx_draw_text(px0 + (pw - 28 * 8) / 2, py0 + ph / 2 - 20, s, 0x08, 0x0F);
+    } else if (br_state == BR_STATE_OVER) {
+        const char *s = "G A M E   O V E R";
+        gfx_draw_text(px0 + (pw - 18 * 8) / 2, py0 + ph / 2 - 20, s, 0x08, 0x0F);
+        const char *s2 = "Press SPACE to restart";
+        gfx_draw_text(px0 + (pw - 22 * 8) / 2, py0 + ph / 2 - 6, s2, 0x07, 0x0F);
+    }
+}
+
+static void browser_key(gw_window_t *w, int key)
+{
+    (void)w;
+    if (key == ' ' || key == KEY_UP || key == 'w' || key == 'W' || key == '\n') {
+        br_action();
+    } else if (key == KEY_DOWN || key == 's' || key == 'S') {
+        if (br_state == BR_STATE_RUN && br_dino_y == 0)
+            br_duck = !br_duck;
+        else if (br_dino_y > 0)
+            br_dino_vy = -12;          /* 空中快速下落 */
+    }
+}
+
+static void browser_click(gw_window_t *w, int lx, int ly)
+{
+    (void)w; (void)lx;
+    if (ly > BR_TOOLBAR_H)             /* 页面区点击 = 跳跃/开始/重开 */
+        br_action();
+}
+
+/* ==================================================================
  * 应用：设置（主题切换）
  * ================================================================== */
 static int settings_theme = 0;
@@ -2147,6 +2467,7 @@ static gw_window_t *gw_spawn_app(int idx)
     case GW_APP_SETTINGS: ww = gw_scale_x(340); wh = gw_scale_y(300); break;
     case GW_APP_ABOUT:    ww = gw_scale_x(320); wh = gw_scale_y(180); break;
     case GW_APP_PAINT:    ww = PT_TB_W + PT_CW + 8; wh = PT_CH + GW_TITLE_H + 7; break;
+    case GW_APP_BROWSER:  ww = gw_scale_x(440); wh = gw_scale_y(320); break;
     default: break;
     }
     gw_window_t *w = gw_create(title, wx, wy, ww, wh, flags);
@@ -2191,6 +2512,10 @@ static gw_window_t *gw_spawn_app(int idx)
         }
         pt_last_x = -1;
         break;
+    case GW_APP_BROWSER:
+        w->draw = browser_draw; w->key = browser_key;
+        w->click = browser_click;
+        break;
     default:
         break;
     }
@@ -2229,7 +2554,7 @@ static int gw_start_menu_mouse(int mx, int my, int buttons)
     }
     if (!(buttons & 1)) return 1;   /* 仅按下时处理 */
 
-    int row_h = gw_scale_y(34);
+    int row_h = gw_menu_row_h();   /* 与绘制共用，小屏自动压缩 */
     int list_y = my0 + gw_scale_y(54);
     int lw = mw - gw_scale_x(64);
     if (mx < mx0 + lw) {
@@ -2519,10 +2844,11 @@ void gw_handle_key(int key)
     }
     if (!gw_focused_wnd) {
         /* 桌面调试热键（排障复现用，正式版可移除）：
-         * m=开/关开始菜单  t=打开Terminal  s=Snake  d=2048  q=退出GUI回终端 */
+         * m=开/关开始菜单  t=打开Terminal  s=Snake  d=2048  b=Browser  q=退出GUI回终端 */
         if (key == 'm' || key == 'M') { gw_start_menu_active = !gw_start_menu_active; return; }
         if (key == 'q' || key == 'Q') { gw_quit = 1; return; }
         if (key == 't' || key == 'T') { gw_launch_app(GW_APP_TERMINAL); return; }
+        if (key == 'b' || key == 'B') { gw_launch_app(GW_APP_BROWSER); return; }
         if (key == 's' || key == 'S' || key == 'd' || key == 'D') {
             gw_launch_game((key == 's' || key == 'S') ? 3 : 4);
             return;
@@ -3508,6 +3834,45 @@ void gw_demo(void)
 
         /* 移动光标前先擦除旧位置背景（8bpp/16bpp 均适用，防残影） */
         gw_cursor_restore_bg();
+
+        /* 浏览器小恐龙帧泵：聚焦且运行中时 ~60FPS 重绘窗口（16bpp 走双缓冲，
+         * 整窗 blit 无闪动；置于擦旧光标后，blit 不残留光标像素）。
+         * 物理步进在 browser_draw 内按 g_pit_ticks 真实毫秒推进 */
+        {
+            gw_window_t *bw = NULL;
+            for (int i = 0; i < GW_MAX_WINDOWS; i++) {
+                gw_window_t *wi = &gw_windows[i];
+                if (wi->used && !wi->hidden && !wi->moving && wi->focused &&
+                    (unsigned long)wi->user == (unsigned long)GW_APP_BROWSER) {
+                    bw = wi;
+                    break;
+                }
+            }
+            if (bw && br_state == BR_STATE_RUN &&
+                (uint32_t)(g_pit_ticks - gw_game_last_draw_ms) >= GW_BB_FPS_MS) {
+                gw_game_last_draw_ms = g_pit_ticks;
+                if (gw_bb_begin()) {
+                    gw_draw_window(bw);
+                    /* 整窗画进离屏（RAM，快），仅回传两条动态带：
+                     * 顶带 = 标题栏+工具栏+分数+云；底带 = 恐龙(跳跃顶点)/
+                     * 仙人掌/地面线/碎石。中部纯白区帧间不变，不回传，
+                     * LFB 搬运量 ~1/3（QEMU TCG 下单帧可 >100ms，很关键） */
+                    int oy = gw_oy(bw);
+                    int ph = bw->inner_h - BR_TOOLBAR_H - 1;
+                    int gy = oy + BR_TOOLBAR_H + 1 + ph - 24;
+                    int by0 = gy - 104, by1 = gy + 16;
+                    if (by0 < oy + BR_TOOLBAR_H + 1) by0 = oy + BR_TOOLBAR_H + 1;
+                    if (by1 > bw->y + bw->h) by1 = bw->y + bw->h;
+                    int top_h = (oy + BR_TOOLBAR_H + 57) - bw->y;
+                    if (top_h > bw->h) top_h = bw->h;
+                    gw_bb_end(bw->x, bw->y, bw->w, top_h);
+                    if (by1 > by0)
+                        gw_bb_end(bw->x, by0, bw->w, by1 - by0);
+                } else {
+                    gw_draw_window(bw);
+                }
+            }
+        }
 
         int taskbar_redrawn = 0;
         if (gw_dirty) {

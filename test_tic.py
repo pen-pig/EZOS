@@ -62,11 +62,15 @@ class Qmp:
             time.sleep(delay)
 
     def mouse_rel(self, dx, dy, step=50, gap=0.03):
+        """精确相对移动：按比例分配每步增量，总和严格等于 (dx,dy)，
+        避免取整累积误差导致光标漂移（曾使图标点击偏出目标）"""
         import math
         n = max(1, math.ceil(max(abs(dx), abs(dy)) / step))
-        sx, sy = dx / n, dy / n
-        ax, ay = round(sx), round(sy)
-        for _ in range(n):
+        sx = sy = 0
+        for i in range(1, n + 1):
+            tx, ty = round(dx * i / n), round(dy * i / n)
+            ax, ay = tx - sx, ty - sy
+            sx, sy = tx, ty
             evs = [{"type":"rel","data":{"axis":"x","value":ax}},
                    {"type":"rel","data":{"axis":"y","value":ay}}]
             self.cmd("input-send-event", events=evs)
@@ -76,6 +80,15 @@ class Qmp:
         self.cmd("input-send-event", events=[{"type":"btn","data":{"down":True,"button":"left"}}])
         time.sleep(0.12)
         self.cmd("input-send-event", events=[{"type":"btn","data":{"down":False,"button":"left"}}])
+        time.sleep(0.15)
+
+    def mouse_dclick(self):
+        """快速双击：两次按下间隔 ~100ms，满足 OS 双击判定（桌面图标启动）"""
+        for _ in range(2):
+            self.cmd("input-send-event", events=[{"type":"btn","data":{"down":True,"button":"left"}}])
+            time.sleep(0.05)
+            self.cmd("input-send-event", events=[{"type":"btn","data":{"down":False,"button":"left"}}])
+            time.sleep(0.05)
         time.sleep(0.15)
 
     def screendump(self, name):
@@ -117,7 +130,9 @@ def find_cursor(prev_px, cur_px, w, h, old_pos):
     if not cs: return None
     cs.sort(key=lambda c: c['n'], reverse=True)
     c = cs[0]
-    return ((c['x0']+c['x1'])//2, (c['y0']+c['y1'])//2, c['n'])
+    # 光标热点在箭头左上角（gw_cursor_draw 以 mx,my 为左上角绘制），
+    # 取簇的左上角而非中心，否则引入系统性偏移使后续移动漂移
+    return (c['x0'], c['y0'], c['n'])
 
 def count_color(px, w, h, r, g, b, tol=14):
     n = 0
@@ -129,7 +144,7 @@ def count_color(px, w, h, r, g, b, tol=14):
     return n * 4  # 1/4 采样还原
 
 def main():
-    proc = subprocess.Popen([QEMU, "-vga","std",
+    proc = subprocess.Popen([QEMU, "-icount","shift=auto","-vga","std",
         "-drive","format=raw,file=os-image.bin",
         "-drive","format=raw,file=disk.img",
         "-qmp","tcp:127.0.0.1:4444,server,nowait",
@@ -146,47 +161,39 @@ def main():
         if w < 640:
             print("FAIL: 未进入图形模式"); return 1
 
-        # TicTac 图标 idx5: 1280x1024 下 rect(122,143,106,106), 中心(175,196)
-        # 通用计算: icon rect 随分辨率缩放
+        # TicTac 图标 idx6（清单：0=This PC..4=Paint,5=Guess,6=TicTac）:
+        # 1280x1024 下 rect(260,143,106,106)
         sx, sy = w/640, h/480
         icon_sz = int(w*40/640); box = icon_sz + 26; gap = int(w*8/640)
         x0 = int(w*8/640); y0 = int(h*10/480)
-        idx = 5; row, col = idx//4, idx%4
+        idx = 6; row, col = idx//4, idx%4
         ix = x0 + col*(box+gap); iy = y0 + row*(box+gap)
         target = (ix + box//2, iy + box//2)
         print(f"[STEP] TicTac icon rect ({ix},{iy},{box},{box}), target {target}")
 
-        cur_pos = (w//2, h//2)  # 桌面启动光标居中
-        prev_probe = base
+        # 精确相对移动（比例分配无取整漂移）+ 信任移动结果，不做帧差光标检测：
+        # 桌面图标悬停高亮会整块重绘，帧差簇被图标重绘主导，检测不可靠
+        # （同 test_features Phase3 的做法）。起点：桌面启动光标居中。
+        cur_pos = (w//2, h//2)
         clicked = False
-        for attempt in range(8):
+        for attempt in range(3):
             dx, dy = target[0]-cur_pos[0], target[1]-cur_pos[1]
-            in_icon = (ix+8 <= cur_pos[0] <= ix+box-8 and iy+8 <= cur_pos[1] <= iy+box-8)
-            if abs(dx) <= 12 and abs(dy) <= 12 or (in_icon and attempt >= 2):
-                q.mouse_click()
-                time.sleep(1.5)
-                q.screendump("shot_tic_empty.ppm")
-                _, _, px = load_ppm("shot_tic_empty.ppm")
-                bg = count_color(px, w, h, 232, 232, 232)
-                grid = count_color(px, w, h, 96, 96, 96)
-                print(f"[CLICK] attempt {attempt}: board bg={bg} grid={grid}")
-                if grid > 100:
-                    clicked = True; break
-                # 未检测到棋盘，可能没点中——重试
-                cur_pos = (w//2, h//2)
-                continue
             print(f"[MOVE] attempt {attempt}: {cur_pos} -> {target} (d={dx},{dy})")
             q.mouse_rel(dx, dy)
-            time.sleep(0.3)
-            q.screendump("shot_probe.ppm")
-            _, _, probe = load_ppm("shot_probe.ppm")
-            newpos = find_cursor(prev_probe, probe, w, h, cur_pos)
-            prev_probe = probe
-            if newpos and newpos[2] >= 20:
-                cur_pos = (newpos[0], newpos[1])
-                print(f"  cursor now at {cur_pos}")
-            else:
-                print("  cursor not detected (no move?)")
+            cur_pos = target
+            time.sleep(0.5)
+            q.mouse_dclick()   # 桌面图标需双击启动
+            time.sleep(1.5)
+            q.screendump("shot_tic_empty.ppm")
+            _, _, px = load_ppm("shot_tic_empty.ppm")
+            bg = count_color(px, w, h, 232, 232, 232)
+            grid = count_color(px, w, h, 96, 96, 96)
+            print(f"[CLICK] attempt {attempt}: board bg={bg} grid={grid}")
+            if grid > 100:
+                clicked = True; break
+            # 未检测到棋盘，可能没点中——移回中心重新来
+            q.mouse_rel(w//2 - target[0], h//2 - target[1])
+            cur_pos = (w//2, h//2)
         if not clicked:
             print("FAIL: 无法点击 TicTac 图标")
             return 1

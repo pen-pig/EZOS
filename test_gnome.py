@@ -26,7 +26,7 @@ def avg_color(px, w, y0, y1):
     return r//n, g//n, b//n
 
 def main():
-    proc = subprocess.Popen([QEMU, "-vga","std",
+    proc = subprocess.Popen([QEMU, "-icount","shift=auto","-vga","std",
         "-drive","format=raw,file=os-image.bin",
         "-drive","format=raw,file=disk.img",
         "-qmp","tcp:127.0.0.1:4444,server,nowait",
@@ -48,8 +48,8 @@ def main():
         th = 32 if h >= 768 else (28 if h >= 400 else 18)
 
         # ---- 2. 验证 GNOME 主题特征 ----
-        # 2a. 顶部黑栏 0x1D1D1D
-        topbar = strip_count(gn, w, 4, th-4, 0x1D, 0x1D, 0x1D)
+        # 2a. 顶部黑栏（内核 gw_draw_taskbar GNOME 分支为纯黑 0x000000）
+        topbar = strip_count(gn, w, 4, th-4, 0x00, 0x00, 0x00)
         check("GNOME 顶部黑栏", topbar > w*(th-8)*0.5, f"(topbar={topbar})")
 
         # 2b. aubergine 壁纸渐变（上部暗紫 0x2C001E -> 下部亮紫 0x5E2750）
@@ -75,11 +75,11 @@ def main():
 
         # ---- 4. Terminal 里执行 theme 0 切回，GUI 内即时生效（顶栏消失变底栏）----
         # 注：帧缓冲为 16bpp RGB565，screendump 后颜色有量化偏移
-        #     GNOME 顶栏 0x1D1D1D -> (24,28,24)，Win10 底栏 0x171717(alpha235) -> (8,20,16)
+        #     GNOME 顶栏纯黑 0x000000，Win10 底栏 0x171717(alpha235) -> (8,20,16)
         q.type_text("theme 0\n"); time.sleep(1.5)
         q.screendump("g_back.ppm")
         _, _, bk = load_ppm("g_back.ppm")
-        topbar2 = strip_count(bk, w, 4, th-4, 0x1D, 0x1D, 0x1D)
+        topbar2 = strip_count(bk, w, 4, th-4, 0x00, 0x00, 0x00)
         botbar2 = strip_count(bk, w, h-th+4, h-4, 0x10, 0x14, 0x10, tol=10)
         check("GUI 内 theme 0 切回 Win10(顶栏消失)", topbar2 < w*(th-8)*0.3, f"(top={topbar2})")
         check("Win10 底部任务栏出现", botbar2 > w*(th-8)*0.3, f"(bot={botbar2})")

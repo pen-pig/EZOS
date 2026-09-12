@@ -21,6 +21,7 @@
 #include "ntfs.h"
 #include "f2fs.h"
 #include "erofs.h"
+#include "refs.h"
 #include "ata.h"
 
 /* 布局一致性编译期检查：三种目录项结构必须逐字节一致 */
@@ -74,6 +75,13 @@ static void fs_fill_info(void) {
         fs_volume.volume_sectors = f->volume_sectors;
     } else if (fs_type_cur == FS_EROFS) {
         const erofs_info_t *r = erofs_get_info();
+        fs_volume.part_start = r->part_start;
+        fs_volume.bytes_per_sector = r->bytes_per_sector;
+        fs_volume.sectors_per_cluster = r->sectors_per_cluster;
+        fs_volume.cluster_count = r->cluster_count;
+        fs_volume.volume_sectors = r->volume_sectors;
+    } else if (fs_type_cur == FS_REFS) {
+        const refs_info_t *r = refs_get_info();
         fs_volume.part_start = r->part_start;
         fs_volume.bytes_per_sector = r->bytes_per_sector;
         fs_volume.sectors_per_cluster = r->sectors_per_cluster;
@@ -167,6 +175,12 @@ static int fs_try_ro_drives(uint8_t drive) {
         fs_fill_info();
         return 1;
     }
+    if (fs_scan_ro(drive, refs_mount)) {
+        fs_type_cur = FS_REFS;
+        fs_drive_cur = drive;
+        fs_fill_info();
+        return 1;
+    }
     return 0;
 }
 
@@ -200,10 +214,11 @@ static int fs_is_fat(void) {
     return fs_type_cur == FS_FAT12 || fs_type_cur == FS_FAT16 || fs_type_cur == FS_FAT32;
 }
 
-/* 绝对路径型驱动（ext4/NTFS/F2FS/EROFS）：cwd 由本层拼接，驱动收绝对路径 */
+/* 绝对路径型驱动（ext4/NTFS/F2FS/EROFS/ReFS）：cwd 由本层拼接，驱动收绝对路径 */
 static int fs_is_ro(void) {
     return fs_type_cur == FS_EXT4 || fs_type_cur == FS_NTFS ||
-           fs_type_cur == FS_F2FS || fs_type_cur == FS_EROFS;
+           fs_type_cur == FS_F2FS || fs_type_cur == FS_EROFS ||
+           fs_type_cur == FS_REFS;
 }
 
 /* 真只读卷：仅 EROFS（ROM 文件系统，按设计无写入者；ext4/NTFS/F2FS 已支持写） */
@@ -244,6 +259,7 @@ const char *fs_type_name(void) {
     case FS_NTFS:  return "NTFS";
     case FS_F2FS:  return "F2FS";
     case FS_EROFS: return "EROFS";
+    case FS_REFS:  return "ReFS";
     default:       return "none";
     }
 }
@@ -279,6 +295,8 @@ int fs_format(int fs_type) {
         if (ntfs_format(fs_preferred_drive) != 0) return -1;
     } else if (fs_type == FS_F2FS) {
         if (f2fs_format(fs_preferred_drive) != 0) return -1;
+    } else if (fs_type == FS_REFS) {
+        if (refs_format(fs_preferred_drive) != 0) return -1;
     } else {
         /* EROFS 为只读 ROM 文件系统，不支持格式化 */
         return -1;
@@ -299,6 +317,7 @@ static int ro_read_file(const char *path, uint8_t *b, uint32_t m) {
     case FS_NTFS:  return ntfs_read_file(path, b, m);
     case FS_F2FS:  return f2fs_read_file(path, b, m);
     case FS_EROFS: return erofs_read_file(path, b, m);
+    case FS_REFS:  return refs_read_file(path, b, m);
     default:       return -1;
     }
 }
@@ -309,6 +328,7 @@ static uint32_t ro_get_file_size(const char *path) {
     case FS_NTFS:  return ntfs_get_file_size(path);
     case FS_F2FS:  return f2fs_get_file_size(path);
     case FS_EROFS: return erofs_get_file_size(path);
+    case FS_REFS:  return refs_get_file_size(path);
     default:       return 0;
     }
 }
@@ -319,6 +339,7 @@ static int ro_read_dir(const char *path, fs_dir_entry_t *e, int n) {
     case FS_NTFS:  return ntfs_read_dir(path, e, n);
     case FS_F2FS:  return f2fs_read_dir(path, e, n);
     case FS_EROFS: return erofs_read_dir(path, e, n);
+    case FS_REFS:  return refs_read_dir(path, e, n);
     default:       return -1;
     }
 }
@@ -329,6 +350,7 @@ static int ro_is_dir(const char *path) {
     case FS_NTFS:  return ntfs_is_dir(path);
     case FS_F2FS:  return f2fs_is_dir(path);
     case FS_EROFS: return erofs_is_dir(path);
+    case FS_REFS:  return refs_is_dir(path);
     default:       return -1;
     }
 }
@@ -339,6 +361,7 @@ static uint32_t ro_get_file_clusters(const char *path) {
     case FS_NTFS:  return ntfs_get_file_clusters(path);
     case FS_F2FS:  return f2fs_get_file_clusters(path);
     case FS_EROFS: return erofs_get_file_clusters(path);
+    case FS_REFS:  return refs_get_file_clusters(path);
     default:       return 0;
     }
 }
@@ -349,6 +372,7 @@ static uint32_t ro_used_clusters(void) {
     case FS_NTFS:  return ntfs_get_info()->used_clusters;
     case FS_F2FS:  return f2fs_get_info()->used_clusters;
     case FS_EROFS: return erofs_get_info()->used_clusters;
+    case FS_REFS:  return refs_get_info()->used_clusters;
     default:       return 0;
     }
 }
@@ -359,6 +383,7 @@ static int ro_create_file(const char *path, const uint8_t *data, uint32_t size) 
     case FS_EXT4:  return ext4_create_file(path, data, size);
     case FS_NTFS:  return ntfs_create_file(path, data, size);
     case FS_F2FS:  return f2fs_create_file(path, data, size);
+    case FS_REFS:  return refs_create_file(path, data, size);
     default:       return -1;
     }
 }
@@ -368,6 +393,7 @@ static int ro_delete_file(const char *path) {
     case FS_EXT4:  return ext4_delete_file(path);
     case FS_NTFS:  return ntfs_delete_file(path);
     case FS_F2FS:  return f2fs_delete_file(path);
+    case FS_REFS:  return refs_delete_file(path);
     default:       return -1;
     }
 }
@@ -377,6 +403,7 @@ static int ro_mkdir(const char *path) {
     case FS_EXT4:  return ext4_mkdir(path);
     case FS_NTFS:  return ntfs_mkdir(path);
     case FS_F2FS:  return f2fs_mkdir(path);
+    case FS_REFS:  return refs_mkdir(path);
     default:       return -1;
     }
 }

@@ -17,6 +17,7 @@
 #include "types.h"
 #include "port.h"
 #include "fs.h"
+#include "isr.h"
 
 /* ==================================================================
  * 1. ezos_console 适配层：把 EZOS tty / 键盘桥接为轻量 console 接口
@@ -451,6 +452,22 @@ static void x_delay_ticks(uint64_t ticks) {
         elapsed += (uint32_t)(now - start);
         start = now;
     }
+}
+
+/* uptime: 开机时长（PIT 1000Hz tick 计） */
+void cmd_uptime(const char *args) {
+    (void)args;
+    uint32_t ticks = g_pit_ticks;
+    /* 顺带锁存 ch0 counter（诊断时钟用：counter 按需读，不走 IRQ） */
+    outb(0x43, 0x00);
+    uint16_t cnt = (uint16_t)(inb(0x40) | (inb(0x40) << 8));
+    ezos_console_write("up ");
+    ezos_console_print_dec(ticks / 1000);
+    ezos_console_write("s (ticks ");
+    ezos_console_print_dec(ticks);
+    ezos_console_write(" c ");
+    ezos_console_print_dec(cnt);
+    ezos_console_write(")\n");
 }
 
 void cmd_sleep(const char *args) {

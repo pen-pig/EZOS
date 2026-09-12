@@ -33,4 +33,4 @@ if [ ! -f "disk.img" ]; then
 fi
 
 echo "[INFO] Booting EZOS in QEMU..."
-"$QEMU" -vga std -m 128 -drive format=raw,file=os-image.bin -drive format=raw,file=disk.img
+"$QEMU" -icount shift=auto -vga std -m 128 -drive format=raw,file=os-image.bin -drive format=raw,file=disk.img

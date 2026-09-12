@@ -24,6 +24,7 @@
 #define FS_NTFS  5
 #define FS_F2FS  6
 #define FS_EROFS 7
+#define FS_REFS  8
 
 /* 目录项输出结构（与 exfat_dir_entry_t / fat_dir_entry_t 布局一致） */
 typedef struct {
@@ -52,7 +53,7 @@ int fs_ready(void);
 /* 当前挂载是否为只读文件系统（ext4/NTFS/F2FS/EROFS） */
 int fs_is_readonly(void);
 
-/* 类型名："exFAT" / "FAT12" / "FAT16" / "FAT32" / "ext4" / "NTFS" / "F2FS" / "EROFS" / "none" */
+/* 类型名："exFAT" / "FAT12" / "FAT16" / "FAT32" / "ext4" / "NTFS" / "F2FS" / "EROFS" / "ReFS" / "none" */
 const char *fs_type_name(void);
 
 /* 挂载后卷信息（未挂载时 type==FS_NONE） */

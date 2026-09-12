@@ -96,6 +96,8 @@ i686-elf-gcc %CFLAGS% -c kernel\f2fs.c -o kernel\f2fs.o
 if errorlevel 1 goto error
 i686-elf-gcc %CFLAGS% -c kernel\erofs.c -o kernel\erofs.o
 if errorlevel 1 goto error
+i686-elf-gcc %CFLAGS% -c kernel\refs.c -o kernel\refs.o
+if errorlevel 1 goto error
 i686-elf-gcc %CFLAGS% -c kernel\div64.c -o kernel\div64.o
 if errorlevel 1 goto error
 i686-elf-gcc %CFLAGS% -c kernel\gfx.c -o kernel\gfx.o
@@ -114,7 +116,7 @@ i686-elf-gcc %CFLAGS% -c kernel\hiscore.c -o kernel\hiscore.o
 if errorlevel 1 goto error
 
 echo [4/6] linking kernel...
-i686-elf-ld %LDFLAGS% -o kernel_raw.bin boot\kernel_entry.o kernel\kernel.o kernel\tty.o kernel\idt.o kernel\isr.o kernel\keyboard.o kernel\ata.o kernel\shell.o kernel\shell_extra.o kernel\exfat.o kernel\fat.o kernel\fs.o kernel\ext4.o kernel\ntfs.o kernel\f2fs.o kernel\erofs.o kernel\div64.o kernel\gfx.o kernel\gui.o kernel\mouse.o kernel\gfxwin.o kernel\desktop.o kernel\games.o kernel\hiscore.o
+i686-elf-ld %LDFLAGS% -o kernel_raw.bin boot\kernel_entry.o kernel\kernel.o kernel\tty.o kernel\idt.o kernel\isr.o kernel\keyboard.o kernel\ata.o kernel\shell.o kernel\shell_extra.o kernel\exfat.o kernel\fat.o kernel\fs.o kernel\ext4.o kernel\ntfs.o kernel\f2fs.o kernel\erofs.o kernel\refs.o kernel\div64.o kernel\gfx.o kernel\gui.o kernel\mouse.o kernel\gfxwin.o kernel\desktop.o kernel\games.o kernel\hiscore.o
 if errorlevel 1 goto error
 
 echo [5/6] padding kernel to 384KB...
@@ -138,7 +140,7 @@ echo rebuilding disk.img (exFAT layout)...
 python "%~dp0temp\gen_diskimg.py" disk.img
 if errorlevel 1 goto error
 echo launching QEMU...
-qemu-system-x86_64 -vga std -drive format=raw,file=os-image.bin -drive format=raw,file=disk.img
+qemu-system-x86_64 -icount shift=auto -vga std -drive format=raw,file=os-image.bin -drive format=raw,file=disk.img
 pause
 goto end
 

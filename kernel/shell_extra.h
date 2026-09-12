@@ -21,6 +21,7 @@ void cmd_type(const char *args);
 void cmd_which(const char *args);
 void cmd_alias(const char *args);
 void cmd_unalias(const char *args);
+void cmd_uptime(const char *args);
 void cmd_sleep(const char *args);
 void cmd_mem(const char *args);
 

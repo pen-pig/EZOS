@@ -1,10 +1,10 @@
 # test_fs.py - 文件系统回归测试：exFAT / FAT32 / FAT16 / FAT12 / 无盘 / format / ext4-RW
 # 每组：QEMU 启动 -> df 报 FS 类型 -> ls 见 README + LFN 长名 -> cat 读内容
 #       -> write 创建/覆盖 -> ls -> rm 删除 -> mkdir/cd/pwd 目录操作 -> exit 进桌面
-# format 变体：format {fat32,fat16,fat12,exfat,ext4,ntfs,f2fs} 后写读删验证
+# format 变体：format {fat32,fat16,fat12,exfat,ext4,ntfs,f2fs,refs} 后写读删验证
 # ext4-rw 变体：生成镜像上的 ext4 挂载 + 读 + 写入/覆盖/删除/目录
-#     （EROFS 保持只读；ntfs/f2fs 无镜像生成器，经 format 变体覆盖）
-# 验证：fs.c 统一分发层 + fat.c/exfat.c/ext4.c/ntfs.c/f2fs.c 驱动 + 无盘降级
+#     （EROFS 保持只读；ntfs/f2fs/refs 无镜像生成器，经 format 变体覆盖）
+# 验证：fs.c 统一分发层 + fat.c/exfat.c/ext4.c/ntfs.c/f2fs.c/refs.c 驱动 + 无盘降级
 # 注意：QMP type_text 仅支持小写字母/数字/空格，文件名匹配大小写不敏感
 import subprocess, sys, time, os, re
 from test_features import ocr_text, Qmp
@@ -219,7 +219,19 @@ def run_format_variant():
         t = norm(vm.sh("rm f2fs.txt"))
         check("f2fs rm", "deleted" in t, t[:160])
 
-        # 8) exit 进桌面
+        # 8) format refs -> 写读删
+        t = norm(vm.sh("format refs", 8.0))
+        check("format refs 成功", "formatted as refs" in t, t[:160])
+        t = norm(vm.sh("df"))
+        check("df 报告 refs", "refs" in t, t.replace('\n', ' ')[:160])
+        t = norm(vm.sh("write refs.txt refs rw test"))
+        check("refs write", "successfully" in t, t[:160])
+        t = norm(vm.sh("cat refs.txt"))
+        check("refs cat", "refs rw test" in t, t[:160])
+        t = norm(vm.sh("rm refs.txt"))
+        check("refs rm", "deleted" in t, t[:160])
+
+        # 9) exit 进桌面
         vm.q.type_text("exit\n"); time.sleep(3.0)
         vm.shot("fsreg_format_desk.ppm")
         w, h = load_size("fsreg_format_desk.ppm")
