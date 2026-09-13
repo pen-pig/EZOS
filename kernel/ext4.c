@@ -593,11 +593,15 @@ uint32_t ext4_get_file_clusters(const char *path) {
  * refs: e2fsprogs lib/ext2fs/{alloc_tables.c,block.c,dir_block.c,
  *       mkdir.c,expand_dir.c,free.c,new_inode.c} 算法参考
  *
- * 简化设计（自洽可测，不自诩产品级）：
+ * 设计（结构全为标准 ext4，Linux/e2fsprogs 可直接读）：
  *   - 新文件：size<=1 块用旧式直接块 i_block[0]（与 read 路径 legacy 兼容）；
- *             >1 块用 extent（depth-0 单 extent，支持连续多块）
- *   - 新目录：线性无 htree（EXT4_INDEX_FL 不置位），自动扩展目录块链
- *   - 删除：回收数据块 + 清 inode 位图 + 清目录项（inode=0）
+ *             >1 块用 extent 树：碎片化多 extent 分配（first-fit 取洞），
+ *             <=4 段放根 depth-0，超 4 段自动升级 depth-1（根 index +
+ *             叶子 extent 块，1KB 块叶容 84 项 x 4 叶 = 336 段上限）
+ *   - 新目录：线性无 htree（EXT4_INDEX_FL 不置位），自动扩展目录块链，
+ *             extent 树增长与文件同一路径（满 4 项自动升级 depth-1）
+ *   - 删除：任意深度 extent 树递归回收数据块与叶子块 + 清 inode 位图
+ *           + 清目录项（inode=0）
  *   - 计数同步：SB free + GDT free count + free inodes count
  * ============================================================ */
 
@@ -706,6 +710,201 @@ static void e4_free_block(uint32_t blkno) {
     e4_update_counts(1, 0);
 }
 
+/* ---------- 多 extent 碎片化写入支持 ----------
+ * 标准结构：i_block 根节点放 4 个 extent（depth-0）；不够时升级为
+ * depth-1 索引（根 4 个 index，每个指向一个叶子 extent 块，
+ * 1KB 块叶子可放 84 项 / 4KB 块 340 项）。读路径 e4_map_extent
+ * 已支持任意深度（GRUB 移植），这里补齐写路径。 */
+
+/* 新文件数据 extent 记录上限：根 depth-1 最多 4 个索引项 x
+ * 叶子容量 84（1KB 块；4KB 块为 340）= 336 段 */
+#define E4_MAX_EXTENTS 336
+static uint32_t e4_x_logical[E4_MAX_EXTENTS] E4_HIBUF;
+static uint32_t e4_x_phys[E4_MAX_EXTENTS] E4_HIBUF;
+static uint32_t e4_x_len[E4_MAX_EXTENTS] E4_HIBUF;
+/* extent 树叶子块缓冲（升级 depth-1 / 追加目录 extent 用） */
+static uint8_t e4_leaf[EXT4_MAX_BLOCKSIZE] E4_HIBUF;
+
+/* 一次分配一段最长 want 的连续空闲块（first-fit）。
+ * 返回起始块号，*got 输出实际分到的块数；无空闲返回 0。 */
+static uint32_t e4_alloc_run(uint32_t want, uint32_t *got) {
+    *got = 0;
+    /* 位图扫描区（跳过 SB/GDT/位图/inode 表元数据区） */
+    uint32_t itbl = e4_gd_inode_table(0);
+    uint32_t bmp_blk = e4_gd_block_bitmap(0);
+    uint32_t itbl_blks = (e4_ipg * e4_ino_size + e4_blksize - 1) / e4_blksize;
+    uint32_t start = itbl + itbl_blks;
+    if (start < e4_first_data_blk + 1) start = e4_first_data_blk + 1;
+    uint32_t limit = e4_blocks_total < e4_bpg ? (uint32_t)e4_blocks_total : e4_bpg;
+    e4_read_blk(bmp_blk, e4_blk);
+
+    /* 贪心：找第一个 >= want 的洞就取 want 块；
+     * 否则取整个过程中遇到的最大洞。 */
+    uint32_t best_start = 0, best_len = 0;
+    uint32_t cur_start = 0, cur_len = 0;
+    for (uint32_t i = start; i < limit; i++) {
+        uint32_t byte_idx = i / 8;
+        uint32_t bit_idx = i % 8;
+        if (byte_idx >= e4_blksize) break;
+        if (!(e4_blk[byte_idx] & (1u << bit_idx))) {
+            if (cur_len == 0) cur_start = i;
+            cur_len++;
+            if (cur_len == want) break;   /* 找到足够大的洞 */
+        } else {
+            if (cur_len > best_len) { best_len = cur_len; best_start = cur_start; }
+            cur_len = 0;
+        }
+    }
+    if (cur_len > best_len) { best_len = cur_len; best_start = cur_start; }
+    if (best_len == 0) return 0;
+
+    /* 标记位图 */
+    for (uint32_t i = 0; i < best_len; i++) {
+        uint32_t b = best_start + i;
+        e4_blk[b / 8] |= (1u << (b % 8));
+    }
+    e4_write_blk(bmp_blk, e4_blk);
+    e4_update_counts(-(int)best_len, 0);
+    *got = best_len;
+    return best_start;
+}
+
+/* 叶子块容量（extent 块除 12B 头外每项 12B） */
+static uint32_t e4_leaf_capacity(void) {
+    return (e4_blksize - 12) / 12;
+}
+
+/* 写一个 extent 树叶子块头 */
+static void e4_leaf_init(uint8_t *leaf, uint32_t entries) {
+    e4_wr16(leaf + EH_OFF_MAGIC, EXT4_EXT_MAGIC);
+    e4_wr16(leaf + EH_OFF_ENTRIES, (uint16_t)entries);
+    e4_wr16(leaf + 4, (uint16_t)e4_leaf_capacity());   /* eh_max */
+    e4_wr16(leaf + EH_OFF_DEPTH, 0);
+}
+
+/* 向 extent 树叶子块追加一个 extent 项；满返回 -1 */
+static int e4_leaf_append(uint8_t *leaf, uint32_t logical,
+                          uint32_t phys, uint32_t len) {
+    uint32_t entries = rd16(leaf + EH_OFF_ENTRIES);
+    if (entries >= e4_leaf_capacity()) return -1;
+    uint8_t *ex = leaf + 12 + entries * 12;
+    e4_wr32(ex + EE_OFF_BLOCK, logical);
+    e4_wr16(ex + EE_OFF_LEN, (uint16_t)len);
+    e4_wr16(ex + EE_OFF_START_HI, 0);
+    e4_wr32(ex + EE_OFF_START_LO, phys);
+    e4_wr16(leaf + EH_OFF_ENTRIES, (uint16_t)(entries + 1));
+    return 0;
+}
+
+/* 向 inode 的 extent 树追加一个逻辑块映射（目录增长用）。
+ * 支持：legacy 直接块（lblk<12）、depth-0 根（满 4 项自动升级
+ * depth-1）、depth-1（末叶满则新叶）。返回 0 成功。
+ * 注意：成功时会写叶子块并修改 dino 中的根；调用者负责把
+ * dino 写回 inode 表。 */
+static int e4_extent_append(uint8_t *dino, uint32_t lblk, uint32_t pb) {
+    if (!(rd32(dino + INO_OFF_FLAGS) & EXT4_EXTENTS_FL)) {
+        /* 旧式直接块目录（本驱动 format 的根目录为 extent，自定义 mkdir 也是
+         * extent；此分支兼容外部 mkfs 出的 legacy 小目录） */
+        if (lblk < 12) {
+            e4_wr32(dino + INO_OFF_IBLOCK + lblk * 4, pb);
+            return 0;
+        }
+        return -1;
+    }
+    uint8_t *hdr = dino + INO_OFF_IBLOCK;
+    if (rd16(hdr) != EXT4_EXT_MAGIC) return -1;
+    uint32_t entries = rd16(hdr + EH_OFF_ENTRIES);
+    uint32_t depth = rd16(hdr + EH_OFF_DEPTH);
+
+    if (depth == 0) {
+        if (entries > 0) {
+            uint8_t *ex = hdr + 12 + (entries - 1) * 12;
+            uint32_t old_len = EXT4_EXT_LEN(rd16(ex + EE_OFF_LEN));
+            uint32_t old_start = rd32(ex + EE_OFF_START_LO);
+            uint32_t old_logical = rd32(ex + EE_OFF_BLOCK);
+            /* 物理与逻辑均连续：扩展末 extent */
+            if (old_start + old_len == pb &&
+                old_logical + old_len == lblk) {
+                e4_wr16(ex + EE_OFF_LEN, (uint16_t)(old_len + 1));
+                return 0;
+            }
+        }
+        if (entries < 4) {
+            uint8_t *nex = hdr + 12 + entries * 12;
+            e4_wr32(nex + EE_OFF_BLOCK, lblk);
+            e4_wr16(nex + EE_OFF_LEN, 1);
+            e4_wr16(nex + EE_OFF_START_HI, 0);
+            e4_wr32(nex + EE_OFF_START_LO, pb);
+            e4_wr16(hdr + EH_OFF_ENTRIES, (uint16_t)(entries + 1));
+            return 0;
+        }
+        /* 根满：升级 depth-1 —— 现有 4 项搬入新叶，根变 1 个 index */
+        uint32_t lb = e4_alloc_block();
+        if (lb == 0) return -1;
+        for (uint32_t i = 0; i < e4_blksize; i++) e4_leaf[i] = 0;
+        e4_leaf_init(e4_leaf, 4);
+        for (uint32_t i = 0; i < 4; i++) {
+            uint8_t *src = hdr + 12 + i * 12;
+            uint8_t *dst = e4_leaf + 12 + i * 12;
+            for (uint32_t k = 0; k < 12; k++) dst[k] = src[k];
+        }
+        if (e4_leaf_append(e4_leaf, lblk, pb, 1) != 0) {
+            e4_free_block(lb);
+            return -1;
+        }
+        e4_write_blk(lb, e4_leaf);
+        /* 根重写为 depth-1 单 index */
+        e4_wr16(hdr + EH_OFF_ENTRIES, 1);
+        e4_wr16(hdr + 4, 4);
+        e4_wr16(hdr + EH_OFF_DEPTH, 1);
+        uint8_t *ix = hdr + 12;
+        e4_wr32(ix + EI_OFF_BLOCK, 0);        /* 首叶覆盖逻辑块 0 起 */
+        e4_wr16(ix + EI_OFF_LEAF_HI, 0);
+        e4_wr32(ix + EI_OFF_LEAF_LO, lb);
+        return 0;
+    }
+
+    if (depth == 1) {
+        if (entries == 0) return -1;
+        uint8_t *last_ix = hdr + 12 + (entries - 1) * 12;
+        uint32_t lb = rd32(last_ix + EI_OFF_LEAF_LO);
+        if (lb == 0) return -1;
+        e4_read_blk(lb, e4_leaf);
+        uint32_t lents = rd16(e4_leaf + EH_OFF_ENTRIES);
+        if (lents > 0) {
+            uint8_t *ex = e4_leaf + 12 + (lents - 1) * 12;
+            uint32_t old_len = EXT4_EXT_LEN(rd16(ex + EE_OFF_LEN));
+            uint32_t old_start = rd32(ex + EE_OFF_START_LO);
+            uint32_t old_logical = rd32(ex + EE_OFF_BLOCK);
+            if (old_start + old_len == pb &&
+                old_logical + old_len == lblk) {
+                e4_wr16(ex + EE_OFF_LEN, (uint16_t)(old_len + 1));
+                e4_write_blk(lb, e4_leaf);
+                return 0;
+            }
+        }
+        if (e4_leaf_append(e4_leaf, lblk, pb, 1) == 0) {
+            e4_write_blk(lb, e4_leaf);
+            return 0;
+        }
+        /* 末叶满：新叶 + 根加 index（根最多 4 个 index，足够 336 段） */
+        if (entries >= 4) return -1;
+        uint32_t nb = e4_alloc_block();
+        if (nb == 0) return -1;
+        for (uint32_t i = 0; i < e4_blksize; i++) e4_leaf[i] = 0;
+        e4_leaf_init(e4_leaf, 0);
+        e4_leaf_append(e4_leaf, lblk, pb, 1);
+        e4_write_blk(nb, e4_leaf);
+        uint8_t *nix = hdr + 12 + entries * 12;
+        e4_wr32(nix + EI_OFF_BLOCK, lblk);
+        e4_wr16(nix + EI_OFF_LEAF_HI, 0);
+        e4_wr32(nix + EI_OFF_LEAF_LO, nb);
+        e4_wr16(hdr + EH_OFF_ENTRIES, (uint16_t)(entries + 1));
+        return 0;
+    }
+    return -1;   /* depth >=2 目录不做增量增长（删除重写即可恢复） */
+}
+
 /* 分配一个 inode；返回 inode 号，失败返回 0 */
 static uint32_t e4_alloc_inode(void) {
     uint32_t bmp_blk = e4_gd_inode_bitmap(0);
@@ -775,46 +974,10 @@ static int e4_dir_add_entry(uint32_t dir_ino, const char *name,
             static uint8_t zbuf[EXT4_MAX_BLOCKSIZE] E4_HIBUF;
             for (uint32_t i = 0; i < e4_blksize; i++) zbuf[i] = 0;
             e4_write_blk(pb, zbuf);
-            /* 更新目录 inode 的 i_block 映射（线性目录：直接块或 extent 单 extent） */
-            /* 简化：仅处理直接块（b < 12）或 extent depth-0 单 extent */
-            if (b < 12 && !(rd32(dino + INO_OFF_FLAGS) & EXT4_EXTENTS_FL)) {
-                e4_wr32(dino + INO_OFF_IBLOCK + b * 4, pb);
-            } else {
-                /* extent 目录：扩展 extent 覆盖新块（简化：重建单 extent） */
-                /* 读当前 extent 头 */
-                uint8_t *hdr = dino + INO_OFF_IBLOCK;
-                if (rd16(hdr) == EXT4_EXT_MAGIC) {
-                    uint32_t entries = rd16(hdr + EH_OFF_ENTRIES);
-                    if (entries > 0) {
-                        uint8_t *ex = hdr + 12 + (entries - 1) * 12;
-                        uint32_t old_len = EXT4_EXT_LEN(rd16(ex + EE_OFF_LEN));
-                        uint32_t old_start = rd32(ex + EE_OFF_START_LO);
-                        /* 仅当新块紧接旧 extent 末尾时扩展 */
-                        if (old_start + old_len == pb) {
-                            e4_wr16(ex + EE_OFF_LEN, (uint16_t)(old_len + 1));
-                        } else {
-                            /* 不连续：新增 extent 项 */
-                            if (entries < 4) {
-                                uint8_t *nex = hdr + 12 + entries * 12;
-                                e4_wr32(nex + EE_OFF_BLOCK, b); /* 逻辑块 */
-                                e4_wr16(nex + EE_OFF_LEN, 1);
-                                e4_wr16(nex + EE_OFF_START_HI, 0);
-                                e4_wr32(nex + EE_OFF_START_LO, pb);
-                                e4_wr16(hdr + EH_OFF_ENTRIES, (uint16_t)(entries + 1));
-                            } else {
-                                e4_free_block(pb);
-                                return -1;  /* extent 满了 */
-                            }
-                        }
-                    } else {
-                        /* 空 extent 树：建第一个 extent */
-                        e4_wr32(hdr + 12 + EE_OFF_BLOCK, 0);
-                        e4_wr16(hdr + 12 + EE_OFF_LEN, 1);
-                        e4_wr16(hdr + 12 + EE_OFF_START_HI, 0);
-                        e4_wr32(hdr + 12 + EE_OFF_START_LO, pb);
-                        e4_wr16(hdr + EH_OFF_ENTRIES, 1);
-                    }
-                }
+            /* 更新目录 inode 的 i_block 映射（任意深度 extent 树） */
+            if (e4_extent_append(dino, b, pb) != 0) {
+                e4_free_block(pb);
+                return -1;
             }
             /* 更新目录大小和 i_blocks */
             uint32_t new_size = (b + 1) * e4_blksize;
@@ -869,31 +1032,10 @@ static int e4_dir_add_entry(uint32_t dir_ino, const char *name,
         nbuf[DE_OFF_NAME + i] = (uint8_t)name[i];
     e4_write_blk(new_blk, nbuf);
 
-    /* 链接新块到目录 inode */
-    uint32_t new_b = nblk;
-    if (new_b < 12 && !(rd32(dino + INO_OFF_FLAGS) & EXT4_EXTENTS_FL)) {
-        e4_wr32(dino + INO_OFF_IBLOCK + new_b * 4, new_blk);
-    } else if (rd32(dino + INO_OFF_FLAGS) & EXT4_EXTENTS_FL) {
-        /* extent 树：简化处理（同上） */
-        uint8_t *hdr = dino + INO_OFF_IBLOCK;
-        if (rd16(hdr) == EXT4_EXT_MAGIC) {
-            uint32_t entries = rd16(hdr + EH_OFF_ENTRIES);
-            if (entries > 0 && entries < 4) {
-                uint8_t *ex = hdr + 12 + (entries - 1) * 12;
-                uint32_t old_len = EXT4_EXT_LEN(rd16(ex + EE_OFF_LEN));
-                uint32_t old_start = rd32(ex + EE_OFF_START_LO);
-                if (old_start + old_len == new_blk) {
-                    e4_wr16(ex + EE_OFF_LEN, (uint16_t)(old_len + 1));
-                } else {
-                    uint8_t *nex = hdr + 12 + entries * 12;
-                    e4_wr32(nex + EE_OFF_BLOCK, new_b); /* 逻辑块 */
-                    e4_wr16(nex + EE_OFF_LEN, 1);
-                    e4_wr16(nex + EE_OFF_START_HI, 0);
-                    e4_wr32(nex + EE_OFF_START_LO, new_blk);
-                    e4_wr16(hdr + EH_OFF_ENTRIES, (uint16_t)(entries + 1));
-                }
-            }
-        }
+    /* 链接新块到目录 inode（任意深度 extent 树） */
+    if (e4_extent_append(dino, nblk, new_blk) != 0) {
+        e4_free_block(new_blk);
+        return -1;
     }
     uint32_t new_size = (nblk + 1) * e4_blksize;
     e4_wr32(dino + INO_OFF_SIZE_LO, new_size);
@@ -989,7 +1131,33 @@ static int e4_split_path(const char *path, uint32_t *parent_ino,
     return 0;
 }
 
-/* 回收 inode 的全部数据块（用于 delete_file） */
+/* 回收 extent 节点：depth=0 释放全部数据块；depth>0 逐 index 读
+ * 叶子块递归释放数据块，并释放叶子块本身 */
+static void e4_free_extent_node(const uint8_t *hdr, uint32_t depth) {
+    uint32_t entries = rd16(hdr + EH_OFF_ENTRIES);
+    if (rd16(hdr) != EXT4_EXT_MAGIC) return;
+    if (depth == 0) {
+        for (uint32_t i = 0; i < entries; i++) {
+            const uint8_t *ex = hdr + 12 + i * 12;
+            uint32_t len = EXT4_EXT_LEN(rd16(ex + EE_OFF_LEN));
+            uint32_t start = rd32(ex + EE_OFF_START_LO);
+            for (uint32_t j = 0; j < len; j++)
+                if (start + j != 0)
+                    e4_free_block(start + j);
+        }
+    } else {
+        for (uint32_t i = 0; i < entries; i++) {
+            const uint8_t *ix = hdr + 12 + i * 12;
+            uint32_t leaf = rd32(ix + EI_OFF_LEAF_LO);
+            if (leaf == 0) continue;
+            e4_read_blk(leaf, e4_leaf);
+            e4_free_extent_node(e4_leaf, depth - 1);
+            e4_free_block(leaf);
+        }
+    }
+}
+
+/* 回收 inode 的全部数据块（用于 delete_file；任意深度 extent 树） */
 static void e4_free_inode_blocks(uint8_t *ino) {
     uint32_t mode = rd16(ino + INO_OFF_MODE);
     if ((mode & 0xF000u) != 0x8000u && (mode & 0xF000u) != 0x4000u)
@@ -999,18 +1167,8 @@ static void e4_free_inode_blocks(uint8_t *ino) {
     uint32_t nblk = (size + e4_blksize - 1) / e4_blksize;
 
     if (rd32(ino + INO_OFF_FLAGS) & EXT4_EXTENTS_FL) {
-        /* extent 树：遍历 depth-0 全部 extent 项 */
         uint8_t *hdr = ino + INO_OFF_IBLOCK;
-        if (rd16(hdr) != EXT4_EXT_MAGIC) return;
-        uint32_t entries = rd16(hdr + EH_OFF_ENTRIES);
-        for (uint32_t i = 0; i < entries && i < 4; i++) {
-            uint8_t *ex = hdr + 12 + i * 12;
-            uint32_t len = EXT4_EXT_LEN(rd16(ex + EE_OFF_LEN));
-            uint32_t start = rd32(ex + EE_OFF_START_LO);
-            for (uint32_t j = 0; j < len; j++)
-                if (start + j != 0)
-                    e4_free_block(start + j);
-        }
+        e4_free_extent_node(hdr, rd16(hdr + EH_OFF_DEPTH));
     } else {
         /* 旧式直接块 */
         for (uint32_t b = 0; b < nblk && b < 12; b++) {
@@ -1064,53 +1222,102 @@ int ext4_create_file(const char *name, const uint8_t *data, uint32_t size) {
         e4_wr32(ino + INO_OFF_IBLOCK, blk);
         e4_wr32(ino + INO_OFF_BLOCKS_LO, e4_blk_per_sec);
     } else {
-        /* 多块：extent 映射 */
+        /* 多块：extent 映射（碎片化多 extent；超 4 段升级 depth-1 索引树） */
         uint32_t nblk = (size + e4_blksize - 1) / e4_blksize;
-        uint32_t first_blk = e4_alloc_block();
-        if (first_blk == 0) { e4_free_inode(new_ino); return -1; }
-        /* 尝试连续分配剩余块 */
-        uint32_t prev = first_blk;
-        for (uint32_t i = 1; i < nblk; i++) {
-            uint32_t nb = e4_alloc_block();
-            if (nb == 0) {
-                /* 分配失败：回滚已分配块 */
-                for (uint32_t j = 0; j < i; j++)
-                    e4_free_block(first_blk + j);  /* 假设连续 */
-                e4_free_inode(new_ino);
-                return -1;
-            }
-            /* 若不连续，回滚全部重试（简化：仅支持连续多块 extent） */
-            if (nb != prev + 1) {
-                for (uint32_t j = 0; j <= i; j++)
-                    e4_free_block(first_blk + j);  /* 近似：可能多释放 */
-                e4_free_inode(new_ino);
-                return -1;
-            }
-            prev = nb;
-        }
-        /* 写入数据 */
+        uint32_t ext_count = 0;
+        uint32_t nalloc = 0, next_logical = 0, done = 0;
         static uint8_t fbuf[EXT4_MAX_BLOCKSIZE] E4_HIBUF;
-        uint32_t done = 0;
-        for (uint32_t i = 0; i < nblk; i++) {
-            for (uint32_t j = 0; j < e4_blksize; j++) fbuf[j] = 0;
-            uint32_t chunk = size - done;
-            if (chunk > e4_blksize) chunk = e4_blksize;
-            for (uint32_t j = 0; j < chunk; j++) fbuf[j] = data[done + j];
-            e4_write_blk(first_blk + i, fbuf);
-            done += chunk;
+        while (nalloc < nblk) {
+            uint32_t want = nblk - nalloc;
+            uint32_t got = 0;
+            uint32_t s = e4_alloc_run(want, &got);
+            if (s == 0 || got == 0) {
+                /* 空间不足：按 extent 记录精确回滚 */
+                for (uint32_t e = 0; e < ext_count; e++)
+                    for (uint32_t j = 0; j < e4_x_len[e]; j++)
+                        e4_free_block(e4_x_phys[e] + j);
+                e4_free_inode(new_ino);
+                return -1;
+            }
+            /* 写这段数据（整段连续，逐块写） */
+            for (uint32_t k = 0; k < got; k++) {
+                for (uint32_t j = 0; j < e4_blksize; j++) fbuf[j] = 0;
+                uint32_t chunk = size - done;
+                if (chunk > e4_blksize) chunk = e4_blksize;
+                for (uint32_t j = 0; j < chunk; j++) fbuf[j] = data[done + j];
+                e4_write_blk(s + k, fbuf);
+                done += chunk;
+            }
+            if (ext_count < E4_MAX_EXTENTS) {
+                e4_x_logical[ext_count] = next_logical;
+                e4_x_phys[ext_count] = s;
+                e4_x_len[ext_count] = got;
+                ext_count++;
+            }
+            next_logical += got;
+            nalloc += got;
         }
-        /* 建单 extent（depth-0） */
+
         uint8_t *hdr = ino + INO_OFF_IBLOCK;
-        e4_wr16(hdr + EH_OFF_MAGIC, EXT4_EXT_MAGIC);
-        e4_wr16(hdr + EH_OFF_ENTRIES, 1);
-        e4_wr16(hdr + 4, 4);    /* eh_max */
-        e4_wr16(hdr + EH_OFF_DEPTH, 0);
-        e4_wr32(hdr + 12 + EE_OFF_BLOCK, 0);     /* 逻辑块 0 */
-        e4_wr16(hdr + 12 + EE_OFF_LEN, (uint16_t)nblk);
-        e4_wr16(hdr + 12 + EE_OFF_START_HI, 0);
-        e4_wr32(hdr + 12 + EE_OFF_START_LO, first_blk);
+        uint32_t leaf_blks = 0;
         e4_wr32(ino + INO_OFF_FLAGS, EXT4_EXTENTS_FL);
-        e4_wr32(ino + INO_OFF_BLOCKS_LO, nblk * e4_blk_per_sec);
+        if (ext_count <= 4) {
+            /* 根 depth-0：extent 直接放 inode i_block */
+            e4_wr16(hdr + EH_OFF_MAGIC, EXT4_EXT_MAGIC);
+            e4_wr16(hdr + EH_OFF_ENTRIES, (uint16_t)ext_count);
+            e4_wr16(hdr + 4, 4);    /* eh_max */
+            e4_wr16(hdr + EH_OFF_DEPTH, 0);
+            for (uint32_t i = 0; i < ext_count; i++) {
+                uint8_t *ex = hdr + 12 + i * 12;
+                e4_wr32(ex + EE_OFF_BLOCK, e4_x_logical[i]);
+                e4_wr16(ex + EE_OFF_LEN, (uint16_t)e4_x_len[i]);
+                e4_wr16(ex + EE_OFF_START_HI, 0);
+                e4_wr32(ex + EE_OFF_START_LO, e4_x_phys[i]);
+            }
+        } else {
+            /* 根 depth-1：extent 分批放叶子块，根放 index（最多 4 叶） */
+            uint32_t cap = e4_leaf_capacity();
+            leaf_blks = (ext_count + cap - 1) / cap;
+            static uint32_t leaves[16] E4_HIBUF;   /* <=4（1KB 块），留裕量 */
+            uint32_t nleaves = 0, next_ext = 0;
+            int fail = 0;
+            for (uint32_t L = 0; L < leaf_blks && !fail; L++) {
+                uint32_t lb = e4_alloc_block();
+                if (lb == 0) { fail = 1; break; }
+                for (uint32_t i = 0; i < e4_blksize; i++) e4_leaf[i] = 0;
+                e4_leaf_init(e4_leaf, 0);
+                while (next_ext < ext_count) {
+                    if (e4_leaf_append(e4_leaf, e4_x_logical[next_ext],
+                                       e4_x_phys[next_ext], e4_x_len[next_ext]) != 0)
+                        break;
+                    next_ext++;
+                }
+                e4_write_blk(lb, e4_leaf);
+                leaves[nleaves++] = lb;
+            }
+            if (fail || next_ext < ext_count || leaf_blks > 4) {
+                /* 叶子分配失败/超根容量：回滚全部（数据块+叶子块+inode） */
+                for (uint32_t e = 0; e < ext_count; e++)
+                    for (uint32_t j = 0; j < e4_x_len[e]; j++)
+                        e4_free_block(e4_x_phys[e] + j);
+                for (uint32_t L = 0; L < nleaves; L++) e4_free_block(leaves[L]);
+                e4_free_inode(new_ino);
+                return -1;
+            }
+            e4_wr16(hdr + EH_OFF_MAGIC, EXT4_EXT_MAGIC);
+            e4_wr16(hdr + EH_OFF_ENTRIES, (uint16_t)leaf_blks);
+            e4_wr16(hdr + 4, 4);
+            e4_wr16(hdr + EH_OFF_DEPTH, 1);
+            uint32_t le = 0;
+            for (uint32_t L = 0; L < leaf_blks; L++) {
+                uint8_t *ix = hdr + 12 + L * 12;
+                e4_wr32(ix + EI_OFF_BLOCK, e4_x_logical[le]);
+                e4_wr16(ix + EI_OFF_LEAF_HI, 0);
+                e4_wr32(ix + EI_OFF_LEAF_LO, leaves[L]);
+                le += cap;   /* 每叶 cap 项（末叶可少） */
+            }
+        }
+        e4_wr32(ino + INO_OFF_BLOCKS_LO, (nblk + leaf_blks) * e4_blk_per_sec);
     }
 
     e4_write_inode(new_ino, ino);
