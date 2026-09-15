@@ -10,7 +10,7 @@ FAT 镜像为标准 MBR + 单主分区 FAT 卷（分区类型 0x01/0x06/0x0B）�
     LONG FILE NAME TEST.TXT  LFN 长名条目（验证驱动 LFN 解析）
 生成后按内核 fat_probe 相同规则自检 BPB 合法性。
 """
-import struct, sys
+import struct, sys, os
 
 # ---------- exFAT 参数（与 kernel/exfat.c exfat_format 对齐） ----------
 EXFAT_DISK_SIZE = 16 * 1024 * 1024
@@ -81,15 +81,6 @@ def make_exfat_vbr():
     vbr[0x70] = 0xFF    # PercentInUse (unknown)
     vbr[510] = 0x55; vbr[511] = 0xAA
     return bytes(vbr)
-
-
-def make_exfat_fat():
-    fat = bytearray(512)
-    struct.pack_into('<I', fat, 0, 0xFFFFFFF8)   # 簇 0: 介质描述符
-    struct.pack_into('<I', fat, 4, 0xFFFFFFFF)   # 簇 1: 保留
-    for c in range(2, 7):                        # 簇 2-6: 根目录/位图/大写表/两文件 EOC
-        struct.pack_into('<I', fat, c * 4, 0xFFFFFFFF)
-    return bytes(fat)
 
 
 def make_exfat_upcase():
@@ -170,6 +161,45 @@ def make_exfat_entry_set(name, first_cluster, size, is_dir=False):
     return bytes(s)
 
 
+def exfat_files():
+    """根目录下的文件清单：(name, data)。
+
+    HELLO.ELF 是步骤 5c 构建的用户态 ELF 程序（user/hello.elf），
+    shell 的 `exec` 命令会把它从盘上读进内核再加载执行。缺失时不算错误
+    ——只是没有可执行的用户程序，镜像其余部分照旧可用。"""
+    files = [
+        ('README.TXT', b"Welcome to EZOS!\nThis is the exFAT data disk.\n"),
+        (LFN_NAME, b"Long filename (LFN) test file on exFAT.\n"),
+    ]
+    here = os.path.dirname(os.path.abspath(__file__))
+    elf = os.path.join(os.path.dirname(here), 'user', 'hello.elf')
+    if os.path.isfile(elf):
+        with open(elf, 'rb') as f:
+            files.append(('HELLO.ELF', f.read()))
+    else:
+        print("WARN %s not found - skip embedding HELLO.ELF (run ninja user first)" % elf)
+
+    # FDTEST.ELF：步骤 6b 的文件描述符测试程序（open/read/lseek/write/close）
+    fdtest = os.path.join(os.path.dirname(here), 'user', 'fdtest.elf')
+    if os.path.isfile(fdtest):
+        with open(fdtest, 'rb') as f:
+            files.append(('FDTEST.ELF', f.read()))
+    else:
+        print("WARN %s not found - skip embedding FDTEST.ELF (run ninja user first)" % fdtest)
+
+    # SPIN.ELF / FDLEAK.ELF：步骤 6c 的多进程验证程序
+    #   SPIN.ELF   —— ring3 忙等几秒，证明用户进程是可被抢占的任务
+    #   FDLEAK.ELF —— 写完文件故意不 close，证明进程退出时内核代关并落盘
+    for fname in ('SPIN.ELF', 'FDLEAK.ELF'):
+        p = os.path.join(os.path.dirname(here), 'user', fname.lower())
+        if os.path.isfile(p):
+            with open(p, 'rb') as f:
+                files.append((fname, f.read()))
+        else:
+            print("WARN %s not found - skip embedding %s (run ninja user first)" % (p, fname))
+    return files
+
+
 def gen_exfat(path):
     img = bytearray(EXFAT_DISK_SIZE)
     vbr = make_exfat_vbr()
@@ -188,37 +218,75 @@ def gen_exfat(path):
     img[13 * 512:14 * 512] = vbr
     img[24 * 512:25 * 512] = chk_sector
 
-    img[26 * 512:27 * 512] = make_exfat_fat()
+    files = exfat_files()
 
-    readme = b"Welcome to EZOS!\nThis is the exFAT data disk.\n"
-    lfn_data = b"Long filename (LFN) test file on exFAT.\n"
-    img[30 * 512:30 * 512 + len(readme)] = readme        # 簇 5: README.TXT
-    img[31 * 512:31 * 512 + len(lfn_data)] = lfn_data    # 簇 6: LFN 长名文件
+    # 簇 2-3=根目录（两簇） 4=位图 5=大写表，数据簇从 6 起顺序分配（1 扇区/簇）
+    #
+    # 根目录为什么是两簇：每个文件的 entry set = 1 文件项 + 1 流扩展项 +
+    # ceil(len/15) 个名字项，每项 32 字节。"LONG FILE NAME TEST.TXT"（23 字符）
+    # 要 4 项 = 128 字节，加上元数据的 96 字节，四个文件就把 512 字节的第一簇
+    # 顶满了——步骤 6c 要再放 SPIN.ELF / FDLEAK.ELF 就必须扩簇。
+    # 内核 exfat_read_dir_chain 沿 FAT 链遍历目录，多簇根目录天然支持。
+    layout = []                       # (name, first_cluster, data)
+    c = 6
+    for name, data in files:
+        layout.append((name, c, data))
+        c += max(1, (len(data) + 511) // 512)
+    used_max = c - 1                  # 最高已用簇号
 
-    # 根目录（簇 2）: 0x83 卷标 + 0x81 位图 + 0x82 大写表 + 两个文件 entry set
-    root = bytearray(512)
+    # FAT：根目录簇 2->3->EOC；位图簇 4、大写表簇 5 各自 EOC；
+    #      每个文件内部串成链，末簇写 EOC
+    fat = bytearray(512)
+    struct.pack_into('<I', fat, 0, 0xFFFFFFF8)     # 簇 0: 介质描述符
+    struct.pack_into('<I', fat, 4, 0xFFFFFFFF)     # 簇 1: 保留
+    struct.pack_into('<I', fat, 2 * 4, 3)          # 根目录第二簇
+    struct.pack_into('<I', fat, 3 * 4, 0xFFFFFFFF) # 根目录链尾
+    struct.pack_into('<I', fat, 4 * 4, 0xFFFFFFFF) # 位图
+    struct.pack_into('<I', fat, 5 * 4, 0xFFFFFFFF) # 大写表
+    for _name, fc, data in layout:
+        nclus = max(1, (len(data) + 511) // 512)
+        for k in range(nclus):
+            nxt = 0xFFFFFFFF if k == nclus - 1 else fc + k + 1
+            struct.pack_into('<I', fat, (fc + k) * 4, nxt)
+    img[26 * 512:27 * 512] = bytes(fat)
+
+    # 数据：簇 N 位于扇区 (ClusterHeapOffset-1)+N（簇堆起点 26 扇区，簇 2 在 27）
+    for _name, fc, data in layout:
+        off = (EXFAT_CLUSTER_HEAP_OFFSET - 1 + fc) * 512
+        img[off:off + len(data)] = data
+
+    # 根目录（簇 2-3）: 0x83 卷标 + 0x81 位图 + 0x82 大写表 + 各文件 entry set
+    root = bytearray(1024)
     root[0] = 0x83; root[1] = 0x02
     root[32] = 0x81; root[33] = 0x00
-    struct.pack_into('<I', root, 52, 3)      # 0x81 FirstCluster@+0x14（簇 3 位图）
+    struct.pack_into('<I', root, 52, 4)      # 0x81 FirstCluster@+0x14（簇 4 位图）
     struct.pack_into('<Q', root, 56, 13)     # 0x81 DataLength@+0x18
     root[64] = 0x82
-    struct.pack_into('<I', root, 84, 4)      # 0x82 FirstCluster@+0x14（簇 4 大写表）
+    struct.pack_into('<I', root, 84, 5)      # 0x82 FirstCluster@+0x14（簇 5 大写表）
     struct.pack_into('<Q', root, 88, 124)    # 0x82 DataLength@+0x18
     off = 96
-    for es in (make_exfat_entry_set('README.TXT', 5, len(readme)),
-               make_exfat_entry_set(LFN_NAME, 6, len(lfn_data))):
+    for name, fc, data in layout:
+        es = make_exfat_entry_set(name, fc, len(data))
+        if off + len(es) > len(root):
+            raise SystemExit("root directory overflow: cannot fit '%s'" % name)
         root[off:off + len(es)] = es
         off += len(es)
-    img[27 * 512:28 * 512] = bytes(root)
+    img[27 * 512:29 * 512] = bytes(root)
 
-    # 位图（簇 3）: 簇 2-6 已用（bit0-4）
-    img[28 * 512:29 * 512] = bytes([0x1F]) + bytes(511)
-    img[29 * 512:30 * 512] = make_exfat_upcase()
+    # 位图（簇 4）: 簇 2..used_max 已用（bit0 对应簇 2）
+    bm = bytearray(512)
+    for cl in range(2, used_max + 1):
+        b = cl - 2
+        bm[b // 8] |= (1 << (b % 8))
+    img[29 * 512:30 * 512] = bytes(bm)
+    img[30 * 512:31 * 512] = make_exfat_upcase()
 
     with open(path, 'wb') as f:
         f.write(img)
-    print("OK %s: %d bytes exFAT (spec-aligned entry sets, files: README.TXT + '%s')"
-          % (path, len(img), LFN_NAME))
+    names = ", ".join("%s(%dB,%d簇)" % (n, len(d), max(1, (len(d) + 511) // 512))
+                      for n, _fc, d in layout)
+    print("OK %s: %d bytes exFAT (spec-aligned entry sets, files: %s)"
+          % (path, len(img), names))
 
 
 # ==================== FAT12/16/32 ====================

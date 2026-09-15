@@ -34,4 +34,20 @@ SECTIONS
         __hbss_end = .;
     }
     ASSERT(__hbss_end <= 0x200000, "high bss exceeds 2MB limit")
+
+    /* 任务内核栈池（步骤 6a）：0x904000 起，到 pmm 物理页池 10MB 之前。
+     *
+     * 不放 .bss.hi 的原因：那里已经用了 ~1.97MB（上限 2MB），8 个 16KB 栈
+     * 会直接顶穿。9MB 陷入栈之后到 10MB 之间有 768KB 空档，正好够用，
+     * 且不挤占任何已有区域：
+     *   2MB 页表池 | 3MB scratch | 4-8MB 用户空间 | 9MB 陷入栈
+     *   | **9.016MB 本池** | 10-16MB pmm 池 | 16MB GUI 背缓冲
+     *
+     * NOLOAD 且启动代码不清零：栈不需要零初始化，省 128KB 的清零时间。 */
+    .bss.kstack 0x00904000 (NOLOAD) : {
+        __kstack_start = .;
+        *(.bss.kstack)
+        __kstack_end = .;
+    }
+    ASSERT(__kstack_end <= 0x00A00000, "task kernel stacks exceed pool")
 }

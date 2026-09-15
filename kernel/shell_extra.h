@@ -24,5 +24,21 @@ void cmd_unalias(const char *args);
 void cmd_uptime(const char *args);
 void cmd_sleep(const char *args);
 void cmd_mem(const char *args);
+void cmd_dmesg(const char *args);
+void cmd_kmtest(const char *args);
+void cmd_pagetest(const char *args);
+void cmd_utest(const char *args);
+void cmd_pmmtest(const char *args);
+void cmd_elftest(const char *args);
+void cmd_exec(const char *args);
+void cmd_calc(const char *args);
+void cmd_selftest(const char *args);
+void cmd_ktask(const char *args);
+void cmd_ps(const char *args);
+
+/* 开机一键自检（kernel_main 调用）：静默跑全部子系统断言，
+ * 返回失败的子系统数（0=全部通过）。失败项可用 shell 的
+ * selftest 命令看逐项详情。 */
+int boot_selftest(void);
 
 #endif

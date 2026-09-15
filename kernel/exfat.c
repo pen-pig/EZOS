@@ -198,11 +198,18 @@ static uint32_t exfat_extend_dir(uint32_t dir_cluster) {
         steps++;
     }
     if (exfat_write_fat_entry(cur, new_cl) != 0) return 0;
-    // 清空新簇
+    /* 清空新簇 */
     uint32_t cluster_size = exfat_info.bytes_per_sector * exfat_info.sectors_per_cluster;
     static uint8_t zero[512 * 16] XF_HIBUF;
     for (uint32_t i = 0; i < cluster_size; i++) zero[i] = 0;
-    if (exfat_write_cluster(new_cl, zero) != 0) return 0;
+    if (exfat_write_cluster(new_cl, zero) != 0) {
+        /* 失败时必须把 FAT 里的 EOC 标记撤掉。
+         * 此时位图还没置 1，若不同步清理，find_free_cluster 会再次返回这一簇
+         * ——两个使用者拿到同一个物理簇，数据互相覆盖。这比单纯的簇泄漏
+         * 危险得多：泄漏只是浪费，双重分配是静默的数据损坏。 */
+        exfat_write_fat_entry(new_cl, 0);
+        return 0;
+    }
     exfat_bitmap_set(new_cl, 1);
     return new_cl;
 }
@@ -534,6 +541,10 @@ int exfat_mkdir(const char *name) {
 
     char dir_name[128];
     int dn = 0;
+    /* 新目录簇必须在所有 goto 之前声明：分配成功之后到 ok=1 之间的任何一条
+     * 失败路径都要归还它。放在 goto 之后声明虽然 C 语法允许，但 goto 会跳过
+     * 它的初始化，restore 里按下文判断就没法可靠地知道"是否已分配"。 */
+    uint32_t new_cluster = 0;
     int last_sep = -1;
     for (int i = nlen - 1; i >= 0; i--) {
         if (path_buf[i] == '/') { last_sep = i; break; }
@@ -560,7 +571,7 @@ int exfat_mkdir(const char *name) {
     uint8_t exist_entry[1024];
     if (exfat_find_entry(exfat_cwd_cluster(), dir_name, exist_entry) >= 0) goto restore;
 
-    uint32_t new_cluster = exfat_find_free_cluster();
+    new_cluster = exfat_find_free_cluster();
     if (new_cluster == 0) goto restore;
     exfat_write_fat_entry(new_cluster, 0xFFFFFFFF);   // 目录仅单簇，标记链尾
     exfat_bitmap_set(new_cluster, 1);
@@ -604,6 +615,14 @@ int exfat_mkdir(const char *name) {
     ok = 1;
 
 restore:
+    /* 失败回滚：已经申请走的簇要还回去。
+     * 否则每次 mkdir 中途失败都会永久吃掉一个簇——FAT 标了 EOC、位图置 1
+     * 却没有任何目录项指向它，属不可回收泄漏（历史上 exec 用户栈踩过同类坑）。
+     * 成功路径（ok=1）的新簇由目录项持有，绝不能在这里释放。 */
+    if (!ok && new_cluster != 0) {
+        exfat_write_fat_entry(new_cluster, 0);
+        exfat_bitmap_set(new_cluster, 0);
+    }
     // 恢复调用方目录状态
     current_dir_cluster = saved_cwd;
     dir_depth = saved_depth;
@@ -1027,6 +1046,30 @@ int exfat_read_file(const char *name, uint8_t *buffer, uint32_t max_size) {
     return (int)bytes_read;
 }
 
+/*
+ * 释放一条 FAT 簇链并把每一簇的位图 bit 清回空闲。
+ *
+ * 抽取出来是因为它有两类调用方：
+ *   1) 分配簇链的过程中途失败（配额用尽）——回滚已经串起来的部分
+ *   2) 数据/目录项写盘失败——整条链都要还回去
+ * 两处以前各写各的，结果第 2 类被漏掉了三次：写文件数据、写目录项、
+ * 写回目录链其余簇。任何一处失败都会永久吃掉整条已分配的数据簇
+ * （FAT 标了 EOC、位图置 1，却没有任何目录项指向它们 = 不可回收泄漏）。
+ */
+static void exfat_free_cluster_chain(uint32_t head) {
+    uint32_t cur = head;
+    uint32_t steps = 0;
+    while (cur >= 2 && cur < exfat_info.cluster_count + 2 &&
+           steps < exfat_info.cluster_count + 2) {
+        uint32_t next = exfat_read_fat_entry(cur);
+        exfat_write_fat_entry(cur, 0);
+        exfat_bitmap_set(cur, 0);
+        if (next >= 0xFFFFFFF8) break;      /* 链表尾或坏簇 */
+        cur = next;
+        steps++;
+    }
+}
+
 int exfat_create_file(const char *name, const uint8_t *data, uint32_t size) {
     if (!exfat_ready) return -1;
 
@@ -1068,18 +1111,8 @@ int exfat_create_file(const char *name, const uint8_t *data, uint32_t size) {
     for (uint32_t i = 0; i < data_clusters; i++) {
         uint32_t cl = exfat_find_free_cluster();
         if (cl == 0) {
-            // 分配失败，回滚已占用的簇（含 bitmap）
-            uint32_t cur = first_cluster;
-            uint32_t steps = 0;
-            while (cur >= 2 && cur < exfat_info.cluster_count + 2 &&
-                   steps < exfat_info.cluster_count + 2) {
-                uint32_t next = exfat_read_fat_entry(cur);
-                exfat_write_fat_entry(cur, 0);
-                exfat_bitmap_set(cur, 0);
-                if (next >= 0xFFFFFFF8) break;
-                cur = next;
-                steps++;
-            }
+            /* 分配失败：回滚已经串起来的那部分簇链（含位图） */
+            exfat_free_cluster_chain(first_cluster);
             return -1;
         }
         exfat_write_fat_entry(cl, 0xFFFFFFFF);  // 先标记为链尾
@@ -1101,7 +1134,10 @@ int exfat_create_file(const char *name, const uint8_t *data, uint32_t size) {
         for (uint32_t j = 0; j < to_copy; j++) {
             cluster_buf[j] = data[bytes_written + j];
         }
-        if (exfat_write_cluster(cur_cluster, cluster_buf) != 0) return -1;
+        if (exfat_write_cluster(cur_cluster, cluster_buf) != 0) {
+            exfat_free_cluster_chain(start_cluster);   /* 已分配的簇链要还回去 */
+            return -1;
+        }
         bytes_written += to_copy;
         if (i < data_clusters - 1) {
             cur_cluster = exfat_read_fat_entry(cur_cluster);
@@ -1110,13 +1146,19 @@ int exfat_create_file(const char *name, const uint8_t *data, uint32_t size) {
 
     // 写 entry set
     exfat_write_entry_set(root_buffer, free_entry_offset, name, start_cluster, size, 0);
-    if (exfat_write_cluster(root_cluster, root_buffer) != 0) return -1;
+    if (exfat_write_cluster(root_cluster, root_buffer) != 0) {
+        exfat_free_cluster_chain(start_cluster);
+        return -1;
+    }
     if (dir_clusters > 1) {
         // 写回目录链其余簇
         uint32_t cur = exfat_read_fat_entry(root_cluster);
         uint32_t idx = 1;
         while (cur >= 2 && cur < exfat_info.cluster_count + 2 && idx < dir_clusters) {
-            if (exfat_write_cluster(cur, root_buffer + idx * cluster_size) != 0) return -1;
+            if (exfat_write_cluster(cur, root_buffer + idx * cluster_size) != 0) {
+                exfat_free_cluster_chain(start_cluster);
+                return -1;
+            }
             idx++;
             cur = exfat_read_fat_entry(cur);
         }

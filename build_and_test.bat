@@ -65,59 +65,23 @@ echo [2/6] assembling kernel entry...
 nasm -f elf32 boot\kernel_entry.asm -o boot\kernel_entry.o
 if errorlevel 1 goto error
 
-echo [3/6] compiling kernel C files...
-i686-elf-gcc %CFLAGS% -c kernel\kernel.c -o kernel\kernel.o
-if errorlevel 1 goto error
-i686-elf-gcc %CFLAGS% -c kernel\tty.c -o kernel\tty.o
-if errorlevel 1 goto error
-i686-elf-gcc %CFLAGS% -c kernel\idt.c -o kernel\idt.o
-if errorlevel 1 goto error
-i686-elf-gcc %CFLAGS% -c kernel\isr.c -o kernel\isr.o
-if errorlevel 1 goto error
-i686-elf-gcc %CFLAGS% -c kernel\keyboard.c -o kernel\keyboard.o
-if errorlevel 1 goto error
-i686-elf-gcc %CFLAGS% -c kernel\ata.c -o kernel\ata.o
-if errorlevel 1 goto error
-i686-elf-gcc %CFLAGS% -c kernel\shell.c -o kernel\shell.o
-if errorlevel 1 goto error
-i686-elf-gcc %CFLAGS% -c kernel\shell_extra.c -o kernel\shell_extra.o
-if errorlevel 1 goto error
-i686-elf-gcc %CFLAGS% -c kernel\exfat.c -o kernel\exfat.o
-if errorlevel 1 goto error
-i686-elf-gcc %CFLAGS% -c kernel\fat.c -o kernel\fat.o
-if errorlevel 1 goto error
-i686-elf-gcc %CFLAGS% -c kernel\fs.c -o kernel\fs.o
-if errorlevel 1 goto error
-i686-elf-gcc %CFLAGS% -c kernel\ext4.c -o kernel\ext4.o
-if errorlevel 1 goto error
-i686-elf-gcc %CFLAGS% -c kernel\ntfs.c -o kernel\ntfs.o
-if errorlevel 1 goto error
-i686-elf-gcc %CFLAGS% -c kernel\f2fs.c -o kernel\f2fs.o
-if errorlevel 1 goto error
-i686-elf-gcc %CFLAGS% -c kernel\erofs.c -o kernel\erofs.o
-if errorlevel 1 goto error
-i686-elf-gcc %CFLAGS% -c kernel\refs.c -o kernel\refs.o
-if errorlevel 1 goto error
-i686-elf-gcc %CFLAGS% -c kernel\div64.c -o kernel\div64.o
-if errorlevel 1 goto error
-i686-elf-gcc %CFLAGS% -c kernel\gfx.c -o kernel\gfx.o
-if errorlevel 1 goto error
-i686-elf-gcc %CFLAGS% -c kernel\gui.c -o kernel\gui.o
-if errorlevel 1 goto error
-i686-elf-gcc %CFLAGS% -c kernel\mouse.c -o kernel\mouse.o
-if errorlevel 1 goto error
-i686-elf-gcc %CFLAGS% -c kernel\gfxwin.c -o kernel\gfxwin.o
-if errorlevel 1 goto error
-i686-elf-gcc %CFLAGS% -c kernel\desktop.c -o kernel\desktop.o
-if errorlevel 1 goto error
-i686-elf-gcc %CFLAGS% -c kernel\games.c -o kernel\games.o
-if errorlevel 1 goto error
-i686-elf-gcc %CFLAGS% -c kernel\hiscore.c -o kernel\hiscore.o
-if errorlevel 1 goto error
+echo [3/6] compiling kernel C files (auto-discovered)...
+rem 源文件自动收集：新增 kernel\*.c 无需改本脚本。
+rem 早期版本在此硬编码"编译列表"与"链接列表"两份，新增模块时极易只改一侧，
+rem 表现为链接期一堆 undefined reference（症状与代码错误难区分）。
+setlocal enabledelayedexpansion
+set "OBJS=boot\kernel_entry.o"
+for %%F in (kernel\*.c) do (
+    echo   CC %%~nxF
+    i686-elf-gcc %CFLAGS% -c "%%F" -o "kernel\%%~nF.o"
+    if errorlevel 1 goto error
+    set "OBJS=!OBJS! kernel\%%~nF.o"
+)
 
 echo [4/6] linking kernel...
-i686-elf-ld %LDFLAGS% -o kernel_raw.bin boot\kernel_entry.o kernel\kernel.o kernel\tty.o kernel\idt.o kernel\isr.o kernel\keyboard.o kernel\ata.o kernel\shell.o kernel\shell_extra.o kernel\exfat.o kernel\fat.o kernel\fs.o kernel\ext4.o kernel\ntfs.o kernel\f2fs.o kernel\erofs.o kernel\refs.o kernel\div64.o kernel\gfx.o kernel\gui.o kernel\mouse.o kernel\gfxwin.o kernel\desktop.o kernel\games.o kernel\hiscore.o
+i686-elf-ld %LDFLAGS% -o kernel_raw.bin !OBJS!
 if errorlevel 1 goto error
+endlocal & set "OBJS="
 
 echo [5/6] padding kernel to 384KB...
 i686-elf-objcopy -I binary -O binary --pad-to 393216 kernel_raw.bin kernel.bin
@@ -146,7 +110,7 @@ goto end
 
 :clean
 echo cleaning build artifacts...
-del /q boot\boot.bin boot\kernel_entry.o kernel\kernel.o kernel\tty.o kernel\idt.o kernel\isr.o kernel\keyboard.o kernel\ata.o kernel\shell.o kernel\exfat.o kernel\gui.o kernel\gfx.o kernel\gfxwin.o kernel\desktop.o kernel\games.o kernel_raw.bin kernel.bin os-image.bin 2>nul
+del /q boot\boot.bin boot\kernel_entry.o kernel\*.o kernel_raw.bin kernel.bin os-image.bin 2>nul
 echo clean done.
 pause
 exit /b 0

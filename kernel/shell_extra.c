@@ -18,6 +18,17 @@
 #include "port.h"
 #include "fs.h"
 #include "isr.h"
+#include "dmesg.h"
+#include "kmalloc.h"
+#include "paging.h"
+#include "syscall.h"
+#include "pmm.h"
+#include "elf.h"
+#include "exec.h"
+#include "fpu.h"
+#include "calc.h"
+#include "task.h"
+#include "fd.h"
 
 /* ==================================================================
  * 1. ezos_console 适配层：把 EZOS tty / 键盘桥接为轻量 console 接口
@@ -470,6 +481,492 @@ void cmd_uptime(const char *args) {
     ezos_console_write(")\n");
 }
 
+/* dmesg [n] - 回看内核环形日志（默认全部；n = 最近 n 行） */
+void cmd_dmesg(const char *args) {
+    ezos_args_t a;
+    ezos_parse_args(args, &a);
+    int n = 0;                             /* 0 = 全部 */
+    if (a.argc >= 1) {
+        n = x_atoi(a.argv[0]);
+        if (n < 0) n = 0;
+    }
+    ezos_console_write("dmesg: last ");
+    ezos_console_print_dec(dmesg_lines());
+    ezos_console_write(" line(s) buffered\n");
+    int dumped = dmesg_dump(ezos_console_putchar, n);
+    if (dumped == 0) ezos_console_write("(empty)\n");
+}
+
+/* kmtest - 堆分配器自检：分配/释放/合并/越界检测演练 */
+/* utest：ring3 + 系统调用自检。
+ *   1) 内核侧断言：非用户页（.bss.hi 的 0x00100000）必须被 user_range_ok 拒绝
+ *   2) 映射用户页 -> 装入内建用户程序 -> enter_usermode() 切入 ring3
+ *   3) 用户程序两次 SYS_WRITE（各往返一次 ring3->ring0->ring3）后 SYS_EXIT
+ *   4) 校验退出码与系统调用计数
+ * 用户程序的输出直接由 SYS_WRITE 打到终端，穿插在本函数输出之间。 */
+void cmd_utest(const char *args) {
+    (void)args;
+    ezos_console_write("usermode demo (step 4):\n");
+
+    /* 1) 安全边界"拒绝"侧（此刻用户页尚未映射）
+     *    只测拒绝不够：校验逻辑若写反到"一律拒绝"，测试同样会显示通过，
+     *    而真实的用户 write 会全部失败——必须正反两侧都验。 */
+    int rej_kernel = (syscall_user_range_ok(0x00100000u, 4) == 0);  /* 已映射但无 PTE_US */
+    int rej_unmap  = (syscall_user_range_ok(0x05000000u, 4) == 0);  /* 完全未映射 */
+    ezos_console_write("  kernel page rejected: ");
+    ezos_console_write(rej_kernel ? "yes [OK]\n" : "NO [FAIL]\n");
+    ezos_console_write("  unmapped page rejected: ");
+    ezos_console_write(rej_unmap ? "yes [OK]\n" : "NO [FAIL]\n");
+
+    /* 2) ring3 实跑（用户输出在此之间直接打印） */
+    uint32_t before = syscall_count();
+    ezos_console_write("  entering ring 3 at 0x00400000...\n");
+
+    int rc = usermode_run_demo();
+
+    ezos_console_write("  back in ring 0, exit code ");
+    ezos_console_print_dec((uint32_t)rc);
+    ezos_console_write(", syscalls ");
+    ezos_console_print_dec(syscall_count() - before);
+    ezos_console_write("\n");
+
+    /* 3) 安全边界"放行"侧：此时用户代码页已映射且带 US|RW */
+    int ok_user = (syscall_user_range_ok(0x00400000u, 4) == 1);
+    int ok_rw   = (syscall_user_range_rw(0x00400000u, 4) == 1);
+    ezos_console_write("  user page accepted: ");
+    ezos_console_write(ok_user ? "yes [OK]\n" : "NO [FAIL]\n");
+    ezos_console_write("  user page writable: ");
+    ezos_console_write(ok_rw ? "yes [OK]\n" : "NO [FAIL]\n");
+
+    int ok = rej_kernel && rej_unmap && ok_user && ok_rw &&
+             (rc == 0) && (syscall_count() - before == 3);
+    ezos_console_write(ok ? "  result: PASS\n" : "  result: FAIL\n");
+}
+
+/* pagetest：分页自检（identity 一致性 + 动态映射/读写/解映射）。
+ * 不主动触发 #PF——破坏性缺页测试用 `crash pf`。 */
+static void pg_puts(const char *s) { ezos_console_write(s); }
+
+/* elftest：ELF 加载器自检（步骤 5b） */
+void cmd_elftest(const char *args) {
+    (void)args;
+    int fail = elf_selftest(pg_puts);
+    if (fail != 0) {
+        ezos_console_write("  (");
+        ezos_console_print_dec((uint32_t)fail);
+        ezos_console_write(" assertion(s) failed)\n");
+    } else {
+        ezos_console_write("  result: PASS\n");
+    }
+}
+
+/* exec：从盘上装载 ELF32 用户程序并在 ring3 执行（步骤 5d） */
+void cmd_exec(const char *args) {
+    /* 第一个空白之前是文件名，其余原样作为用户程序的命令行参数 */
+    char name[64];
+    int i = 0;
+    while (args[i] != '\0' && args[i] != ' ' && i < 63) { name[i] = args[i]; i++; }
+    name[i] = '\0';
+    const char *rest = args + i;
+    while (*rest == ' ') rest++;
+
+    if (name[0] == '\0') {
+        ezos_console_write("exec: usage: exec <file> [args...]\n");
+        return;
+    }
+
+    ezos_console_write("exec: loading ");
+    ezos_console_write(name);
+    ezos_console_write(" ...\n");
+
+    const char *why = 0;
+    int rc = exec_file(name, rest, &why);
+    if (rc < 0) {
+        ezos_console_write("exec: ");
+        ezos_console_write(name);
+        ezos_console_write(": ");
+        ezos_console_write(why ? why : "failed");
+        ezos_console_write("\n");
+        return;
+    }
+    ezos_console_write("exec: ");
+    ezos_console_write(name);
+    ezos_console_write(" exited with code ");
+    ezos_console_print_dec((uint32_t)rc);
+    ezos_console_write("\n");
+}
+
+/* calc：浮点计算器（步骤 5e）。
+ * 递归下降解析 + x87 求值，语法见 calc.h。
+ * 结果打印：整数不带小数点，其余固定 6 位小数（四舍五入）。 */
+void cmd_calc(const char *args) {
+    if (args == 0 || args[0] == '\0') {
+        ezos_console_write("calc <expr> - floating point calculator\n");
+        ezos_console_write("  ops: + - * / % ^ ( )\n");
+        ezos_console_write("  funcs: sqrt sin cos tan exp ln log abs floor ceil round\n");
+        ezos_console_write("  consts: pi e\n");
+        ezos_console_write("  examples:\n");
+        ezos_console_write("    calc 1.5*2+1\n");
+        ezos_console_write("    calc sqrt(2)\n");
+        ezos_console_write("    calc sin(pi/6)*100\n");
+        return;
+    }
+
+    if (!fpu_available()) {
+        ezos_console_write("calc: no FPU present on this machine\n");
+        return;
+    }
+
+    double v;
+    const char *err = 0;
+    if (calc_eval(args, &v, &err) != 0) {
+        ezos_console_write("calc: ");
+        ezos_console_write(err ? err : "error");
+        ezos_console_write("\n");
+        return;
+    }
+
+    ezos_console_write("= ");
+    /* 打印：四舍五入到 6 位小数；round(x*1e6)/1e6 会引入双重舍入误差，
+     * 但显示 6 位小数时不可见，且实现只需一次 x87 调整。 */
+    double r = v;
+    if (r < 0) { ezos_console_write("-"); r = -r; }
+    double scaled = r * 1000000.0 + 0.5;      /* 舍入 */
+    uint32_t whole = (uint32_t)(scaled / 1000000.0);
+    uint32_t frac  = (uint32_t)(scaled - (double)whole * 1000000.0);
+    /* 舍入可能进位到 1e6（如 0.9999996） */
+    if (frac >= 1000000u) { whole += 1; frac -= 1000000u; }
+    ezos_console_print_dec(whole);
+    if (frac != 0) {
+        ezos_console_write(".");
+        char digits[7];
+        for (int i = 5; i >= 0; i--) { digits[i] = (char)('0' + frac % 10u); frac /= 10u; }
+        digits[6] = '\0';
+        /* 去掉尾部的 0（0.5 而不是 0.500000） */
+        int end = 6;
+        while (end > 0 && digits[end - 1] == '0') end--;
+        digits[end] = '\0';
+        ezos_console_write(digits);
+    }
+    ezos_console_write("\n");
+}
+
+/* selftest：一键运行所有子系统自检（步骤 5e） */
+void cmd_selftest(const char *args) {
+    (void)args;
+    ezos_console_write("EZOS full self-test:\n");
+    struct { const char *name; int run; } r[8];
+    int n = 0, failed = 0;
+
+    /* kmalloc：静默判定（分配/写入/回读/释放后 used 归零）
+     * ——详细数字留给 kmtest，这里只看健康与否 */
+    {
+        uint32_t u0 = kmalloc_used();
+        void *p1 = kmalloc(1000), *p2 = kmalloc(4000), *p3 = kmalloc(200);
+        int ok = (p1 != 0 && p2 != 0 && p3 != 0);
+        if (ok) {
+            for (int i = 0; i < 1000; i++) ((uint8_t *)p1)[i] = (uint8_t)i;
+            for (int i = 0; i < 1000; i++)
+                if (((uint8_t *)p1)[i] != (uint8_t)i) { ok = 0; break; }
+            kfree(p3); kfree(p2); kfree(p1);
+            if (kmalloc_used() != u0) ok = 0;            /* 合并后必须回到基线 */
+        }
+        r[n].name = "kmalloc  kernel heap";
+        r[n].run = ok ? 0 : 1;
+        n++;
+    }
+
+    /* paging：官方自检（无输出参数时静默跑断言） */
+    r[n].name = "paging   identity + map/unmap";
+    r[n].run = paging_selftest(0);
+    n++;
+
+    /* pmm / elf：自检自带逐条输出，直接跑 */
+    r[n].name = "pmm      page frame allocator";
+    r[n].run = pmm_selftest(pg_puts);
+    n++;
+
+    r[n].name = "elf      ELF32 loader";
+    r[n].run = elf_selftest(pg_puts);
+    n++;
+
+    /* fpu：x87 探测 + 算术 */
+    r[n].name = "fpu      x87 arithmetic";
+    r[n].run = fpu_selftest(pg_puts);
+    n++;
+
+    /* calc：表达式引擎（静默：一组已知答案的算式） */
+    {
+        static const struct { const char *e; double want; } t[] = {
+            { "1.5*2+1",        4 },
+            { "10/4",           2.5 },
+            { "sqrt(2)*sqrt(2)",2 },
+            { "2^10",           1024 },
+            { "sin(0)",         0 },
+            { "1+2*3",          7 },
+            { "(1+2)*3",        9 },
+            { "-4+10",          6 },
+        };
+        int bad = 0;
+        for (uint32_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
+            double v; const char *err = 0;
+            if (calc_eval(t[i].e, &v, &err) != 0) { bad++; continue; }
+            /* 显示 6 位小数内相等即可（1/3 类循环小数不算失败） */
+            double d = v - t[i].want;
+            if (d < 0) d = -d;
+            if (d > 5e-7) bad++;
+        }
+        /* 错误路径：这些表达式必须被拒绝 */
+        static const char *badexpr[] = { "1+", "sin", "1/0", "0/0", "abc", "1 2" };
+        for (uint32_t i = 0; i < sizeof(badexpr) / sizeof(badexpr[0]); i++) {
+            double v; const char *err = 0;
+            if (calc_eval(badexpr[i], &v, &err) == 0) bad++;      /* 不该成功 */
+        }
+        r[n].name = "calc     expression engine";
+        r[n].run = bad;
+        n++;
+    }
+
+    /* exec：真跑盘上的 HELLO.ELF，退出码 42 = 全链路健康
+     * （FS->ELF->ring3->syscall->exit->页回收） */
+    {
+        const char *why = 0;
+        int rc = exec_file("HELLO.ELF", 0, &why);
+        r[n].name = "exec     ring3 ELF run";
+        r[n].run = (rc == 42) ? 0 : 1;
+        n++;
+    }
+
+    /* fd：open/read/lseek/write/close 全语义（真实文件系统走一遍） */
+    r[n].name = "fd       file descriptors";
+    r[n].run = fd_selftest(pg_puts);
+    n++;
+
+    /* 汇总 */
+    ezos_console_write("----------\n");
+    for (int i = 0; i < n; i++) {
+        ezos_console_write("  ");
+        ezos_console_write(r[i].name);
+        ezos_console_write(": ");
+        ezos_console_write(r[i].run == 0 ? "PASS\n" : "FAIL\n");
+        if (r[i].run != 0) failed++;
+    }
+    ezos_console_write("----------\n");
+    ezos_console_write("  ");
+    ezos_console_print_dec((uint32_t)n);
+    ezos_console_write(" tests, ");
+    ezos_console_print_dec((uint32_t)failed);
+    ezos_console_write(" failed -> ");
+    ezos_console_write(failed == 0 ? "ALL PASS\n" : "SYSTEM UNSTABLE\n");
+}
+
+/* boot_selftest：开机自检（kernel_main 调用）。
+ * 与 cmd_selftest 同一套判定逻辑，但全程静默，只返回失败子系统数。
+ * 0 = 全部通过。 */
+int boot_selftest(void) {
+    struct { int run; } r[8];
+    int n = 0;
+
+    {   /* kmalloc */
+        uint32_t u0 = kmalloc_used();
+        void *p1 = kmalloc(1000), *p2 = kmalloc(4000), *p3 = kmalloc(200);
+        int ok = (p1 != 0 && p2 != 0 && p3 != 0);
+        if (ok) {
+            for (int i = 0; i < 1000; i++) ((uint8_t *)p1)[i] = (uint8_t)i;
+            for (int i = 0; i < 1000; i++)
+                if (((uint8_t *)p1)[i] != (uint8_t)i) { ok = 0; break; }
+            kfree(p3); kfree(p2); kfree(p1);
+            if (kmalloc_used() != u0) ok = 0;
+        }
+        r[n++].run = ok ? 0 : 1;
+    }
+    r[n++].run = paging_selftest(0);                 /* NULL = 静默 */
+    r[n++].run = pmm_selftest(0);
+    r[n++].run = elf_selftest(0);
+    r[n++].run = fpu_selftest(0);
+    {   /* calc：已知答案 + 必须拒绝的畸形 */
+        static const struct { const char *e; double want; } t[] = {
+            { "1.5*2+1", 4 }, { "10/4", 2.5 }, { "sqrt(2)*sqrt(2)", 2 },
+            { "2^10", 1024 }, { "sin(0)", 0 }, { "1+2*3", 7 },
+        };
+        int bad = 0;
+        for (uint32_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
+            double v; const char *err = 0;
+            if (calc_eval(t[i].e, &v, &err) != 0) { bad++; continue; }
+            double d = v - t[i].want;
+            if (d < 0) d = -d;
+            if (d > 5e-7) bad++;
+        }
+        static const char *badexpr[] = { "1+", "sin", "1/0", "abc" };
+        for (uint32_t i = 0; i < sizeof(badexpr) / sizeof(badexpr[0]); i++) {
+            double v; const char *err = 0;
+            if (calc_eval(badexpr[i], &v, &err) == 0) bad++;
+        }
+        r[n++].run = bad;
+    }
+    {   /* exec：HELLO.ELF 退出码 42 */
+        const char *why = 0;
+        r[n++].run = (exec_file("HELLO.ELF", 0, &why) == 42) ? 0 : 1;
+    }
+    r[n++].run = fd_selftest(0);        /* NULL = 静默 */
+
+    int failed = 0;
+    for (int i = 0; i < n; i++)
+        if (r[i].run != 0) failed++;
+    return failed;
+}
+
+
+/* ktask：起两个计数内核线程，验证抢占式调度真的在工作（步骤 6a） */
+static volatile uint32_t kt_a, kt_b;
+static volatile int kt_a_quit, kt_b_quit;
+
+static void kt_worker(void *arg) {
+    volatile uint32_t *ctr = (arg == 0) ? &kt_a : &kt_b;
+    volatile int *quit = (arg == 0) ? &kt_a_quit : &kt_b_quit;
+    while (!*quit) (*ctr)++;
+}
+
+void cmd_ktask(const char *args) {
+    (void)args;
+    kt_a = kt_b = 0;
+    kt_a_quit = kt_b_quit = 0;
+
+    int p1 = task_create("kt_a", kt_worker, 0);
+    int p2 = task_create("kt_b", kt_worker, (void *)1);
+    if (p1 < 0 || p2 < 0) {
+        ezos_console_write("ktask: task_create failed\n");
+        return;
+    }
+    ezos_console_write("ktask: started 2 kernel threads, running 2s...\n");
+
+    /* 忙等约 2 秒（用 PIT tick，1000Hz） */
+    uint32_t start = g_pit_ticks;
+    while (g_pit_ticks - start < 2000u) task_yield();
+
+    kt_a_quit = 1;
+    kt_b_quit = 1;
+    /* 再让一轮，确保两个线程都退出 */
+    start = g_pit_ticks;
+    while (g_pit_ticks - start < 200u) task_yield();
+
+    ezos_console_write("  thread a iterations: ");
+    ezos_console_print_dec(kt_a);
+    ezos_console_write("\n  thread b iterations: ");
+    ezos_console_print_dec(kt_b);
+    ezos_console_write("\n  scheduler switches: ");
+    ezos_console_print_dec(schedule_count());
+    ezos_console_write("\n");
+
+    uint32_t sw = schedule_count();
+    int ok = (kt_a > 0) && (kt_b > 0) && (sw > 2);
+    ezos_console_write("  result: ");
+    ezos_console_write(ok ? "PASS\n" : "FAIL\n");
+}
+
+/* ps：列出任务表 */
+void cmd_ps(const char *args) {
+    (void)args;
+    static const char *st[] = { "unused", "ready", "running", "blocked", "zombie" };
+    uint32_t n = 0;
+    const task_t *tab = task_table(&n);
+    ezos_console_write("  PID  STATE    SWITCH  NAME\n");
+    for (uint32_t i = 0; i < n; i++) {
+        if (tab[i].state == TASK_UNUSED) continue;
+        ezos_console_write("  ");
+        ezos_console_print_dec(tab[i].pid);
+        ezos_console_write("   ");
+        ezos_console_write(st[(uint32_t)tab[i].state]);
+        ezos_console_write("   ");
+        ezos_console_print_dec(tab[i].switches);
+        ezos_console_write("     ");
+        ezos_console_write(tab[i].name[0] ? tab[i].name : "(unnamed)");
+        ezos_console_write("\n");
+    }
+    ezos_console_write("  scheduler switches: ");
+    ezos_console_print_dec(schedule_count());
+    ezos_console_write("\n");
+}
+
+/* pmmtest：物理页帧分配器自检（步骤 5a） */
+void cmd_pmmtest(const char *args) {
+    (void)args;
+    int fail = pmm_selftest(pg_puts);
+    if (fail != 0) {
+        ezos_console_write("  (");
+        ezos_console_print_dec((uint32_t)fail);
+        ezos_console_write(" assertion(s) failed)\n");
+    }
+}
+
+void cmd_pagetest(const char *args) {
+    (void)args;
+    if (!paging_enabled()) {
+        ezos_console_write("paging: CR0.PG=0 (paging not enabled)\n");
+        return;
+    }
+    int fail = paging_selftest(pg_puts);
+    if (fail != 0) {
+        ezos_console_write("  (");
+        ezos_console_print_dec((uint32_t)fail);
+        ezos_console_write(" assertion(s) failed)\n");
+    }
+}
+
+void cmd_kmtest(const char *args) {
+    (void)args;
+    ezos_console_write("kmalloc self-test:\n");
+    uint32_t t0 = kmalloc_total(), u0 = kmalloc_used(), f0 = kmalloc_largest_free();
+    ezos_console_write("  before: total ");
+    ezos_console_print_dec(t0 / 1024);
+    ezos_console_write("KB used ");
+    ezos_console_print_dec(u0);
+    ezos_console_write("B largest ");
+    ezos_console_print_dec(f0 / 1024);
+    ezos_console_write("KB\n");
+
+    void *p1 = kmalloc(1000);
+    void *p2 = kmalloc(4000);
+    void *p3 = kmalloc(200);
+    if (!p1 || !p2 || !p3) {
+        ezos_console_write("  FAIL: alloc returned NULL\n");
+        return;
+    }
+    /* 填充并校验 */
+    for (int i = 0; i < 1000; i++) ((uint8_t *)p1)[i] = (uint8_t)i;
+    for (int i = 0; i < 1000; i++)
+        if (((uint8_t *)p1)[i] != (uint8_t)i) {
+            ezos_console_write("  FAIL: data corrupted at ");
+            ezos_console_print_dec(i);
+            ezos_console_write("\n");
+            return;
+        }
+    ezos_console_write("  alloc 1000+4000+200B ... write/readback OK\n");
+
+    uint32_t u1 = kmalloc_used();
+    kfree(p2);
+    kfree(p1);
+    kfree(p3);
+    uint32_t u2 = kmalloc_used();
+    ezos_console_write("  used ");
+    ezos_console_print_dec(u1);
+    ezos_console_write("B -> ");
+    ezos_console_print_dec(u2);
+    ezos_console_write("B after free (merge ");
+    ezos_console_write(u2 == u0 ? "OK" : "FAIL");
+    ezos_console_write(")\n");
+
+    uint32_t f1 = kmalloc_largest_free();
+    ezos_console_write("  largest free after: ");
+    ezos_console_print_dec(f1 / 1024);
+    ezos_console_write("KB (before ");
+    ezos_console_print_dec(f0 / 1024);
+    ezos_console_write("KB)\n");
+    ezos_console_write("  result: ");
+    ezos_console_write(u2 == u0 ? "PASS" : "FAIL");
+    ezos_console_write("\n");
+}
+
 void cmd_sleep(const char *args) {
     int ms = x_atoi(args);
     if (ms <= 0) {
@@ -549,6 +1046,57 @@ const char *shell_extra_help(const char *cmd) {
     }
     if (x_strcasecmp(cmd, "mem") == 0) {
         return "mem <hexaddr> [len] - dump physical memory\n  usage: mem 0xB8000\n         mem 0x100000 64";
+    }
+    if (x_strcasecmp(cmd, "dmesg") == 0) {
+        return "dmesg [n] - show kernel ring log (all or last n lines)\n  usage: dmesg\n         dmesg 10";
+    }
+    if (x_strcasecmp(cmd, "kmtest") == 0) {
+        return "kmtest - kernel heap allocator self-test (alloc/free/merge/guard)";
+    }
+    if (x_strcasecmp(cmd, "pagetest") == 0) {
+        return "pagetest - paging self-test (identity consistency + map/rw/unmap)";
+    }
+    if (x_strcasecmp(cmd, "utest") == 0) {
+        return "utest - ring3 user-mode + int 0x80 syscall self-test\n"
+               "  usage: utest\n"
+               "  runs a builtin machine-code program in ring 3 (2 writes + exit),\n"
+               "  and checks the user-pointer safety boundary on both sides.";
+    }
+    if (x_strcasecmp(cmd, "pmmtest") == 0) {
+        return "pmmtest - physical page frame allocator self-test\n"
+               "  usage: pmmtest\n"
+               "  checks alloc/free accounting, double-free rejection and\n"
+               "  out-of-range rejection.";
+    }
+    if (x_strcasecmp(cmd, "elftest") == 0) {
+        return "elftest - ELF32 loader self-test\n"
+               "  usage: elftest\n"
+               "  validates a well-formed ELF is accepted and 6 malformed ones\n"
+               "  are rejected, then loads, reads back, checks W^X and unloads.";
+    }
+    if (x_strcasecmp(cmd, "exec") == 0) {
+        return "exec <file> [args] - load and run an ELF32 user program in ring 3\n"
+               "  usage: exec HELLO.ELF\n"
+               "         exec HELLO.ELF arg1 arg2\n"
+               "  reads the file from the mounted filesystem, loads it at\n"
+               "  0x00400000, passes argc/argv on the user stack, and runs it\n"
+               "  until SYS_EXIT. Pages are fully reclaimed afterwards.\n"
+               "  A malformed ELF is rejected before a single page is mapped.";
+    }
+    if (x_strcasecmp(cmd, "calc") == 0) {
+        return "calc <expr> - floating point calculator\n"
+               "  usage: calc 1.5*2+1\n"
+               "         calc sqrt(2)\n"
+               "         calc sin(pi/6)\n"
+               "  operators: + - * / % ^ ( )\n"
+               "  functions: sqrt sin cos tan exp ln log abs floor ceil round\n"
+               "  constants: pi e";
+    }
+    if (x_strcasecmp(cmd, "selftest") == 0) {
+        return "selftest - run all subsystem self-tests at once\n"
+               "  usage: selftest\n"
+               "  covers: kmalloc, paging, pmm, elf loader, fpu, calc, exec\n"
+               "  a summary line reports PASS/FAIL per subsystem and overall.";
     }
     if (x_strcasecmp(cmd, "df") == 0) {
         return "df - show exFAT disk space usage\n  usage: df\n  shows total, used and free space of the current exFAT drive.";

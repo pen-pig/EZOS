@@ -44,8 +44,15 @@ done
 CFLAGS="-ffreestanding -O2 -Wall -Wextra -Ikernel"
 LDFLAGS="-m elf_i386 -T linker.ld --oformat binary -e _start"
 
-OBJS="boot/kernel_entry.o kernel/kernel.o kernel/tty.o kernel/idt.o kernel/isr.o kernel/keyboard.o kernel/ata.o kernel/shell.o kernel/shell_extra.o kernel/exfat.o kernel/fat.o kernel/fs.o kernel/ext4.o kernel/ntfs.o kernel/f2fs.o kernel/erofs.o kernel/refs.o kernel/div64.o kernel/gfx.o kernel/gui.o kernel/mouse.o kernel/gfxwin.o kernel/desktop.o kernel/games.o kernel/hiscore.o"
-SRCS="kernel/kernel.c kernel/tty.c kernel/idt.c kernel/isr.c kernel/keyboard.c kernel/ata.c kernel/shell.c kernel/shell_extra.c kernel/exfat.c kernel/fat.c kernel/fs.c kernel/ext4.c kernel/ntfs.c kernel/f2fs.c kernel/erofs.c kernel/refs.c kernel/div64.c kernel/gfx.c kernel/gui.c kernel/mouse.c kernel/gfxwin.c kernel/desktop.c kernel/games.c kernel/hiscore.c"
+# 源文件自动收集（与 ci/build.sh 一致）：新增 kernel/*.c 无需改本脚本。
+# 早期版本在这里硬编码 SRCS/OBJS 两份列表，新增模块时极易漏改 OBJS 一侧，
+# 表现为链接期一堆 "undefined reference"（症状与代码错误难区分）。
+# OBJS 也由 SRCS 推导，保证两侧永不脱节；kernel_entry.o 单独前置（入口）。
+SRCS="$(find kernel -name '*.c' | sort)"
+OBJS="boot/kernel_entry.o"
+for src in $SRCS; do
+    OBJS="$OBJS ${src%.c}.o"
+done
 
 clean() {
     echo "正在清理构建产物..."
@@ -78,8 +85,18 @@ done
 echo "[4/6] 链接内核..."
 "$LD" $LDFLAGS -o kernel_raw.bin $OBJS
 
-echo "[5/6] 填充内核到 256KB..."
-"$OBJCOPY" -I binary -O binary --pad-to 262144 kernel_raw.bin kernel.bin
+# padding 必须从 boot.asm 的 KERNEL_SECTORS 推导，不能写死。
+# 此前这里硬编码 256KB，而 KERNEL_SECTORS=768（384KB）——镜像比引导程序
+# 要读的扇区数短 1/3，boot 读盘时越过镜像尾部，内核尾部数据丢失。
+# ci/build.sh 早已是动态推导，此处对齐同一做法（单一事实来源：boot.asm）。
+KERNEL_SECTORS="$(grep -oiE 'KERNEL_SECTORS[[:space:]]+equ[[:space:]]+[0-9]+' boot/boot.asm | grep -oE '[0-9]+' | head -1)"
+if [ -z "${KERNEL_SECTORS}" ]; then
+    echo "[错误] 无法从 boot/boot.asm 解析 KERNEL_SECTORS" >&2
+    exit 1
+fi
+PAD_BYTES=$((KERNEL_SECTORS * 512))
+echo "[5/6] 填充内核到 ${PAD_BYTES} 字节 (KERNEL_SECTORS=${KERNEL_SECTORS})..."
+"$OBJCOPY" -I binary -O binary --pad-to "${PAD_BYTES}" kernel_raw.bin kernel.bin
 
 echo "[6/6] 生成系统镜像..."
 cat boot/boot.bin kernel.bin > os-image.bin

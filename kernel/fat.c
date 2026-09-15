@@ -1261,9 +1261,20 @@ int fat_create_file(const char *name, const uint8_t *data, uint32_t size) {
                 fat_free_chain(first_cluster);   /* 回滚已分配簇 */
                 return -1;
             }
-            if (fat_entry_set(c, fat_eoc_val()) != 0) return -1;
+            /* 以下任何一步失败都要把已标记进 FAT 的簇还回去，
+             * 否则整条数据簇链成为没有任何目录项指向的不可回收泄漏
+             * （FAT 标 EOC、却永远无人认领——exFAT 同类问题已修，见
+             * exfat_free_cluster_chain）。 */
+            if (fat_entry_set(c, fat_eoc_val()) != 0) {
+                fat_free_chain(first_cluster);
+                return -1;
+            }
             if (first_cluster == 0) first_cluster = c;
-            else if (fat_entry_set(prev, c) != 0) return -1;
+            else if (fat_entry_set(prev, c) != 0) {
+                fat_free_chain(first_cluster);
+                fat_free_chain(c);   /* c 已标 EOC 但 prev->c 链接失败，从链上够不到它 */
+                return -1;
+            }
             prev = c;
         }
         uint32_t written = 0;
@@ -1273,7 +1284,10 @@ int fat_create_file(const char *name, const uint8_t *data, uint32_t size) {
             uint32_t to_copy = size - written;
             if (to_copy > cluster_size) to_copy = cluster_size;
             for (uint32_t j = 0; j < to_copy; j++) io_scratch[j] = data[written + j];
-            if (fat_write_cluster(cur, io_scratch) != 0) return -1;
+            if (fat_write_cluster(cur, io_scratch) != 0) {
+                fat_free_chain(first_cluster);   /* 数据写失败：整条链要还 */
+                return -1;
+            }
             written += to_copy;
             if (i + 1 < data_clusters) cur = fat_entry_get(cur);
         }
@@ -1286,8 +1300,10 @@ int fat_create_file(const char *name, const uint8_t *data, uint32_t size) {
         return -1;
     }
     if (write_dir_entries(&ref, name, sn11, lfn_entries,
-                          ATTR_ARCHIVE, first_cluster, size) != 0)
+                          ATTR_ARCHIVE, first_cluster, size) != 0) {
+        fat_free_chain(first_cluster);   /* 目录项写失败：数据簇链要还 */
         return -1;
+    }
     return 0;
 }
 
@@ -1350,7 +1366,12 @@ int fat_mkdir(const char *name) {
     /* 分配目录簇并初始化 . 与 .. */
     uint32_t nc = fat_alloc_cluster();
     if (nc == 0) return -1;
-    if (fat_entry_set(nc, fat_eoc_val()) != 0) return -1;
+    if (fat_entry_set(nc, fat_eoc_val()) != 0) {
+        /* 标记失败时稳妥起见再清一次（若缓存已改而盘上没改，
+         * 这次 set 会把它落回 0），不留"FAT 说占用却无主"的簇 */
+        fat_free_chain(nc);
+        return -1;
+    }
 
     uint32_t cluster_size = (uint32_t)fi.bytes_per_sector * fi.sectors_per_cluster;
     for (uint32_t i = 0; i < cluster_size; i++) io_scratch[i] = 0;
@@ -1377,7 +1398,10 @@ int fat_mkdir(const char *name) {
     }
     io_scratch[58] = (uint8_t)(parent_for_dotdot & 0xFF);
     io_scratch[59] = (uint8_t)((parent_for_dotdot >> 8) & 0xFF);
-    if (fat_write_cluster(nc, io_scratch) != 0) return -1;
+    if (fat_write_cluster(nc, io_scratch) != 0) {
+        fat_free_chain(nc);   /* 目录簇初始化失败：还回去 */
+        return -1;
+    }
 
     /* 父目录写目录项 */
     uint8_t sn11[11];
@@ -1386,9 +1410,14 @@ int fat_mkdir(const char *name) {
     int need = 1 + lfn_entries;
 
     fat_dirent_t ref;
-    if (fat_find_free_slots(parent_cluster, need, &ref) != 0) return -1;
-    if (write_dir_entries(&ref, name, sn11, lfn_entries,
-                          ATTR_DIRECTORY, nc, 0) != 0)
+    if (fat_find_free_slots(parent_cluster, need, &ref) != 0) {
+        fat_free_chain(nc);   /* 父目录放不下新目录项：目录簇要还 */
         return -1;
+    }
+    if (write_dir_entries(&ref, name, sn11, lfn_entries,
+                          ATTR_DIRECTORY, nc, 0) != 0) {
+        fat_free_chain(nc);   /* 目录项写失败：目录簇要还 */
+        return -1;
+    }
     return 0;
 }

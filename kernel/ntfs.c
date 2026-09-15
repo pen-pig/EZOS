@@ -45,6 +45,15 @@ static uint64_t rd64(const uint8_t *p) {
 #define NT_MAX_REC    4096                  /* MFT 记录上限 */
 #define NT_MAX_IDX    4096                  /* INDX 块上限 */
 #define NT_BITMAP_CAP 8192                  /* $Bitmap 读取上限 */
+
+/*
+ * 内核静态簇数据缓冲的上限（nt_cbuf）。
+ * 卷的簇字节数**必须** <= 这个值，否则读写簇会越过 nt_cbuf 踩坏相邻内核数据。
+ * 它是独立于 NT_MAX_IDX 的一个不变式：虽然当前两者同值（nt_write_file 那条
+ * 路径要求 INDX 块 == 簇），但语义不同，别让将来有人改了 NT_MAX_IDX 就悄悄
+ * 打破 nt_cbuf 的容量假设。
+ */
+#define NT_MAX_CLUSTER_BYTES 4096
 #define NT_ROOT_FILE  5                     /* 根目录 MFT 记录号 */
 #define NT_BITMAP_FILE 6                    /* $Bitmap MFT 记录号 */
 
@@ -506,6 +515,13 @@ int ntfs_mount(uint8_t drive, uint32_t part_start) {
     nt_drive = drive;
     nt_part_lba = part_start;
     nt_spc = spc;
+    /* 簇大小上界：spc 是 uint8_t 且只校验了"非零、2 的幂"，最大能到 128，
+     * 于是 spc*512 可达 64KB——远超 nt_cbuf 的 NT_MAX_CLUSTER_BYTES。
+     * 镜像是外部不可信输入，必须在 probe 阶段就拒绝，否则后面
+     * `for (i < nt_cluster_bytes) nt_cbuf[i] = 0` 会越过静态缓冲写约 28KB，
+     * 踩坏 .bss.hi 里相邻的内核数据（这条本项目已经踩过一次同类坑）。
+     * Fail closed：明确拒绝挂载，好过静默破坏内核。 */
+    if (spc * 512 > NT_MAX_CLUSTER_BYTES) return -1;
     nt_cluster_bytes = spc * 512;
     nt_rec_bytes = rec_secs * 512;
     nt_idx_bytes = idx_secs * 512;
@@ -599,7 +615,7 @@ static void nt_wr64(uint8_t *p, uint64_t v) {
 
 /* MFT 记录写回缓冲 / 簇数据缓冲 */
 static uint8_t nt_newrec[NT_MAX_REC] NT_HIBUF;
-static uint8_t nt_cbuf[NT_MAX_IDX] NT_HIBUF;
+static uint8_t nt_cbuf[NT_MAX_CLUSTER_BYTES] NT_HIBUF;
 /* 卷簇位图（记录 6 $DATA，bit i = LCN i） */
 static uint8_t nt_vbmp[NT_BITMAP_CAP] NT_HIBUF;
 static uint32_t nt_vbmp_len;

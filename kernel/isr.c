@@ -1,6 +1,7 @@
 #include "idt.h"
 #include "isr.h"
 #include "port.h"
+#include "task.h"
 
 extern void irq0();
 extern void irq1();
@@ -20,10 +21,16 @@ void pit_init(void) {
     outb(0x40, (1193 >> 8) & 0xFF);
 }
 
-/* PIT 定时器中断处理：真实 tick 计数 + 主 PIC EOI */
+/* PIT 定时器中断处理：真实 tick 计数 + 抢占式调度
+ *
+ * 顺序必须是"先 EOI、后调度"：schedule() 可能切换出去，本任务要过很久
+ * 才被切回来；EOI 若放在后面，PIC 在收到 EOI 前不再投递任何中断——
+ * 整个系统的 IRQ 会被这个"睡着了"的任务卡住。
+ */
 void irq0_handler(void) {
     g_pit_ticks++;
-    outb(0x20, 0x20);   /* 主 PIC EOI */
+    outb(0x20, 0x20);   /* 主 PIC EOI（必须在 schedule 之前） */
+    schedule();
 }
 
 void irq_install(void) {

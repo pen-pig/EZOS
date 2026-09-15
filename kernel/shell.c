@@ -12,6 +12,7 @@
 #include "gfxwin.h"
 #include "games.h"
 #include "isr.h"
+#include "panic.h"
 
 #define CMD_BUFFER_SIZE 128
 #define HISTORY_SIZE 8
@@ -147,6 +148,10 @@ static void cmd_version(const char *args);
 static void cmd_time(const char *args);
 static void cmd_date(const char *args);
 static void cmd_reboot(const char *args);
+
+/* crash：可控触发 CPU 异常，验证 panic 屏（不恢复，测试用） */
+static void cmd_crash(const char *args);
+static const char *parse_token(const char *args, char *out, int max);
 static void cmd_shutdown(const char *args);
 static void cmd_meminfo(const char *args);
 static void cmd_cpuid(const char *args);
@@ -179,7 +184,7 @@ static void cmd_uname(const char *args);
 static void cmd_vi(const char *args);
 static void cmd_df(const char *args);
 static void cmd_du(const char *args);
-static void cmd_calc(const char *args);
+static void cmd_icalc(const char *args);
 void cmd_hex(const char *args);
 void cmd_rand(const char *args);
 void cmd_guess(const char *args);
@@ -203,6 +208,7 @@ static const command_t commands[] = {
     {"date",     cmd_date},
     {"reboot",   cmd_reboot},
     {"shutdown", cmd_shutdown},
+    {"crash",    cmd_crash},
     {"meminfo",  cmd_meminfo},
     {"cpuid",    cmd_cpuid},
     {"readdisk", cmd_readdisk},
@@ -234,7 +240,7 @@ static const command_t commands[] = {
     {"vi",       cmd_vi},
     {"df",       cmd_df},
     {"du",       cmd_du},
-    {"calc",     cmd_calc},
+    {"icalc",    cmd_icalc},
     {"hex",      cmd_hex},
     {"rand",     cmd_rand},
     {"guess",    cmd_guess},
@@ -251,6 +257,17 @@ static const command_t commands[] = {
     {"sleep",    cmd_sleep},
     {"uptime",   cmd_uptime},
     {"mem",      cmd_mem},
+    {"dmesg",    cmd_dmesg},
+    {"kmtest",   cmd_kmtest},
+    {"pagetest", cmd_pagetest},
+    {"utest",    cmd_utest},
+    {"pmmtest",  cmd_pmmtest},
+    {"elftest",  cmd_elftest},
+    {"exec",     cmd_exec},
+    {"calc",     cmd_calc},
+    {"selftest", cmd_selftest},
+    {"ktask",     cmd_ktask},
+    {"ps",        cmd_ps},
     {0, 0}
 };
 
@@ -682,6 +699,18 @@ static void cmd_help(const char *args) {
     terminal_writestring("  unalias <name> - remove a command alias\n");
     terminal_writestring("  sleep <ms> - busy-wait delay (approx)\n");
     terminal_writestring("  mem <hexaddr> [len] - dump physical memory\n");
+    terminal_writestring("  dmesg [n] - show last n buffered kernel log lines\n");
+    terminal_writestring("  kmtest - kernel heap self-test\n");
+    terminal_writestring("  pagetest - paging self-test (identity/map/unmap)\n");
+    terminal_writestring("  utest - ring3 user-mode + int 0x80 syscall self-test\n");
+    terminal_writestring("  pmmtest - physical page frame allocator self-test\n");
+    terminal_writestring("  elftest - ELF32 loader self-test (validate/load/W^X/unload)\n");
+    terminal_writestring("  exec <file> [args] - load & run an ELF32 user program in ring3\n");
+    terminal_writestring("  calc <expr> - floating point calculator (sqrt sin cos pi e ...)\n");
+    terminal_writestring("  selftest - run ALL subsystem self-tests at once\n");
+    terminal_writestring("  ktask - start 2 kernel threads to demo preemptive scheduling\n");
+    terminal_writestring("  ps - list tasks (pid/state/switches)\n");
+    terminal_writestring("  crash [gp|pf|ud|div] - trigger a CPU fault (panic screen)\n");
     terminal_writestring("  help <cmd> - detailed help for a command\n");
 }
 
@@ -775,6 +804,41 @@ static void cmd_date(const char *args) {
 static void cmd_reboot(const char *args) {
     (void)args;
     system_reboot();
+}
+
+/* crash [gp|pf|ud|div]：主动触发异常验证 panic 屏。
+ * 无参数默认 gp。触发后停在蓝屏（by design），QEMU 重启即恢复。 */
+static void cmd_crash(const char *args) {
+    char kind[8];
+    parse_token(args, kind, sizeof(kind));
+    if (kind[0] == 'p') {          /* pf：读未映射地址 -> #PF（CR2 = 该地址） */
+        panic_set_context("shell:crash(pf)");
+        terminal_writestring("triggering #PF at 0x04000000...\n");
+        /* 0x04000000（64MB）在 identity 区（0-32MB）之外且未映射：
+         * 无论物理 RAM 是否存在都会 #PF（缺页只看页表）。 */
+        volatile uint32_t *bad = (volatile uint32_t *)0x04000000u;
+        (void)*bad;
+    } else if (kind[0] == 'u') {   /* ud：执行非法指令字节 */
+        panic_set_context("shell:crash(ud)");
+        terminal_writestring("triggering #UD...\n");
+        /* 只用 ud2（0F 0B）：SDM 明确保证 #UD。
+         * 早期版本前面还放了 .byte 0xF1（ICEBP/INT1）——它在执行时就已经
+         * 抛异常，ud2 永远不可达；且 ICEBP 行为随 CPU/虚拟化实现而异
+         * （可能 #UD 也可能 #DB），用作测试触发点不可靠。 */
+        asm volatile("ud2");
+    } else if (kind[0] == 'd') {   /* div：除零 -> #DE */
+        panic_set_context("shell:crash(div)");
+        terminal_writestring("triggering #DE...\n");
+        volatile uint32_t z = 0;
+        volatile uint32_t r = 1 / z;
+        (void)r;
+    } else {                       /* gp：段级非法操作 -> #GP */
+        panic_set_context("shell:crash(gp)");
+        terminal_writestring("triggering #GP...\n");
+        asm volatile("mov $0xFFFFFFFF, %eax; mov %eax, %ds");
+    }
+    /* pf/gp/pf 若硬件未按预期触发（如 QEMU 差异），落到这里给提示 */
+    terminal_writestring("no fault raised?\n");
 }
 
 void system_reboot(void) {
@@ -1932,9 +1996,9 @@ static void print_int(int num) {
 }
 
 // calc: ����ʽ������������ gfx_eval��
-static void cmd_calc(const char *args) {
+static void cmd_icalc(const char *args) {
     if (*args == '\0') {
-        terminal_writestring("Usage: calc <expr>   e.g. calc 1+2*3\n");
+        terminal_writestring("Usage: icalc <expr>   e.g. calc 1+2*3\n");
         return;
     }
     int ok = 0;

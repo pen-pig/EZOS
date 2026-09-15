@@ -2,9 +2,19 @@
 #include "keyboard.h"
 #include "idt.h"
 #include "isr.h"
+#include "panic.h"
+#include "paging.h"
+#include "pmm.h"
+#include "gdt.h"
+#include "syscall.h"
+#include "dmesg.h"
+#include "kmalloc.h"
 #include "types.h"
 #include "ata.h"
 #include "shell.h"
+#include "shell_extra.h"
+#include "task.h"
+#include "fpu.h"
 #include "fs.h"
 #include "mouse.h"
 #include "port.h"
@@ -20,6 +30,7 @@ static size_t my_strlen(const char *s) {
 }
 
 static void klog(const char *msg);
+static void dm_mirror(const char *body, const char *tail);
 
 /* ���������ֵ���־�и�ʽ����h1/h2 Ϊ 1 ʱʮ���������������ʮ���ƣ�?*/
 static void klogf(const char *s1, uint32_t v1, int h1,
@@ -91,11 +102,6 @@ static void kput_uint(uint32_t v, int width) {
     while (i < width) buf[i++] = ' ';
     while (i) terminal_putchar(buf[--i]);
 }
-static void kput_uint3(uint32_t v) {
-    terminal_putchar((char)('0' + (v / 100) % 10));
-    terminal_putchar((char)('0' + (v / 10) % 10));
-    terminal_putchar((char)('0' + v % 10));
-}
 
 /* ������?PIT channel 0 ��ǰ��������Ƶ 1193�������� 1193..0�� */
 static uint16_t pit_read_counter(void) {
@@ -128,22 +134,50 @@ static void klog_prefix(void) {
     terminal_writestring("] ");
 }
 
+/* klog 镜像进 dmesg 环形缓冲：[ 秒.微秒] 正文 tail\n */
+static void dm_mirror(const char *body, const char *tail) {
+    char line[192];
+    uint32_t o = 0;
+    uint32_t us = pit_usec();
+    /* 手写数字格式（无 sprintf）：[ N.NNNNNN] */
+    char t[12]; int n = 0;
+    uint32_t v = us / 1000000u;
+    if (v == 0) t[n++] = '0';
+    while (v) { t[n++] = (char)('0' + v % 10); v /= 10; }
+    line[o++] = '['; line[o++] = ' ';
+    while (n && o + 1 < sizeof(line)) line[o++] = t[--n];
+    line[o++] = '.';
+    for (int32_t d = 100000; d; d /= 10) {
+        if (o + 1 >= (int32_t)sizeof(line)) break;
+        line[o++] = (char)('0' + (us / d) % 10);
+    }
+    line[o++] = ']'; line[o++] = ' ';
+    for (const char *p = body; *p && o + 1 < sizeof(line); p++) line[o++] = *p;
+    for (const char *p = tail; *p && o + 1 < sizeof(line); p++) line[o++] = *p;
+    if (o + 1 < sizeof(line)) line[o++] = '\n';
+    line[o] = 0;
+    dmesg_write(line);
+}
+
 static void klog(const char *msg) {
     klog_prefix();
     terminal_writestring(msg);
     terminal_writestring("\n");
+    dm_mirror(msg, "");
 }
 
 static void klog_ok(const char *msg) {
     klog_prefix();
     terminal_writestring(msg);
     terminal_writestring(" [ OK ]\n");
+    dm_mirror(msg, " [ OK ]");
 }
 
 static void klog_fail(const char *msg) {
     klog_prefix();
     terminal_writestring(msg);
     terminal_writestring(" [FAIL]\n");
+    dm_mirror(msg, " [FAIL]");
 }
 
 /* ʮ���Ƶ�ֵ��־�� */
@@ -270,23 +304,44 @@ void kernel_main(void) {
     terminal_initialize();
     gfx_text_font_init();     /* unify text-mode font with GUI/OCR font table */
 
+    kmalloc_init();           /* 内核堆（384KB @ .bss.hi，先于一切使用者） */
+
+    /* 分页：identity map 0-32MB + VBE LFB 后开 CR0.PG。
+     * 必须在任何可能写 LFB / 触发 #PF 的驱动之前完成。 */
+    if (paging_init() != 0) {
+        terminal_writestring("PAGING: init failed - halting\n");
+        for (;;) asm volatile("cli; hlt");
+    }
+    /* 物理页帧池：ELF 加载（步骤 5）与将来的进程都要从这里拿页。
+     * 必须在 paging_init 之后——池本身要能正常访问。 */
+    pmm_init();
+
     klog("EZOS Kernel 0.9.0 loaded at 0x10000, i686 protected mode");
     klog("Boot: 512 sectors kernel image read by BIOS INT 13h AH=42h (64-sector batches, 3 retries)");
     klog("Boot: A20 gate enabled (BIOS int 15h / port 0x92 / KBC fallback)");
-    klog("Boot: GDT 3 descriptors (null/code/data, DPL=0); no TSS, no user-mode yet");
+    klog("Boot: GDT rebuilt in kernel - 6 descriptors (null/kcode/kdata/ucode DPL3/udata DPL3/TSS), TSS esp0=0x900000");
     klog("VGA text mode: 80x25 active");
     klog("APIC: local APIC disabled via MSR 0x1B, IRQ routing via legacy 8259 PIC");
 
+    /* GDT 必须先于 IDT 之后的任何用户态机制建立：ring3 段与 TSS 都在这里 */
+    gdt_init();
+
     idt_init();
+    isr_register_stubs();     /* CPU 异常门 0-31（#GP/#PF 等触发蓝屏 panic） */
     isr_install();
     irq_install();
+    syscall_init();           /* int 0x80 DPL=3 门：用户态唯一合法陷入入口 */
     pit_init();               /* 1000Hz ϵͳʱ�ӣ��˺���־ʱ���Ϊ��ʵ����ʱ��?*/
     asm volatile("sti");
     klog_ok("PIT: system timer 1000Hz (channel 0 rate generator)");
     klog_rtc_time("RTC: boot time 20");   /* ��ʵ����ʱ�䣨CMOS BCD, UTC+8�� */
     klog_ok("IDT: 256 gates installed");
     klog_ok("PIC: IRQ0-15 remapped to INT 0x20-0x2f, IRQ0/1/12 enabled");
-    klog("ISR: exception stubs not yet installed (isr_install is a stub)");
+    klog_ok("ISR: 32 CPU exception gates installed (panic screen on fault)");
+    klogf("Paging: identity map 0-", PAGING_IDENTITY_END / (1024 * 1024), 0,
+          "MB, 4KB pages, PD 0x", PAGING_PD_ADDR, 1, ", CR0.PG=1");
+    klog_ok("SYSCALL: int 0x80 gate (DPL=3), SYS_READ/SYS_WRITE/SYS_EXIT");
+    klogf("Kmalloc: ", 384, 0, "KB heap at .bss.hi, 16B align, magic guard", 0, 0, "");
 
     /* CPU����ʵ CPUID ̽�� */
     klog_cpuinfo();
@@ -349,6 +404,37 @@ void kernel_main(void) {
         klog_ok("PS/2 mouse: detected");
     } else {
         klog("PS/2 mouse: not detected, keyboard only");
+    }
+
+    /* 任务与抢占式调度器（步骤 6a）。
+     * 必须在 pit_init + sti 之后：调度由 IRQ0 驱动，早于此时开调度会让
+     * PIT 在 IDT 就绪前就尝试切换。当前执行流登记为 0 号任务（shell）。
+     * 默认不额外创建任务——shell 仍是唯一可运行任务，行为与之前完全一致，
+     * 抢占只在用 ktask 起了线程后才真正发生。 */
+    task_init();
+    klog_ok("TASK: preemptive scheduler ready (round-robin, 10ms slice)");
+
+    /* x87 FPU：calc/浮点运算的前提。fninit 把控制字归一到 0x037F
+     * （精度/舍入默认，异常全屏蔽）。无 FPU 只是禁用 calc，不是致命错。 */
+    if (fpu_init() == 0) {
+        klog_ok("FPU: x87 present, control word initialized (0x037F)");
+    } else {
+        klog("FPU: not present, floating point disabled (calc unavailable)");
+    }
+
+    /* 开机一键自检：所有子系统静默跑一遍断言，只报总结。
+     * 放在 shell 之前——用户看到 banner 时就已经知道系统是否健全。
+     * 失败不 panic：自检的意义是给出信号，不是拦住启动（单任务系统
+     * 没有"拒绝调度到坏节点"这个选项）。 */
+    {
+        int n_fail = boot_selftest();
+        if (n_fail == 0) {
+            klog_ok("SELFTEST: all subsystem checks passed (boot-time)");
+        } else {
+            klog_fail("SELFTEST: boot-time self-test reported failures");
+            klog_dec32("SELFTEST: failing subsystems: ", (uint32_t)n_fail, "");
+            klog("SELFTEST: run 'selftest' in the shell for per-subsystem details");
+        }
     }
 
     /* VBE ͼ��ģʽ����ȡ boot.asm ʵģʽ̽������0x5000 �ṹ����

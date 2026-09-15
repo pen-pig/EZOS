@@ -1223,6 +1223,7 @@ static int gw_icon_covered(int ix, int iy, int iw, int ih)
 
 static void gw_dirty_from_mouse(int mx, int my, int th)
 {
+    (void)th;    /* 预留：拖拽阈值。当前由 task_lock 的临界区间接防抖 */
     if (gw_start_menu_active) {
         gw_draw_start_menu();
         if (gw_in_taskbar(my)) gw_taskbar_dirty = 1;
@@ -1681,7 +1682,7 @@ static void notepad_click(gw_window_t *w, int lx, int ly)
 #define PT_TB_W  26             /* 左侧工具栏宽 */
 #define PT_COLS  16             /* 调色板颜色数 */
 
-static uint8_t pt_canvas[PT_CW * PT_CH];       /* 画布：调色板索引（bss） */
+static uint8_t pt_canvas[PT_CW * PT_CH] __attribute__((section(".bss.hi")));  /* 画布：调色板索引（高内存 bss，给低地址 bss 腾地方） */
 static const uint32_t pt_rgb[PT_COLS] = {
     0x000000u, 0xFFFFFFu, 0xD80000u, 0xF5A800u, 0xF5E100u, 0x00A800u,
     0x00C8C8u, 0x0055D4u, 0xC800C8u, 0x8A4B00u, 0x606060u, 0xB8B8B8u,
@@ -2406,7 +2407,8 @@ static void settings_draw(gw_window_t *w)
         char mb[24];
         int v = settings_mspeed / 64 - 1;
         const char *lvl[7] = {"1/8", "2/8", "3/8", "4/8", "5/8", "6/8", "7/8"};
-        if (v < 0) v = 0; if (v > 6) v = 6;
+        if (v < 0) v = 0;
+        if (v > 6) v = 6;
         mb[0] = 0;
         for (int i = 0; i <= v; i++) { mb[i] = '#'; mb[i + 1] = 0; }
         gfx_draw_text(ox + 130, oy + mrow - 12, mb, 0x07, 0x0E);
@@ -2417,6 +2419,7 @@ static void settings_draw(gw_window_t *w)
 static void settings_click(gw_window_t *w, int lx, int ly)
 {
     (void)w;
+    (void)lx;   /* 点击列由 ly 决定行，本面板无横向分区 */
     int row = (ly - 30) / 18;
     if (row >= 0 && row < GW_THEME_COUNT) {
         settings_theme = row;
@@ -3182,6 +3185,7 @@ static void term_draw(gw_window_t *w)
 
 static void term_key(gw_window_t *w, int key)
 {
+    (void)w;    /* 单终端实例，无需区分窗口 */
     if (key == '\n' || key == '\r') {
         /* 执行输入缓冲中的完整命令（保留空格参数） */
         char line[TERM_COLS + 1];
