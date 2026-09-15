@@ -267,6 +267,27 @@ static uint32_t rs_alloc(void) {
     return rs_hint++;
 }
 
+/*
+ * bump 分配器的回滚。
+ *
+ * rs_alloc 只有 ++，没有 free list，所以"释放"单个块做不到；失败路径只能
+ * 把分配指针按逆序退回去。这要求被回滚的确实是**最后分配的**那几个块——
+ * 本 OS 单线程、分配点之间不存在并发分配，这条前提成立。
+ *
+ * blocks     : 要退回的 rs_alloc 次数（回退 rs_hint）
+ * used_delta : 要回退的 rs_used_blocks 量（各分配点对这个计数器的更新并不
+ *              一致——有的地方 ++ 了有的没加，所以单独传，不能统一按 blocks 算）
+ *
+ * 不回滚会怎样：块被 rs_hint 划走却没有任何元数据指向它，等于永久泄漏。
+ * ReFS 池只有 RS_POOL_MAX 个块，create/mkdir 反复失败几次就会把池耗干，
+ * 之后所有写操作一律 -1——表现出来就是"文件系统用着用着突然变成只读"。
+ */
+static void rs_rollback_alloc(uint32_t blocks, uint32_t used_delta) {
+    rs_hint = (blocks > rs_hint) ? 0u : (rs_hint - blocks);
+    rs_used_blocks = (used_delta > rs_used_blocks) ? 0u
+                                                   : (rs_used_blocks - used_delta);
+}
+
 /* ---------- MSDN FSRS 校验和（前 0x18 字节 WORD 递加取补，跳过 0x16） ---------- */
 static uint16_t rs_fsrs_checksum(const uint8_t *vh) {
     uint32_t sum = 0;
@@ -990,7 +1011,10 @@ static int rs_commit(uint32_t new_dir_blk, uint64_t parent_obj,
 
     uint32_t new_otree = rs_alloc();
     if (new_otree == 0) return -1;
-    if (rs_write_block(new_otree, rs_blk) != 0) return -1;
+    if (rs_write_block(new_otree, rs_blk) != 0) {
+        rs_rollback_alloc(1, 0);   /* 谁分配谁还：new_otree 此刻已是孤儿块 */
+        return -1;
+    }
 
     /* 翻转 CP：内容同构，seq+1，树 0 -> 新根 */
     uint32_t next_cp = (rs_cp_no == RS_CPA_NO) ? RS_CPB_NO : RS_CPA_NO;
@@ -1014,7 +1038,13 @@ static int rs_commit(uint32_t new_dir_blk, uint64_t parent_obj,
     for (uint32_t t = 1; t < RS_NTREES; t++) trees_new[t] = rs_trees[t];
     for (uint32_t t = 0; t < RS_NTREES; t++)
         rs_fill_bref(cp + CP_TREE_BREF + t * RS_BREF_SIZE, trees_new[t]);
-    if (rs_write_block(next_cp, cp) != 0) return -1;
+    if (rs_write_block(next_cp, cp) != 0) {
+        /* CP 没翻成功：new_otree 没有任何活动元数据指向它，是孤儿块。
+         * 此刻 rs_cp_no 尚未改写（下面才赋），活动 CP 仍指向旧 otree，
+         * 所以退回 rs_hint 不会覆盖任何活动元数据。 */
+        rs_rollback_alloc(1, 0);
+        return -1;
+    }
 
     rs_cp_no = next_cp;
     rs_cp_seq = next_seq;
@@ -1201,20 +1231,44 @@ int refs_create_file(const char *path, const uint8_t *data, uint32_t size) {
     /* 新父目录内容（rs_blk2 = 副本 - 旧条目 + 新条目） */
     rs_copy(rs_blk2, rs_blk, RS_META_BLK);
     uint8_t *nnode = rs_loaded_node(rs_blk2);
-    if (old >= 0 && rs_node_remove_rec(nnode, (uint32_t)old) != 0) return -1;
+    /* 以下失败时新父目录还没写盘，数据块只是被 rs_hint 划走、无人引用，
+     * 退回指针即可复用（nblk 块，且 used_blocks 已在上面 += nblk）。 */
+    if (old >= 0 && rs_node_remove_rec(nnode, (uint32_t)old) != 0) {
+        rs_rollback_alloc(nblk, nblk);
+        return -1;
+    }
     uint8_t key[DE_KEY_HDR + RS_NAME_MAX * 2];
     uint32_t ksize = rs_name_encode(key, fname, DE_TYPE_FILE);
     if (rs_dir_insert_sorted(nnode, key, ksize, 0x0008,
-                             rs_databuf, vsize) != 0) return -1;
-    if (rs_node_check(nnode, RS_NODE_AREA, RS_NHO_BLOCK) != 0) return -1;
+                             rs_databuf, vsize) != 0) {
+        rs_rollback_alloc(nblk, nblk);
+        return -1;
+    }
+    if (rs_node_check(nnode, RS_NODE_AREA, RS_NHO_BLOCK) != 0) {
+        rs_rollback_alloc(nblk, nblk);
+        return -1;
+    }
 
     uint32_t new_dir = rs_alloc();
-    if (new_dir == 0) return -1;
-    if (rs_write_block(new_dir, rs_blk2) != 0) return -1;
+    if (new_dir == 0) {
+        rs_rollback_alloc(nblk, nblk);
+        return -1;
+    }
+    /* nblk + 1：new_dir 也一并退回（它还没被任何元数据引用） */
+    if (rs_write_block(new_dir, rs_blk2) != 0) {
+        rs_rollback_alloc(nblk + 1, nblk);
+        return -1;
+    }
 
     /* objects tree：rs_blk 重读根，父 bref -> 新目录块 */
-    if (rs_load_node(rs_otree_blk, rs_blk) != 0) return -1;
-    if (rs_commit(new_dir, parent_obj, 0, 0, 0, 0, 0) != 0) return -1;
+    if (rs_load_node(rs_otree_blk, rs_blk) != 0) {
+        rs_rollback_alloc(nblk + 1, nblk);
+        return -1;
+    }
+    if (rs_commit(new_dir, parent_obj, 0, 0, 0, 0, 0) != 0) {
+        rs_rollback_alloc(nblk + 1, nblk);
+        return -1;
+    }
     rs_info.used_clusters = rs_used_blocks * 4;
     return 0;
 }
@@ -1234,9 +1288,13 @@ int refs_mkdir(const char *path) {
     rs_fill_mbh(rs_databuf, 0, 1);          /* 块号后补 */
     rs_node_init(rs_loaded_node(rs_databuf), RS_NHO_BLOCK, RS_TABLE_REL);
     uint32_t sub_blk = rs_alloc();
-    if (sub_blk == 0) return -1;
+    if (sub_blk == 0) { rs_next_subid--; return -1; }   /* subid 也要退回去 */
     wr64(rs_databuf + MBH_BLKNO, sub_blk);
-    if (rs_write_block(sub_blk, rs_databuf) != 0) return -1;
+    if (rs_write_block(sub_blk, rs_databuf) != 0) {
+        rs_rollback_alloc(1, 0);        /* used_blocks 还没 ++，只退指针 */
+        rs_next_subid--;
+        return -1;
+    }
     rs_used_blocks++;
 
     /* entry value（72B directory values） */
@@ -1248,17 +1306,40 @@ int refs_mkdir(const char *path) {
     uint8_t *nnode = rs_loaded_node(rs_blk2);
     uint8_t key[DE_KEY_HDR + RS_NAME_MAX * 2];
     uint32_t ksize = rs_name_encode(key, fname, DE_TYPE_DIR);
-    if (rs_dir_insert_sorted(nnode, key, ksize, 0, dval, DV_SIZE) != 0)
+    if (rs_dir_insert_sorted(nnode, key, ksize, 0, dval, DV_SIZE) != 0) {
+        rs_rollback_alloc(1, 1);        /* sub_blk：指针与 used_blocks 都已推进 */
+        rs_next_subid--;
         return -1;
-    if (rs_node_check(nnode, RS_NODE_AREA, RS_NHO_BLOCK) != 0) return -1;
+    }
+    if (rs_node_check(nnode, RS_NODE_AREA, RS_NHO_BLOCK) != 0) {
+        rs_rollback_alloc(1, 1);
+        rs_next_subid--;
+        return -1;
+    }
     uint32_t new_dir = rs_alloc();
-    if (new_dir == 0) return -1;
-    if (rs_write_block(new_dir, rs_blk2) != 0) return -1;
+    if (new_dir == 0) {
+        rs_rollback_alloc(1, 1);
+        rs_next_subid--;
+        return -1;
+    }
+    /* 2 = new_dir + sub_blk；used_blocks 只加了 sub_blk 那 1 个 */
+    if (rs_write_block(new_dir, rs_blk2) != 0) {
+        rs_rollback_alloc(2, 1);
+        rs_next_subid--;
+        return -1;
+    }
 
     /* objects tree：+对象记录 + 父 bref 更新 */
-    if (rs_load_node(rs_otree_blk, rs_blk) != 0) return -1;
-    if (rs_commit(new_dir, parent_obj, 1, subid, sub_blk, 0, 0) != 0)
+    if (rs_load_node(rs_otree_blk, rs_blk) != 0) {
+        rs_rollback_alloc(2, 1);
+        rs_next_subid--;
         return -1;
+    }
+    if (rs_commit(new_dir, parent_obj, 1, subid, sub_blk, 0, 0) != 0) {
+        rs_rollback_alloc(2, 1);
+        rs_next_subid--;
+        return -1;
+    }
     rs_info.used_clusters = rs_used_blocks * 4;
     return 0;
 }
@@ -1280,15 +1361,25 @@ int refs_delete_file(const char *path) {
     uint8_t *nnode = rs_loaded_node(rs_blk2);
     if (rs_node_remove_rec(nnode, hit.rec_idx) != 0) return -1;
     if (rs_node_check(nnode, RS_NODE_AREA, RS_NHO_BLOCK) != 0) return -1;
+    /* 删除路径只分配 new_dir 一个块，且不涉及 rs_used_blocks 增减 */
     uint32_t new_dir = rs_alloc();
     if (new_dir == 0) return -1;
-    if (rs_write_block(new_dir, rs_blk2) != 0) return -1;
+    if (rs_write_block(new_dir, rs_blk2) != 0) {
+        rs_rollback_alloc(1, 0);
+        return -1;
+    }
 
     /* objects tree：父 bref 更新（目录另删对象记录） */
-    if (rs_load_node(rs_otree_blk, rs_blk) != 0) return -1;
+    if (rs_load_node(rs_otree_blk, rs_blk) != 0) {
+        rs_rollback_alloc(1, 0);
+        return -1;
+    }
     int del_obj = (hit.ent.type == DE_TYPE_DIR);
     if (rs_commit(new_dir, hit.parent_objid, 0, 0, 0,
-                  del_obj, hit.ent.objid) != 0) return -1;
+                  del_obj, hit.ent.objid) != 0) {
+        rs_rollback_alloc(1, 0);
+        return -1;
+    }
     rs_info.used_clusters = rs_used_blocks * 4;
     return 0;
 }

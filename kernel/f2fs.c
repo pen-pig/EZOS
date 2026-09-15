@@ -1548,6 +1548,39 @@ static uint32_t f2_file_write_blocks(uint32_t nid, const uint8_t *data,
 }
 
 /* ---------- 按路径写文件（create-or-replace） ---------- */
+/*
+ * 新建 inode 失败时的回滚：把已经分走的块还回 SIT。
+ *
+ * 为什么只回收块、不回收 nid：块是稀缺资源，泄漏几轮就把卷写满；而 nid
+ * 只是 NAT 表里的一项，浪费掉不会让卷不可用。用"块优先"换取回滚逻辑的
+ * 简单与可靠——nid 的回收要动 NAT 与 free_nid 位图，出错代价远高于收益。
+ *
+ * 前提（调用方必须保证）：失败时该 inode **还没有任何 dentry 指向它**，
+ * 因此 f2_wnode 里记录的每一个块都是"只被它引用"的，释放不会误伤别人。
+ * create_file / mkdir / write_file 的失败点都满足这一条。
+ */
+static void f2_rollback_new_inode(uint32_t node_blk) {
+    /* inode 里的直接块 */
+    for (uint32_t b = 0; b < DEF_ADDRS_PER_INODE; b++) {
+        uint32_t pb = rd32(f2_wnode + INO_OFF_ADDR + b * 4);
+        if (pb) f2_free_block(pb);
+    }
+    /* 一级 direct node：它的数据块 + 该 node 块自身 */
+    uint32_t dnid = rd32(f2_wnode + INO_OFF_NID + 0 * 4);
+    if (dnid) {
+        uint32_t dblkaddr = f2_nat_lookup(dnid);
+        if (dblkaddr) {
+            f2_read_block(dblkaddr, f2_wblk);
+            for (uint32_t b = 0; b < ADDRS_PER_BLOCK; b++) {
+                uint32_t pb = rd32(f2_wblk + b * 4);
+                if (pb) f2_free_block(pb);
+            }
+            f2_free_block(dblkaddr);
+        }
+    }
+    if (node_blk) f2_free_block(node_blk);
+}
+
 int f2fs_create_file(const char *name, const uint8_t *data, uint32_t size) {
     uint32_t parent;
     char fname[256];
@@ -1589,25 +1622,40 @@ int f2fs_create_file(const char *name, const uint8_t *data, uint32_t size) {
 
     /* 节点落盘：footer + NAT */
     uint32_t node_blk = f2_alloc_node_block(nid);
-    if (node_blk == 0) return -1;
+    if (node_blk == 0) {
+        f2_rollback_new_inode(0);   /* 数据块已经分出去了，节点块还没 */
+        return -1;
+    }
     f2_set_footer(f2_wnode, nid, nid, node_blk + 1);
     f2_write_block(node_blk, f2_wnode);
     f2_nat_set(nid, node_blk);
 
-    /* 父目录插入 dentry（inline 目录优先，满则转常规块；常规目录直接走哈希桶） */
+    /* 父目录插入 dentry（inline 目录优先，满则转常规块；常规目录直接走哈希桶）
+     * 以下每条失败都要回滚：此时没有任何 dentry 指向新 inode，
+     * 不回收的话它连同它的数据块一起成为"只占 SIT、无人引用"的孤儿。 */
     uint32_t pblk = f2_nat_lookup(parent);
-    if (pblk == 0 || pblk < f2_main_blkaddr) return -1;
+    if (pblk == 0 || pblk < f2_main_blkaddr) {
+        f2_rollback_new_inode(node_blk);
+        return -1;
+    }
     if (f2_node[INO_OFF_INLINE] & F2FS_INLINE_DENTRY) {
         if (f2_inline_insert(f2_node, fname, nid, F2FS_FT_REG_FILE) < 0) {
-            if (f2_dir_convert_inline(f2_node, parent) != 0) return -1;
-            if (f2_dir_add_dentry(f2_node, parent, fname, nid,
-                                  F2FS_FT_REG_FILE) != 0)
+            if (f2_dir_convert_inline(f2_node, parent) != 0) {
+                f2_rollback_new_inode(node_blk);
                 return -1;
+            }
+            if (f2_dir_add_dentry(f2_node, parent, fname, nid,
+                                  F2FS_FT_REG_FILE) != 0) {
+                f2_rollback_new_inode(node_blk);
+                return -1;
+            }
         }
     } else {
         if (f2_dir_add_dentry(f2_node, parent, fname, nid,
-                              F2FS_FT_REG_FILE) != 0)
+                              F2FS_FT_REG_FILE) != 0) {
+            f2_rollback_new_inode(node_blk);
             return -1;
+        }
     }
     f2_write_block(pblk, f2_node);
 
@@ -1739,23 +1787,36 @@ int f2fs_mkdir(const char *name) {
     f2_wnode[INO_OFF_INLINE] = F2FS_INLINE_DENTRY;
 
     uint32_t node_blk = f2_alloc_node_block(nid);
-    if (node_blk == 0) return -1;
+    if (node_blk == 0) {
+        f2_rollback_new_inode(0);   /* 目录自身那一个数据块（'.'/'..'）要还 */
+        return -1;
+    }
     f2_set_footer(f2_wnode, nid, nid, node_blk + 1);
     f2_write_block(node_blk, f2_wnode);
     f2_nat_set(nid, node_blk);
 
     /* 父目录插入 dentry（inline 目录优先，满则转常规块；常规目录直接走哈希桶） */
     uint32_t pblk = f2_nat_lookup(parent);
-    if (pblk == 0 || pblk < f2_main_blkaddr) return -1;
+    if (pblk == 0 || pblk < f2_main_blkaddr) {
+        f2_rollback_new_inode(node_blk);
+        return -1;
+    }
     if (f2_node[INO_OFF_INLINE] & F2FS_INLINE_DENTRY) {
         if (f2_inline_insert(f2_node, fname, nid, F2FS_FT_DIR) < 0) {
-            if (f2_dir_convert_inline(f2_node, parent) != 0) return -1;
-            if (f2_dir_add_dentry(f2_node, parent, fname, nid, F2FS_FT_DIR) != 0)
+            if (f2_dir_convert_inline(f2_node, parent) != 0) {
+                f2_rollback_new_inode(node_blk);
                 return -1;
+            }
+            if (f2_dir_add_dentry(f2_node, parent, fname, nid, F2FS_FT_DIR) != 0) {
+                f2_rollback_new_inode(node_blk);
+                return -1;
+            }
         }
     } else {
-        if (f2_dir_add_dentry(f2_node, parent, fname, nid, F2FS_FT_DIR) != 0)
+        if (f2_dir_add_dentry(f2_node, parent, fname, nid, F2FS_FT_DIR) != 0) {
+            f2_rollback_new_inode(node_blk);
             return -1;
+        }
     }
     f2_write_block(pblk, f2_node);
 
