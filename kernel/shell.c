@@ -268,6 +268,7 @@ static const command_t commands[] = {
     {"selftest", cmd_selftest},
     {"ktask",     cmd_ktask},
     {"ps",        cmd_ps},
+    {"pci",       cmd_pci},
     {0, 0}
 };
 

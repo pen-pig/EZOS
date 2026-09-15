@@ -11,6 +11,7 @@
 #include "kmalloc.h"
 #include "types.h"
 #include "ata.h"
+#include "pci.h"
 #include "shell.h"
 #include "shell_extra.h"
 #include "task.h"
@@ -366,6 +367,14 @@ void kernel_main(void) {
             klog_dec32("ATA: drive ", d, " present (MBR signature valid)");
         else
             klog_dec32("ATA: drive ", d, " present (no MBR signature)");
+    }
+
+    /* PCI 总线枚举（步骤 7 网络前置）：只扫描登记，不驱动任何设备。
+     * 必须在任何设备驱动初始化之前——网卡/存储控制器都靠这张表认领设备。
+     * 没有 PCI 总线的机器（或 QEMU 未挂 PCI 设备）返回 0，不是错误。 */
+    {
+        int npci = pci_scan();
+        klog_dec32("PCI: scanned bus, ", (uint32_t)npci, " device(s) found");
     }
 
     int ret = fs_init();

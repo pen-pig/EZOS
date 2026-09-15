@@ -29,6 +29,7 @@
 #include "calc.h"
 #include "task.h"
 #include "fd.h"
+#include "pci.h"
 
 /* ==================================================================
  * 1. ezos_console 适配层：把 EZOS tty / 键盘桥接为轻量 console 接口
@@ -1228,4 +1229,71 @@ const char *shell_extra_help(const char *cmd) {
         return "shutdown - shutdown the system (QEMU exits)\n  usage: shutdown";
     }
     return NULL;
+}
+
+/* pci：列出 PCI 总线上的设备（步骤 7 网络的前置设施）
+ * 没有参数时简洁列表；`pci -v` 额外打印 BAR 与中断信息。 */
+void cmd_pci(const char *args) {
+    int verbose = 0;
+    if (args) {
+        while (*args == ' ') args++;
+        if (args[0] == '-' && (args[1] == 'v' || args[1] == 'V')) verbose = 1;
+    }
+
+    int n = pci_device_count();
+    if (n == 0) {
+        ezos_console_write("  no PCI devices found\n");
+        return;
+    }
+
+    ezos_console_write("  BUS:DEV.FNC  VENDOR:DEVICE  CLASS\n");
+    for (int i = 0; i < n; i++) {
+        const pci_device_t *d = pci_get_device(i);
+
+        ezos_console_write("  ");
+        ezos_console_print_dec(d->bus);
+        ezos_console_write(":");
+        ezos_console_print_dec(d->dev);
+        ezos_console_write(".");
+        ezos_console_print_dec(d->func);
+        ezos_console_write("      ");
+
+        ezos_console_print_hex32(((uint32_t)d->vendor_id << 16) | d->device_id);
+        ezos_console_write("  ");
+        ezos_console_write(pci_class_name(d->class_code, d->subclass));
+        ezos_console_write("\n");
+
+        if (verbose) {
+            ezos_console_write("      ");
+            ezos_console_write(pci_vendor_name(d->vendor_id));
+            ezos_console_write(" ");
+            ezos_console_write(pci_device_name(d->vendor_id, d->device_id));
+            ezos_console_write("\n      IRQ line ");
+            ezos_console_print_dec(d->intr_line);
+            ezos_console_write(" pin ");
+            ezos_console_print_dec(d->intr_pin);
+            ezos_console_write("\n");
+            for (int b = 0; b < 6; b++) {
+                if (d->bar[b] == 0) continue;
+                ezos_console_write("      BAR");
+                ezos_console_print_dec(b);
+                ezos_console_write(" 0x");
+                ezos_console_print_hex32(d->bar[b]);
+                ezos_console_write(d->bar[b] & 0x1u ? "  (IO)" : "  (MMIO)");
+                ezos_console_write("\n");
+            }
+        }
+    }
+    ezos_console_write("  ");
+    ezos_console_print_dec((uint32_t)n);
+    ezos_console_write(" device(s)\n");
+
+    const pci_device_t *net = pci_find_by_class(PCI_CLASS_NETWORK);
+    ezos_console_write("  network controller: ");
+    if (net) {
+        ezos_console_write(pci_device_name(net->vendor_id, net->device_id));
+        ezos_console_write("\n");
+    } else {
+        ezos_console_write("none\n");
+    }
 }

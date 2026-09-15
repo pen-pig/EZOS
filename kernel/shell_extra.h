@@ -35,6 +35,7 @@ void cmd_calc(const char *args);
 void cmd_selftest(const char *args);
 void cmd_ktask(const char *args);
 void cmd_ps(const char *args);
+void cmd_pci(const char *args);
 
 /* 开机一键自检（kernel_main 调用）：静默跑全部子系统断言，
  * 返回失败的子系统数（0=全部通过）。失败项可用 shell 的
