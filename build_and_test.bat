@@ -3,7 +3,9 @@ setlocal
 cd /d "%~dp0"
 
 rem ===== toolchain resolution: prefer PATH, auto-detect MyOS tools dir as fallback =====
-rem no hardcoded tool paths; all tools resolved via PATH
+rem NOTE: this file must stay pure ASCII. cmd.exe decodes .bat with the local
+rem codepage (GBK on zh-CN Windows), so any UTF-8 Chinese text here turns into
+rem mojibake and may even be executed as a command.
 set "MYOS_ROOT="
 for %%D in (C D E F G H) do (
     if not defined MYOS_ROOT (
@@ -61,16 +63,44 @@ echo [1/6] assembling boot sector...
 nasm -f bin boot\boot.asm -o boot\boot.bin
 if errorlevel 1 goto error
 
-echo [2/6] assembling kernel entry...
+echo [2/6] assembling kernel entry + task switch...
 nasm -f elf32 boot\kernel_entry.asm -o boot\kernel_entry.o
 if errorlevel 1 goto error
+rem task_switch.asm provides switch_to and task_irq_trampoline (preemptive
+rem scheduler). It is NOT auto-discovered by the kernel\*.c loop below, so it
+rem must be listed explicitly here and in OBJS - forgetting it shows up as
+rem "undefined reference to switch_to / task_irq_trampoline" at link time.
+nasm -f elf32 boot\task_switch.asm -o boot\task_switch.o
+if errorlevel 1 goto error
 
-echo [3/6] compiling kernel C files (auto-discovered)...
-rem 源文件自动收集：新增 kernel\*.c 无需改本脚本。
-rem 早期版本在此硬编码"编译列表"与"链接列表"两份，新增模块时极易只改一侧，
-rem 表现为链接期一堆 undefined reference（症状与代码错误难区分）。
+rem ===== prefer ninja: build.ninja is the source of truth for LINK ORDER =====
+rem Compiling kernel\*.c one by one produces byte-identical .o files either
+rem way, but this kernel is LINK-ORDER SENSITIVE: linking in alphabetical
+rem order (what an auto-discovery loop gives) boots fine through the self-test
+rem and then HANGS before reaching the shell. Only the explicit order in
+rem build.ninja is known good. So delegate to ninja whenever it is present
+rem instead of maintaining a second, drifting link list here.
+if not exist "%~dp0ninja.exe" goto auto_discover
+echo [3/6] building with ninja (build.ninja defines the correct link order)...
+ninja -f build.ninja os-image.bin
+if errorlevel 1 goto error
+echo.
+echo Build OK: os-image.bin generated (ninja)
+if "%AUTO_RUN%"=="1" goto run
+echo build-only mode: QEMU not launched.
+exit /b 0
+
+:auto_discover
+echo [3/6] compiling kernel C files (auto-discovered, FALLBACK)...
+echo [WARN] ninja.exe not found - falling back to alphabetical link order.
+echo [WARN] This is known to produce a kernel that hangs after the boot
+echo [WARN] self-test. Use build.ninja (or drop ninja.exe here) instead.
+rem Sources are auto-discovered: adding kernel\*.c needs no change here.
+rem Older revisions hardcoded a compile list AND a separate link list, which
+rem easily drifted apart and produced link-time undefined references that are
+rem hard to tell apart from real code errors.
 setlocal enabledelayedexpansion
-set "OBJS=boot\kernel_entry.o"
+set "OBJS=boot\kernel_entry.o boot\task_switch.o"
 for %%F in (kernel\*.c) do (
     echo   CC %%~nxF
     i686-elf-gcc %CFLAGS% -c "%%F" -o "kernel\%%~nF.o"
@@ -110,7 +140,7 @@ goto end
 
 :clean
 echo cleaning build artifacts...
-del /q boot\boot.bin boot\kernel_entry.o kernel\*.o kernel_raw.bin kernel.bin os-image.bin 2>nul
+del /q boot\boot.bin boot\kernel_entry.o boot\task_switch.o kernel\*.o kernel_raw.bin kernel.bin os-image.bin 2>nul
 echo clean done.
 pause
 exit /b 0
