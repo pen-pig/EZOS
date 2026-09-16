@@ -653,51 +653,148 @@ void cmd_calc(const char *args) {
 }
 
 /* selftest：一键运行所有子系统自检（步骤 5e） */
+/* ---------- 自检报告 ---------- */
+/*
+ * 内核没有 snprintf，所以手工把字符串与十进制数拼进定长缓冲。
+ *
+ * 为什么要同时写 dmesg：开机自检发生在 shell 起来之前，屏幕一滚就再也看不到，
+ * 进环形缓冲后才能用 `dmesg` 事后回看（panic 屏也带最近几行）。
+ *
+ * 顺带给每一项记耗时：PIT 是 1000Hz，一个 tick = 1ms，哪个子系统变慢一眼可见。
+ * 每项还带上自己的关键指标（堆用量、映射页数、物理页用量…），
+ * 这样自检不只是"PASS/FAIL"，出问题时能直接看出是哪个量不对。
+ */
+static void st_puts(char *b, uint32_t *p, uint32_t cap, const char *s) {
+    while (*s && *p + 1 < cap) b[(*p)++] = *s++;
+}
+static void st_putd(char *b, uint32_t *p, uint32_t cap, uint32_t v) {
+    char t[12];
+    int n = 0;
+    if (v == 0) t[n++] = '0';
+    while (v) { t[n++] = (char)('0' + (v % 10u)); v /= 10u; }
+    while (n && *p + 1 < cap) b[(*p)++] = t[--n];
+}
+
+/* 一行自检结果：<prefix><name>: PASS|FAIL  (<detail>)  [<ms> ms] */
+static void st_report(const char *prefix, const char *name, int fails,
+                      uint32_t t0, const char *detail) {
+    char line[200];
+    uint32_t p = 0;
+    st_puts(line, &p, sizeof(line), prefix);
+    st_puts(line, &p, sizeof(line), name);
+    st_puts(line, &p, sizeof(line), ": ");
+    st_puts(line, &p, sizeof(line), fails ? "FAIL" : "PASS");
+    if (detail && detail[0]) {
+        st_puts(line, &p, sizeof(line), "  (");
+        st_puts(line, &p, sizeof(line), detail);
+        st_puts(line, &p, sizeof(line), ")");
+    }
+    st_puts(line, &p, sizeof(line), "  [");
+    st_putd(line, &p, sizeof(line), g_pit_ticks - t0);
+    st_puts(line, &p, sizeof(line), " ms]\n");
+    line[p] = '\0';
+    ezos_console_write(line);
+    dmesg_write(line);
+}
+
 void cmd_selftest(const char *args) {
     (void)args;
     ezos_console_write("EZOS full self-test:\n");
-    struct { const char *name; int run; } r[8];
+    struct { const char *name; int run; uint32_t ms; const char *detail; } r[8];
+    /* detail 要活到最后的汇总循环，不能指向块内局部数组 */
+    static char det[8][80];
     int n = 0, failed = 0;
 
-    /* kmalloc：静默判定（分配/写入/回读/释放后 used 归零）
-     * ——详细数字留给 kmtest，这里只看健康与否 */
+    /* kmalloc：分配/写入/回读/释放后 used 必须归零（验证合并） */
     {
+        uint32_t t0 = g_pit_ticks;
+        uint32_t dpos = 0;
         uint32_t u0 = kmalloc_used();
         void *p1 = kmalloc(1000), *p2 = kmalloc(4000), *p3 = kmalloc(200);
         int ok = (p1 != 0 && p2 != 0 && p3 != 0);
+        uint32_t peak = 0;
         if (ok) {
             for (int i = 0; i < 1000; i++) ((uint8_t *)p1)[i] = (uint8_t)i;
             for (int i = 0; i < 1000; i++)
                 if (((uint8_t *)p1)[i] != (uint8_t)i) { ok = 0; break; }
+            peak = kmalloc_used();
             kfree(p3); kfree(p2); kfree(p1);
             if (kmalloc_used() != u0) ok = 0;            /* 合并后必须回到基线 */
         }
+        st_puts(det[n], &dpos, sizeof(det[n]), "heap ");
+        st_putd(det[n], &dpos, sizeof(det[n]), kmalloc_total() / 1024);
+        st_puts(det[n], &dpos, sizeof(det[n]), "KB, ");
+        st_putd(det[n], &dpos, sizeof(det[n]), peak);
+        st_puts(det[n], &dpos, sizeof(det[n]), "B -> ");
+        st_putd(det[n], &dpos, sizeof(det[n]), kmalloc_used());
+        st_puts(det[n], &dpos, sizeof(det[n]), "B");
+        det[n][dpos] = '\0';
         r[n].name = "kmalloc  kernel heap";
         r[n].run = ok ? 0 : 1;
+        r[n].ms = g_pit_ticks - t0;
+        r[n].detail = det[n];
         n++;
     }
 
     /* paging：官方自检（无输出参数时静默跑断言） */
-    r[n].name = "paging   identity + map/unmap";
-    r[n].run = paging_selftest(0);
-    n++;
+    {
+        uint32_t t0 = g_pit_ticks, dpos = 0;
+        int rc = paging_selftest(0);
+        st_puts(det[n], &dpos, sizeof(det[n]), "");
+        st_putd(det[n], &dpos, sizeof(det[n]), paging_mapped_pages());
+        st_puts(det[n], &dpos, sizeof(det[n]), " pages, ");
+        st_putd(det[n], &dpos, sizeof(det[n]), paging_used_tables());
+        st_puts(det[n], &dpos, sizeof(det[n]), " tables");
+        det[n][dpos] = '\0';
+        r[n].name = "paging   identity + map/unmap";
+        r[n].run = rc;
+        r[n].ms = g_pit_ticks - t0;
+        r[n].detail = det[n];
+        n++;
+    }
 
-    /* pmm / elf：自检自带逐条输出，直接跑 */
-    r[n].name = "pmm      page frame allocator";
-    r[n].run = pmm_selftest(pg_puts);
-    n++;
+    /* pmm：物理页帧分配器 */
+    {
+        uint32_t t0 = g_pit_ticks, dpos = 0;
+        int rc = pmm_selftest(pg_puts);
+        st_puts(det[n], &dpos, sizeof(det[n]), "");
+        st_putd(det[n], &dpos, sizeof(det[n]), pmm_free_count());
+        st_puts(det[n], &dpos, sizeof(det[n]), "/");
+        st_putd(det[n], &dpos, sizeof(det[n]), pmm_total_pages());
+        st_puts(det[n], &dpos, sizeof(det[n]), " pages free");
+        det[n][dpos] = '\0';
+        r[n].name = "pmm      page frame allocator";
+        r[n].run = rc;
+        r[n].ms = g_pit_ticks - t0;
+        r[n].detail = det[n];
+        n++;
+    }
 
-    r[n].name = "elf      ELF32 loader";
-    r[n].run = elf_selftest(pg_puts);
-    n++;
+    /* elf：装载器（校验/装载/W^X/卸载） */
+    {
+        uint32_t t0 = g_pit_ticks;
+        int rc = elf_selftest(pg_puts);
+        r[n].name = "elf      ELF32 loader";
+        r[n].run = rc;
+        r[n].ms = g_pit_ticks - t0;
+        r[n].detail = "validate + load + W^X + unload";
+        n++;
+    }
 
     /* fpu：x87 探测 + 算术 */
-    r[n].name = "fpu      x87 arithmetic";
-    r[n].run = fpu_selftest(pg_puts);
-    n++;
+    {
+        uint32_t t0 = g_pit_ticks;
+        int rc = fpu_selftest(pg_puts);
+        r[n].name = "fpu      x87 arithmetic";
+        r[n].run = rc;
+        r[n].ms = g_pit_ticks - t0;
+        r[n].detail = "x87 detect + arithmetic";
+        n++;
+    }
 
     /* calc：表达式引擎（静默：一组已知答案的算式） */
     {
+        uint32_t t0 = g_pit_ticks;
         static const struct { const char *e; double want; } t[] = {
             { "1.5*2+1",        4 },
             { "10/4",           2.5 },
@@ -723,52 +820,106 @@ void cmd_selftest(const char *args) {
             double v; const char *err = 0;
             if (calc_eval(badexpr[i], &v, &err) == 0) bad++;      /* 不该成功 */
         }
+        {
+            uint32_t dpos = 0;
+            st_puts(det[n], &dpos, sizeof(det[n]), "");
+            st_putd(det[n], &dpos, sizeof(det[n]),
+                    (uint32_t)(sizeof(t) / sizeof(t[0])) +
+                    (uint32_t)(sizeof(badexpr) / sizeof(badexpr[0])));
+            st_puts(det[n], &dpos, sizeof(det[n]),
+                    " cases (eval + reject), ");
+            st_putd(det[n], &dpos, sizeof(det[n]), (uint32_t)bad);
+            st_puts(det[n], &dpos, sizeof(det[n]), " bad");
+            det[n][dpos] = '\0';
+        }
         r[n].name = "calc     expression engine";
         r[n].run = bad;
+        r[n].ms = g_pit_ticks - t0;
+        r[n].detail = det[n];
         n++;
     }
 
     /* exec：真跑盘上的 HELLO.ELF，退出码 42 = 全链路健康
      * （FS->ELF->ring3->syscall->exit->页回收） */
     {
+        uint32_t t0 = g_pit_ticks, dpos = 0;
         const char *why = 0;
         int rc = exec_file("HELLO.ELF", 0, &why);
+        int bad = (rc == 42) ? 0 : 1;
+        st_puts(det[n], &dpos, sizeof(det[n]), "HELLO.ELF exit=");
+        st_putd(det[n], &dpos, sizeof(det[n]), (uint32_t)rc);
+        if (bad && why) {
+            st_puts(det[n], &dpos, sizeof(det[n]), ", why=");
+            st_puts(det[n], &dpos, sizeof(det[n]), why);
+        }
+        det[n][dpos] = '\0';
         r[n].name = "exec     ring3 ELF run";
-        r[n].run = (rc == 42) ? 0 : 1;
+        r[n].run = bad;
+        r[n].ms = g_pit_ticks - t0;
+        r[n].detail = det[n];
         n++;
     }
 
     /* fd：open/read/lseek/write/close 全语义（真实文件系统走一遍） */
-    r[n].name = "fd       file descriptors";
-    r[n].run = fd_selftest(pg_puts);
-    n++;
+    {
+        uint32_t t0 = g_pit_ticks;
+        int rc = fd_selftest(pg_puts);
+        r[n].name = "fd       file descriptors";
+        r[n].run = rc;
+        r[n].ms = g_pit_ticks - t0;
+        r[n].detail = "open/read/lseek/write/close";
+        n++;
+    }
 
-    /* 汇总 */
+    /* 汇总：每项一行（含指标与耗时），末尾给总耗时 */
     ezos_console_write("----------\n");
     for (int i = 0; i < n; i++) {
-        ezos_console_write("  ");
-        ezos_console_write(r[i].name);
-        ezos_console_write(": ");
-        ezos_console_write(r[i].run == 0 ? "PASS\n" : "FAIL\n");
+        /* st_report 内部用 g_pit_ticks - t0 算耗时，这里反推一个等价的 t0 传进去 */
+        st_report("  ", r[i].name, r[i].run, g_pit_ticks - r[i].ms, r[i].detail);
         if (r[i].run != 0) failed++;
     }
     ezos_console_write("----------\n");
-    ezos_console_write("  ");
-    ezos_console_print_dec((uint32_t)n);
-    ezos_console_write(" tests, ");
-    ezos_console_print_dec((uint32_t)failed);
-    ezos_console_write(" failed -> ");
-    ezos_console_write(failed == 0 ? "ALL PASS\n" : "SYSTEM UNSTABLE\n");
+    {
+        char sum[96];
+        uint32_t sp = 0;
+        uint32_t total = 0;
+        for (int i = 0; i < n; i++) total += r[i].ms;
+        st_puts(sum, &sp, sizeof(sum), "");
+        st_putd(sum, &sp, sizeof(sum), (uint32_t)n);
+        st_puts(sum, &sp, sizeof(sum), " tests, ");
+        st_putd(sum, &sp, sizeof(sum), (uint32_t)failed);
+        st_puts(sum, &sp, sizeof(sum), " failed, ");
+        st_putd(sum, &sp, sizeof(sum), total);
+        st_puts(sum, &sp, sizeof(sum), " ms -> ");
+        st_puts(sum, &sp, sizeof(sum),
+                failed == 0 ? "ALL PASS" : "SYSTEM UNSTABLE");
+        sum[sp] = '\0';
+        ezos_console_write("  ");
+        ezos_console_write(sum);
+        ezos_console_write("\n");
+        dmesg_write(sum);
+        dmesg_write("\n");
+    }
 }
 
 /* boot_selftest：开机自检（kernel_main 调用）。
  * 与 cmd_selftest 同一套判定逻辑，但全程静默，只返回失败子系统数。
  * 0 = 全部通过。 */
 int boot_selftest(void) {
-    struct { int run; } r[8];
+    struct { int run; uint32_t ms; } r[8];
     int n = 0;
 
+    /* 每一项都记耗时：开机自检以前只留一行"all passed"，出了问题是哪一个
+     * 失败、哪一项慢，事后完全无从查起。现在逐项进 dmesg。 */
+#define ST_RUN(expr) do { \
+        uint32_t st_t0 = g_pit_ticks; \
+        r[n].run = (expr); \
+        r[n].ms = g_pit_ticks - st_t0; \
+        n++; \
+    } while (0)
+
     {   /* kmalloc */
+        uint32_t t0 = g_pit_ticks;
         uint32_t u0 = kmalloc_used();
         void *p1 = kmalloc(1000), *p2 = kmalloc(4000), *p3 = kmalloc(200);
         int ok = (p1 != 0 && p2 != 0 && p3 != 0);
@@ -779,13 +930,16 @@ int boot_selftest(void) {
             kfree(p3); kfree(p2); kfree(p1);
             if (kmalloc_used() != u0) ok = 0;
         }
-        r[n++].run = ok ? 0 : 1;
+        r[n].run = ok ? 0 : 1;
+        r[n].ms = g_pit_ticks - t0;
+        n++;
     }
-    r[n++].run = paging_selftest(0);                 /* NULL = 静默 */
-    r[n++].run = pmm_selftest(0);
-    r[n++].run = elf_selftest(0);
-    r[n++].run = fpu_selftest(0);
+    ST_RUN(paging_selftest(0));                 /* NULL = 静默 */
+    ST_RUN(pmm_selftest(0));
+    ST_RUN(elf_selftest(0));
+    ST_RUN(fpu_selftest(0));
     {   /* calc：已知答案 + 必须拒绝的畸形 */
+        uint32_t t0 = g_pit_ticks;
         static const struct { const char *e; double want; } t[] = {
             { "1.5*2+1", 4 }, { "10/4", 2.5 }, { "sqrt(2)*sqrt(2)", 2 },
             { "2^10", 1024 }, { "sin(0)", 0 }, { "1+2*3", 7 },
@@ -803,17 +957,37 @@ int boot_selftest(void) {
             double v; const char *err = 0;
             if (calc_eval(badexpr[i], &v, &err) == 0) bad++;
         }
-        r[n++].run = bad;
+        r[n].run = bad;
+        r[n].ms = g_pit_ticks - t0;
+        n++;
     }
     {   /* exec：HELLO.ELF 退出码 42 */
+        uint32_t t0 = g_pit_ticks;
         const char *why = 0;
-        r[n++].run = (exec_file("HELLO.ELF", 0, &why) == 42) ? 0 : 1;
+        r[n].run = (exec_file("HELLO.ELF", 0, &why) == 42) ? 0 : 1;
+        r[n].ms = g_pit_ticks - t0;
+        n++;
     }
-    r[n++].run = fd_selftest(0);        /* NULL = 静默 */
+    ST_RUN(fd_selftest(0));             /* NULL = 静默 */
 
+    /* 逐项进 dmesg（顺序与上面 n 的递增顺序一致） */
+    static const char *const st_names[8] = {
+        "kmalloc  kernel heap",
+        "paging   identity + map/unmap",
+        "pmm      page frame allocator",
+        "elf      ELF32 loader",
+        "fpu      x87 arithmetic",
+        "calc     expression engine",
+        "exec     ring3 ELF run",
+        "fd       file descriptors",
+    };
     int failed = 0;
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < n; i++) {
+        const char *nm = (i < 8) ? st_names[i] : "subsystem";
+        st_report("SELFTEST: ", nm, r[i].run, g_pit_ticks - r[i].ms, 0);
         if (r[i].run != 0) failed++;
+    }
+#undef ST_RUN
     return failed;
 }
 
