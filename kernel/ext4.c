@@ -1430,6 +1430,10 @@ int ext4_mkdir(const char *name) {
 int ext4_format(uint8_t drive) {
     if (drive > 3) return -1;
 
+    /* 所有结构写入都经 e4_write_secs，而它只用全局 e4_drive；必须先指向目标盘，
+     * 否则会写到上一次挂载残留的 e4_drive（默认 0=引导盘），导致 mount 读不到 SB。 */
+    e4_drive = drive;
+
     uint32_t part_start = 1;
     uint32_t vol_blocks = 1024;     /* 1MB 卷 */
     uint32_t blksize = 1024;
