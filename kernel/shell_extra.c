@@ -1156,6 +1156,31 @@ void cmd_sleep(const char *args) {
 }
 
 /* mem: 查看指定物理地址内存。mem <hexaddr> [len]（默认 128 字节） */
+/*
+ * 内核要直接解引用"用户给的地址"之前，必须先确认整段区间都已映射。
+ *
+ * 否则 `mem 0xFFFFFFFF` 这种输入会在 **ring0** 触发缺页 —— 崩的不是用户进程，
+ * 是整个内核：实测得到 #PF (CR2=0xFFFFFFFF)、context=shell、System halted。
+ * 一个 shell 命令就能让机器停机，这在任何场景下都不可接受。
+ *
+ * 逐页用 paging_query 检查；另外拒绝 addr+len 在 32 位绕回的区间
+ * （那会让"末地址"反而小于起始地址，循环边界失效）。
+ */
+int mem_range_mapped(uint32_t addr, uint32_t len) {
+    if (len == 0) return 1;
+    uint32_t last = addr + len - 1u;
+    if (last < addr) return 0;                  /* 绕回 */
+    uint32_t page = addr & 0xFFFFF000u;
+    uint32_t last_page = last & 0xFFFFF000u;
+    for (;;) {
+        uint32_t phys = 0, flags = 0;
+        if (paging_query(page, &phys, &flags) != 0) return 0;
+        if (page == last_page) return 1;
+        page += 0x1000u;
+        if (page == 0) return 0;                /* 走到地址空间顶端 */
+    }
+}
+
 void cmd_mem(const char *args) {
     ezos_args_t a;
     ezos_parse_args(args, &a);
@@ -1169,6 +1194,12 @@ void cmd_mem(const char *args) {
         len = x_atoi(a.argv[1]);
         if (len <= 0) len = 128;
         if (len > 512) len = 512;
+    }
+
+    if (!mem_range_mapped(addr, (uint32_t)len)) {
+        ezos_console_write("error: that address range is not mapped "
+                           "(dumping it would fault the kernel)\n");
+        return;
     }
 
     ezos_console_write("Memory dump at 0x");

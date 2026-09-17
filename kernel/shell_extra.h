@@ -1,6 +1,8 @@
 #ifndef SHELL_EXTRA_H
 #define SHELL_EXTRA_H
 
+#include "types.h"      /* 下面 mem_range_mapped 的声明用到 uint32_t */
+
 /*
  * shell_extra.h - EZOS 命令行增强模块（借鉴 MikanOS 参数解析与命令语义）
  *
@@ -36,6 +38,11 @@ void cmd_selftest(const char *args);
 void cmd_ktask(const char *args);
 void cmd_ps(const char *args);
 void cmd_pci(const char *args);
+
+/* 内核解引用"用户给的地址"前的必查项：整段区间是否都已映射。
+ * 未做校验时 `mem 0xFFFFFFFF` 会在 ring0 缺页，整个内核停机。
+ * shell.c 的 hexdump 与 shell_extra.c 的 mem 共用这一份实现。 */
+int mem_range_mapped(uint32_t addr, uint32_t len);
 
 /* 开机一键自检（kernel_main 调用）：静默跑全部子系统断言，
  * 返回失败的子系统数（0=全部通过）。失败项可用 shell 的

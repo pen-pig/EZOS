@@ -956,6 +956,13 @@ static void cmd_hexdump(const char *args) {
         if (len <= 0) len = 64;
         if (len > 1024) len = 1024;
     }
+    /* 与 `mem` 同理：不校验就在 ring0 解引用用户给的地址，
+     * 一条 `hexdump 0xFFFFFFFF` 足以让整个内核缺页停机。 */
+    if (!mem_range_mapped(addr, (uint32_t)len)) {
+        terminal_writestring("error: that address range is not mapped "
+                             "(dumping it would fault the kernel)\n");
+        return;
+    }
     terminal_writestring("Hexdump at 0x");
     print_hex32(addr);
     terminal_writestring(":\n");
