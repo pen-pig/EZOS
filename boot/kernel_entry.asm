@@ -4,6 +4,7 @@
 [extern irq0_handler]
 [extern irq1_handler]
 [extern irq12_handler]
+[extern irq11_handler]
 [extern isr_dispatch]
 [extern syscall_handler]
 [extern __bss_start]
@@ -15,6 +16,7 @@ global _start
 global irq0
 global irq1
 global irq12
+global irq11
 global idt_flush
 global isr_stub_table
 global gdt_flush
@@ -71,6 +73,15 @@ irq12:
     call irq12_handler
     popa
     sti
+    iret
+
+; IRQ11 entry (RTL8139 NIC). Gate 0x8E clears IF on entry; iret restores
+; it from the saved EFLAGS, so no explicit sti here (no reentry window).
+irq11:
+    cli
+    pusha
+    call irq11_handler
+    popa
     iret
 
 ; ¼ÓÔØ IDT µÄº¯Êý

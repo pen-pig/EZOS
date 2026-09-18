@@ -1505,24 +1505,81 @@ void cmd_pci(const char *args) {
 }
 
 /*
- * nic - 查看 RTL8139 网卡状态（步骤 7.1 的诊断命令）。
- * 打印 IO base / IRQ / MAC；未挂网卡时明确提示，便于 E2E 区分
- * "驱动没跑" 与 "QEMU 没挂设备"。
+ * nic - 查看 RTL8139 网卡状态（步骤 7.2 诊断命令）。
+ *   nic             打印 IO base / IRQ / MAC / IP / 收发统计 / 首包诊断值
+ *   nic ip a.b.c.d  设置本机 IP（默认 10.0.2.15 = QEMU user-net guest 地址）
  */
 void cmd_nic(const char *args) {
-    (void)args;
     if (!rtl8139_present()) {
         ezos_console_write("RTL8139: not present\n");
         return;
     }
-    char ms[18];
+
+    /* 可选子命令：nic ip a.b.c.d */
+    while (*args == ' ') args++;
+    if (args[0] == 'i' && args[1] == 'p' && args[2] == ' ') {
+        const char *s = args + 3;
+        uint32_t v[4];
+        int n = 0;
+        while (*s == ' ') s++;
+        for (n = 0; n < 4; n++) {
+            if (*s < '0' || *s > '9') break;
+            uint32_t x = 0;
+            while (*s >= '0' && *s <= '9') {
+                x = x * 10 + (uint32_t)(*s - '0');
+                s++;
+                if (x > 255) break;
+            }
+            if (x > 255) break;
+            v[n] = x;
+            if (n < 3) {
+                if (*s != '.') break;
+                s++;
+            }
+        }
+        if (n == 4 && *s == '\0') {
+            rtl8139_set_ip((uint8_t)v[0], (uint8_t)v[1],
+                           (uint8_t)v[2], (uint8_t)v[3]);
+            ezos_console_write("IP set\n");
+            return;
+        }
+        ezos_console_write("usage: nic ip a.b.c.d\n");
+        return;
+    }
+
+    char ms[18], ips[16];
     rtl8139_mac_str(ms);
+    rtl8139_ip_str(ips);
     ezos_console_write("RTL8139: IO base 0x");
     ezos_console_print_hex32(rtl8139_io_base());
     ezos_console_write(" IRQ ");
     ezos_console_print_dec(rtl8139_irq());
-    ezos_console_write("\n");
-    ezos_console_write("MAC: ");
+    ezos_console_write("\nMAC: ");
     ezos_console_write(ms);
+    ezos_console_write("\nIP: ");
+    ezos_console_write(ips);
+    ezos_console_write("\nRX: ");
+    ezos_console_print_dec(rtl8139_rx_packets());
+    ezos_console_write(" pkts ");
+    ezos_console_print_dec(rtl8139_rx_errors());
+    ezos_console_write(" errs\nTX: ");
+    ezos_console_print_dec(rtl8139_tx_packets());
+    ezos_console_write(" pkts ");
+    ezos_console_print_dec(rtl8139_tx_busy());
+    ezos_console_write(" busy\nARP: ");
+    ezos_console_print_dec(rtl8139_arp_replied());
+    ezos_console_write(" replied\nICMP: ");
+    ezos_console_print_dec(rtl8139_icmp_replied());
+    ezos_console_write(" replied\nIRQ11: ");
+    ezos_console_print_dec(rtl8139_irq_count());
+    ezos_console_write("\nDBG: st=0x");
+    uint32_t ds = 0, dl = 0, dc = 0;
+    rtl8139_rx_debug(&ds, &dl, &dc);
+    ezos_console_print_hex32(ds);
+    ezos_console_write(" len=");
+    ezos_console_print_dec(dl);
+    ezos_console_write(" capr=0x");
+    ezos_console_print_hex32(dc);
     ezos_console_write("\n");
 }
+

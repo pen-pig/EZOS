@@ -6,6 +6,7 @@
 #define IRQ0 32
 #define IRQ1 33
 #define IRQ2 34
+#define IRQ11 43
 #define IRQ12 44
 
 void isr_install(void);

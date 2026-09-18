@@ -378,9 +378,9 @@ void kernel_main(void) {
         klog_dec32("PCI: scanned bus, ", (uint32_t)npci, " device(s) found");
     }
 
-    /* RTL8139 NIC (step 7.1): claim from PCI table, enable IO decode +
-     * bus master, soft-reset, read MAC. Returns -1 when QEMU has no NIC
-     * attached; that is not an error, so we stay silent then. */
+    /* RTL8139 NIC (step 7.2): claim + reset + MAC + 8K RX ring + 4 TX
+     * descriptors + IRQ + ARP/ICMP echo reply. Returns -1 when QEMU has
+     * no NIC attached; that is not an error, so we stay silent then. */
     if (rtl8139_init() == 0) {
         char l[96];
         int n = 0;
@@ -388,8 +388,12 @@ void kernel_main(void) {
         while (*p) l[n++] = *p++;
         rtl8139_mac_str(l + n);
         klog_ok(l);
-        klogf("RTL8139: IO base 0x", (uint32_t)rtl8139_io_base(), 1,
-              ", IRQ ", (uint32_t)rtl8139_irq(), 0, " (io decode + bus master on)");
+        char l2[96];
+        int n2 = 0;
+        p = "RTL8139: RX 8K ring + 4 TX desc, IRQ 11, ARP/ICMP echo, IP ";
+        while (*p) l2[n2++] = *p++;
+        rtl8139_ip_str(l2 + n2);
+        klog_ok(l2);
     }
 
     int ret = fs_init();
