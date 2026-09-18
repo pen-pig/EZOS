@@ -269,6 +269,7 @@ static const command_t commands[] = {
     {"ktask",     cmd_ktask},
     {"ps",        cmd_ps},
     {"pci",       cmd_pci},
+    {"nic",       cmd_nic},
     {0, 0}
 };
 

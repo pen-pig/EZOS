@@ -22,6 +22,7 @@
 #include "desktop.h"
 #include "gfxwin.h"
 #include "gfx.h"
+#include "rtl8139.h"
 
 // �򵥳��Ⱥ��������Զ���ʽ��ʾ��ʹ��
 static size_t my_strlen(const char *s) {
@@ -375,6 +376,20 @@ void kernel_main(void) {
     {
         int npci = pci_scan();
         klog_dec32("PCI: scanned bus, ", (uint32_t)npci, " device(s) found");
+    }
+
+    /* RTL8139 NIC (step 7.1): claim from PCI table, enable IO decode +
+     * bus master, soft-reset, read MAC. Returns -1 when QEMU has no NIC
+     * attached; that is not an error, so we stay silent then. */
+    if (rtl8139_init() == 0) {
+        char l[96];
+        int n = 0;
+        const char *p = "RTL8139: MAC ";
+        while (*p) l[n++] = *p++;
+        rtl8139_mac_str(l + n);
+        klog_ok(l);
+        klogf("RTL8139: IO base 0x", (uint32_t)rtl8139_io_base(), 1,
+              ", IRQ ", (uint32_t)rtl8139_irq(), 0, " (io decode + bus master on)");
     }
 
     int ret = fs_init();

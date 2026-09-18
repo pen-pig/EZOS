@@ -30,6 +30,7 @@
 #include "task.h"
 #include "fd.h"
 #include "pci.h"
+#include "rtl8139.h"
 
 /* ==================================================================
  * 1. ezos_console 适配层：把 EZOS tty / 键盘桥接为轻量 console 接口
@@ -1501,4 +1502,27 @@ void cmd_pci(const char *args) {
     } else {
         ezos_console_write("none\n");
     }
+}
+
+/*
+ * nic - 查看 RTL8139 网卡状态（步骤 7.1 的诊断命令）。
+ * 打印 IO base / IRQ / MAC；未挂网卡时明确提示，便于 E2E 区分
+ * "驱动没跑" 与 "QEMU 没挂设备"。
+ */
+void cmd_nic(const char *args) {
+    (void)args;
+    if (!rtl8139_present()) {
+        ezos_console_write("RTL8139: not present\n");
+        return;
+    }
+    char ms[18];
+    rtl8139_mac_str(ms);
+    ezos_console_write("RTL8139: IO base 0x");
+    ezos_console_print_hex32(rtl8139_io_base());
+    ezos_console_write(" IRQ ");
+    ezos_console_print_dec(rtl8139_irq());
+    ezos_console_write("\n");
+    ezos_console_write("MAC: ");
+    ezos_console_write(ms);
+    ezos_console_write("\n");
 }
