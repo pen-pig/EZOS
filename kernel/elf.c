@@ -108,7 +108,12 @@ int elf_validate(const uint8_t *buf, uint32_t size, const char **why) {
         if (ph[i].p_filesz > ph[i].p_memsz) REJ("p_filesz > p_memsz");
         if (!range_in(ph[i].p_vaddr, ph[i].p_memsz, USER_IMAGE_BASE, USER_IMAGE_END))
             REJ("segment outside user image area");
-        if (!range_in(ph[i].p_offset, ph[i].p_filesz, 0u, size))
+        /* p_filesz=0 的段（纯 .bss）不从文件读任何字节——ld 常把它的
+         * p_offset 放到下一页边界（0x1000），可能落在文件长度之外。
+         * 装载侧同样只在 filesz!=0 时才拷，所以这里必须同条件校验，
+         * 否则会误拒合法的"text + bss 双段"ELF（曾让 exec 全线失败）。 */
+        if (ph[i].p_filesz != 0 &&
+            !range_in(ph[i].p_offset, ph[i].p_filesz, 0u, size))
             REJ("segment file range outside file");
         if (nload > ELF_MAX_SEG) REJ("too many PT_LOAD segments");
     }

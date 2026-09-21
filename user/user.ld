@@ -24,7 +24,11 @@ SECTIONS
 
     .text   : { *(.text*) *(.rodata*) }
     .data   : ALIGN(0x1000) { *(.data*) }
-    .bss    : { *(.bss*) *(COMMON) }
+    /* .bss 也要分页对齐：只给 .data 加 ALIGN 时，若程序没有已初始化数据
+     * （.data 为空），ld 不会真的推进位置计数器，.bss 会被并进 .text 那个
+     * PT_LOAD，段标志变成 RWE —— 既触发 "LOAD segment with RWX permissions"
+     * 警告，又让 .text 可写，脚本文档承诺的 W^X 失效。 */
+    .bss    : ALIGN(0x1000) { *(.bss*) *(COMMON) }
 
     /DISCARD/ : { *(.comment) *(.eh_frame*) *(.note*) }
 }
