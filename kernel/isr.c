@@ -2,6 +2,7 @@
 #include "isr.h"
 #include "port.h"
 #include "task.h"
+#include "net.h"
 
 extern void irq0();
 extern void irq1();
@@ -33,6 +34,7 @@ void irq0_handler(void) {
     g_pit_ticks++;
     outb(0x20, 0x20);   /* 主 PIC EOI（必须在 schedule 之前） */
     task_timer_tick();  /* 步骤 8a：到点的定时睡眠者先回 READY，再进调度 */
+    net_tick();         /* 步骤 7.4：TCP 重传定时器（内部按 100ms 节流） */
     schedule();
 }
 

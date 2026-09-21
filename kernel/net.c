@@ -46,6 +46,15 @@
 #define NET_BUILD_MAX 1792u          /* 协议构造缓冲（最大以太帧 + 余量） */
 #define NET_DEFAULT_WAIT_MS 10000u   /* timeout 参数为 0 时的缺省等待 */
 
+/* ---- TCP 可靠性参数（步骤 7.4） ----
+ * RTO 取固定 200ms 起步 + 指数退避（无 RTT 测量：教学取舍，注释在
+ * tcp_retransmit_check）。上限 5 次 —— 全部落空则放弃连接（发 RST）。 */
+#define TCP_RTO_MS      200u
+#define TCP_RTX_MAX     5u
+#define TCP_RTX_BUF     1536u        /* 未确认数据副本（单段，无流水线） */
+#define TCP_OOO_BUF     2048u        /* 乱序重组缓冲（每 socket） */
+#define TCP_TICK_MS     100u         /* net_tick 的工作间隔（IRQ0 驱动） */
+
 /* TCP 标志位 */
 #define TCP_FIN 0x01u
 #define TCP_SYN 0x02u
@@ -62,6 +71,7 @@ enum {
     TS_UNUSED = 0,
     TS_LISTEN,
     TS_SYN_RCVD,
+    TS_SYN_SENT,        /* 主动打开：SYN 已发，等 SYN+ACK（步骤 7.4 connect） */
     TS_ESTABLISHED,
     TS_CLOSE_WAIT,      /* 对端已 FIN */
     TS_LAST_ACK,        /* 我方 FIN 已发，等最终 ACK */
@@ -82,6 +92,21 @@ typedef struct {
     uint8_t *rx;                    /* 接收环（kmalloc，槽位复用） */
     uint32_t rx_r, rx_w;            /* 环读写指针（字节，模 NET_SOCK_BUF） */
     uint32_t snd_nxt, rcv_nxt;      /* TCP 序号 */
+
+    /* ---- 步骤 7.4：可靠性 ----
+     * 重传：一个时刻只允许一段未确认（无流水线、无滑动窗口），rtx 存这段
+     * 的副本，snd_una 是它的起始序号；ACK 推进 snd_una 后把已确认字节从
+     * rtx 头部移掉。syn_unacked 是 connect 的 SYN 重传标志（无数据）。
+     * 乱序：ooo 存"到达比 rcv_nxt 早不了、但比 rcv_nxt 晚"的那一串连续
+     * 字节（ooo_seq 起 ooo_len 字节）；等缺口补上后一次性倒进接收环。 */
+    uint32_t snd_una;               /* 最早未确认序号 */
+    uint8_t *rtx;                   /* 未确认数据副本（kmalloc TCP_RTX_BUF） */
+    uint32_t rtx_len;               /* 未确认字节数；0 = 无待确认数据 */
+    uint32_t rto_tick;              /* 下次重传时刻（g_pit_ticks）；0 = 未定时 */
+    uint8_t  rtx_tries;             /* 已重传次数（退避/放弃判据） */
+    uint8_t  syn_unacked;           /* SYN 待确认（SYN_SENT 的重传对象） */
+    uint8_t *ooo;                   /* 乱序重组缓冲（kmalloc TCP_OOO_BUF） */
+    uint32_t ooo_seq, ooo_len;      /* 乱序数据的起始序号与长度 */
 } sock_t;
 
 /* socket 表与 ARP 缓存放 .bss.hi（1-2MB 高内存段）：低 .bss 预算紧
@@ -99,6 +124,8 @@ static uint8_t *g_frame;            /* 最终帧组装缓冲（与 g_build 分�
 /* 统计 */
 static uint32_t g_udp_rx, g_udp_tx, g_tcp_rx, g_tcp_tx;
 static uint32_t g_arp_replied, g_icmp_replied;
+static uint32_t g_tcp_rtx;          /* 步骤 7.4：重传次数（E2E 断言用） */
+static uint16_t g_ephemeral = 40000u;  /* connect 的临时端口分配游标 */
 
 /* IP 标识计数器 */
 static uint16_t g_ip_id = 0x1000;
@@ -358,7 +385,10 @@ static int net_udp_send(uint32_t dst_ip, uint16_t dst_port, uint16_t src_port,
 
 /* ---------- TCP ---------- */
 
-static int tcp_send_seg(sock_t *s, uint8_t flags, const uint8_t *data, uint32_t n) {
+/* seq 显式传入：正常发送用 snd_nxt，重传必须用 snd_una（重传不改变
+ * snd_nxt，否则序号空间会被重传段推着走）。 */
+static int tcp_send_seg_ex(sock_t *s, uint8_t flags, const uint8_t *data,
+                           uint32_t n, uint32_t seq) {
     if (n > NET_BUILD_MAX - IP_HDR_MIN - TCP_HDR_MIN) return -1;
     const uint8_t *dst_mac = arp_lookup(s->peer_ip);
     if (!dst_mac) return -1;
@@ -383,7 +413,7 @@ static int tcp_send_seg(sock_t *s, uint8_t flags, const uint8_t *data, uint32_t 
     uint8_t *t = ip + IP_HDR_MIN;
     put16(t + 0, s->local_port);
     put16(t + 2, s->peer_port);
-    put32(t + 4, s->snd_nxt);
+    put32(t + 4, seq);
     put32(t + 8, s->rcv_nxt);
     t[12] = (uint8_t)(TCP_HDR_MIN << 2);
     t[13] = flags;
@@ -410,10 +440,88 @@ static int tcp_send_seg(sock_t *s, uint8_t flags, const uint8_t *data, uint32_t 
     return 0;
 }
 
+static int tcp_send_seg(sock_t *s, uint8_t flags, const uint8_t *data, uint32_t n) {
+    return tcp_send_seg_ex(s, flags, data, n, s->snd_nxt);
+}
+
+/* ---------------- 步骤 7.4：重传定时器 ----------------
+ *
+ * RTO 固定 200ms 起、每次 ×2（无 RTT 采样：教学取舍——真栈用 Jacobson/
+ * Karn 算法按实测 RTT 估算，这里只求"丢了能补上"）。最多重传 5 次，
+ * 全部落空就发 RST 放弃：无限重传会把一个死连接永久钉在 socket 表上。
+ *
+ * 调用上下文：IRQ0（isr.c 的 irq0_handler，每 tick 进 net_tick，内部按
+ * TCP_TICK_MS 节流）与系统调用（net_poll）。两者不并发（单核 + 中断门
+ * 清 IF），故无需加锁。重传走 rtl8139_send，它内部自带 IF 保护。 */
+static void sock_free(sock_t *s);   /* 定义在下面的 socket 层 */
+
+static void tcp_retransmit_check(sock_t *s, uint32_t now) {
+    if (s->state == TS_UNUSED || s->type != SOCK_TYPE_TCP) return;
+    if (s->rto_tick == 0) return;                       /* 无待确认对象 */
+    if ((int32_t)(now - s->rto_tick) < 0) return;       /* 未到期（回绕安全） */
+
+    if (s->rtx_tries >= TCP_RTX_MAX) {                  /* 放弃 */
+        tcp_send_seg(s, TCP_RST | TCP_ACK, 0, 0);
+        sock_free(s);
+        return;
+    }
+    s->rtx_tries++;
+    uint32_t backoff = (uint32_t)TCP_RTO_MS << (s->rtx_tries > 4 ? 4 : s->rtx_tries);
+    s->rto_tick = now + backoff;
+    g_tcp_rtx++;
+    if (s->syn_unacked) {
+        /* SYN 重传：序号回退到 ISN（snd_una 就是它），不带数据 */
+        tcp_send_seg_ex(s, TCP_SYN, 0, 0, s->snd_una);
+        return;
+    }
+    if (s->rtx_len == 0) { s->rto_tick = 0; return; }
+    tcp_send_seg_ex(s, TCP_PSH | TCP_ACK, s->rtx, s->rtx_len, s->snd_una);
+}
+
+void net_tick(void) {
+    static uint32_t last_tick;
+    uint32_t now = g_pit_ticks;
+    if ((int32_t)(now - last_tick) < (int32_t)TCP_TICK_MS) return;
+    last_tick = now;
+    for (uint32_t i = 0; i < NET_MAX_SOCKS; i++) {
+        sock_t *s = &g_socks[i];
+        if (!s->used || s->type != SOCK_TYPE_TCP) continue;
+        if (s->rto_tick == 0) continue;
+        /* 只有"还有东西没被确认"的连接需要定时器：纯 ACK/FIN 已确认、
+         * 或状态机已结束的都该是 0。 */
+        tcp_retransmit_check(s, now);
+    }
+}
+
+/* TCP 的可靠性缓冲（rtx/ooo）按需分配：UDP socket 不该为用不到的东西
+ * 付内存；分配失败时 fail closed（该 socket 不能进 ESTABLISHED）。 */
+static int tcp_bufs(sock_t *s) {
+    if (!s->rtx) {
+        s->rtx = kmalloc(TCP_RTX_BUF);
+        if (!s->rtx) return 0;
+    }
+    if (!s->ooo) {
+        s->ooo = kmalloc(TCP_OOO_BUF);
+        if (!s->ooo) return 0;
+    }
+    s->rtx_len = 0;
+    s->rto_tick = 0;
+    s->rtx_tries = 0;
+    s->syn_unacked = 0;
+    s->ooo_len = 0;
+    s->ooo_seq = 0;
+    return 1;
+}
+
 static void sock_free(sock_t *s) {
     s->used = 0;
     s->state = TS_UNUSED;
-    /* rx 缓冲保留复用（挂在槽上），不 kfree */
+    s->rtx_len = 0;
+    s->rto_tick = 0;
+    s->rtx_tries = 0;
+    s->syn_unacked = 0;
+    s->ooo_len = 0;
+    /* rx/rtx/ooo 缓冲保留复用（挂在槽上），不 kfree */
 }
 
 static void tcp_input(const uint8_t *ip, uint32_t ihl) {
@@ -457,7 +565,9 @@ static void tcp_input(const uint8_t *ip, uint32_t ihl) {
             s->rx_r = s->rx_w = 0;
             /* ISN 由收发计数器拼成，可预测——教学取舍；真实环境必须随机化
              * （RFC 6528），否则序列号可被猜出，连接可被注入/劫持。 */
+            if (!tcp_bufs(s)) { s->used = 0; return; }   /* 缓冲不足：拒连 */
             s->snd_nxt = 0x1000 + g_tcp_tx * 64000u + g_udp_rx;
+            s->snd_una = s->snd_nxt;
             s->rcv_nxt = seq + 1;
             tcp_send_seg(s, TCP_SYN | TCP_ACK, 0, 0);
             s->snd_nxt++;
@@ -468,7 +578,45 @@ static void tcp_input(const uint8_t *ip, uint32_t ihl) {
 
     if (flags & TCP_RST) { sock_free(conn); return; }
 
+    /* ---- ACK 推进发送窗口（所有状态通用，含 SYN_SENT 收到的 SYN+ACK）----
+     * snd_una 左边界右移 → rtx 里已确认的字节去掉；全确认就撤掉定时器。
+     * 注意 ack 必须落在 (snd_una, snd_nxt] 内：超出 snd_nxt 是对端在确认
+     * 我们没发过的字节（异常/攻击），忽略。比较用有符号差，回绕安全。 */
+    if (flags & TCP_ACK) {
+        uint32_t una = conn->snd_una;
+        if ((int32_t)(ack - una) > 0 && (int32_t)(ack - conn->snd_nxt) <= 0) {
+            uint32_t acked = ack - una;
+            conn->snd_una = ack;
+            if (conn->syn_unacked) {            /* SYN 被确认 */
+                conn->syn_unacked = 0;
+                conn->rtx_tries = 0;
+                if (conn->rtx_len == 0) conn->rto_tick = 0;
+            } else if (acked >= conn->rtx_len) { /* 数据全确认 */
+                conn->rtx_len = 0;
+                conn->rto_tick = 0;
+                conn->rtx_tries = 0;
+            } else {                             /* 部分确认：剩余字节挪到头 */
+                for (uint32_t k = 0; k + acked < conn->rtx_len; k++)
+                    conn->rtx[k] = conn->rtx[k + acked];
+                conn->rtx_len -= acked;
+                conn->rto_tick = g_pit_ticks + TCP_RTO_MS;
+                conn->rtx_tries = 0;
+            }
+        }
+    }
+
     switch (conn->state) {
+    case TS_SYN_SENT:
+        /* 主动打开：只认 SYN+ACK；纯 ACK / 同时打开的裸 SYN 都忽略。 */
+        if (!(flags & TCP_SYN) || !(flags & TCP_ACK)) return;
+        if (ack != conn->snd_una) return;      /* 上面的处理已把 una 推到 ack */
+        conn->rcv_nxt = seq + 1;
+        conn->state = TS_ESTABLISHED;
+        conn->syn_unacked = 0;
+        conn->rto_tick = 0;
+        conn->rtx_tries = 0;
+        tcp_send_seg(conn, TCP_ACK, 0, 0);     /* 三次握手最后一包 */
+        return;
     case TS_SYN_RCVD:
         if (!(flags & TCP_ACK) || ack != conn->snd_nxt) return;
         conn->state = TS_ESTABLISHED;
@@ -479,18 +627,51 @@ static void tcp_input(const uint8_t *ip, uint32_t ihl) {
         /* FALLTHROUGH */
     case TS_ESTABLISHED:
     case TS_CLOSE_WAIT:
-        if (dlen > 0 && seq == conn->rcv_nxt) {
-            uint32_t space = (NET_SOCK_BUF - 1 + conn->rx_r - conn->rx_w)
-                             % NET_SOCK_BUF;
-            if (space >= dlen) {
-                for (uint32_t k = 0; k < dlen; k++) {
+        /* 数据按序号入位（步骤 7.4 乱序重组）：
+         *   seq <  rcv_nxt：重传来的旧段（我们的 ACK 丢了），丢掉即可
+         *   seq == rcv_nxt：直接进接收环，然后看能不能把乱序串接上
+         *   seq >  rcv_nxt：先存进乱序缓冲；只有"紧挨着已收乱序串"的才收，
+         *                   中间还有洞的段只能等重传补（教学取舍：不做
+         *                   多洞分段链表，缓冲 2KB 单串足够覆盖演示场景） */
+        if (dlen > 0) {
+            if ((int32_t)(seq - conn->rcv_nxt) < 0) {
+                /* 旧数据：不推进 rcv_nxt，靠下面的 ACK 让对端往前走 */
+            } else if (seq == conn->rcv_nxt) {
+                uint32_t space = (NET_SOCK_BUF - 1 + conn->rx_r - conn->rx_w)
+                                 % NET_SOCK_BUF;
+                uint32_t take = (dlen > space) ? space : dlen;
+                for (uint32_t k = 0; k < take; k++) {
                     conn->rx[conn->rx_w] = data[k];
                     conn->rx_w = (conn->rx_w + 1) % NET_SOCK_BUF;
                 }
-                conn->rcv_nxt += dlen;
-                g_tcp_rx += dlen;
+                conn->rcv_nxt += take;
+                g_tcp_rx += take;
+                /* 缺口补上了：把乱序串里紧接着的连续数据倒进接收环 */
+                while (conn->ooo_len && conn->ooo_seq == conn->rcv_nxt) {
+                    space = (NET_SOCK_BUF - 1 + conn->rx_r - conn->rx_w)
+                            % NET_SOCK_BUF;
+                    uint32_t n = (conn->ooo_len < space) ? conn->ooo_len : space;
+                    if (n == 0) break;          /* 接收环满：留给下一轮 */
+                    for (uint32_t k = 0; k < n; k++) {
+                        conn->rx[conn->rx_w] = conn->ooo[k];
+                        conn->rx_w = (conn->rx_w + 1) % NET_SOCK_BUF;
+                    }
+                    conn->rcv_nxt += n;
+                    g_tcp_rx += n;
+                    for (uint32_t k = 0; k + n < conn->ooo_len; k++)
+                        conn->ooo[k] = conn->ooo[k + n];
+                    conn->ooo_len -= n;
+                    conn->ooo_seq = conn->rcv_nxt;
+                }
+            } else if (conn->ooo && conn->ooo_len + dlen <= TCP_OOO_BUF &&
+                       (conn->ooo_len == 0 ||
+                        seq == conn->ooo_seq + conn->ooo_len)) {
+                if (conn->ooo_len == 0) conn->ooo_seq = seq;
+                for (uint32_t k = 0; k < dlen; k++)
+                    conn->ooo[conn->ooo_len + k] = data[k];
+                conn->ooo_len += dlen;
             }
-            /* 环满：不推进 rcv_nxt —— 对端超时重传即恢复 */
+            /* 环满/缓冲满：不推进 rcv_nxt —— 对端超时重传即恢复 */
         }
         if (flags & TCP_FIN) {
             if (seq + dlen == conn->rcv_nxt) {
@@ -644,6 +825,10 @@ static int cond_tcp(void *p) {
     sock_t *s = (sock_t *)p;
     return s->rx_r != s->rx_w || s->got_fin;
 }
+static int cond_connected(void *p) {
+    sock_t *s = (sock_t *)p;
+    return s->state == TS_ESTABLISHED;
+}
 static int cond_accept(void *p) {
     sock_t *l = (sock_t *)p;
     for (uint32_t i = 0; i < NET_MAX_SOCKS; i++)
@@ -702,6 +887,50 @@ int net_sockcall(uint32_t subcmd, const uint32_t a[5]) {
         }
         return -1;
     }
+    case SC_CONNECT: {
+        /* 步骤 7.4 主动打开：分配临时端口 → 发 SYN → 睡等 SYN+ACK。
+         * SYN 的重传由 net_tick 负责（syn_unacked + rto_tick），所以这里
+         * 发完就可以直接去睡，不必自己循环重试。 */
+        sock_t *s = sock_get(a[0]);
+        if (!s || s->type != SOCK_TYPE_TCP) return -1;
+        if (s->state != TS_UNUSED || s->local_port != 0) return -1;
+        if (a[1] == 0 || a[2] == 0 || a[2] > 0xFFFF) return -1;
+
+        uint16_t port = 0;
+        for (int tries = 0; tries < 200 && port == 0; tries++) {
+            uint16_t cand = g_ephemeral++;
+            if (cand < 40000u) g_ephemeral = 40000u;
+            int conflict = 0;
+            for (uint32_t i = 0; i < NET_MAX_SOCKS; i++)
+                if (g_socks[i].used && g_socks[i].local_port == cand) { conflict = 1; break; }
+            if (!conflict) port = cand;
+        }
+        if (port == 0) return -1;
+        if (!tcp_bufs(s)) return -1;
+
+        s->local_port = port;
+        s->peer_ip   = a[1];
+        s->peer_port = (uint16_t)a[2];
+        s->got_fin   = 0;
+        s->rx_r = s->rx_w = 0;
+        s->rcv_nxt = 0;
+        /* ISN 同上：可预测是教学取舍（RFC 6528 要求随机化） */
+        s->snd_nxt = 0x1000 + g_tcp_tx * 64000u + g_udp_rx;
+        s->snd_una = s->snd_nxt;
+        s->state = TS_SYN_SENT;
+        s->syn_unacked = 1;
+
+        /* 先解析对端 MAC（可能睡等 ARP reply），再起重传定时器并发 SYN：
+         * 顺序反了的话定时器会在 MAC 还没解析完时就尝试重传而白跑一趟。 */
+        if (arp_resolve(s->peer_ip, 3000) == 0) { sock_free(s); return -1; }
+        s->rto_tick = g_pit_ticks + TCP_RTO_MS;
+        s->rtx_tries = 0;
+        tcp_send_seg(s, TCP_SYN, 0, 0);
+        s->snd_nxt++;
+
+        if (!wait_cond(cond_connected, s, a[3])) { sock_free(s); return -1; }
+        return 0;
+    }
     case SC_SENDTO: {
         sock_t *s = sock_get(a[0]);
         if (!s || a[2] == 0) return -1;
@@ -713,8 +942,20 @@ int net_sockcall(uint32_t subcmd, const uint32_t a[5]) {
                                 s->local_port, buf, a[2]);
         }
         if (s->state != TS_ESTABLISHED && s->state != TS_CLOSE_WAIT) return -1;
-        if (tcp_send_seg(s, TCP_PSH | TCP_ACK, buf, a[2]) != 0) return -1;
+        /* 一时刻只允许一段未确认：上一段还没被 ACK 就先拒绝（真实的滑动
+         * 窗口要排队 + 拥塞控制，这里只求"丢了能重传"）。 */
+        if (s->rtx_len != 0) return -1;
+        if (a[2] > TCP_RTX_BUF) return -1;
+        if (!s->rtx && !tcp_bufs(s)) return -1;
+        for (uint32_t k = 0; k < a[2]; k++) s->rtx[k] = buf[k];
+        s->rtx_len = a[2];
+        if (tcp_send_seg(s, TCP_PSH | TCP_ACK, buf, a[2]) != 0) {
+            s->rtx_len = 0;                    /* 提交失败：不留待确认状态 */
+            return -1;
+        }
         s->snd_nxt += a[2];
+        s->rto_tick = g_pit_ticks + TCP_RTO_MS;   /* 起重传定时器 */
+        s->rtx_tries = 0;
         return (int)a[2];
     }
     case SC_RECVFROM: {
@@ -789,12 +1030,14 @@ int net_sockcall(uint32_t subcmd, const uint32_t a[5]) {
 
 void net_poll(void) {
     rtl8139_poll();
+    net_tick();          /* 系统调用上下文（IF=0，IRQ0 进不来）也要推进重传 */
 }
 
 uint32_t net_udp_rx(void)      { return g_udp_rx; }
 uint32_t net_udp_tx(void)      { return g_udp_tx; }
 uint32_t net_tcp_rx(void)      { return g_tcp_rx; }
 uint32_t net_tcp_tx(void)      { return g_tcp_tx; }
+uint32_t net_tcp_rtx(void)     { return g_tcp_rtx; }
 uint32_t net_arp_replied(void) { return g_arp_replied; }
 uint32_t net_icmp_replied(void) { return g_icmp_replied; }
 uint32_t net_arp_entries(void) {

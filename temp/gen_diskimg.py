@@ -202,7 +202,10 @@ def exfat_files():
     #   NETECHO.ELF  —— UDP echo（7000 端口），宿主发数据报断言回显
     #   NETTCP.ELF   —— TCP echo 服务器（7001 端口），三次握手/回显/四次挥手
     #   SEGPROBE.ELF —— sockcall 返回路径段寄存器自检（7.3 调试复现，留作回归）
-    for fname in ('NETECHO.ELF', 'NETTCP.ELF', 'SEGPROBE.ELF'):
+    #   NETCLI.ELF   —— TCP 主动连接客户端（7.4：connect/乱序重组/重传）
+    # 根目录只有 2 簇（1KB，约 10 个目录项），SEGPROBE 是 7.3 调试期的
+    # 一次性探针，让位给 NETCLI（7.4 需要）；源码与构建规则仍保留。
+    for fname in ('NETECHO.ELF', 'NETTCP.ELF', 'NETCLI.ELF'):
         p = os.path.join(os.path.dirname(here), 'user', fname.lower())
         if os.path.isfile(p):
             with open(p, 'rb') as f:

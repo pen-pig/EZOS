@@ -40,6 +40,8 @@
                           * a4=out 指针(u32[2]: src ip/port，可为 0)
                           *                               -> 收到字节数/0=EOF/-1 */
 #define SC_CLOSE    6u   /* a0=sock                        -> 0/-1      */
+#define SC_CONNECT  7u   /* a0=sock, a1=dst_ip(大端), a2=dst_port,
+                          * a3=timeout_ms（步骤 7.4 主动打开）  -> 0/-1   */
 
 /* rtl8139.c 收到完整以太帧（不含 CRC）后调入；返回后缓冲可复用 */
 int net_input(const uint8_t *frame, uint32_t len);
@@ -49,6 +51,11 @@ int net_sockcall(uint32_t subcmd, const uint32_t a[5]);
 
 /* 阻塞等待期间推进网络收包（轮询 RX，不依赖 IRQ） */
 void net_poll(void);
+
+/* 步骤 7.4：TCP 重传定时器——由 IRQ0（isr.c 的 irq0_handler）每 tick 调用，
+ * 内部按 TCP_TICK_MS 节流；系统调用上下文由 net_poll 一并调用。IRQ 上下文
+ * 安全（重传走 rtl8139_send，自带 IF 保护）。 */
+void net_tick(void);
 
 /* 步骤 8a：rtl8139 在 rx_drain 排完一批包后调用——踢醒睡在 net 等待
  * 队列上的 recvfrom/accept/ARP 解析（task_wake_all，IRQ 上下文安全）。
@@ -60,6 +67,7 @@ uint32_t net_udp_rx(void);
 uint32_t net_udp_tx(void);
 uint32_t net_tcp_rx(void);
 uint32_t net_tcp_tx(void);
+uint32_t net_tcp_rtx(void);   /* 步骤 7.4：重传次数 */
 uint32_t net_arp_replied(void);
 uint32_t net_icmp_replied(void);
 uint32_t net_arp_entries(void);
