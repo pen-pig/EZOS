@@ -9,6 +9,7 @@
 #include "panic.h"
 #include "task.h"
 #include "fd.h"
+#include "net.h"
 
 /* kernel_entry.asm */
 extern void syscall_entry(void);
@@ -70,8 +71,8 @@ int syscall_handler(uint32_t num, uint32_t a1, uint32_t a2, uint32_t a3) {
         return fd_write(&cur->fds, (int)fd, (const uint8_t *)buf, n);
     }
     case SYS_READ: {
-        /* 标准输入非阻塞：keyboard_getchar() 空缓冲返回 0（见 fd.c fd_read）。
-         * 真正的阻塞读要等调度器把任务睡眠在键盘等待队列上（6c 之后）。 */
+        /* 步骤 8a：stdin 是阻塞读——键盘缓冲空时 fd_read 会把当前任务
+         * 睡到 IRQ1（keyboard_block），其它 fd 照旧同步返回。 */
         uint32_t fd = a1;
         char *buf = (char *)a2;
         uint32_t n = a3;
@@ -108,6 +109,16 @@ int syscall_handler(uint32_t num, uint32_t a1, uint32_t a2, uint32_t a3) {
         int whence = (int)a3;
         if (cur == 0) return -1;
         return fd_lseek(&cur->fds, (int)fd, offset, whence);
+    }
+    case SYS_SOCKCALL: {
+        /* Linux i386 socketcall(102) style: ebx=subcmd, ecx=user u32 args[5].
+         * The args array itself is copied in here; pointers INSIDE it
+         * are validated by net.c at point of use (net_sockcall). */
+        const uint32_t *ua = (const uint32_t *)a2;
+        uint32_t ka[5];
+        if (!user_range_ok(a2, sizeof(ka), 0)) return -1;
+        for (int i = 0; i < 5; i++) ka[i] = ua[i];
+        return net_sockcall(a1, ka);
     }
     case SYS_EXIT:
         if (cur != 0 && cur->is_user) {

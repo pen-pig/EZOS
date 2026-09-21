@@ -2,11 +2,16 @@
 #include "tty.h"
 #include "port.h"
 #include "types.h"
+#include "task.h"
 
 #define KEYBOARD_BUFFER_SIZE 256
-static int keyboard_buffer[KEYBOARD_BUFFER_SIZE];  // �洢 int��֧���������
+static int keyboard_buffer[KEYBOARD_BUFFER_SIZE];  // 键存 int，支持扩展键码
 static int buffer_start = 0;
 static int buffer_end = 0;
+
+/* 键盘等待队列（步骤 8a）：阻塞读睡在这上面，IRQ1 塞入按键后唤醒。
+ * 静态即可——全系统只有一个键盘。{-1}：head 哨兵（0 是任务下标）。 */
+static wait_queue_t kb_wq = {-1};
 
 static int left_shift = 0;
 static int right_shift = 0;
@@ -150,6 +155,7 @@ void keyboard_handler(void) {
             if (next != buffer_start) {
                 keyboard_buffer[buffer_end] = key;
                 buffer_end = next;
+                task_wake_all(&kb_wq);    /* 有新数据：踢醒阻塞读（IRQ 上下文安全） */
             }
         }
     }
@@ -162,6 +168,14 @@ int keyboard_getchar(void) {
     int c = keyboard_buffer[buffer_start];
     buffer_start = (buffer_start + 1) % KEYBOARD_BUFFER_SIZE;
     return c;
+}
+
+/* 步骤 8a：任务上下文的阻塞等待——睡到下一个按键（IRQ1 唤醒）或
+ * 30s 超时。超时兜底是给"永远没人打字"的调用方（如用户进程阻塞
+ * read(stdin)）留一条退出路径，避免任务永久滞留 BLOCKED。
+ * 不可在 IRQ / task_lock 临界区调用（task_sleep 会拒绝并立即返回）。 */
+void keyboard_block(void) {
+    task_sleep(&kb_wq, 30000);
 }
 
 void irq1_handler(void) {

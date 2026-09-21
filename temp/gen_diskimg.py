@@ -2,7 +2,7 @@
 """gen_diskimg.py - EZOS 数据盘镜像生成器（exFAT / FAT12 / FAT16 / FAT32）
 
 用法:
-    python gen_diskimg.py <path> [exfat|fat12|fat16|fat32]
+    python gen_diskimg.py <path> [exfat|fat12|fat16|fat32|ext4]
 
 默认 exFAT，布局与内核 exfat_format 完全一致（build_and_test.bat 兼容）。
 FAT 镜像为标准 MBR + 单主分区 FAT 卷（分区类型 0x01/0x06/0x0B），含两个测试文件：
@@ -191,6 +191,18 @@ def exfat_files():
     #   SPIN.ELF   —— ring3 忙等几秒，证明用户进程是可被抢占的任务
     #   FDLEAK.ELF —— 写完文件故意不 close，证明进程退出时内核代关并落盘
     for fname in ('SPIN.ELF', 'FDLEAK.ELF'):
+        p = os.path.join(os.path.dirname(here), 'user', fname.lower())
+        if os.path.isfile(p):
+            with open(p, 'rb') as f:
+                files.append((fname, f.read()))
+        else:
+            print("WARN %s not found - skip embedding %s (run ninja user first)" % (p, fname))
+
+    # 步骤 7.3 的 socket 层验证程序（E2E：temp/test_step7_sock.py）：
+    #   NETECHO.ELF  —— UDP echo（7000 端口），宿主发数据报断言回显
+    #   NETTCP.ELF   —— TCP echo 服务器（7001 端口），三次握手/回显/四次挥手
+    #   SEGPROBE.ELF —— sockcall 返回路径段寄存器自检（7.3 调试复现，留作回归）
+    for fname in ('NETECHO.ELF', 'NETTCP.ELF', 'SEGPROBE.ELF'):
         p = os.path.join(os.path.dirname(here), 'user', fname.lower())
         if os.path.isfile(p):
             with open(p, 'rb') as f:

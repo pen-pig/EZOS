@@ -61,7 +61,11 @@ rule make_disk
 rule run_qemu
     # -icount shift=auto: 虚拟时钟跟踪真实时间（否则 portable QEMU 非 icount 模式
     # 下虚拟时钟仅按 vCPU 执行进度推进，PIT 实测只有 ~7% 实时，游戏/计时全慢）
-    command = $QEMU -icount shift=auto -vga std -drive format=raw,file=os-image.bin -drive format=raw,file=disk.img
+    # 步骤 7 起默认挂 rtl8139（user-net：guest 10.0.2.15 / 宿主 10.0.2.2）。
+    # 无网卡环境下 rtl8139_init 静默跳过，不影响启动。宿主转发（hostfwd
+    # tcp/udp 7000-7001）由 temp/test_step7_sock.py 自带——不放这里，
+    # 常驻 hostfwd 在端口被占时会直接拒绝 QEMU 启动。
+    command = $QEMU -icount shift=auto -vga std -drive format=raw,file=os-image.bin -drive format=raw,file=disk.img -netdev user,id=n0 -device rtl8139,netdev=n0
     description = RUN EZOS
 
 # ===================== ???? =====================
@@ -90,6 +94,7 @@ build kernel/keyboard.o: cc kernel/keyboard.c
 build kernel/ata.o: cc kernel/ata.c
 build kernel/pci.o: cc kernel/pci.c
 build kernel/rtl8139.o: cc kernel/rtl8139.c
+build kernel/net.o: cc kernel/net.c
 build kernel/shell.o: cc kernel/shell.c
 build kernel/shell_extra.o: cc kernel/shell_extra.c
 build kernel/exfat.o: cc kernel/exfat.c
@@ -118,18 +123,24 @@ build user/spin.o: cc_user user/spin.c
 build user/spin.elf: link_user user/crt0.o user/spin.o | user/user.ld
 build user/fdleak.o: cc_user user/fdleak.c
 build user/fdleak.elf: link_user user/crt0.o user/fdleak.o | user/user.ld
+build user/netecho.o: cc_user user/netecho.c
+build user/netecho.elf: link_user user/crt0.o user/netecho.o | user/user.ld
+build user/nettcp.o: cc_user user/nettcp.c
+build user/nettcp.elf: link_user user/crt0.o user/nettcp.o | user/user.ld
+build user/segprobe.o: cc_user user/segprobe.c
+build user/segprobe.elf: link_user user/crt0.o user/segprobe.o | user/user.ld
 
-build kernel_raw.bin: link boot/kernel_entry.o boot/task_switch.o kernel/kernel.o kernel/tty.o kernel/idt.o kernel/isr.o kernel/paging.o kernel/pmm.o kernel/task.o kernel/fd.o kernel/elf.o kernel/exec.o kernel/fpu.o kernel/calc.o kernel/gdt.o kernel/syscall.o kernel/panic.o kernel/kmalloc.o kernel/dmesg.o kernel/keyboard.o kernel/ata.o kernel/pci.o kernel/rtl8139.o kernel/shell.o kernel/shell_extra.o kernel/exfat.o kernel/fat.o kernel/fs.o kernel/ext4.o kernel/ntfs.o kernel/f2fs.o kernel/erofs.o kernel/refs.o kernel/div64.o kernel/gfx.o kernel/gui.o kernel/mouse.o kernel/gfxwin.o kernel/desktop.o kernel/games.o kernel/hiscore.o
+build kernel_raw.bin: link boot/kernel_entry.o boot/task_switch.o kernel/kernel.o kernel/tty.o kernel/idt.o kernel/isr.o kernel/paging.o kernel/pmm.o kernel/task.o kernel/fd.o kernel/elf.o kernel/exec.o kernel/fpu.o kernel/calc.o kernel/gdt.o kernel/syscall.o kernel/panic.o kernel/kmalloc.o kernel/dmesg.o kernel/keyboard.o kernel/ata.o kernel/pci.o kernel/rtl8139.o kernel/net.o kernel/shell.o kernel/shell_extra.o kernel/exfat.o kernel/fat.o kernel/fs.o kernel/ext4.o kernel/ntfs.o kernel/f2fs.o kernel/erofs.o kernel/refs.o kernel/div64.o kernel/gfx.o kernel/gui.o kernel/mouse.o kernel/gfxwin.o kernel/desktop.o kernel/games.o kernel/hiscore.o
 
 build kernel.bin: objcopy_pad kernel_raw.bin
 
 build os-image.bin: make_os_image boot/boot.bin kernel.bin
 
-build disk.img: make_disk user/hello.elf user/fdtest.elf user/spin.elf user/fdleak.elf
+build disk.img: make_disk user/hello.elf user/fdtest.elf user/spin.elf user/fdleak.elf user/netecho.elf user/nettcp.elf user/segprobe.elf
 
 build run: run_qemu os-image.bin disk.img
 
-default os-image.bin user/hello.elf user/fdtest.elf user/spin.elf user/fdleak.elf disk.img
+default os-image.bin user/hello.elf user/fdtest.elf user/spin.elf user/fdleak.elf user/netecho.elf user/nettcp.elf user/segprobe.elf disk.img
 
 build clean: phony
     command = cmd /c del /q boot\boot.bin boot\kernel_entry.o kernel\*.o kernel\*.d kernel_raw.bin kernel.bin os-image.bin 2>nul

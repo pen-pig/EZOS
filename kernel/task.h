@@ -6,7 +6,9 @@
  *   - 每个任务有独立内核栈，切换时更新 TSS.esp0（ring3 陷入栈）
  *   - 单地址空间：所有任务共用内核页目录，不做 per-process CR3 切换
  *     （步骤 6c 的多用户进程才会引入）
- *   - 没有优先级、没有睡眠队列的高效实现、没有 SMP
+ *   - 没有优先级、没有 SMP；阻塞睡眠用静态侵入式等待队列（步骤 8a：
+ *     task_sleep/task_wake_all——条件检查与入队之间关中断，
+ *     丢失唤醒窗口被结构性排除，超时由 PIT tick 驱动）
  *
  * 切换机制（为什么必须是这样）：
  *   抢占发生在 IRQ0（PIT）上下文里。被中断任务的全部寄存器由 irq0 桩的
@@ -28,6 +30,12 @@
 #define MAX_TASKS      8
 #define TASK_KSIZE     0x4000u          /* 每任务内核栈 16KB */
 #define TASK_TIMESLICE 10               /* 时间片：10 个 PIT tick = 10ms */
+
+/* 等待队列（步骤 8a）：静态侵入式单链——链节点就是任务表下标本身，
+ * 无动态内存。head 为 -1 表示空队列。定义须在 task_t 之前（字段引用）。 */
+typedef struct wait_queue {
+    int head;                           /* 队首任务下标；-1 = 空 */
+} wait_queue_t;
 
 typedef enum {
     TASK_UNUSED  = 0,
@@ -57,6 +65,11 @@ typedef struct {
     uint32_t     pd_phys;           /* 进程页目录物理页（回收用记账） */
     uint32_t     pt_phys;           /* 用户区页表物理页（4-8MB，回收用记账） */
     elf_image_t  img;               /* ELF 段记账：退出时按账回收物理页 */
+
+    /* ---- 步骤 8a：可睡眠的阻塞原语（等待队列） ---- */
+    int          wait_next;         /* 所在等待队列链的 next（任务下标），-1 = 不在队 */
+    uint32_t     wake_tick;         /* 定时睡眠的唤醒截止（g_pit_ticks），0 = 非定时 */
+    wait_queue_t *wait_q;           /* 正在排队的队列（唤醒/超时摘链用） */
 } task_t;
 
 /* 初始化任务表，并把当前执行流（kernel_main）登记为 0 号任务。
@@ -95,6 +108,22 @@ int task_wait_pid(int pid);
 
 /* 当前任务主动放弃 CPU（协作式让位，抢占之外的补充） */
 void task_yield(void);
+
+/*
+ * 睡到被唤醒或超时（步骤 8a 的阻塞原语）。
+ *   - timeout_ms=0 表示无限等；否则按 PIT tick（1ms/格）定时到点唤醒
+ *   - 只能在任务上下文（系统调用/内核线程）调用，不得在 task_lock
+ *     临界区内（那里 schedule 拒绝切换，本函数退化为立即返回）
+ *   - 唤醒方（IRQ 处理/资源释放方）调 task_wake_all；惊群语义：
+ *     醒来的等待者各自重查条件，不满足就再睡（≤ MAX_TASKS，无负担）
+ */
+void task_sleep(wait_queue_t *wq, uint32_t timeout_ms);
+
+/* 唤醒整条等待队列（IRQ 处理 / 资源就绪方调用；IF=0 上下文安全） */
+void task_wake_all(wait_queue_t *wq);
+
+/* PIT 每 tick 调用（IRQ0 上下文）：到点的定时睡眠者回 READY */
+void task_timer_tick(void);
 
 /* 当前任务退出（fn 返回时自动调用；也可显式调用） */
 void task_exit(void);

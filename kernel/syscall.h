@@ -23,6 +23,10 @@
 #define SYS_OPEN   5u
 #define SYS_CLOSE  6u
 #define SYS_LSEEK  19u
+/* socketcall 复用器（沿用 Linux i386 的 102 号）：
+ * ebx=子命令（net.h SC_*），ecx=用户态 u32 args[5]。
+ * 3 参数 ABI 不变，子命令的 5 个槽位经一个结构体传入。 */
+#define SYS_SOCKCALL 102u
 
 #define SYSCALL_VECTOR  0x80u
 

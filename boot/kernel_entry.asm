@@ -5,6 +5,8 @@
 [extern irq1_handler]
 [extern irq12_handler]
 [extern irq11_handler]
+[extern irq7s_handler]
+[extern irq15s_handler]
 [extern isr_dispatch]
 [extern syscall_handler]
 [extern __bss_start]
@@ -17,6 +19,8 @@ global irq0
 global irq1
 global irq12
 global irq11
+global irq7s
+global irq15s
 global idt_flush
 global isr_stub_table
 global gdt_flush
@@ -81,6 +85,23 @@ irq11:
     cli
     pusha
     call irq11_handler
+    popa
+    iret
+
+; spurious IRQ7 handlers (vector 39 master / 47 slave): see isr.c
+; - the 8259 raises these when an IRQ line withdraws before INTA.
+;   Same stub shape as irq11 (gate 0x8E clears IF; iret restores it).
+irq7s:
+    cli
+    pusha
+    call irq7s_handler
+    popa
+    iret
+
+irq15s:
+    cli
+    pusha
+    call irq15s_handler
     popa
     iret
 
@@ -268,13 +289,27 @@ syscall_entry:
     cmp dword [g_user_exited], 0
     jne .return_to_kernel
 
-    mov [esp + 28], eax          ; 写回返回值到 pusha 区的 eax 槽（popa 会恢复它�?
+    mov [esp + 28], eax
     popa
     pop gs
     pop fs
     pop es
     pop ds
-    iret                         ; 返回 ring3
+    ; defensive: when returning to ring3 force user data segments.
+    ; A task may have started with stale/null selectors; the pops
+    ; above would restore them verbatim and the next user memory
+    ; access faults. CS sits right after EIP in the iret frame.
+    ; EDX is scratch (cdecl) - EAX must survive: it is the return value.
+    mov edx, [esp + 4]
+    test dl, 3
+    jz .sys_ring0_out
+    mov dx, 0x23
+    mov ds, dx
+    mov es, dx
+    mov fs, dx
+    mov gs, dx
+.sys_ring0_out:
+    iret
 
 .return_to_kernel:
     mov esp, [g_kernel_esp_save]

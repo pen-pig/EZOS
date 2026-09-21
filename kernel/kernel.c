@@ -319,7 +319,7 @@ void kernel_main(void) {
     pmm_init();
 
     klog("EZOS Kernel 0.9.0 loaded at 0x10000, i686 protected mode");
-    klog("Boot: 512 sectors kernel image read by BIOS INT 13h AH=42h (64-sector batches, 3 retries)");
+    klog("Boot: 768 sectors kernel image read by BIOS INT 13h AH=42h (64-sector batches, 3 retries)");
     klog("Boot: A20 gate enabled (BIOS int 15h / port 0x92 / KBC fallback)");
     klog("Boot: GDT rebuilt in kernel - 6 descriptors (null/kcode/kdata/ucode DPL3/udata DPL3/TSS), TSS esp0=0x900000");
     klog("VGA text mode: 80x25 active");

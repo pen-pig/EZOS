@@ -6,6 +6,8 @@
 extern void irq0();
 extern void irq1();
 extern void irq12();
+extern void irq7s();
+extern void irq15s();
 
 void isr_install(void) {
     /* 暂时无异常处理 */
@@ -30,6 +32,7 @@ void pit_init(void) {
 void irq0_handler(void) {
     g_pit_ticks++;
     outb(0x20, 0x20);   /* 主 PIC EOI（必须在 schedule 之前） */
+    task_timer_tick();  /* 步骤 8a：到点的定时睡眠者先回 READY，再进调度 */
     schedule();
 }
 
@@ -52,4 +55,35 @@ void irq_install(void) {
     idt_set_gate(32, (uint32_t)irq0, 0x08, 0x8E);
     idt_set_gate(33, (uint32_t)irq1, 0x08, 0x8E);
     idt_set_gate(44, (uint32_t)irq12, 0x08, 0x8E);
+
+    /* spurious IRQ7 (8259 spec): line withdrawn before INTA. With
+     * level-triggered PCI IRQs (PIIX ELCR) this happens whenever the
+     * NIC deasserts INTA while the CPU still has IF=0 (poll-path RX).
+     * Vector 39 = master spurious, 47 = slave spurious. */
+    idt_set_gate(39, (uint32_t)irq7s, 0x08, 0x8E);
+    idt_set_gate(47, (uint32_t)irq15s, 0x08, 0x8E);
+}
+
+/* ---- spurious IRQ7 (8259 spec) ----
+ * On INTA with no valid request the PIC issues IRQ7 (the slave's goes
+ * up through the cascade as vector 0x2F = 47). Distinguish real vs
+ * spurious via the in-service register:
+ *   real IRQ7/15: normal EOI (slave also needs the master cascade EOI);
+ *   spurious: no in-service bit, must NOT EOI that PIC (it would clear
+ * a lower-priority in-service interrupt), but a slave spurious still
+ * must EOI the master - cascade IRQ2 is genuinely in-service. */
+void irq7s_handler(void) {
+    outb(0x20, 0x0B);              /* OCW3: read ISR */
+    uint8_t isr = inb(0x20);
+    if (isr & 0x80)
+        outb(0x20, 0x20);          /* real IRQ7: master EOI */
+    /* spurious: no EOI */
+}
+
+void irq15s_handler(void) {
+    outb(0xA0, 0x0B);              /* OCW3: read slave ISR */
+    uint8_t isr = inb(0xA0);
+    if (isr & 0x80)
+        outb(0xA0, 0x20);          /* real IRQ15: slave EOI */
+    outb(0x20, 0x20);              /* cascade was in-service: master EOI */
 }

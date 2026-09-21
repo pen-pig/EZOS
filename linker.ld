@@ -65,4 +65,13 @@ SECTIONS
         __kstack_end = .;
     }
     ASSERT(__kstack_end <= 0x00A00000, "task kernel stacks exceed pool")
+    /* 大型纯数据缓冲（NOLOAD，启动不清零：内容均由守卫变量保护，
+     * 未写前不会被读）：tty 滚回区等。放 9.25-10MB 的空闲带——
+     * 陷入栈(9MB-16KB)与任务栈池(0x904000..0x924000)之后、pmm 池(10MB)之前。 */
+    .bss.buff 0x00930000 (NOLOAD) : {
+        __bbuf_start = .;
+        *(.bss.buff)
+        __bbuf_end = .;
+    }
+    ASSERT(__bbuf_end <= 0x00A00000, "buffer pool exceeds pmm area")
 }

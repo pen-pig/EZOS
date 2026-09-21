@@ -35,11 +35,13 @@ int terminal_end_capture(void) {
 static uint16_t* terminal_buffer;
 
 #define SCROLLBACK_LINES 100
-static uint16_t scrollback[SCROLLBACK_LINES][VGA_WIDTH];
+static uint16_t scrollback[SCROLLBACK_LINES][VGA_WIDTH]
+    __attribute__((section(".bss.buff")));
 static int sb_start = 0;
 static int sb_count = 0;
 static int view_offset = 0;
-static uint16_t screen_backup[VGA_HEIGHT][VGA_WIDTH];
+static uint16_t screen_backup[VGA_HEIGHT][VGA_WIDTH]
+    __attribute__((section(".bss.buff")));
 static int backup_valid = 0;
 
 enum vga_color {

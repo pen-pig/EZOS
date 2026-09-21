@@ -1,26 +1,19 @@
 /*
- * rtl8139.c - Realtek RTL8139 网卡驱动（步骤 7：收发 + ARP/ICMP echo）
+ * rtl8139.c - Realtek RTL8139 网卡驱动（步骤 7：帧收发层）
  *
  * 寄存器资料来源：Realtek RTL8139D datasheet + Linux rtl8139too 驱动位定义。
  *
- * 阶段覆盖：
- *   7.1  PCI 认领 → COMMAND 开 IO 解码 + BusMaster → CONFIG1 退出低功耗 →
- *       CR.RST 软复位（轮询自清，带超时）→ IDR0-5 读 MAC
- *   7.2  8KB RX 环（RBSTART + 软件读指针，CAPR 偏移 -0x10 约定）、
- *       4 个 TX 描述符轮转（TSD/TSAD，提交即返回）、IRQ 中断收包
- *       （IMR 只开 ROK，先清后处理防丢包竞态）、
- *       ARP request 应答、ICMP echo reply（IP/ICMP 校验和自算）。
+ * 职责边界（7.3 起）：本文件只做"帧进帧出"——
+ *   PCI 认领 → 复位 → 8KB RX 环（软件读指针）→ 4 TX 描述符轮转 →
+ *   IRQ11 中断收包 + rtl8139_poll() 轮询收包。
+ *   收到完整以太帧后上调 net_input()（kernel/net.c）做协议处理；
+ *   发送 rtl8139_send() 只管把帧塞进描述符。
  *
- * 内存模型：收发缓冲来自 kmalloc（.bss.hi 1-2MB，identity 映射，
- * 物理=线性，设备 DMA 直接用缓冲线性地址）；所有进程页目录共享内核
- * PDE（exec.c 只换 PDE1），故 IRQ 在任意 CR3 下访问缓冲都不会缺页。
- *
- * 并发模型：收包在 IRQ11 上下文（IF=0），send() 用 pushf/cli 保护
- * 描述符轮转——将来 ring0 任务态调用 send 与中断路径不会互踩。
- *
- * 安全边界：COMMAND 寄存器 32 位读-改-写保留 STATUS 原值；只对认领到的
- * 10EC:8139 写配置空间；RX 环长度字段做上界校验（防坏帧把读指针推飞），
- * 越界即复位环，fail closed。
+ * 两种收包驱动方式：
+ *   - IRQ11（系统调用之外、ring3 运行时）：异步排水
+ *   - rtl8139_poll()（系统调用内，IF=0 中断被屏蔽）：net.c 的阻塞
+ *     等待循环主动调用，保证 syscall 期间网络仍在收
+ *   两条路径互斥（单核 + 中断门清 IF），共用 rx_drain 无需加锁。
  *
  * 勘误（对 7.1 注释）：CR 的 TE=bit2(0x04)、RE=bit3(0x08)，
  * 不是旧注释写的 bit1/bit2——按旧注释写 0x06 只会置保留位+缺 RE，
@@ -32,6 +25,7 @@
 #include "kmalloc.h"
 #include "idt.h"
 #include "dmesg.h"
+#include "net.h"
 
 #define RTL8139_VENDOR 0x10EC
 #define RTL8139_DEVICE 0x8139
@@ -61,8 +55,8 @@
 #define RCR_APM    0x02
 #define RCR_AB     0x08
 
-/* TSD 位（Linux rtl8139too 同名位）：bit13 主机所有权、
- * bit14 欠载、bit15 发送成功。写低 13 位 = 帧长，即触发发送。 */
+/* TSD 位（Linux rtl8139too 同名位）：bit14 欠载、bit15 发送成功。
+ * 写低 13 位 = 帧长，即触发发送。 */
 #define TSD_TOK    0x8000u
 #define TSD_TUN    0x4000u
 
@@ -75,12 +69,9 @@
 #define RX_BUF_ALLOC   (RX_RING_SIZE + 16u)  /* datasheet 惯例：+16 字节尾巴 */
 #define RX_LEN_MIN     32u            /* 合法帧长（含 CRC）下界 */
 #define RX_LEN_MAX     1518u          /* 合法帧长（含 CRC）上界 */
+#define RX_HDR_LEN     4u             /* 每包头部：状态 16 + 帧长 16（含 CRC） */
 
-/* 每包头部 4 字节：低 16 位状态（bit0 ROK），高 16 位帧长（含 CRC，
- * 不含头部本身）——与 Linux rx_status>>16 的取法一致。 */
-#define RX_HDR_LEN     4u
-
-/* 每次 IRQ 最多处理的包数（防中断活锁；剩余包靠下一次中断） */
+/* 每次 IRQ 最多处理的包数（防中断活锁；剩余包靠下一次中断/轮询） */
 #define RX_DRAIN_MAX   64
 
 /* ---------- TX 参数 ---------- */
@@ -104,16 +95,13 @@ static uint8_t  g_ip[4] = {10, 0, 2, 15};
 static uint8_t *g_rx_ring;                    /* 8208B，kmalloc */
 static uint8_t *g_rx_frame;                   /* 收包整帧拷出缓冲（环回安全） */
 static uint8_t *g_tx_buf[TX_DESC_COUNT];      /* 4 × 1792B */
-static uint8_t *g_tx_build;                   /* ARP/ICMP 回复构造缓冲 */
 static uint32_t g_rx_pos;                     /* 下一个待读包的环内偏移（软件自持） */
 static uint8_t  g_tx_used[TX_DESC_COUNT];     /* 描述符已发射过（首次免等待） */
 static uint8_t  g_tx_next;
 
-/* 统计 */
+/* 统计（协议层计数在 net.c） */
 static uint32_t g_rx_packets, g_rx_errors;
 static uint32_t g_tx_packets, g_tx_busy;
-static uint32_t g_arp_rx, g_arp_replied;
-static uint32_t g_icmp_rx, g_icmp_replied;
 static uint32_t g_irq_count;
 
 /* 首包诊断（nic 命令显示，排查环偏移约定用） */
@@ -128,24 +116,6 @@ extern void irq11(void);
 
 /* ---------- 小工具 ---------- */
 
-static uint16_t be16(const uint8_t *p) {
-    return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
-}
-
-static int ip4_eq(const uint8_t *a, const uint8_t *b) {
-    for (int i = 0; i < 4; i++) if (a[i] != b[i]) return 0;
-    return 1;
-}
-
-/* Internet 校验和（RFC 1071）：16 位反码和，入参/返回均为网络字节序 */
-static uint16_t cksum(const uint8_t *p, uint32_t n) {
-    uint32_t s = 0;
-    while (n >= 2) { s += ((uint32_t)p[0] << 8) | p[1]; p += 2; n -= 2; }
-    if (n) s += (uint32_t)p[0] << 8;
-    while (s >> 16) s = (s & 0xFFFFu) + (s >> 16);
-    return (uint16_t)(~s);
-}
-
 /* 环形读：任意偏移按 8KB 取模（帧跨环尾自动回绕） */
 static uint8_t rx_r8(uint32_t off) {
     return g_rx_ring[off & RX_RING_MASK];
@@ -155,89 +125,6 @@ static uint16_t rx_r16(uint32_t off) {
 }
 static void rx_copy(uint8_t *dst, uint32_t off, uint32_t n) {
     for (uint32_t i = 0; i < n; i++) dst[i] = rx_r8(off + i);
-}
-
-/* ---------- 协议处理（g_rx_frame 里是不含 CRC 的完整以太帧） ---------- */
-
-static void arp_input(const uint8_t *f, uint32_t len) {
-    g_arp_rx++;
-    if (len < ETH_HDR_LEN + 28) return;
-    const uint8_t *a = f + ETH_HDR_LEN;
-    /* 只回 IPv4-over-Ethernet 的 request */
-    if (be16(a + 0) != 0x0001 || be16(a + 2) != 0x0800) return;
-    if (a[4] != 6 || a[5] != 4) return;
-    if (be16(a + 6) != 1) return;
-    if (!ip4_eq(a + 24, g_ip)) return;          /* 问的不是我们的 IP */
-
-    uint8_t rmac[6], rip[4];                    /* 先取出再覆写缓冲 */
-    for (int i = 0; i < 6; i++) rmac[i] = a[8 + i];
-    for (int i = 0; i < 4; i++) rip[i]  = a[14 + i];
-
-    uint8_t *r = g_tx_build;
-    for (int i = 0; i < 6; i++) r[i] = rmac[i];     /* dst = 请求方 */
-    for (int i = 0; i < 6; i++) r[6 + i] = g_mac[i];/* src = 本卡 */
-    r[12] = 0x08; r[13] = 0x06;
-    uint8_t *p = r + ETH_HDR_LEN;
-    p[0] = 0; p[1] = 1;                         /* htype = Ethernet */
-    p[2] = 0x08; p[3] = 0x00;                   /* ptype = IPv4 */
-    p[4] = 6; p[5] = 4;                         /* hlen / plen */
-    p[6] = 0; p[7] = 2;                         /* oper = reply */
-    for (int i = 0; i < 6; i++) p[8 + i] = g_mac[i];
-    for (int i = 0; i < 4; i++) p[14 + i] = g_ip[i];
-    for (int i = 0; i < 6; i++) p[18 + i] = rmac[i];
-    for (int i = 0; i < 4; i++) p[24 + i] = rip[i];
-    if (rtl8139_send(r, ETH_HDR_LEN + 28) == 0) g_arp_replied++;
-}
-
-static void ip_input(const uint8_t *f, uint32_t len) {
-    if (len < ETH_HDR_LEN + 20) return;
-    const uint8_t *ip = f + ETH_HDR_LEN;
-    if ((ip[0] >> 4) != 4) return;                       /* 非 IPv4 */
-    uint32_t ihl = (uint32_t)(ip[0] & 0x0F) * 4u;
-    if (ihl < 20 || ETH_HDR_LEN + ihl > len) return;
-    uint32_t totlen = be16(ip + 2);
-    if (totlen < ihl || totlen > 1500) return;
-    if (ETH_HDR_LEN + totlen > len) return;              /* 截断帧丢弃 */
-    if (ip[9] != 1) return;                              /* 只处理 ICMP */
-    if (!ip4_eq(ip + 16, g_ip)) return;                  /* 非本机 IP */
-
-    const uint8_t *ic = ip + ihl;
-    uint32_t iclen = totlen - ihl;
-    if (iclen < 8 || iclen > 1472) return;
-    if (ic[0] != 8 || ic[1] != 0) return;                /* 只回 echo request */
-    g_icmp_rx++;
-
-    uint32_t flen = ETH_HDR_LEN + totlen;
-    if (flen > TX_BUF_SIZE) return;
-
-    uint8_t *r = g_tx_build;                 /* 与 g_rx_frame 不同块，无别名 */
-    for (uint32_t i = 0; i < flen; i++) r[i] = f[i];
-    for (int i = 0; i < 6; i++) { r[i] = f[6 + i]; r[6 + i] = g_mac[i]; }
-
-    uint8_t *rip = r + ETH_HDR_LEN;
-    rip[8] = 64;                             /* TTL */
-    rip[10] = 0; rip[11] = 0;                /* 校验和先清零再算 */
-    for (int i = 0; i < 4; i++) {
-        rip[12 + i] = g_ip[i];               /* src = 本机 */
-        rip[16 + i] = ip[12 + i];            /* dst = 请求方 */
-    }
-    uint16_t c = cksum(rip, ihl);
-    rip[10] = (uint8_t)(c >> 8); rip[11] = (uint8_t)(c & 0xFF);
-
-    uint8_t *ric = rip + ihl;
-    ric[0] = 0;                              /* echo reply */
-    ric[2] = 0; ric[3] = 0;
-    c = cksum(ric, iclen);
-    ric[2] = (uint8_t)(c >> 8); ric[3] = (uint8_t)(c & 0xFF);
-
-    if (rtl8139_send(r, flen) == 0) g_icmp_replied++;
-}
-
-static void net_input(const uint8_t *f, uint32_t len) {
-    if (len < ETH_HDR_LEN) return;
-    uint16_t et = be16(f + 12);
-    if (et == 0x0806)      arp_input(f, len);
-    else if (et == 0x0800) ip_input(f, len);
 }
 
 /* ---------- RX 环处理 ---------- */
@@ -256,8 +143,7 @@ static void rx_drain(void) {
         }
 
         if (flen < RX_LEN_MIN || flen > RX_LEN_MAX) {
-            /* 环数据损坏（长度出界）：复位读指针，fail closed。
-             * 真实原因通常是主机侧注入了畸形帧或硬件状态异常。 */
+            /* 环数据损坏（长度出界）：复位读指针，fail closed */
             g_rx_errors++;
             g_rx_pos = 0;
             outw(REG(R_CAPR), (uint16_t)(0u - 0x10u));   /* = 0xFFF0 */
@@ -267,7 +153,7 @@ static void rx_drain(void) {
         uint32_t dlen = flen - 4;              /* 去 4 字节 CRC */
         rx_copy(g_rx_frame, g_rx_pos + RX_HDR_LEN, dlen);
         g_rx_packets++;
-        net_input(g_rx_frame, dlen);
+        net_input(g_rx_frame, dlen);           /* 协议处理（kernel/net.c） */
 
         /* 前进：帧占环 = 4 字节头 + flen，按 4 对齐后回绕 */
         g_rx_pos = (g_rx_pos + RX_HDR_LEN + flen + 3) & ~3u;
@@ -275,7 +161,10 @@ static void rx_drain(void) {
         /* CAPR 硬件约定 = 已读结束位置 - 0x10（16 位自然回绕） */
         outw(REG(R_CAPR), (uint16_t)(g_rx_pos - 0x10));
     }
-    /* guard 耗尽：剩余包等下一次 ROK 中断 */
+    /* 步骤 8a：本批包已入协议栈，踢醒睡在 net 等待队列上的
+     * recvfrom/accept/ARP 解析（IRQ 与轮询两种上下文都安全）。 */
+    net_rx_wake();
+    /* guard 耗尽：剩余包等下一次中断/轮询 */
 }
 
 /* ---------- IRQ11 处理 ---------- */
@@ -295,6 +184,16 @@ void irq11_handler(void) {
     outb(0x20, 0x20);                          /* 主 PIC EOI（级联始终要） */
 }
 
+/* 轮询收包：系统调用上下文（IF=0）里由 net.c 的阻塞循环调用 */
+void rtl8139_poll(void) {
+    if (!g_present) return;
+    uint16_t isr = inw(REG(R_ISR));
+    if (isr & ISR_ROK) {
+        outw(REG(R_ISR), ISR_ROK);
+        rx_drain();
+    }
+}
+
 /* ---------- 初始化 ---------- */
 
 static const pci_device_t *find_device(void) {
@@ -310,7 +209,6 @@ static const pci_device_t *find_device(void) {
 static void bufs_free(void) {
     if (g_rx_ring)  { kfree(g_rx_ring);  g_rx_ring = 0; }
     if (g_rx_frame) { kfree(g_rx_frame); g_rx_frame = 0; }
-    if (g_tx_build) { kfree(g_tx_build); g_tx_build = 0; }
     for (int i = 0; i < TX_DESC_COUNT; i++) {
         if (g_tx_buf[i]) { kfree(g_tx_buf[i]); g_tx_buf[i] = 0; }
     }
@@ -341,24 +239,24 @@ int rtl8139_init(void) {
     /* BAR0 必须是 IO 空间（bit0=1）；低 2 位是标志位，清掉得到基址。
      * QEMU 实测 BAR0=0xC001 → IO base 0xC000。 */
     uint32_t bar0 = d->bar[0];
-    if ((bar0 & 1u) == 0) {            /* 不是 IO BAR，异常形态，fail closed */
+    if ((bar0 & 1u) == 0) {
         dmesg_write("RTL8139: BAR0 is not IO space, giving up");
         return -1;
     }
     uint32_t io = bar0 & ~0x3u;
-    if (io == 0 || io > 0xFFFFu) {     /* IO 端口空间只有 64KB */
+    if (io == 0 || io > 0xFFFFu) {
         dmesg_write("RTL8139: invalid IO base, giving up");
         return -1;
     }
     g_io_base = (uint16_t)io;
     g_irq = d->intr_line;
 
-    /* 开 IO 空间解码 + Bus Master（收发 DMA 必需）。 */
+    /* 开 IO 空间解码 + Bus Master（收发 DMA 必需） */
     uint32_t cmd = pci_read_dword(d->bus, d->dev, d->func, PCI_REG_COMMAND);
     cmd |= PCI_CMD_IO_SPACE | PCI_CMD_BUS_MASTER;
     pci_write_dword(d->bus, d->dev, d->func, PCI_REG_COMMAND, cmd);
 
-    /* 退出低功耗后软复位；RST 自清零，等它清完才能碰其它寄存器。 */
+    /* 退出低功耗后软复位；RST 自清零，等它清完才能碰其它寄存器 */
     outb(REG(R_CONFIG1), 0x00);
     outb(REG(R_CR), CR_RST);
     {
@@ -374,11 +272,10 @@ int rtl8139_init(void) {
     for (int i = 0; i < 6; i++)
         g_mac[i] = inb(REG(R_IDR0 + i));
 
-    /* ---- 7.2：收发缓冲（kmalloc，.bss.hi identity，DMA 直投） ---- */
+    /* ---- 收发缓冲（kmalloc，.bss.hi identity，DMA 直投） ---- */
     g_rx_ring  = kmalloc(RX_BUF_ALLOC);
     g_rx_frame = kmalloc(TX_BUF_SIZE);
-    g_tx_build = kmalloc(TX_BUF_SIZE);
-    int ok = (g_rx_ring && g_rx_frame && g_tx_build);
+    int ok = (g_rx_ring && g_rx_frame);
     for (int i = 0; ok && i < TX_DESC_COUNT; i++) {
         g_tx_buf[i] = kmalloc(TX_BUF_SIZE);
         if (!g_tx_buf[i]) ok = 0;
@@ -397,15 +294,13 @@ int rtl8139_init(void) {
     outl(REG(R_RBSTART), (uint32_t)g_rx_ring);
     outl(REG(R_RCR), RCR_APM | RCR_AB);
 
-    /* 清残留中断状态 → 使能收发（注意 TE|RE = 0x0C，见文件头勘误） */
+    /* 清残留中断状态 → 使能收发（TE|RE = 0x0C，见文件头勘误） */
     outw(REG(R_ISR), 0x7FFF);
     outb(REG(R_CR), CR_TE | CR_RE);
 
     /* 中断路由：IDT 门 + PIC 掩码，最后才开 IMR（防半初始化状态进中断） */
-    if (irq_route() != 0) {
+    if (irq_route() != 0)
         dmesg_write("RTL8139: unusual IRQ line, run without interrupts");
-        /* 无中断时收包不可用，但 MAC/发送仍可工作；不视为致命 */
-    }
     outw(REG(R_IMR), ISR_ROK);
 
     g_present = 1;
@@ -486,8 +381,6 @@ uint32_t rtl8139_rx_packets(void)   { return g_rx_packets; }
 uint32_t rtl8139_rx_errors(void)    { return g_rx_errors; }
 uint32_t rtl8139_tx_packets(void)   { return g_tx_packets; }
 uint32_t rtl8139_tx_busy(void)      { return g_tx_busy; }
-uint32_t rtl8139_arp_replied(void)  { return g_arp_replied; }
-uint32_t rtl8139_icmp_replied(void) { return g_icmp_replied; }
 uint32_t rtl8139_irq_count(void)    { return g_irq_count; }
 
 void rtl8139_rx_debug(uint32_t *status, uint32_t *len, uint32_t *capr) {

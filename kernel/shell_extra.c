@@ -31,6 +31,7 @@
 #include "fd.h"
 #include "pci.h"
 #include "rtl8139.h"
+#include "net.h"
 
 /* ==================================================================
  * 1. ezos_console 适配层：把 EZOS tty / 键盘桥接为轻量 console 接口
@@ -76,7 +77,13 @@ int ezos_console_readline(char *buf, int maxlen) {
     int n = 0;
     while (1) {
         int c = keyboard_getchar();
-        if (c == 0) continue;
+        if (c == 0) {
+            /* 步骤 8a：没键就睡（IRQ1 唤醒 / 30s 超时兜底），不再忙轮询——
+             * shell 空闲时 CPU 停在 hlt 上，风扇/功耗友好，也让出片给
+             * 其它任务。仅任务上下文可睡：shell 正是任务 0。 */
+            keyboard_block();
+            continue;
+        }
         if (c == 27) return -1;
         if (c == '\n') {
             terminal_putchar('\n');
@@ -216,7 +223,7 @@ const char *shell_extra_lookup_alias(const char *name) {
 /* ver: 显示内核版本 */
 void cmd_ver(const char *args) {
     (void)args;
-    ezos_console_write("EZOS Kernel version 0.3-gui (i386)\n");
+    ezos_console_write("EZOS Kernel version 0.9.0 (i386)\n");
 }
 
 /* sysinfo: 汇总系统信息（CPU / 内存 / 时间 / 版本） */
@@ -245,7 +252,7 @@ void cmd_sysinfo(const char *args) {
 
     ezos_console_write("EZOS System Information\n");
     ezos_console_write("------------------------\n");
-    ezos_console_write("Version : 0.3-gui (i386)\n");
+    ezos_console_write("Version : 0.9.0 (i386)\n");
     ezos_console_write("CPU     : ");
     x_print_cpu_vendor();
     ezos_console_write("\n");
@@ -1567,11 +1574,23 @@ void cmd_nic(const char *args) {
     ezos_console_write(" pkts ");
     ezos_console_print_dec(rtl8139_tx_busy());
     ezos_console_write(" busy\nARP: ");
-    ezos_console_print_dec(rtl8139_arp_replied());
+    ezos_console_print_dec(net_arp_replied());
     ezos_console_write(" replied\nICMP: ");
-    ezos_console_print_dec(rtl8139_icmp_replied());
+    ezos_console_print_dec(net_icmp_replied());
     ezos_console_write(" replied\nIRQ11: ");
     ezos_console_print_dec(rtl8139_irq_count());
+    ezos_console_write("\nUDP: ");
+    ezos_console_print_dec(net_udp_rx());
+    ezos_console_write(" in ");
+    ezos_console_print_dec(net_udp_tx());
+    ezos_console_write(" out\nTCP: ");
+    ezos_console_print_dec(net_tcp_rx());
+    ezos_console_write(" in ");
+    ezos_console_print_dec(net_tcp_tx());
+    ezos_console_write(" out\nARPcache: ");
+    ezos_console_print_dec(net_arp_entries());
+    ezos_console_write(" entries, sockets: ");
+    ezos_console_print_dec(net_sock_count());
     ezos_console_write("\nDBG: st=0x");
     uint32_t ds = 0, dl = 0, dc = 0;
     rtl8139_rx_debug(&ds, &dl, &dc);

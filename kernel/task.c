@@ -16,12 +16,22 @@
 static uint8_t g_kstacks[MAX_TASKS][TASK_KSIZE]
     __attribute__((section(".bss.kstack"), aligned(16)));
 
-static task_t   g_tasks[MAX_TASKS];
+/* g_tasks 迁 .bss.hi（步骤 8a）：低 .bss 在 0x90000 栈区断言前只剩
+ * ~160B，等待队列新字段（wait_next/wake_tick/wait_q）加上必然顶爆
+ * ASSERT。高段（1-2MB）identity 映射且所有进程 PD 共享，IRQ/系统调用
+ * 上下文访问无碍（同 net.c 的 socket 表/ARP 缓存的取舍）。 */
+static task_t   g_tasks[MAX_TASKS] __attribute__((section(".bss.hi")));
 static uint32_t g_current;              /* 当前任务在表中的下标 */
 static uint32_t g_next_pid = 1;
 static uint32_t g_sched_count;
 static uint32_t g_lock_depth;           /* 临界区嵌套计数 */
 static int      g_ready;                /* task_init 是否已完成 */
+
+/* ZOMBIE 收割等待队列（步骤 8a）：task_wait_pid 睡在这上面，
+ * 子进程 process_exit 时唤醒——取代旧的"轮询 + task_yield"忙等。
+ * {-1}：head 哨兵必须是 -1（0 是合法任务下标，静态零初始化会把
+ * shell 误挂进空队列）。所有静态等待队列同理。 */
+static wait_queue_t g_wq_reap = {-1};
 
 extern void switch_to(uint32_t *old_esp, uint32_t new_esp);
 
@@ -29,50 +39,54 @@ extern void switch_to(uint32_t *old_esp, uint32_t new_esp);
 /*
  * 新任务的栈必须摆成**完整的 IRQ0 中断帧**，因为抢占切换发生在中断上下文里。
  *
- * switch_to 恢复序列：pop edi; pop esi; pop ebx; pop ebp; ret
- * ret 落到 task_irq_trampoline，它执行 popa; sti; iret（等价于 irq0 桩的
- * 后半段）——iret 弹出 EIP/CS/EFLAGS 进入 fn，EFLAGS 预置 0x202 使 IF=1。
+ * switch_to 恢复序列（步骤 8a 起）：pop edi; pop esi; pop ebx; pop ebp;
+ * popfd; ret。ret 落到 task_irq_trampoline，它执行 popa; sti; iret（等价于
+ * irq0 桩的后半段）——iret 弹出 EIP/CS/EFLAGS 进入 fn，EFLAGS 预置 0x202
+ * 使 IF=1。popfd 槽预置 0x0002（IF=0）：首次出场由 trampoline 的 sti
+ * 再开中断，与切换点 IF=0 的约定一致（见 task_switch.asm 的注释）。
  *
  *   esp+ 0  edi          <- switch_to 的 pop edi
  *   esp+ 4  esi
  *   esp+ 8  ebx
  *   esp+12  ebp
- *   esp+16  trampoline   <- switch_to 的 ret 目标
- *   esp+20  eax          <- popa 区（低地址是 eax：pusha 先压 eax）
- *   esp+24  ecx
- *   esp+28  edx
- *   esp+32  ebx
- *   esp+36  esp (dummy)
- *   esp+40  ebp
- *   esp+44  esi
- *   esp+48  edi
- *   esp+52  EIP = fn     <- iret 弹出（ring0 中断：无 ESP/SS）
- *   esp+56  CS  = 0x08
- *   esp+60  EFLAGS=0x202 (IF=1)
- *   esp+64  task_exit    <- fn 的返回地址
- *   esp+68  arg          <- fn 的参数
+ *   esp+16  EFLAGS=0x0002 <- switch_to 的 popfd（IF=0）
+ *   esp+20  trampoline   <- switch_to 的 ret 目标
+ *   esp+24  eax          <- popa 区（低地址是 eax：pusha 先压 eax）
+ *   esp+28  ecx
+ *   esp+32  edx
+ *   esp+36  ebx
+ *   esp+40  esp (dummy)
+ *   esp+44  ebp
+ *   esp+48  esi
+ *   esp+52  edi
+ *   esp+56  EIP = fn     <- iret 弹出（ring0 中断：无 ESP/SS）
+ *   esp+60  CS  = 0x08
+ *   esp+64  EFLAGS=0x202 (IF=1)
+ *   esp+68  task_exit    <- fn 的返回地址
+ *   esp+72  arg          <- fn 的参数
  *
- * 若改动 irq0 桩（boot/kernel_entry.asm）或 task_switch.asm 的 trampoline，
- * 本布局必须同步修改——三者是绑定的。
+ * 若改动 irq0 桩（boot/kernel_entry.asm）或 task_switch.asm 的 trampoline/
+ * popfd 序列，本布局必须同步修改——三者是绑定的。
  */
 extern void task_irq_trampoline(void);
 
 static void stack_init(task_t *t, void (*fn)(void *), void *arg) {
     uint32_t *sp = (uint32_t *)t->kstack_top;
-    *--sp = (uint32_t)arg;              /* +68 */
-    *--sp = (uint32_t)task_exit;        /* +64 */
-    *--sp = 0x202u;                     /* +60 EFLAGS: IF=1 */
-    *--sp = 0x08u;                      /* +56 CS = 内核代码段 */
-    *--sp = (uint32_t)fn;               /* +52 EIP */
-    *--sp = 0u;                         /* +48 edi (popa) */
-    *--sp = 0u;                         /* +44 esi */
-    *--sp = 0u;                         /* +40 ebp */
-    *--sp = 0u;                         /* +36 esp (dummy) */
-    *--sp = 0u;                         /* +32 ebx */
-    *--sp = 0u;                         /* +28 edx */
-    *--sp = 0u;                         /* +24 ecx */
-    *--sp = 0u;                         /* +20 eax */
-    *--sp = (uint32_t)task_irq_trampoline;  /* +16 switch_to ret 目标 */
+    *--sp = (uint32_t)arg;              /* +72 */
+    *--sp = (uint32_t)task_exit;        /* +68 */
+    *--sp = 0x202u;                     /* +64 EFLAGS: IF=1 */
+    *--sp = 0x08u;                      /* +60 CS = 内核代码段 */
+    *--sp = (uint32_t)fn;               /* +56 EIP */
+    *--sp = 0u;                         /* +52 edi (popa) */
+    *--sp = 0u;                         /* +48 esi */
+    *--sp = 0u;                         /* +44 ebp */
+    *--sp = 0u;                         /* +40 esp (dummy) */
+    *--sp = 0u;                         /* +36 ebx */
+    *--sp = 0u;                         /* +32 edx */
+    *--sp = 0u;                         /* +28 ecx */
+    *--sp = 0u;                         /* +24 eax */
+    *--sp = (uint32_t)task_irq_trampoline;  /* +20 switch_to ret 目标 */
+    *--sp = 0x0002u;                    /* +16 EFLAGS for popfd（IF=0，bit1 恒 1） */
     *--sp = 0u;                         /* +12 ebp */
     *--sp = 0u;                         /* +8  ebx */
     *--sp = 0u;                         /* +4  esi */
@@ -102,6 +116,9 @@ void task_init(void) {
         g_tasks[i].img.nseg = 0;
         g_tasks[i].img.entry = 0;
         g_tasks[i].img.brk = 0;
+        g_tasks[i].wait_next = -1;
+        g_tasks[i].wake_tick = 0;
+        g_tasks[i].wait_q = 0;
     }
 
     /* 0 号任务 = 当前执行流（kernel_main → shell）。它用的还是启动栈，
@@ -152,6 +169,10 @@ int task_create(const char *name, void (*fn)(void *), void *arg) {
     t->pd_phys    = 0;
     t->pt_phys    = 0;
     t->img.nseg   = 0;
+    t->wait_next  = -1;             /* 槽位复用：等待字段必须清——上个任务
+                                       的残留链指针会挂出幽灵队列 */
+    t->wake_tick  = 0;
+    t->wait_q     = 0;
     if (name) {
         int i = 0;
         for (; name[i] && i < 15; i++) t->name[i] = name[i];
@@ -169,8 +190,10 @@ void task_exit(void) {
     g_tasks[g_current].state = TASK_ZOMBIE;
     /* 让出 CPU：ZOMBIE 不会被再选中，调度器自然切走 */
     task_yield();
-    /* 不该走到这里 */
-    for (;;) asm volatile("cli; hlt");
+    /* 不该走到这里（没有别的可运行任务时 schedule 直接返回）。
+     * 停车必须 sti 而不是 cli：僵尸占着 CPU 只是暂态，等待者可能睡在
+     * 定时唤醒上——关中断会让 PIT 停摆，全系统的超时一起冻死。 */
+    for (;;) asm volatile("sti; hlt");
 }
 
 /* ---------- 用户进程（步骤 6c） ---------- */
@@ -209,6 +232,9 @@ int task_create_process(const char *name, uint32_t entry, uint32_t user_esp,
     t->pd_phys    = pd_phys;
     t->pt_phys    = 0;
     t->img.nseg   = 0;
+    t->wait_next  = -1;             /* 槽位复用：同 task_create */
+    t->wake_tick  = 0;
+    t->wait_q     = 0;
     if (name) {
         int i = 0;
         for (; name[i] && i < 15; i++) t->name[i] = name[i];
@@ -245,6 +271,7 @@ int task_create_process(const char *name, uint32_t entry, uint32_t user_esp,
     *--sp = entry;                  /* EIP */
     for (int i = 0; i < 8; i++) *--sp = 0u;      /* popa 区 */
     *--sp = (uint32_t)task_irq_trampoline;
+    *--sp = 0x0002u;                /* EFLAGS for popfd（IF=0，bit1 恒 1） */
     *--sp = 0u;                     /* ebp */
     *--sp = 0u;                     /* ebx */
     *--sp = 0u;                     /* esi */
@@ -264,6 +291,13 @@ void process_exit(int code) {
 
     me->exit_code = code;
     me->state = TASK_ZOMBIE;
+
+    /* 0) 唤醒所有等待者（步骤 8a）：
+     *    - 睡在收割队列上的父进程（wait_pid）——它等的就是这一刻的 ZOMBIE；
+     *    - 万一还有谁直接睡在本任务身上（me->wait_q，预留语义）。
+     * 必须在拆页目录之前做：waiter 醒来可能引用本进程的用户内存。 */
+    task_wake_all(&g_wq_reap);
+    if (me->wait_q != 0) task_wake_all(me->wait_q);
 
     /* 1) 先回内核地址空间——下面要释放的正是当前页目录所在的页 */
     paging_switch_cr3(PAGING_PD_ADDR);
@@ -285,9 +319,10 @@ void process_exit(int code) {
     /* 3) 关掉它打开的文件（dirty 落盘）：进程退出的 fd 语义 */
     for (uint32_t f = 3; f < MAX_OPEN_FDS; f++) fd_close(&me->fds, (int)f);
 
-    /* 4) 让出 CPU。本帧永不返回——槽位由 task_wait_pid 回收。 */
+    /* 4) 让出 CPU。本帧永不返回——槽位由 task_wait_pid 回收。
+     * 兜底停车同样 sti;hlt（理由同 task_exit：别关死中断）。 */
     schedule();
-    for (;;) asm volatile("cli; hlt");
+    for (;;) asm volatile("sti; hlt");
 }
 
 int task_wait_pid(int pid) {
@@ -306,8 +341,110 @@ int task_wait_pid(int pid) {
             t->name[0] = '\0';
             return code;
         }
-        task_yield();                            /* 还活着：让出 CPU 等它 */
+        /* 步骤 8a：真睡眠等子进程 ZOMBIE（process_exit 会 wake_all）。
+         * 无超时——wait 语义就是无限等；对方消失由循环顶的 task_find 判定。 */
+        task_sleep(&g_wq_reap, 0);
     }
+}
+
+/* ---------- 等待队列与可睡眠阻塞（步骤 8a） ----------
+ *
+ * 正确性核心：丢失唤醒在结构上不可能。
+ *   task_sleep 全程 IF=0——"查条件→入队→置 BLOCKED→切换"这条路径上
+ *   任何唤醒源（IRQ1 键盘 / IRQ11 网卡 / IRQ0 定时）都无法插进来：
+ *   唤醒者要么整体先跑（条件已真，等待者根本不入队），要么整体后跑
+ *   （必然看得到入队与 BLOCKED 置位）。单核上，cli 窗口就是原子性。
+ *
+ * 超时用 g_pit_ticks（1ms/格，uint32 约 49.7 天回绕）：deadline 比较用
+ * 回绕安全的有符号差。注意"超时打断后再次 task_sleep"会重新计满整个
+ * timeout——本原语的调用方（wait_cond 风格包装）都持自己的绝对
+ * deadline，不依赖 task_sleep 保留剩余预算。
+ *
+ * schedule() 发现无人可切而直接返回时，睡眠者"顶着 BLOCKED 状态"继续
+ * 持有 CPU（状态对调度器的谎言）：此时它留在队列上，由 task_sleep 收尾
+ * 摘链并 sti;hlt 停机等唤醒源。停机只能发生在任务上下文——schedule 若
+ * 从 IRQ0 进来，被中断任务的 state 是 RUNNING，走不到这个分支。
+ */
+
+static void wq_push(wait_queue_t *wq, int idx) {
+    g_tasks[idx].wait_next = wq->head;
+    g_tasks[idx].wait_q = wq;
+    wq->head = idx;
+}
+
+static void wq_remove(wait_queue_t *wq, int idx) {
+    int *p = &wq->head;
+    while (*p != -1) {
+        if (*p == idx) {
+            *p = g_tasks[idx].wait_next;
+            g_tasks[idx].wait_next = -1;
+            g_tasks[idx].wait_q = 0;
+            return;
+        }
+        p = &g_tasks[*p].wait_next;
+    }
+}
+
+void task_timer_tick(void) {
+    if (!g_ready) return;
+    uint32_t now = g_pit_ticks;
+    for (uint32_t i = 0; i < MAX_TASKS; i++) {
+        task_t *t = &g_tasks[i];
+        if (t->state != TASK_BLOCKED || t->wake_tick == 0) continue;
+        if ((int32_t)(now - t->wake_tick) < 0) continue;   /* 未到期 */
+        if (t->wait_q != 0) wq_remove(t->wait_q, (int)i);
+        t->wake_tick = 0;
+        t->state = TASK_READY;     /* 真唤醒还是超时，由等待循环自查条件 */
+    }
+}
+
+void task_wake_all(wait_queue_t *wq) {
+    if (!g_ready || wq == 0) return;
+    int i = wq->head;
+    while (i != -1) {
+        int nx = g_tasks[i].wait_next;
+        g_tasks[i].wait_next = -1;
+        g_tasks[i].wait_q = 0;
+        g_tasks[i].wake_tick = 0;
+        /* 只动真正睡着的。顶 BLOCKED 状态持 CPU 的睡眠者（见文件头）
+         * 还没被切走，wake_all 若把它置 READY 会让 schedule 多派一次——
+         * 但它随后的收尾会把状态归位，这里保持只字面唤醒。 */
+        if (g_tasks[i].state == TASK_BLOCKED) g_tasks[i].state = TASK_READY;
+        i = nx;
+    }
+    wq->head = -1;
+}
+
+void task_sleep(wait_queue_t *wq, uint32_t timeout_ms) {
+    if (!g_ready || wq == 0) return;
+    if (g_lock_depth != 0) return;     /* 临界区内不许睡：schedule 也不切 */
+
+    int me = (int)g_current;
+    task_t *t = &g_tasks[me];
+
+    asm volatile("cli");
+    t->wake_tick = timeout_ms ? (g_pit_ticks + timeout_ms) : 0;
+    t->state = TASK_BLOCKED;
+    wq_push(wq, me);
+    schedule();                        /* 全程 IF=0：路径不可分割 */
+
+    /* 回到这里两种可能：
+     *   a) 被切走又切回——唤醒/超时方已摘链，调度器派发时置了 RUNNING；
+     *   b) 无人可切，schedule 未切换直接返回——本任务"顶着 BLOCKED"
+     *      继续持 CPU，且仍在队列上（这正是要的：wake_all 与 timer_tick
+     *      都还能找到它。若在此前摘链/清 deadline，停机后就再无人能唤醒
+     *      ——PIT 到点无人可标 READY，等于自锁）。 */
+    if (t->state == TASK_BLOCKED) {
+        /* b)：保持登记，开中断停机。从 hlt 醒来即某个唤醒源已跑完：
+         * 可能是真唤醒、超时、或无关中断（假唤醒——调用方循环重查条件）。
+         * 无论哪种，这里归一化状态后返回，由调用方判定下一步。 */
+        asm volatile("sti; hlt");
+        if (t->wait_q == wq) wq_remove(wq, me);
+        t->wake_tick = 0;
+        t->state = TASK_RUNNING;       /* 此刻 CPU 就在它手里，如实登记 */
+        return;
+    }
+    t->wake_tick = 0;                  /* a)：清残留 deadline 即可 */
 }
 
 void task_yield(void) {
@@ -358,13 +495,16 @@ void schedule(void) {
     uint32_t next = g_current;
     for (uint32_t i = 1; i <= MAX_TASKS; i++) {
         uint32_t cand = (g_current + i) % MAX_TASKS;
+        /* BLOCKED（步骤 8a）：睡在等待队列上，只等唤醒，不参与轮转 */
         if (g_tasks[cand].state == TASK_READY || g_tasks[cand].state == TASK_RUNNING) {
             next = cand;
             break;
         }
     }
     if (next == g_current) {
-        /* 没有别的候选（当前是唯一可运行的），续一个时间片继续跑 */
+        /* 没有别的候选：睡眠者的等待循环自己负责停机等待（task_sleep
+         * 里的 sti;hlt——只能任务上下文做，中断上下文 sti 会引 PIT 嵌套），
+         * 这里直接返回，让调用方（很可能正睡在循环里）继续。 */
         cur->ticks = TASK_TIMESLICE;
         return;
     }
@@ -435,6 +575,7 @@ uint32_t schedule_count(void) { return g_sched_count; }
  */
 static volatile uint32_t g_a, g_b;
 static volatile int g_a_done, g_b_done;
+static wait_queue_t g_wq_self = {-1};   /* 自检：定时睡眠用（哨兵 -1，同上） */
 
 static void tick_a(void *arg) {
     (void)arg;
@@ -494,6 +635,20 @@ int task_selftest(void (*out)(const char *)) {
 
     if (ta) ta->state = TASK_UNUSED;
     if (tb) tb->state = TASK_UNUSED;
+
+    /* 4) 定时睡眠（步骤 8a）：此刻没有别的可运行任务——task_sleep 会
+     * 走"无人可切 → 保持入队登记 → sti;hlt 停机"路径，30ms 后由 IRQ0
+     * 的 task_timer_tick 标 READY 并把 CPU 从 hlt 拉起来。睡眠期间
+     * tick 必须前进（ woke = PIT 没停摆），且偏差在教学容差内。 */
+    {
+        uint32_t t0 = g_pit_ticks;
+        task_sleep(&g_wq_self, 30);
+        uint32_t dt = g_pit_ticks - t0;
+        int ok_sleep = (dt >= 25u && dt <= 500u);
+        out("  timed sleep 30ms woke via PIT: ");
+        out(ok_sleep ? "yes [OK]\n" : "NO [FAIL]\n");
+        if (!ok_sleep) fail++;
+    }
 
     out(fail == 0 ? "  result: PASS\n" : "  result: FAIL\n");
     return fail;

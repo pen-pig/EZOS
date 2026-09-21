@@ -141,12 +141,18 @@ int fd_read(fd_table_t *t, int fd, uint8_t *buf, uint32_t n) {
     fd_entry_t *e = &t->fds[fd];
 
     if (e->type == FD_TYPE_STDIN) {
-        /* 非阻塞读键盘：缓冲空返回 0（真正的阻塞读要等调度器就绪后
-         * 把 shell 睡眠在键盘等待队列上，那是 6c 之后的事）。 */
+        /* 步骤 8a：阻塞读键盘。缓冲空 → keyboard_block() 睡到 IRQ1
+         * 塞入按键或 30s 超时（超时按 EOF 语义返回已读字节，可能为 0）。
+         * 已读到部分数据时缓冲取空即返回——保持"有数据就不等满"的
+         * 旧语义，readline 类调用方不会被卡在半个行缓冲上。 */
         uint32_t i = 0;
         while (i < n) {
             int c = keyboard_getchar();
-            if (c == 0) break;
+            if (c == 0) {
+                if (i > 0) break;
+                keyboard_block();
+                continue;
+            }
             buf[i++] = (uint8_t)c;
         }
         return (int)i;

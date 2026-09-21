@@ -99,3 +99,15 @@ lseek:
     int     0x80
     pop     ebx
     ret
+
+; ---- int sockcall(int subcmd, void *args) : SYS_SOCKCALL (102) ----
+; args points to five u32 slots (a..e); subcmd codes in kernel/net.h (SC_*).
+global sockcall
+sockcall:
+    push    ebx
+    mov     eax, 102            ; SYS_SOCKCALL
+    mov     ebx, [esp + 8]      ; subcmd
+    mov     ecx, [esp + 12]     ; args
+    int     0x80
+    pop     ebx
+    ret
