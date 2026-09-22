@@ -14,7 +14,7 @@
   [rtx]      对端故意不 ACK guest 的回显段，断言同一 seq 的段出现 ≥2 次
              （重传定时器真的在工作），随后再 ACK 让它停下
 
-用法：python temp/test_step7_tcp.py        （退出码 0 = 全部断言通过）
+用法：python tests/test_step7_tcp.py        （退出码 0 = 全部断言通过）
 前置：ninja 已产出 os-image.bin / disk.img（disk.img 需含 NETCLI.ELF）
 端口：netdev 4476（QEMU listen，脚本连），monitor 55666（sendkey 键入）
 """

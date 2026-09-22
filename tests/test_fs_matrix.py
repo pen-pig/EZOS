@@ -13,9 +13,9 @@
 （EROFS 只读，不提供 format，不在矩阵里）
 每个 FS 跑：format → df → write → ls → cat → rm → ls（确认删掉）
 
-数据盘用 disk.img 的副本（temp/disk_fs.img），绝不污染构建产物。
+数据盘用 disk.img 的副本（tests/disk_fs.img），绝不污染构建产物。
 端口 4493（与其它 E2E 端口约定一致）。
-用法：python temp/test_fs_matrix.py        （退出码 0 = 全部通过）
+用法：python tests/test_fs_matrix.py        （退出码 0 = 全部通过）
 """
 import json
 import os

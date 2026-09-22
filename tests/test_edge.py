@@ -14,7 +14,7 @@
   - 用例前先确认上一轮的 QEMU 已释放端口，否则会连到残留 VM（脏状态）
   - 单用例异常记 FAIL 并继续，不整组中止；QMP 读写都有超时，不会挂死
   - 数据盘用 disk.img 副本（超长文件名会真的写进卷里）
-端口 4496。用法：python temp/test_edge.py
+端口 4496。用法：python tests/test_edge.py
 """
 import json
 import os

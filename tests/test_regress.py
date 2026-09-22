@@ -15,7 +15,7 @@ QMP sendkey 打字 → screendump → 真字库 OCR → 断言。
   - 全程断言屏幕无 "panic"，末尾再跑一条命令证明系统仍可用
 
 端口 4463（与项目其它 E2E 端口约定一致，脚本间不撞车）。
-用法：python temp/test_regress.py      （退出码 0 = 全通过）
+用法：python tests/test_regress.py      （退出码 0 = 全通过）
 """
 import json
 import os
