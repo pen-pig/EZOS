@@ -93,3 +93,9 @@ backups/
 b*.txt
 *_err.txt
 merge_*.txt
+
+# E2E 运行产物（tests/ 下的脚本本身入库，抓包/截图/临时盘镜像不入库）
+tests/*.pcap
+tests/*.ppm
+tests/disk_fs.img
+tests/disk_edge.img
