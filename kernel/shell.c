@@ -270,6 +270,8 @@ static const command_t commands[] = {
     {"ps",        cmd_ps},
     {"pci",       cmd_pci},
     {"nic",       cmd_nic},
+    {"ping",      cmd_ping},
+    {"httpd",     cmd_httpd},
     {0, 0}
 };
 

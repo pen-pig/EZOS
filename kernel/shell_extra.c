@@ -1591,6 +1591,11 @@ void cmd_nic(const char *args) {
     ezos_console_print_dec(net_arp_entries());
     ezos_console_write(" entries, sockets: ");
     ezos_console_print_dec(net_sock_count());
+    ezos_console_write("\nPING: ");
+    ezos_console_print_dec(net_ping_reqs());
+    ezos_console_write(" req, ");
+    ezos_console_print_dec(net_ping_matched());
+    ezos_console_write(" matched");
     ezos_console_write("\nDBG: st=0x");
     uint32_t ds = 0, dl = 0, dc = 0;
     rtl8139_rx_debug(&ds, &dl, &dc);
@@ -1600,5 +1605,88 @@ void cmd_nic(const char *args) {
     ezos_console_write(" capr=0x");
     ezos_console_print_hex32(dc);
     ezos_console_write("\n");
+}
+
+/* ---- ping <a.b.c.d>：发 4 个 ICMP echo request，打印往返时延 ---- */
+static wait_queue_t g_ping_gap_wq = {-1};   /* 两次 ping 之间的间歇睡这 */
+static const char *ips_of(uint32_t be);
+
+void cmd_ping(const char *args) {
+    uint32_t ip[4];
+    const char *p = args;
+    while (*p == ' ') p++;
+    for (int f = 0; f < 4; f++) {
+        uint32_t v = 0;
+        int d = 0;
+        while (*p >= '0' && *p <= '9') {
+            v = v * 10 + (uint32_t)(*p - '0');
+            p++;
+            d++;
+            if (v > 255) break;
+        }
+        if (d == 0 || v > 255) { p = ""; break; }
+        ip[f] = v;
+        if (f < 3) {
+            if (*p == '.') p++;
+            else { p = ""; break; }
+        }
+    }
+    if (*p != '\0') {
+        ezos_console_write("Usage: ping <a.b.c.d>\n");
+        return;
+    }
+    uint32_t be = (ip[0] << 24) | (ip[1] << 16) | (ip[2] << 8) | ip[3];
+
+    for (int i = 1; i <= 4; i++) {
+        uint32_t rtt = 0;
+        int rc = net_ping(be, 2000, &rtt);
+        if (rc == 0) {
+            ezos_console_write("reply from ");
+            ezos_console_write(ips_of(be));
+            ezos_console_write(": seq=");
+            ezos_console_print_dec((uint32_t)i);
+            ezos_console_write(" time=");
+            ezos_console_print_dec(rtt);
+            ezos_console_write(" ms\n");
+        } else if (rc == 1) {
+            ezos_console_write("request timeout (seq=");
+            ezos_console_print_dec((uint32_t)i);
+            ezos_console_write(")\n");
+        } else {
+            ezos_console_write("send failed (no route / arp)\n");
+        }
+        if (i < 4) task_sleep(&g_ping_gap_wq, 500);
+    }
+}
+
+/* "a.b.c.d"（大端打包 → 文本；ips 缓冲至少 16 字节） */
+static const char *ips_of(uint32_t be) {
+    static char buf[16];
+    uint8_t o[4] = { (uint8_t)(be >> 24), (uint8_t)(be >> 16),
+                     (uint8_t)(be >> 8), (uint8_t)be };
+    int n = 0;
+    for (int i = 0; i < 4; i++) {
+        uint32_t v = o[i];
+        if (v >= 100) buf[n++] = (char)('0' + v / 100);
+        if (v >= 10)  buf[n++] = (char)('0' + (v / 10) % 10);
+        buf[n++] = (char)('0' + v % 10);
+        if (i < 3) buf[n++] = '.';
+    }
+    buf[n] = '\0';
+    return buf;
+}
+
+/* ---- httpd：监听 80，服务一个 GET（固定 200 页面）后返回 ---- */
+void cmd_httpd(const char *args) {
+    (void)args;
+    ezos_console_write("httpd: listening on 0.0.0.0:80 (one request, 30s)...\n");
+    int rc = net_httpd_once();
+    if (rc == 0) {
+        ezos_console_write("httpd: served 200, done\n");
+    } else if (rc == 1) {
+        ezos_console_write("httpd: nobody connected within 30s\n");
+    } else {
+        ezos_console_write("httpd: failed (port busy / out of memory)\n");
+    }
 }
 

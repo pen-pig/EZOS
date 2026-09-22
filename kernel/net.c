@@ -289,15 +289,31 @@ static int ipv4_send(uint32_t dst_ip, uint8_t proto,
     return rtl8139_send(r, ETH_HDR_LEN + IP_HDR_MIN + len);
 }
 
-/* ---------- ICMP（echo reply） ---------- */
+/* ---------- ICMP（echo reply + ping 客户端） ---------- */
+
+/* ping 等待者：单等待者足够（shell 一次只 ping 一个目标）。reply 在
+ * IRQ/轮询上下文被匹配上后置 got，等待者睡在 net 等待队列上被踢醒。 */
+static struct {
+    uint8_t  active;
+    uint16_t id, seq;
+    uint8_t  got;
+} g_ping_w;
+static uint32_t g_ping_reqs, g_ping_matched;   /* 诊断：nic 显示 */
 
 static void icmp_input(const uint8_t *ip, uint32_t ihl) {
     const uint8_t *ic = ip + ihl;
-    if (ic[0] != 8 || ic[1] != 0) return;          /* 只回 echo request */
-
     uint32_t totlen = be16(ip + 2);
     uint32_t iclen = totlen - ihl;
     if (iclen < 8 || iclen > NET_BUILD_MAX) return;
+
+    /* echo reply：只认正在等的那个 (id, seq) */
+    if (ic[0] == 0 && ic[1] == 0 && g_ping_w.active && !g_ping_w.got &&
+        be16(ic + 4) == g_ping_w.id && be16(ic + 6) == g_ping_w.seq) {
+        g_ping_w.got = 1;
+        g_ping_matched++;
+        return;
+    }
+    if (ic[0] != 8 || ic[1] != 0) return;          /* 其余类型不处理 */
 
     uint8_t *p = g_build;
     p[0] = 0;                                      /* echo reply（type 0） */
@@ -306,6 +322,48 @@ static void icmp_input(const uint8_t *ip, uint32_t ihl) {
     for (uint32_t i = 4; i < iclen; i++) p[i] = ic[i];
     put16(p + 2, cksum(p, iclen));
     if (ipv4_send(be32(ip + 12), 1, p, iclen) == 0) g_icmp_replied++;
+}
+
+/* 主动 ping：发 echo request，睡等匹配的 reply。返回 0=收到（rtt_ms 有效），
+ * 1=超时，-1=发送失败（无路由/ARP 解析失败）。 */
+int net_ping(uint32_t dst_ip_be, uint32_t timeout_ms, uint32_t *rtt_ms) {
+    if (!build_ready()) return -1;
+    uint16_t id = 0x455Au;                         /* 'EZ'，单等待者不需要唯一 */
+    static uint16_t seq_counter;
+    uint16_t seq = ++seq_counter;
+
+    uint8_t *p = g_build;
+    p[0] = 8; p[1] = 0;                            /* echo request */
+    put16(p + 2, 0);
+    put16(p + 4, id);
+    put16(p + 6, seq);
+    for (int i = 0; i < 8; i++) p[8 + i] = "EZOSPING"[i];
+    put16(p + 2, cksum(p, 16));                    /* 8 头 + 8 载荷 */
+
+    g_ping_reqs++;
+    g_ping_w.active = 1;
+    g_ping_w.id = id;
+    g_ping_w.seq = seq;
+    g_ping_w.got = 0;
+
+    uint32_t t0 = g_pit_ticks;
+    uint32_t deadline = t0 + timeout_ms;
+    /* active 先置位再发：reply 可能在 ipv4_send 的 ARP 睡等期间就到达 */
+    int rc = ipv4_send(dst_ip_be, 1, p, 16);
+    if (rc == 0) {
+        for (;;) {
+            net_poll();
+            if (g_ping_w.got) {
+                if (rtt_ms) *rtt_ms = g_pit_ticks - t0;
+                break;
+            }
+            uint32_t now = g_pit_ticks;
+            if ((int32_t)(now - deadline) >= 0) { rc = 1; break; }
+            task_sleep(&g_netrx_wq, deadline - now);
+        }
+    }
+    g_ping_w.active = 0;
+    return rc;
 }
 
 /* ---------- UDP ---------- */
@@ -524,6 +582,32 @@ static void sock_free(sock_t *s) {
     /* rx/rtx/ooo 缓冲保留复用（挂在槽上），不 kfree */
 }
 
+/* TCP 的统一关闭：ESTABLISHED/CLOSE_WAIT 发 FIN 进收尾状态机；LISTEN
+ * 连未 accept 的子连接一并回收（防止 parent 下标被新 socket 复用后误认领，
+ * 见 SC_CLOSE 的注释）；其它状态直接释放。内核侧（httpd）与 SC_CLOSE 共用。 */
+static int tcp_close(sock_t *s) {
+    if (s->type == SOCK_TYPE_TCP) {
+        if (s->state == TS_ESTABLISHED || s->state == TS_CLOSE_WAIT) {
+            uint32_t seq = s->snd_nxt;
+            s->snd_nxt = seq + 1;
+            if (tcp_send_seg_ex(s, TCP_FIN | TCP_ACK, 0, 0, seq) != 0) {
+                s->snd_nxt = seq;
+                return -1;
+            }
+            s->state = (s->state == TS_ESTABLISHED) ? TS_FIN_WAIT_1 : TS_LAST_ACK;
+            return 0;
+        }
+        if (s->state == TS_LISTEN) {
+            for (uint32_t i = 0; i < NET_MAX_SOCKS; i++) {
+                if (g_socks[i].used && g_socks[i].parent == (int)(s - g_socks))
+                    sock_free(&g_socks[i]);
+            }
+        }
+    }
+    sock_free(s);
+    return 0;
+}
+
 static void tcp_input(const uint8_t *ip, uint32_t ihl) {
     uint32_t totlen = be16(ip + 2);
     if (totlen < ihl + TCP_HDR_MIN) return;
@@ -569,8 +653,11 @@ static void tcp_input(const uint8_t *ip, uint32_t ihl) {
             s->snd_nxt = 0x1000 + g_tcp_tx * 64000u + g_udp_rx;
             s->snd_una = s->snd_nxt;
             s->rcv_nxt = seq + 1;
-            tcp_send_seg(s, TCP_SYN | TCP_ACK, 0, 0);
-            s->snd_nxt++;
+            {
+                uint32_t sq = s->snd_nxt;
+                s->snd_nxt = sq + 1;
+                tcp_send_seg_ex(s, TCP_SYN | TCP_ACK, 0, 0, sq);
+            }
             return;
         }
         return;                                    /* 连接表满：丢弃 */
@@ -680,7 +767,11 @@ static void tcp_input(const uint8_t *ip, uint32_t ihl) {
                 if (conn->state == TS_ESTABLISHED) conn->state = TS_CLOSE_WAIT;
             }
         }
-        tcp_send_seg(conn, TCP_ACK, 0, 0);         /* 数据/FIN/乱序均即时 ACK */
+        /* 只有数据/FIN 才需要 ACK。对对端的**纯 ACK**回 ACK 会形成
+         * ping-pong 风暴：我方 ACK（还带着过期 seq）→ 对端 dup-ACK →
+         * 我方再 ACK……IRQ 风暴把单核整个饿死（httpd E2E 抓出来的）。 */
+        if (dlen > 0 || (flags & TCP_FIN))
+            tcp_send_seg(conn, TCP_ACK, 0, 0);
         return;
     case TS_LAST_ACK:
         if ((flags & TCP_ACK) && ack == conn->snd_nxt) sock_free(conn);
@@ -925,8 +1016,11 @@ int net_sockcall(uint32_t subcmd, const uint32_t a[5]) {
         if (arp_resolve(s->peer_ip, 3000) == 0) { sock_free(s); return -1; }
         s->rto_tick = g_pit_ticks + TCP_RTO_MS;
         s->rtx_tries = 0;
-        tcp_send_seg(s, TCP_SYN, 0, 0);
-        s->snd_nxt++;
+        {
+            uint32_t seq = s->snd_nxt;
+            s->snd_nxt = seq + 1;
+            tcp_send_seg_ex(s, TCP_SYN, 0, 0, seq);
+        }
 
         if (!wait_cond(cond_connected, s, a[3])) { sock_free(s); return -1; }
         return 0;
@@ -949,11 +1043,15 @@ int net_sockcall(uint32_t subcmd, const uint32_t a[5]) {
         if (!s->rtx && !tcp_bufs(s)) return -1;
         for (uint32_t k = 0; k < a[2]; k++) s->rtx[k] = buf[k];
         s->rtx_len = a[2];
-        if (tcp_send_seg(s, TCP_PSH | TCP_ACK, buf, a[2]) != 0) {
-            s->rtx_len = 0;                    /* 提交失败：不留待确认状态 */
+        /* 先推进 snd_nxt 再发送：段一旦上线，IRQ 可能立刻带着对端的
+         * ACK 回来——那时如果 snd_nxt 还是旧值，后续 ACK/重传全用错序号 */
+        uint32_t seq = s->snd_nxt;
+        s->snd_nxt += a[2];
+        if (tcp_send_seg_ex(s, TCP_PSH | TCP_ACK, buf, a[2], seq) != 0) {
+            s->rtx_len = 0;                    /* 提交失败：回滚不留残状态 */
+            s->snd_nxt = seq;
             return -1;
         }
-        s->snd_nxt += a[2];
         s->rto_tick = g_pit_ticks + TCP_RTO_MS;   /* 起重传定时器 */
         s->rtx_tries = 0;
         return (int)a[2];
@@ -1000,26 +1098,7 @@ int net_sockcall(uint32_t subcmd, const uint32_t a[5]) {
     case SC_CLOSE: {
         sock_t *s = sock_get(a[0]);
         if (!s) return -1;
-        if (s->type == SOCK_TYPE_TCP) {
-            if (s->state == TS_ESTABLISHED || s->state == TS_CLOSE_WAIT) {
-                if (tcp_send_seg(s, TCP_FIN | TCP_ACK, 0, 0) != 0) return -1;
-                s->snd_nxt++;
-                s->state = (s->state == TS_ESTABLISHED) ? TS_FIN_WAIT_1
-                                                        : TS_LAST_ACK;
-                return 0;
-            }
-            if (s->state == TS_LISTEN) {
-                /* 关监听：未 accept 的子连接一并回收。留着它们的话，
-                 * parent 记录的下标在本槽位被新 socket 复用后会遭误认领
-                 * （cond_accept/accept 只比对下标，不比对身份）。 */
-                for (uint32_t i = 0; i < NET_MAX_SOCKS; i++) {
-                    if (g_socks[i].used && g_socks[i].parent == (int)(s - g_socks))
-                        sock_free(&g_socks[i]);
-                }
-            }
-        }
-        sock_free(s);
-        return 0;
+        return tcp_close(s);
     }
     default:
         return -1;
@@ -1031,6 +1110,72 @@ int net_sockcall(uint32_t subcmd, const uint32_t a[5]) {
 void net_poll(void) {
     rtl8139_poll();
     net_tick();          /* 系统调用上下文（IF=0，IRQ0 进不来）也要推进重传 */
+}
+
+/* ---------- 简易 HTTP 服务（网络上层演示） ----------
+ * 内核侧直接走 socket 内部 API（shell 是任务 0，不必绕 sockcall）。
+ * 服务一个连接即返回：教学演示 + E2E 都只需要一次 GET/200 往返，
+ * 常驻监听会让 shell 永久阻塞在 accept 上（无 Ctrl-C 中断机制）。 */
+int net_httpd_once(void) {
+    static const char resp[] =
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: text/html\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "<html><head><title>EZOS</title></head><body>"
+        "<h1>EZOS 0.9.0</h1>"
+        "<p>Hello from a hand-written i686 kernel - "
+        "TCP/IP stack included, no libc required.</p>"
+        "</body></html>";
+
+    if (!build_ready()) return -1;
+    sock_t *c = 0;                             /* out: 处也要访问，先置空 */
+    sock_t *l = sock_alloc(SOCK_TYPE_TCP, 0);
+    if (!l) return -1;
+    if (!tcp_bufs(l)) { sock_free(l); return -1; }
+
+    l->local_port = 80;
+    for (uint32_t i = 0; i < NET_MAX_SOCKS; i++) {
+        if (g_socks[i].used && &g_socks[i] != l && g_socks[i].local_port == 80) {
+            sock_free(l);                      /* 80 已被占用 */
+            return -1;
+        }
+    }
+    l->state = TS_LISTEN;
+
+    int rc = 0;
+    if (!wait_cond(cond_accept, l, 30000)) {
+        rc = 1;                                /* 30s 没人来连 */
+        goto out;
+    }
+    for (uint32_t i = 0; i < NET_MAX_SOCKS; i++) {
+        sock_t *s = &g_socks[i];
+        if (s->used && s->parent == (int)(l - g_socks) && s->state == TS_ESTABLISHED) {
+            c = s;
+            break;
+        }
+    }
+    if (!c) { rc = -1; goto out; }
+    c->parent = -1;                            /* 从监听者名下摘走 */
+
+    /* 等请求头到达再回（不解析内容：对 200 响应无关紧要） */
+    wait_cond(cond_tcp, c, 5000);
+
+    uint32_t len = sizeof(resp) - 1;
+    if (len > TCP_RTX_BUF || !tcp_bufs(c)) { rc = -1; goto out; }
+    for (uint32_t k = 0; k < len; k++) c->rtx[k] = (uint8_t)resp[k];
+    c->rtx_len = len;
+    uint32_t seq = c->snd_nxt;
+    c->snd_nxt += len;                         /* 同 SC_SENDTO：先推进再发送 */
+    if (tcp_send_seg_ex(c, TCP_PSH | TCP_ACK, c->rtx, len, seq) != 0) {
+        rc = -1; goto out;
+    }
+    c->rto_tick = g_pit_ticks + TCP_RTO_MS;    /* 响应也要能重传 */
+
+out:
+    tcp_close(l);
+    if (c) tcp_close(c);                       /* 发 FIN；对端回 ACK 后自动回收 */
+    return rc;
 }
 
 uint32_t net_udp_rx(void)      { return g_udp_rx; }
@@ -1045,6 +1190,8 @@ uint32_t net_arp_entries(void) {
     for (int i = 0; i < ARP_CACHE; i++) if (g_arp[i].ip != 0) n++;
     return n;
 }
+uint32_t net_ping_reqs(void)   { return g_ping_reqs; }
+uint32_t net_ping_matched(void){ return g_ping_matched; }
 uint32_t net_sock_count(void) {
     uint32_t n = 0;
     for (uint32_t i = 0; i < NET_MAX_SOCKS; i++) if (g_socks[i].used) n++;

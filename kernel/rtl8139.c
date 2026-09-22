@@ -130,10 +130,11 @@ static void rx_copy(uint8_t *dst, uint32_t off, uint32_t n) {
 /* ---------- RX 环处理 ---------- */
 
 static void rx_drain(void) {
+    int processed = 0;
     for (int guard = 0; guard < RX_DRAIN_MAX; guard++) {
         uint16_t status = rx_r16(g_rx_pos);
         uint16_t flen   = rx_r16(g_rx_pos + 2);
-        if (flen == 0) return;                 /* 读空：环内无待处理包 */
+        if (flen == 0) break;                  /* 读空：环内无待处理包 */
 
         if (!g_dbg_seen) {
             g_dbg_seen = 1;
@@ -147,13 +148,14 @@ static void rx_drain(void) {
             g_rx_errors++;
             g_rx_pos = 0;
             outw(REG(R_CAPR), (uint16_t)(0u - 0x10u));   /* = 0xFFF0 */
-            return;
+            break;
         }
 
         uint32_t dlen = flen - 4;              /* 去 4 字节 CRC */
         rx_copy(g_rx_frame, g_rx_pos + RX_HDR_LEN, dlen);
         g_rx_packets++;
         net_input(g_rx_frame, dlen);           /* 协议处理（kernel/net.c） */
+        processed = 1;
 
         /* 前进：帧占环 = 4 字节头 + flen，按 4 对齐后回绕 */
         g_rx_pos = (g_rx_pos + RX_HDR_LEN + flen + 3) & ~3u;
@@ -162,8 +164,11 @@ static void rx_drain(void) {
         outw(REG(R_CAPR), (uint16_t)(g_rx_pos - 0x10));
     }
     /* 步骤 8a：本批包已入协议栈，踢醒睡在 net 等待队列上的
-     * recvfrom/accept/ARP 解析（IRQ 与轮询两种上下文都安全）。 */
-    net_rx_wake();
+     * recvfrom/accept/ARP 解析（IRQ 与轮询两种上下文都安全）。
+     * 必须在**每个出口**都唤醒：早先版本把 wake 放在循环之后，环一读空就
+     * 提前 return——收包数 < 64（几乎总是）时睡眠者永远等不到唤醒，
+     * recvfrom/ping 全靠超时兜底（ping E2E 抓出来的真 bug）。 */
+    if (processed) net_rx_wake();
     /* guard 耗尽：剩余包等下一次中断/轮询 */
 }
 

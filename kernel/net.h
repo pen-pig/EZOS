@@ -57,6 +57,18 @@ void net_poll(void);
  * 安全（重传走 rtl8139_send，自带 IF 保护）。 */
 void net_tick(void);
 
+/* ---- 网络上层演示（shell 命令 ping / httpd 的后端） ---- */
+
+/* 主动 ping：发 ICMP echo request 并睡等匹配 reply。
+ * 返回 0 = 收到（*rtt_ms = 往返毫秒）、1 = 超时、-1 = 发送失败。
+ * 只能在任务上下文调用（内部会 task_sleep）。 */
+int net_ping(uint32_t dst_ip_be, uint32_t timeout_ms, uint32_t *rtt_ms);
+
+/* 简易 HTTP 服务：监听 80，服务**一个** GET 连接（回固定 200 页面 + FIN）
+ * 后返回。返回 0 = 已服务、1 = 30s 无连接、-1 = 端口占用/内存不足/发送失败。
+ * 不做常驻监听：shell 无 Ctrl-C 中断机制，accept 常驻会让 shell 永久阻塞。 */
+int net_httpd_once(void);
+
 /* 步骤 8a：rtl8139 在 rx_drain 排完一批包后调用——踢醒睡在 net 等待
  * 队列上的 recvfrom/accept/ARP 解析（task_wake_all，IRQ 上下文安全）。
  * 轮询路径（syscall 内 net_poll）同样会走到，重复唤醒无害（惊群自查）。 */
@@ -72,5 +84,7 @@ uint32_t net_arp_replied(void);
 uint32_t net_icmp_replied(void);
 uint32_t net_arp_entries(void);
 uint32_t net_sock_count(void);
+uint32_t net_ping_reqs(void);
+uint32_t net_ping_matched(void);
 
 #endif
