@@ -408,6 +408,16 @@ static int ro_mkdir(const char *path) {
     }
 }
 
+static int ro_rmdir(const char *path) {
+    switch (fs_type_cur) {
+    case FS_EXT4:  return ext4_rmdir(path);
+    case FS_NTFS:  return ntfs_rmdir(path);
+    case FS_F2FS:  return f2fs_rmdir(path);
+    case FS_REFS:  return refs_rmdir(path);
+    default:       return -1;      /* EROFS：只读卷，拒绝删目录 */
+    }
+}
+
 /* 把 name（相对 cwd 或绝对路径）规范化为绝对路径写入 out；0=成功 */
 static int fs_ro_abs(const char *name, char *out, uint32_t outsz) {
     char raw[512];
@@ -555,6 +565,17 @@ int fs_mkdir(const char *name) {
         return ro_mkdir(full);
     }
     return -1;      /* EROFS：拒绝建目录 */
+}
+
+int fs_rmdir(const char *name) {
+    if (fs_type_cur == FS_EXFAT) return exfat_rmdir(name);
+    if (fs_is_fat()) return fat_rmdir(name);
+    if (fs_is_ro()) {
+        char full[512];
+        if (fs_ro_abs(name, full, sizeof(full)) != 0) return -1;
+        return ro_rmdir(full);
+    }
+    return -1;
 }
 
 const char *fs_cwd_path(void) {

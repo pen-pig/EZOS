@@ -8,7 +8,9 @@
   [httpd] guest 跑 `httpd`（slirp + hostfwd 8080→80）：宿主连上去发 GET，
           断言 200 响应含 EZOS 页面，guest 主动 FIN；屏幕出现 "served"
 
-端口：ping netdev 4477 / monitor 55668；httpd hostfwd 8080 / monitor 55669。
+端口：ping netdev 4477 / monitor 4479；httpd hostfwd 8080 / monitor 4480。
+注意别用 5xxxx 高位端口：Windows 会把动态段划成 excludedportrange
+（本机实测 55669-55768 被预留，绑定直接 WinError 10013），换机器症状还会变。
 用法：python tests/test_netapp.py    （退出码 0 = 全部通过）
 """
 import os
@@ -203,7 +205,7 @@ def icmp_reply(req_ip, req_ic):
 
 def phase_ping():
     print("== phase ping: guest `ping 10.0.2.2` ==")
-    g = Guest(net_port=4477, mon_port=55668)
+    g = Guest(net_port=4477, mon_port=4479)
     g.start()
     try:
         time.sleep(BOOT_WAIT_S)
@@ -253,7 +255,7 @@ def phase_ping():
 
 def phase_httpd():
     print("== phase httpd: guest `httpd` + host GET ==")
-    g = Guest(mon_port=55669,
+    g = Guest(mon_port=4480,
               extra_net=["-netdev", "user,id=n0,hostfwd=tcp::8080-:80",
                          "-device", "rtl8139,netdev=n0"])
     g.start()

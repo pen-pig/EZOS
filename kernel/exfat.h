@@ -40,6 +40,7 @@ const char *exfat_cwd_path(void);
 void exfat_reset_cwd(void);
 int exfat_change_dir(const char *name);
 int exfat_mkdir(const char *name);
+int exfat_rmdir(const char *name);   /* 仅删目录；目标是文件或非空则失败 */
 
 /* 目录项结构（供 desktop 文件管理器使用） */
 typedef struct {

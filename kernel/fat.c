@@ -1421,3 +1421,26 @@ int fat_mkdir(const char *name) {
     }
     return 0;
 }
+
+/* ===== rmdir ===== */
+/* 删除**空目录**，与 rm（fat_delete_file）职责分离：
+ *   目标不存在 / 是普通文件 / 目录非空 / 是 "." ".." → 返回 -1 且不释放任何簇。
+ *   只接受相对当前目录的单段名字（要删别处的目录请先 cd）。
+ * 非空判定复用 empty_check_cb：遍历的是 fat_dir_foreach，它已经跳过
+ *   已删除项、LFN 从项，且 . / .. 不计为内容。
+ * 真正的删除复用 fat_delete_file，避免释放逻辑出现第二份副本。 */
+int fat_rmdir(const char *name) {
+    if (!fat_type || name == 0) return -1;
+    if (name[0] == '\0' || name[0] == '/') return -1;
+    if (name[0] == '.' && (name[1] == '\0' ||
+        (name[1] == '.' && name[2] == '\0'))) return -1;
+
+    fat_dirent_t de;
+    if (fat_find_entry(current_dir_cluster, name, &de) != 0) return -1;
+    if (!de.is_dir) return -1;              /* 普通文件归 rm 管 */
+    if (de.first_cluster == 0) return -1;   /* 根目录区，不允许删 */
+
+    /* 非空与否交给 fat_delete_file 判定（它用 empty_check_cb 拒绝非空目录）。
+     * 不再在这里重复扫一遍：避免释放逻辑出现第二份副本并保持行为一致。 */
+    return fat_delete_file(name);
+}

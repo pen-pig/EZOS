@@ -39,6 +39,7 @@ uint32_t f2fs_get_file_clusters(const char *path);
 int      f2fs_create_file(const char *name, const uint8_t *data, uint32_t size);
 int      f2fs_delete_file(const char *name);
 int      f2fs_mkdir(const char *name);
+int      f2fs_rmdir(const char *name);
 
 /* 格式化：在 drive 上创建 F2FS 卷（2MB，4KB 块，inline dentry 模型）
  * 并挂载；0=成功 */

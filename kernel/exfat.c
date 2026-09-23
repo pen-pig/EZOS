@@ -349,6 +349,29 @@ static int exfat_find_entry(uint32_t dir_cluster, const char *name, uint8_t *out
     return -1;
 }
 
+/* ===== rmdir ===== */
+/* 删除**空目录**，与 rm（exfat_delete_file）职责分离：
+ *   目标不存在 / 是普通文件 / 目录非空 / 是 "." ".."  →  一律返回 -1，
+ *   且在此之前不释放任何簇（避免半成品状态）。
+ * 只接受相对当前目录的单段名字；要删别处的目录请先 cd。
+ * 真正的删除**复用** exfat_delete_file，不复制第二份释放逻辑，
+ * 否则两边迟早漂移（历史教训：exfat 的 free 循环已经被抄过一份）。 */
+int exfat_rmdir(const char *name) {
+    if (!exfat_ready || name == 0) return -1;
+    if (name[0] == '\0' || name[0] == '/') return -1;
+    if (name[0] == '.' && (name[1] == '\0' ||
+        (name[1] == '.' && name[2] == '\0'))) return -1;
+
+    uint8_t merged[1024];
+    if (exfat_find_entry(exfat_cwd_cluster(), name, merged) < 0) return -1;
+    if ((merged[1] & EXFAT_ATTR_DIRECTORY) == 0) return -1;   /* 文件归 rm 管 */
+
+    /* 非空与否交给 exfat_delete_file 判定（它拒绝非空目录并原样返回 -1）。
+     * 这里不再自己扫一遍目录簇：一来重复，二来要再背一个 8KB 的静态簇缓冲，
+     * 而 .bss.hi 只剩几 KB 余量（linker.ld:51 上限）。 */
+    return exfat_delete_file(name);
+}
+
 /* ============ 目录支持（子目录） ============ */
 
 // 返回当前工作目录簇（首次调用时初始化为根目录簇）

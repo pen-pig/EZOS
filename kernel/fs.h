@@ -76,6 +76,7 @@ int      fs_list_root(void);
 int      fs_read_dir(fs_dir_entry_t *entries, int max_entries);
 int      fs_change_dir(const char *name);
 int      fs_mkdir(const char *name);
+int      fs_rmdir(const char *name);   /* 删空目录；非目录/非空/不存在均 -1 */
 const char *fs_cwd_path(void);
 uint32_t fs_count_used_clusters(void);
 uint32_t fs_get_file_clusters(const char *name);

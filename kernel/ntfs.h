@@ -39,6 +39,7 @@ uint32_t ntfs_get_file_clusters(const char *path);
 int      ntfs_create_file(const char *name, const uint8_t *data, uint32_t size);
 int      ntfs_delete_file(const char *name);
 int      ntfs_mkdir(const char *name);
+int      ntfs_rmdir(const char *path);
 
 /* 格式化：在 drive 上创建 NTFS 卷（4KB 簇，驻留 INDEX_ROOT 小目录模型）
  * 并挂载；0=成功 */

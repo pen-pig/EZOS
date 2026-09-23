@@ -19,6 +19,7 @@
  */
 #include "ntfs.h"
 #include "ata.h"
+#include "kmalloc.h"
 
 /* ---------- 小端读取助手 ---------- */
 static uint16_t rd16(const uint8_t *p) {
@@ -404,7 +405,12 @@ static uint32_t nt_resolve(const char *path, int *is_dir_out, uint32_t *size_out
 int ntfs_is_dir(const char *path) {
     int is_dir;
     if (nt_resolve(path, &is_dir, 0) == 0) return -1;
-    return is_dir;
+    /* 契约是 1=目录 / 0=文件 / -1=不存在。
+     * nt_rec_is_dir 返回的是**原始旗位**（rd16(rec+0x16) & 2 == 2），
+     * 直接透传会让 ro_is_dir 的调用方（fs_change_dir 里 `!= 1` 的判断）
+     * 把目录一律当成"不是目录"，NTFS 下 cd 子目录永远失败。
+     * 所以这里必须规范化成 0/1。 */
+    return is_dir ? 1 : 0;
 }
 
 uint32_t ntfs_get_file_size(const char *path) {
@@ -1759,6 +1765,118 @@ int ntfs_mkdir(const char *name) {
     }
     if (nt_write_record(parent, nt_rec) != 0) return -1;
     return nt_maps_save();
+}
+
+/* 统计真实子项（跳过 "."/".."/DOS/内部条目）。发现 >=1 项即返回 1 早停。 */
+static int nt_rmdir_count_cb(const char *name, uint32_t ref, int is_dir, void *ctx) {
+    (void)name; (void)ref; (void)is_dir;
+    int *c = (int *)ctx;
+    if (++(*c) >= 1) return 1;            /* 非空：停止遍历 */
+    return 0;
+}
+
+/* 删除一个空目录（语义对齐 ext4/F2FS 的 rmdir）：
+ *   - 不存在 / 目标是普通文件 / 非空 / 根 "/" / "." / ".." -> -1 且零副作用
+ *   - 成功：父目录索引项摘除并落盘（元数据先行），再回收目录的
+ *     $INDEX_ALLOCATION 簇与 MFT 记录槽（含 $MFT 位图同步）
+ * 落盘顺序严格为：父索引项 -> 子记录标记未用 -> 两张位图，任何一步
+ * 失败均按镜像回滚到操作前状态，避免悬空引用 / 半提交。 */
+int ntfs_rmdir(const char *path) {
+    char parent_path[256];
+    char fname[256];
+    uint32_t name_len = 0;
+
+    if (path == 0 || path[0] != '/') return -1;
+
+    /* 抽取父路径与叶名；根 "/" 与无叶名情形由 split 失败覆盖 */
+    if (nt_split_path(path, parent_path, sizeof(parent_path), fname) != 0)
+        return -1;
+    while (fname[name_len]) name_len++;
+    if (name_len == 1 && fname[0] == '.') return -1;   /* "." */
+    if (name_len == 2 && fname[0] == '.' && fname[1] == '.') return -1; /* ".." */
+
+    if (nt_maps_load() != 0) return -1;
+
+    uint32_t parent = nt_resolve_dir(parent_path);
+    if (parent == 0) return -1;
+
+    uint32_t ref;
+    int in_indx;
+    uint32_t loc_vcn, loc_off;
+    if (nt_find_loc(nt_rec, fname, &ref, &in_indx, &loc_vcn, &loc_off) != 1)
+        return -1;                       /* 不存在 */
+
+    if (nt_read_record(ref, nt_child) != 0) return -1;
+    if (!nt_rec_is_dir(nt_child)) return -1;   /* 目标是普通文件：归 rm 管 */
+
+    /* 非空检查：本驱动目录无 "."/".." 条目，故真实子项数为 0 即空。
+     * 非空时零释放、零磁盘写。 */
+    int ent_count = 0;
+    if (nt_dir_walk(nt_child, nt_rmdir_count_cb, &ent_count) != 0) return -1;
+    if (ent_count > 0) return -1;              /* 非空 */
+
+    /* ---- 以下进入变更路径，尚无任何磁盘写 ---- */
+    /* 回滚镜像**运行时申请**，不放静态数组：
+     * 静态会进 .bss.hi，而 linker.ld:51 给它的预算是 1MB，实测全内核已用到
+     * 1043/1024 KB——再放 17KB 镜像直接 LINK FAILED（已经踩过一次）。 */
+    if (nt_rec_bytes == 0 || nt_rec_bytes > NT_MAX_REC) return -1;
+    if (nt_vbmp_len == 0 || nt_vbmp_len > NT_BITMAP_CAP) return -1;
+    uint32_t mbmp_len = (uint32_t)sizeof(nt_mbmp);
+    uint8_t *parent_save = (uint8_t *)kmalloc(nt_rec_bytes);
+    if (!parent_save) return -1;
+    uint8_t *child_save = (uint8_t *)kmalloc(nt_rec_bytes);
+    if (!child_save) { kfree(parent_save); return -1; }
+    uint8_t *vbmp_save = (uint8_t *)kmalloc(nt_vbmp_len);
+    if (!vbmp_save) { kfree(child_save); kfree(parent_save); return -1; }
+    uint8_t *mbmp_save = (uint8_t *)kmalloc(mbmp_len);
+    if (!mbmp_save) {
+        kfree(vbmp_save); kfree(child_save); kfree(parent_save);
+        return -1;
+    }
+    for (uint32_t i = 0; i < nt_rec_bytes; i++) parent_save[i] = nt_rec[i];
+    for (uint32_t i = 0; i < nt_rec_bytes; i++) child_save[i] = nt_child[i];
+    for (uint32_t i = 0; i < nt_vbmp_len; i++) vbmp_save[i] = nt_vbmp[i];
+    for (uint32_t i = 0; i < mbmp_len; i++) mbmp_save[i] = nt_mbmp[i];
+
+    /* 1) 父目录索引项摘除（内存） */
+    if (in_indx) {
+        if (nt_indx_remove(nt_rec, loc_vcn, loc_off) != 0) goto fail_free;
+    } else {
+        if (nt_remove_entry(nt_rec, loc_off) != 0) goto fail_free;
+    }
+
+    /* 2) 回收目录的 $INDEX_ALLOCATION 簇（仅大目录有；小目录无，空操作） */
+    const uint8_t *ia = nt_find_attr(nt_child, NT_AT_INDEX_ALLOC, "$I30");
+    nt_free_data_runs(ia);
+
+    /* 3) 标记子记录未用 + 回收 MFT 槽（内存） */
+    nt_wr16(nt_child + 0x16, 0);
+    nt_free_mft(ref);
+
+    /* ---- 落盘：元数据（父索引项）先行，簇/MFT 位图最后 ---- */
+    if (nt_write_record(parent, nt_rec) != 0) goto rollback;
+    if (nt_write_record(ref, nt_child) != 0) goto rollback;
+    if (nt_maps_save() != 0) goto rollback;
+
+    kfree(mbmp_save); kfree(vbmp_save); kfree(child_save); kfree(parent_save);
+    return 0;
+
+rollback:
+    /* 对称回滚：用镜像把父/子记录与两张位图恢复到操作前。
+     * 这里不释放数据簇：簇的回收在 step 2/3 里只改了内存位图，
+     * 只要 nt_maps_save() 没成功，磁盘上的位图还是原样。 */
+    for (uint32_t i = 0; i < nt_rec_bytes; i++) nt_rec[i] = parent_save[i];
+    if (nt_write_record(parent, nt_rec) == 0) {
+        for (uint32_t i = 0; i < nt_rec_bytes; i++) nt_child[i] = child_save[i];
+        (void)nt_write_record(ref, nt_child);
+        for (uint32_t i = 0; i < nt_vbmp_len; i++) nt_vbmp[i] = vbmp_save[i];
+        for (uint32_t i = 0; i < mbmp_len; i++) nt_mbmp[i] = mbmp_save[i];
+        (void)nt_maps_save();
+    }
+    /* fallthrough */
+fail_free:
+    kfree(mbmp_save); kfree(vbmp_save); kfree(child_save); kfree(parent_save);
+    return -1;
 }
 
 /* ============================================================

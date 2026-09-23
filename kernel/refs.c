@@ -1344,6 +1344,19 @@ int refs_mkdir(const char *path) {
     return 0;
 }
 
+/* ===== rmdir ===== */
+/* 删除**空目录**，与 rm（refs_delete_file）职责分离：
+ *   目标不存在 / 是普通文件 → 立即失败且不改盘；
+ *   目录非空 → refs_delete_file 内部已有检查（rs_node_count != 0 即拒绝），
+ *              此时也不释放任何东西。
+ * 真正的删除复用 refs_delete_file，避免出现第二份释放逻辑。
+ * 注：refs_delete_file 本来就支持删空目录，这里只是把语义收窄成"只收目录"。 */
+int refs_rmdir(const char *path) {
+    if (path == 0 || path[0] == '\0') return -1;
+    if (refs_is_dir(path) != 1) return -1;   /* 文件 / 不存在 / 根 */
+    return refs_delete_file(path);
+}
+
 int refs_delete_file(const char *path) {
     rs_hit_t hit;
     if (rs_is_root_path(path) || rs_walk(path, &hit) != 0 || !hit.found)

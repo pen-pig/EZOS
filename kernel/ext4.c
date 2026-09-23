@@ -47,6 +47,7 @@ static uint32_t rd32(const uint8_t *p) {
 #define INO_OFF_BLOCKS_LO    28    /* i_blocks_lo（512B 扇区数） */
 #define INO_OFF_FLAGS        32
 #define INO_OFF_IBLOCK       40    /* i_block[15]，60 字节 */
+#define INO_OFF_LINKS        26    /* i_links_count（2 字节） */
 #define INO_OFF_SIZE_HI      108
 
 #define EXT4_EXTENTS_FL      0x80000u
@@ -1412,6 +1413,87 @@ int ext4_mkdir(const char *name) {
         e4_free_inode(new_ino);
         return -1;
     }
+    return 0;
+}
+
+/* 删除空目录（rmdir）：只收目录，绝不碰普通文件。
+ * 关键顺序：先把目录项从父目录摘掉并落盘，之后才回收数据块/inode，
+ * 否则一旦写盘失败会出现"目录项还在却指向已释放块"的悬空引用。 */
+static int e4_rmdir_empty_cb(const char *name, uint32_t name_len, uint32_t ino,
+                             uint8_t ftype, void *ctx) {
+    (void)name; (void)name_len; (void)ino; (void)ftype;
+    *(int *)ctx = 0;   /* 发现任何非 '.' / '..' 条目 -> 非空 */
+    return 1;          /* 停止遍历 */
+}
+
+int ext4_rmdir(const char *name) {
+    if (name == 0 || name[0] != '/') return -1;
+
+    /* 根目录 "/" 本身拒绝 */
+    if (name[1] == '\0') return -1;
+
+    /* 取末段组件名，并拒绝 "." / ".." */
+    const char *slash = 0;
+    const char *p = name;
+    while (*p) { if (*p == '/') slash = p; p++; }
+    if (!slash) return -1;
+    const char *fname = slash + 1;
+    uint32_t fname_len = 0;
+    while (fname[fname_len] && fname[fname_len] != '/') fname_len++;
+    if (fname_len == 0 || fname_len > 255) return -1;
+    if (fname_len == 1 && fname[0] == '.') return -1;
+    if (fname_len == 2 && fname[0] == '.' && fname[1] == '.') return -1;
+
+    /* 解析父目录 inode */
+    uint32_t parent_ino;
+    if (slash == name) {
+        parent_ino = EXT4_ROOT_INO;
+    } else {
+        char parent_path[256];
+        uint32_t plen = (uint32_t)(slash - name);
+        if (plen >= 256) return -1;
+        for (uint32_t i = 0; i < plen; i++) parent_path[i] = name[i];
+        parent_path[plen] = 0;
+        int is_dir;
+        uint32_t pin = e4_resolve(parent_path, &is_dir, 0, 0);
+        if (pin == 0 || !is_dir) return -1;
+        parent_ino = pin;
+    }
+
+    /* 在父目录中查找目标 */
+    uint32_t target_ino;
+    uint8_t target_type;
+    if (e4_dir_find(parent_ino, fname, fname_len, &target_ino, &target_type) != 0)
+        return -1;   /* 不存在或查找出错 */
+
+    /* 读取目标 inode，确为目录 */
+    static uint8_t ino[EXT4_MAX_INODESIZE];
+    if (e4_read_inode(target_ino, ino) != 0) return -1;
+    if (!e4_ino_is_dir(ino)) return -1;   /* 是普通文件 -> 拒绝 */
+
+    /* 拒绝根 inode（理论上到不了，因 "/" 已被拒） */
+    if (target_ino == EXT4_ROOT_INO) return -1;
+
+    /* 检查空目录：除 '.' / '..' 外的任何条目都算非空 */
+    int empty = 1;
+    if (e4_dir_walk(target_ino, e4_rmdir_empty_cb, &empty) != 0) return -1;
+    if (!empty) return -1;   /* 非空：不释放任何东西 */
+
+    /* === 开始修改磁盘（元数据优先） === */
+
+    /* 1) 从父目录摘掉目录项并落盘。成功后才回收块。 */
+    if (e4_dir_del_entry(parent_ino, target_ino) != 0) return -1;
+
+    /* 2) 回收目标目录的数据块（extent / legacy 任意深度） */
+    e4_free_inode_blocks(ino);
+
+    /* 3) 将 links_count 归零并写回 inode（ext4 要求，避免 fsck 误判为活 inode） */
+    e4_wr16(ino + INO_OFF_LINKS, 0);
+    e4_write_inode(target_ino, ino);
+
+    /* 4) 回收 inode（inode bitmap + counts） */
+    e4_free_inode(target_ino);
+
     return 0;
 }
 

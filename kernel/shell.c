@@ -165,6 +165,16 @@ static void cmd_ls(const char *args);
 static void cmd_cat(const char *args);
 static void cmd_write(const char *args);
 static void cmd_rm(const char *args);
+/* 删除空目录。与 rm 职责分离：rm 只收文件，rmdir 只收目录。
+ * 非空 / 不是目录 / 不存在 一律失败，且失败时不释放任何簇。 */
+static void cmd_rmdir(const char *args) {
+    if (fs_rmdir(args) != 0) {
+        terminal_writestring("Failed to remove directory.\n");
+        return;
+    }
+    terminal_writestring("Directory removed.\n");
+}
+
 static void cmd_format(const char *args);
 static void cmd_setdrive(const char *args);
 static void cmd_grep(const char *args);
@@ -232,6 +242,7 @@ static const command_t commands[] = {
     {"mv",       cmd_mv},
     {"cd",       cmd_cd},
     {"mkdir",    cmd_mkdir},
+    {"rmdir",    cmd_rmdir},
     {"pwd",      cmd_pwd},
     {"gui",      cmd_gui},
     {"desktop",  cmd_desktop},
@@ -679,6 +690,7 @@ static void cmd_help(const char *args) {
     terminal_writestring("  mv <src> <dst> - move/rename file\n");
     terminal_writestring("  cd <dir>   - change directory\n");
     terminal_writestring("  mkdir <dir> - create directory\n");
+    terminal_writestring("  rmdir <dir> - remove empty directory\n");
     terminal_writestring("  pwd        - print working directory\n");
     terminal_writestring("  desktop    - launch graphical desktop\n");
     terminal_writestring("  gui        - launch text-mode GUI\n");

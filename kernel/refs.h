@@ -48,6 +48,7 @@ uint32_t refs_get_file_clusters(const char *path);
 int      refs_create_file(const char *name, const uint8_t *data, uint32_t size);
 int      refs_delete_file(const char *name);
 int      refs_mkdir(const char *name);
+int      refs_rmdir(const char *name);   /* 仅删目录；目标是文件或非空则失败 */
 
 /* 格式化：在 drive 上创建 ReFS 卷（2MB，4KB 簇，位图 + 128 目录项模型）
  * 并挂载；0=成功 */

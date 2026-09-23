@@ -37,6 +37,7 @@ uint32_t ext4_get_file_clusters(const char *path);
 int      ext4_create_file(const char *name, const uint8_t *data, uint32_t size);
 int      ext4_delete_file(const char *name);
 int      ext4_mkdir(const char *name);
+int      ext4_rmdir(const char *name);
 
 /* 格式化：在 drive 上创建 ext4 卷（1024B 块，单块组）并挂载；0=成功 */
 int      ext4_format(uint8_t drive);

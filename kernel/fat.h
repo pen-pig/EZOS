@@ -49,6 +49,7 @@ int      fat_list_root(void);
 int      fat_read_dir(fat_dir_entry_t *entries, int max_entries);
 int      fat_change_dir(const char *name);
 int      fat_mkdir(const char *name);
+int      fat_rmdir(const char *name);   /* 仅删目录；目标是文件或非空则失败 */
 uint32_t fat_cwd_cluster(void);
 const char *fat_cwd_path(void);
 uint32_t fat_count_used_clusters(void);

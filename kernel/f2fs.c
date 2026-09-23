@@ -1763,6 +1763,185 @@ int f2fs_delete_file(const char *name) {
     return f2_remove_child(parent, &hit, f2_node);
 }
 
+/* ============================================================
+ * rmdir：摘除空目录（元数据先改、块后释放，失败对称回滚）
+ *
+ * 与 f2fs_delete_file 平行但处理目录。目录的数据块即多级哈希 dentry 块
+ * （inline / i_addr / DIR1(i_nid[0]) / DIR2(i_nid[1])）。现有
+ * f2_remove_child 只回收单 direct node 且「先释放后写盘」（反向顺序，会
+ * 产生悬空引用），也不覆盖 DIR2 与多级哈希块，故此处自实现。
+ * ============================================================ */
+
+typedef struct { int empty; } f2_empty_ctx;
+static int f2_empty_cb(const char *name, uint32_t ino, int is_dir, void *ctx) {
+    (void)ino; (void)is_dir;
+    /* EZOS 子目录不含 . / .. 项；即使有也忽略 */
+    if (name[0] == '.' && (name[1] == 0 ||
+        (name[1] == '.' && name[2] == 0))) return 0;
+    ((f2_empty_ctx *)ctx)->empty = 0;
+    return 1;   /* 发现真实条目，提前结束 */
+}
+
+/* fail closed：校验子目录数据块地址上界（写盘前，零副作用） */
+static int f2_rmdir_validate_child(const uint8_t *inode) {
+    if (inode[INO_OFF_INLINE] & F2FS_INLINE_DENTRY) return 0;
+    for (uint32_t b = 0; b < (uint32_t)DEF_ADDRS_PER_INODE; b++) {
+        uint32_t pb = rd32(inode + INO_OFF_ADDR + b * 4);
+        if (pb && (pb < f2_main_blkaddr || pb >= f2_total_blocks)) return -1;
+    }
+    for (uint32_t k = 0; k < 2; k++) {
+        uint32_t dnid = rd32(inode + INO_OFF_NID + k * 4);
+        if (dnid == 0) continue;
+        uint32_t dnblk = f2_nat_lookup(dnid);
+        if (dnblk == 0 || dnblk < f2_main_blkaddr || dnblk >= f2_total_blocks)
+            return -1;
+        f2_read_block(dnblk, f2_wblk);
+        for (uint32_t b = 0; b < (uint32_t)ADDRS_PER_BLOCK; b++) {
+            uint32_t pb = rd32(f2_wblk + b * 4);
+            if (pb && (pb < f2_main_blkaddr || pb >= f2_total_blocks)) return -1;
+        }
+    }
+    return 0;
+}
+
+/* 回收子目录数据块 + 直接节点（i_addr + DIR1/DIR2）。
+ * 调用方已校验地址上界；*dblk / *dnodes 累加已释放块数。 */
+static void f2_rmdir_free_child(uint8_t *inode, int *dblk, int *dnodes) {
+    if (inode[INO_OFF_INLINE] & F2FS_INLINE_DENTRY) return;
+    for (uint32_t b = 0; b < (uint32_t)DEF_ADDRS_PER_INODE; b++) {
+        uint32_t pb = rd32(inode + INO_OFF_ADDR + b * 4);
+        if (pb >= f2_main_blkaddr && pb < f2_total_blocks) {
+            f2_free_block(pb); (*dblk)++;
+        }
+    }
+    for (uint32_t k = 0; k < 2; k++) {
+        uint32_t dnid = rd32(inode + INO_OFF_NID + k * 4);
+        if (dnid == 0) continue;
+        uint32_t dnblk = f2_nat_lookup(dnid);
+        if (dnblk >= f2_main_blkaddr && dnblk < f2_total_blocks) {
+            f2_read_block(dnblk, f2_wblk);
+            for (uint32_t b = 0; b < (uint32_t)ADDRS_PER_BLOCK; b++) {
+                uint32_t pb = rd32(f2_wblk + b * 4);
+                if (pb >= f2_main_blkaddr && pb < f2_total_blocks) {
+                    f2_free_block(pb); (*dblk)++;
+                }
+            }
+            f2_free_block(dnblk); (*dblk)++;
+            f2_nat_set(dnid, 0); (*dnodes)++;
+        }
+    }
+}
+
+/* 常规父目录：按哈希桶定位并摘除 dentry 块位图 + 落盘 */
+static int f2_rmdir_detach_regular(uint8_t *parent_node, const char *fname) {
+    uint32_t name_len = f2_strlen(fname);
+    uint32_t hash = f2_name_hash(fname, name_len);
+    uint32_t depth = rd32(parent_node + INO_OFF_CURRENT_DEPTH);
+    uint8_t dir_level = parent_node[INO_OFF_DIR_LEVEL];
+    for (unsigned int level = 0; level <= depth && level < 64; level++) {
+        uint32_t nbucket = f2_dir_buckets(level, dir_level);
+        uint32_t bidx = f2_dir_block_index(level, dir_level, hash % nbucket);
+        for (unsigned int m = 0; m < f2_bucket_blocks(level); m++) {
+            uint32_t pb = f2_get_block(parent_node, bidx + m);
+            if (pb == 0) continue;
+            if (pb < f2_main_blkaddr || pb >= f2_total_blocks) return -1;
+            f2_read_block(pb, f2_dblk);
+            f2_dentry_hit h;
+            if (f2_dent_find(f2_dblk, f2_dentry_base(f2_dblk),
+                             f2_filename_base(f2_dblk), NR_DENTRY_IN_BLOCK,
+                             fname, &h) == 0) {
+                uint32_t slots = (h.name_len + F2FS_SLOT_LEN - 1) /
+                                 F2FS_SLOT_LEN;
+                for (uint32_t s = 0; s < slots &&
+                     h.slot + s < NR_DENTRY_IN_BLOCK; s++) {
+                    uint32_t bb = (uint32_t)h.slot + s;
+                    f2_dblk[bb >> 3] &= (uint8_t)~(1u << (bb & 7));
+                }
+                f2_write_block(pb, f2_dblk);
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
+/* 失败回滚：把已被摘除的 dentry 重新插回父目录 */
+static int f2_rmdir_restore(uint8_t *parent_node, uint32_t parent_nid,
+                            const char *fname, uint32_t child_ino) {
+    if (parent_node[INO_OFF_INLINE] & F2FS_INLINE_DENTRY) {
+        if (f2_inline_insert(parent_node, fname, child_ino, F2FS_FT_DIR) < 0)
+            return -1;
+    } else {
+        if (f2_dir_add_dentry(parent_node, parent_nid, fname, child_ino,
+                              F2FS_FT_DIR) != 0)
+            return -1;
+    }
+    uint32_t pblk = f2_nat_lookup(parent_nid);
+    if (pblk == 0 || pblk < f2_main_blkaddr) return -1;
+    f2_write_block(pblk, parent_node);
+    return 0;
+}
+
+int f2fs_rmdir(const char *name) {
+    uint32_t parent;
+    char fname[256];
+    if (f2_split_path(name, &parent, fname, sizeof(fname)) != 0) return -1;
+    /* 拒绝 . / ..（根 "/" 已被 split_path 以 nlen==0 拒绝） */
+    if (fname[0] == '.' && (fname[1] == 0 ||
+        (fname[1] == '.' && fname[2] == 0))) return -1;
+
+    f2_dentry_hit hit;
+    if (f2_dir_find(f2_node, fname, &hit) != 0) return -1;   /* 不存在 */
+    if (hit.ftype != F2FS_FT_DIR) return -1;                 /* 是文件 */
+    if (hit.ino < 3) return -1;                              /* . / .. / 保留 */
+
+    uint32_t child_ino = hit.ino;
+    if (f2_read_node(child_ino, f2_wnode) != 0) return -1;   /* 子节点不可读 */
+    if ((rd16(f2_wnode + INO_OFF_MODE) & 0xF000u) != 0x4000u) return -1;
+
+    /* 非空检查（只读，零副作用） */
+    f2_empty_ctx ec; ec.empty = 1;
+    f2_dir_walk(f2_wnode, f2_empty_cb, &ec);
+    if (!ec.empty) return -1;
+
+    /* fail closed：子目录块地址上界校验（写盘前） */
+    if (f2_rmdir_validate_child(f2_wnode) != 0) return -1;
+
+    /* ---- 元数据先改：摘除父目录 dentry 并落盘 ---- */
+    if (f2_node[INO_OFF_INLINE] & F2FS_INLINE_DENTRY) {
+        uint32_t pblk = f2_nat_lookup(parent);
+        if (pblk == 0 || pblk < f2_main_blkaddr) return -1;
+        uint8_t *base = f2_inline_base(f2_node);
+        uint8_t *bitmap = base;
+        uint32_t slots = (hit.name_len + F2FS_SLOT_LEN - 1) / F2FS_SLOT_LEN;
+        for (uint32_t k = 0; k < slots && hit.slot + k < NR_INLINE_DENTRY; k++) {
+            uint32_t bb = (uint32_t)hit.slot + k;
+            bitmap[bb >> 3] &= (uint8_t)~(1u << (bb & 7));
+        }
+        f2_write_block(pblk, f2_node);
+    } else {
+        if (f2_rmdir_detach_regular(f2_node, fname) != 0) return -1;
+    }
+
+    /* ---- 校验子 inode 节点块（用于失败回滚判定） ---- */
+    uint32_t child_node_blk = f2_nat_lookup(child_ino);
+    if (child_node_blk == 0 || child_node_blk < f2_main_blkaddr ||
+        child_node_blk >= f2_total_blocks) {
+        f2_rmdir_restore(f2_node, parent, fname, child_ino);
+        return -1;
+    }
+
+    /* ---- 块后释放 ---- */
+    int dblk = 1;     /* inode 节点块本身 */
+    int dnodes = 1;   /* inode 节点 */
+    f2_rmdir_free_child(f2_wnode, &dblk, &dnodes);
+    f2_free_block(child_node_blk);
+    f2_nat_set(child_ino, 0);
+
+    f2_cp_commit(-dblk, -dnodes, -1);
+    return 0;
+}
+
 int f2fs_mkdir(const char *name) {
     uint32_t parent;
     char fname[256];
