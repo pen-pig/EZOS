@@ -167,13 +167,7 @@ static void cmd_write(const char *args);
 static void cmd_rm(const char *args);
 /* 删除空目录。与 rm 职责分离：rm 只收文件，rmdir 只收目录。
  * 非空 / 不是目录 / 不存在 一律失败，且失败时不释放任何簇。 */
-static void cmd_rmdir(const char *args) {
-    if (fs_rmdir(args) != 0) {
-        terminal_writestring("Failed to remove directory.\n");
-        return;
-    }
-    terminal_writestring("Directory removed.\n");
-}
+static void cmd_rmdir(const char *args);
 
 static void cmd_format(const char *args);
 static void cmd_setdrive(const char *args);
@@ -303,6 +297,72 @@ static int pipe_len = 0;
 
 static void shell_fg(uint8_t fg) { terminal_setcolor((uint8_t)(fg | (0 << 4))); }
 static void shell_color_default(void) { shell_fg(CLR_LIGHT_GREY); }
+
+/* ===== zsh 风格语义色：在 CLR_* 之上做语义别名，方便后来人复用 ===== */
+#define CLR_ERROR    12   /* 亮红：失败 / 错误 / Usage */
+#define CLR_SUCCESS  10   /* 亮绿：成功确认 */
+#define CLR_DIR      9    /* 亮蓝：目录 */
+#define CLR_EXE      10   /* 亮绿：可执行文件 */
+#define CLR_HEADER   11   /* 亮青：表头 / 强调（命令名、提示符）*/
+#define CLR_INFO     8    /* 深灰：次要信息（说明文字）*/
+#define CLR_WARNING  14   /* 黄：警告 */
+
+/* 用指定前景色打印整串，打印完自动还原默认色（绝不改动任何文本字符）*/
+static void puts_c(const char *s, uint8_t fg) {
+    shell_fg(fg);
+    terminal_writestring(s);
+    shell_color_default();
+}
+
+/* 打印缓冲区区间 [start,end)，将 pattern 命中处用高亮色，其余保持默认（文本字符不变）*/
+static void print_highlighted(const char *buf, int start, int end, const char *pattern, int plen) {
+    int i = start;
+    while (i < end) {
+        if (i + plen <= end) {
+            int k = 0;
+            while (k < plen && buf[i + k] == pattern[k]) k++;
+            if (k == plen) {
+                shell_fg(CLR_ERROR);
+                for (int t = 0; t < plen; t++) terminal_putchar(buf[i + t]);
+                shell_color_default();
+                i += plen;
+                continue;
+            }
+        }
+        terminal_putchar(buf[i]);
+        i++;
+    }
+}
+
+/* help 列表行：命令名列（" - " 之前）用强调色，其后说明用次要色；无 " - " 的整行作表头色 */
+/* 删除空目录。与 rm 职责分离：rm 只收文件，rmdir 只收目录。
+ * 非空 / 不是目录 / 不存在 一律失败，且失败时不释放任何簇。
+ * 定义在着色 helper 之后：成败提示要走 puts_c 的语义色。 */
+static void cmd_rmdir(const char *args) {
+    if (fs_rmdir(args) != 0) {
+        puts_c("Failed to remove directory.\n", CLR_ERROR);
+        return;
+    }
+    puts_c("Directory removed.\n", CLR_SUCCESS);
+}
+
+static void help_line(const char *s) {
+    const char *sep = NULL;
+    for (const char *p = s; p[0] && p[1] && p[2]; p++) {
+        if (p[0] == ' ' && p[1] == '-' && p[2] == ' ') { sep = p; break; }
+    }
+    if (sep == NULL) {
+        shell_fg(CLR_HEADER);
+        terminal_writestring(s);
+        shell_color_default();
+        return;
+    }
+    shell_fg(CLR_HEADER);
+    for (const char *p = s; p < sep; p++) terminal_putchar(*p);
+    shell_fg(CLR_INFO);
+    for (const char *p = sep; *p; p++) terminal_putchar(*p);
+    shell_color_default();
+}
 
 /* �����չ���Ƿ�Ϊ��ִ��?*/
 static int is_exe_name(const char *name) {
@@ -512,7 +572,9 @@ static void shell_redraw_line(void) {
 
 void shell_run(void) {
     terminal_writestring("EZOS Shell - Type 'help' for commands, 'exit' to launch desktop.\n");
+    shell_fg(CLR_HEADER);
     terminal_writestring("> ");
+    shell_color_default();
 
     cmd_pos = 0;
     cursor = 0;
@@ -578,7 +640,9 @@ void shell_run(void) {
             cmd_pos = 0;
             cursor = 0;
             history_index = -1;
+            shell_fg(CLR_HEADER);
             terminal_writestring("> ");
+            shell_color_default();
             current_row = terminal_get_row();
         } else if (c == '\b') {
             if (cursor > 0) {
@@ -658,76 +722,76 @@ static void cmd_help(const char *args) {
         terminal_writestring("'. Use 'help' for the full command list.\n");
         return;
     }
-    terminal_writestring("Available commands:\n");
-    terminal_writestring("  help       - show this help\n");
-    terminal_writestring("  clear/cls  - clear screen\n");
-    terminal_writestring("  echo <txt> - print text\n");
-    terminal_writestring("  version    - show version\n");
-    terminal_writestring("  time       - show current time\n");
-    terminal_writestring("  date       - show current date\n");
-    terminal_writestring("  reboot     - reboot system\n");
-    terminal_writestring("  shutdown   - shutdown (QEMU exits)\n");
-    terminal_writestring("  meminfo    - show memory info\n");
-    terminal_writestring("  cpuid      - show CPU vendor\n");
-    terminal_writestring("  readdisk [drive] <lba> - read and hexdump disk sector\n");
-    terminal_writestring("  hexdump <hexaddr> - dump memory\n");
-    terminal_writestring("  beep       - make a beep sound\n");
-    terminal_writestring("  about      - about this OS\n");
-    terminal_writestring("  history    - show command history\n");
-    terminal_writestring("  setcolor <fg> [bg] - set text color (0-15)\n");
-    terminal_writestring("  setdrive <0-3> - set filesystem drive\n");
-    terminal_writestring("  ls         - list root directory (exFAT)\n");
-    terminal_writestring("  cat <file> - read file content (exFAT)\n");
-    terminal_writestring("  write <file> <content> - create file with content\n");
-    terminal_writestring("  rm <file>  - delete file\n");
-    terminal_writestring("  format [fs] - format slave disk: exfat|fat12|fat16|fat32|ext4|ntfs|f2fs|refs\n");
-    terminal_writestring("  grep <pattern> <file> - print lines containing pattern\n");
-    terminal_writestring("  wc <file>  - count lines/words/characters\n");
-    terminal_writestring("  head <file> [n] - show first n lines (default 10)\n");
-    terminal_writestring("  tail <file> [n] - show last n lines (default 10)\n");
-    terminal_writestring("  touch <file> - create empty file\n");
-    terminal_writestring("  cp <src> <dst> - copy file\n");
-    terminal_writestring("  mv <src> <dst> - move/rename file\n");
-    terminal_writestring("  cd <dir>   - change directory\n");
-    terminal_writestring("  mkdir <dir> - create directory\n");
-    terminal_writestring("  rmdir <dir> - remove empty directory\n");
-    terminal_writestring("  pwd        - print working directory\n");
-    terminal_writestring("  desktop    - launch graphical desktop\n");
-    terminal_writestring("  gui        - launch text-mode GUI\n");
-    terminal_writestring("  exit       - launch graphical desktop\n");
-    terminal_writestring("  theme [n]  - list/switch GUI theme\n");
-    terminal_writestring("  uname      - print system information\n");
-    terminal_writestring("  vi <file>  - edit a text file\n");
-    terminal_writestring("  df         - show disk space usage\n");
-    terminal_writestring("  du [name]  - show disk usage of current dir or file\n");
-    terminal_writestring("  calc <expr> - evaluate expression (e.g. calc 1+2*3)\n");
-    terminal_writestring("  hex <num>  - convert decimal <-> hex (0x.. for hex input)\n");
-    terminal_writestring("  rand [max] - generate a random number (default 0-99)\n");
-    terminal_writestring("  guess      - guess-the-number game\n");
-    terminal_writestring("  tictactoe  - play tic-tac-toe vs AI\n");
-    terminal_writestring("  snake      - play snake game (arrows, P pause, Esc quit)\n");
-    terminal_writestring("  games      - list/launch games\n");
-    terminal_writestring("  ver        - show kernel version\n");
-    terminal_writestring("  sysinfo    - show system summary (CPU/memory/time)\n");
-    terminal_writestring("  type <cmd> - show command type (builtin/alias/file)\n");
-    terminal_writestring("  which <cmd> - locate a command\n");
-    terminal_writestring("  alias [name=cmd] - list or define command aliases\n");
-    terminal_writestring("  unalias <name> - remove a command alias\n");
-    terminal_writestring("  sleep <ms> - busy-wait delay (approx)\n");
-    terminal_writestring("  mem <hexaddr> [len] - dump physical memory\n");
-    terminal_writestring("  dmesg [n] - show last n buffered kernel log lines\n");
-    terminal_writestring("  kmtest - kernel heap self-test\n");
-    terminal_writestring("  pagetest - paging self-test (identity/map/unmap)\n");
-    terminal_writestring("  utest - ring3 user-mode + int 0x80 syscall self-test\n");
-    terminal_writestring("  pmmtest - physical page frame allocator self-test\n");
-    terminal_writestring("  elftest - ELF32 loader self-test (validate/load/W^X/unload)\n");
-    terminal_writestring("  exec <file> [args] - load & run an ELF32 user program in ring3\n");
-    terminal_writestring("  calc <expr> - floating point calculator (sqrt sin cos pi e ...)\n");
-    terminal_writestring("  selftest - run ALL subsystem self-tests at once\n");
-    terminal_writestring("  ktask - start 2 kernel threads to demo preemptive scheduling\n");
-    terminal_writestring("  ps - list tasks (pid/state/switches)\n");
-    terminal_writestring("  crash [gp|pf|ud|div] - trigger a CPU fault (panic screen)\n");
-    terminal_writestring("  help <cmd> - detailed help for a command\n");
+    help_line("Available commands:\n");
+    help_line("  help       - show this help\n");
+    help_line("  clear/cls  - clear screen\n");
+    help_line("  echo <txt> - print text\n");
+    help_line("  version    - show version\n");
+    help_line("  time       - show current time\n");
+    help_line("  date       - show current date\n");
+    help_line("  reboot     - reboot system\n");
+    help_line("  shutdown   - shutdown (QEMU exits)\n");
+    help_line("  meminfo    - show memory info\n");
+    help_line("  cpuid      - show CPU vendor\n");
+    help_line("  readdisk [drive] <lba> - read and hexdump disk sector\n");
+    help_line("  hexdump <hexaddr> - dump memory\n");
+    help_line("  beep       - make a beep sound\n");
+    help_line("  about      - about this OS\n");
+    help_line("  history    - show command history\n");
+    help_line("  setcolor <fg> [bg] - set text color (0-15)\n");
+    help_line("  setdrive <0-3> - set filesystem drive\n");
+    help_line("  ls         - list root directory (exFAT)\n");
+    help_line("  cat <file> - read file content (exFAT)\n");
+    help_line("  write <file> <content> - create file with content\n");
+    help_line("  rm <file>  - delete file\n");
+    help_line("  format [fs] - format slave disk: exfat|fat12|fat16|fat32|ext4|ntfs|f2fs|refs\n");
+    help_line("  grep <pattern> <file> - print lines containing pattern\n");
+    help_line("  wc <file>  - count lines/words/characters\n");
+    help_line("  head <file> [n] - show first n lines (default 10)\n");
+    help_line("  tail <file> [n] - show last n lines (default 10)\n");
+    help_line("  touch <file> - create empty file\n");
+    help_line("  cp <src> <dst> - copy file\n");
+    help_line("  mv <src> <dst> - move/rename file\n");
+    help_line("  cd <dir>   - change directory\n");
+    help_line("  mkdir <dir> - create directory\n");
+    help_line("  rmdir <dir> - remove empty directory\n");
+    help_line("  pwd        - print working directory\n");
+    help_line("  desktop    - launch graphical desktop\n");
+    help_line("  gui        - launch text-mode GUI\n");
+    help_line("  exit       - launch graphical desktop\n");
+    help_line("  theme [n]  - list/switch GUI theme\n");
+    help_line("  uname      - print system information\n");
+    help_line("  vi <file>  - edit a text file\n");
+    help_line("  df         - show disk space usage\n");
+    help_line("  du [name]  - show disk usage of current dir or file\n");
+    help_line("  calc <expr> - evaluate expression (e.g. calc 1+2*3)\n");
+    help_line("  hex <num>  - convert decimal <-> hex (0x.. for hex input)\n");
+    help_line("  rand [max] - generate a random number (default 0-99)\n");
+    help_line("  guess      - guess-the-number game\n");
+    help_line("  tictactoe  - play tic-tac-toe vs AI\n");
+    help_line("  snake      - play snake game (arrows, P pause, Esc quit)\n");
+    help_line("  games      - list/launch games\n");
+    help_line("  ver        - show kernel version\n");
+    help_line("  sysinfo    - show system summary (CPU/memory/time)\n");
+    help_line("  type <cmd> - show command type (builtin/alias/file)\n");
+    help_line("  which <cmd> - locate a command\n");
+    help_line("  alias [name=cmd] - list or define command aliases\n");
+    help_line("  unalias <name> - remove a command alias\n");
+    help_line("  sleep <ms> - busy-wait delay (approx)\n");
+    help_line("  mem <hexaddr> [len] - dump physical memory\n");
+    help_line("  dmesg [n] - show last n buffered kernel log lines\n");
+    help_line("  kmtest - kernel heap self-test\n");
+    help_line("  pagetest - paging self-test (identity/map/unmap)\n");
+    help_line("  utest - ring3 user-mode + int 0x80 syscall self-test\n");
+    help_line("  pmmtest - physical page frame allocator self-test\n");
+    help_line("  elftest - ELF32 loader self-test (validate/load/W^X/unload)\n");
+    help_line("  exec <file> [args] - load & run an ELF32 user program in ring3\n");
+    help_line("  calc <expr> - floating point calculator (sqrt sin cos pi e ...)\n");
+    help_line("  selftest - run ALL subsystem self-tests at once\n");
+    help_line("  ktask - start 2 kernel threads to demo preemptive scheduling\n");
+    help_line("  ps - list tasks (pid/state/switches)\n");
+    help_line("  crash [gp|pf|ud|div] - trigger a CPU fault (panic screen)\n");
+    help_line("  help <cmd> - detailed help for a command\n");
 }
 
 static void cmd_clear(const char *args) {
@@ -1150,7 +1214,7 @@ static void cmd_cat(const char *args) {
     static uint8_t file_buffer[4096];
     int bytes = fs_read_file(filename, file_buffer, 4096);
     if (bytes < 0) {
-        terminal_writestring("File not found or read error.\n");
+        puts_c("File not found or read error.\n", CLR_ERROR);
     } else {
         for (int j = 0; j < bytes; j++) {
             char c = (char)file_buffer[j];
@@ -1223,11 +1287,13 @@ static void cmd_format(const char *args) {
         }
     }
     if (fs_format(type) != 0) {
-        terminal_writestring("Format failed.\n");
+        puts_c("Format failed.\n", CLR_ERROR);
     } else {
+        shell_fg(CLR_SUCCESS);
         terminal_writestring("Disk formatted as ");
         terminal_writestring(fs_type_name());
         terminal_writestring(".\n");
+        shell_color_default();
         // fs_format succeeds with the new FS mounted; no re-init needed
     }
 }
@@ -1297,7 +1363,7 @@ static void cmd_grep(const char *args) {
     static uint8_t file_buffer[4096];
     int bytes = fs_read_file(filename, file_buffer, 4096);
     if (bytes < 0) {
-        terminal_writestring("File not found or read error.\n");
+        puts_c("File not found or read error.\n", CLR_ERROR);
         return;
     }
     int plen = my_strlen(pattern);
@@ -1311,7 +1377,7 @@ static void cmd_grep(const char *args) {
             if (k == plen) { found = 1; break; }
         }
         if (found) {
-            for (int j = line_start; j < line_end; j++) terminal_putchar((char)file_buffer[j]);
+            print_highlighted((const char *)file_buffer, line_start, line_end, pattern, plen);
             terminal_putchar('\n');
         }
         line_end++;
@@ -1345,7 +1411,7 @@ static void cmd_wc(const char *args) {
     static uint8_t file_buffer[4096];
     int bytes = fs_read_file(filename, file_buffer, 4096);
     if (bytes < 0) {
-        terminal_writestring("File not found or read error.\n");
+        puts_c("File not found or read error.\n", CLR_ERROR);
         return;
     }
     int lines = 0, words = 0, chars = 0;
@@ -1380,7 +1446,7 @@ static void cmd_head(const char *args) {
     static uint8_t file_buffer[4096];
     int bytes = fs_read_file(filename, file_buffer, 4096);
     if (bytes < 0) {
-        terminal_writestring("File not found or read error.\n");
+        puts_c("File not found or read error.\n", CLR_ERROR);
         return;
     }
     int shown = 0, line_start = 0, line_end = 0;
@@ -1407,7 +1473,7 @@ static void cmd_tail(const char *args) {
     static uint8_t file_buffer[4096];
     int bytes = fs_read_file(filename, file_buffer, 4096);
     if (bytes < 0) {
-        terminal_writestring("File not found or read error.\n");
+        puts_c("File not found or read error.\n", CLR_ERROR);
         return;
     }
     int total_lines = 0;
@@ -1436,7 +1502,7 @@ static void cmd_touch(const char *args) {
     if (fs_create_file(filename, 0, 0) != 0) {
         terminal_writestring("Failed to create file.\n");
     } else {
-        terminal_writestring("File created.\n");
+        puts_c("File created.\n", CLR_SUCCESS);
     }
 }
 
@@ -1451,7 +1517,7 @@ static void cmd_cp(const char *args) {
     static uint8_t file_buffer[4096];
     int bytes = fs_read_file(src, file_buffer, 4096);
     if (bytes < 0) {
-        terminal_writestring("Source file not found.\n");
+        puts_c("Source file not found.\n", CLR_ERROR);
         return;
     }
     if (fs_create_file(dst, file_buffer, (uint32_t)bytes) != 0) {
@@ -1466,23 +1532,23 @@ static void cmd_mv(const char *args) {
     const char *p = parse_token(args, src, 128);
     parse_token(p, dst, 128);
     if (src[0] == '\0' || dst[0] == '\0') {
-        terminal_writestring("Usage: mv <src> <dst>\n");
+        puts_c("Usage: mv <src> <dst>\n", CLR_ERROR);
         return;
     }
     static uint8_t file_buffer[4096];
     int bytes = fs_read_file(src, file_buffer, 4096);
     if (bytes < 0) {
-        terminal_writestring("Source file not found.\n");
+        puts_c("Source file not found.\n", CLR_ERROR);
         return;
     }
     if (fs_create_file(dst, file_buffer, (uint32_t)bytes) != 0) {
-        terminal_writestring("Move failed.\n");
+        puts_c("Move failed.\n", CLR_ERROR);
         return;
     }
     if (fs_delete_file(src) != 0) {
         terminal_writestring("Moved, but failed to delete source.\n");
     } else {
-        terminal_writestring("Moved.\n");
+        puts_c("Moved.\n", CLR_SUCCESS);
     }
 }
 
@@ -1560,13 +1626,15 @@ static void cmd_theme(const char *args) {
         idx = idx * 10 + (*p - '0');
     }
     if (!valid || idx >= n) {
-        terminal_writestring("Invalid theme index. Use 'theme' to list.\n");
+        puts_c("Invalid theme index. Use 'theme' to list.\n", CLR_ERROR);
         return;
     }
     gw_set_theme(idx);
+    shell_fg(CLR_SUCCESS);
     terminal_writestring("Theme: ");
     terminal_writestring(gw_theme_name(idx));
     terminal_writestring("\n");
+    shell_color_default();
 }
 
 
@@ -1587,6 +1655,234 @@ static int vi_modified = 0;
 static int vi_mode = 0;
 static const char *vi_msg = NULL;
 
+// �����校ɫ����static����.bss����100*96 ɫ����ջ����ö�.bss.hi
+static uint8_t vi_colbuf[VI_MAX_LINE];     // ��ǰ�пɼ��е�逐����ɫ(ÿ���ظ���)
+static uint8_t vi_block_comment[VI_MAX_LINES]; // ÿ��进�뿪����ע��״̬(0/1)
+
+// ===== vi �������룺��������ѡ�󷨹������� =====
+static int vi_is_digit(char c) { return c >= '0' && c <= '9'; }
+static int vi_is_ident_start(char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+}
+static int vi_is_ident(char c) { return vi_is_ident_start(c) || vi_is_digit(c); }
+
+// Сдַ����Ƚϣ��ֱ����β '\0'����strcmp
+static int vi_streq(const char *a, const char *b) {
+    while (*a && *a == *b) { a++; b++; }
+    return (*a == '\0' && *b == '\0');
+}
+
+// C �ؼ�/asm ���������бȽϣ�s �� len �ֽڣ����ǰβ
+static int vi_match_list(const char *s, int len, const char *const *list, int n) {
+    for (int k = 0; k < n; k++) {
+        const char *kw = list[k];
+        int j = 0, match = 1;
+        while (j < len) {
+            if (kw[j] != s[j]) { match = 0; break; }
+            j++;
+        }
+        if (match && kw[j] == '\0') return 1; // s ����ȷ���� kw
+    }
+    return 0;
+}
+
+static int vi_get_lang(void) {
+    int len = 0;
+    while (len < 128 && vi_filename[len]) len++;
+    int dot = -1;
+    for (int i = len - 1; i >= 0; i--) {
+        if (vi_filename[i] == '.') { dot = i; break; }
+    }
+    if (dot < 0) return 0;
+    char ext[8];
+    int e = 0;
+    for (int i = dot + 1; i < len && e < 7; i++) {
+        char c = vi_filename[i];
+        if (c >= 'A' && c <= 'Z') c += 32; // תСд
+        ext[e++] = c;
+    }
+    ext[e] = '\0';
+    if (vi_streq(ext, "c") || vi_streq(ext, "h")) return 1;
+    if (vi_streq(ext, "s") || vi_streq(ext, "asm")) return 2;
+    if (vi_streq(ext, "md")) return 3;
+    return 0; // δ֪����ΪĬ�Ϻ�ɫ
+}
+
+// һ�δ�量ɨ�����и�进�뿪 /* */ ״̬����O(总行*列) ����כ����и�
+static void vi_compute_block_states(void) {
+    int in_block = 0;
+    for (int line = 0; line < vi_count && line < VI_MAX_LINES; line++) {
+        vi_block_comment[line] = in_block ? 1 : 0;
+        int L = vi_len[line];
+        if (L < 0) L = 0;
+        int i = 0;
+        while (i < L) {
+            char c = vi_lines[line][i];
+            if (in_block) {
+                if (i + 1 < L && c == '*' && vi_lines[line][i + 1] == '/') { in_block = 0; i += 2; }
+                else i++;
+            } else {
+                if (c == '/' && i + 1 < L && vi_lines[line][i + 1] == '/') break; // �к�ע��
+                else if (c == '/' && i + 1 < L && vi_lines[line][i + 1] == '*') { in_block = 1; i += 2; }
+                else i++;
+            }
+        }
+    }
+}
+
+// ΢һ�п�逐����ɫ��vi_colbuf[0..L-1]����ʹ in_block 进����ע��״̬
+static void vi_color_line(int line, int lang, int in_block) {
+    int L = vi_len[line];
+    if (L < 0) L = 0;
+    /* vi_colbuf 只有 VI_MAX_LINE 个元素，所有写它的循环都以 L 为上界。
+     * vi_len 理论上由插入逻辑保证 <= VI_MAX_LINE-1，但这里是最后一道防线：
+     * 一旦越界就是向相邻 static 数据写颜色值，属于极难排查的静默破坏。 */
+    if (L > VI_MAX_LINE) L = VI_MAX_LINE;
+    for (int i = 0; i < VI_MAX_LINE; i++) vi_colbuf[i] = CLR_LIGHT_GREY; // Ĭ����ɫ 0x07
+    if (lang == 0 || L == 0) return;
+
+    if (lang == 3) { // ===== Markdown =====
+        int k = 0; while (k < L && vi_lines[line][k] == ' ') k++;
+        if (k < L && vi_lines[line][k] == '#') { // ����
+            for (int j = 0; j < L; j++) vi_colbuf[j] = CLR_LIGHT_BLUE;
+            return;
+        }
+        int i = 0;
+        if (k < L && (vi_lines[line][k] == '-' || vi_lines[line][k] == '*') &&
+            (k + 1 >= L || vi_lines[line][k + 1] == ' ' || vi_lines[line][k + 1] == '\t')) {
+            vi_colbuf[k] = CLR_LIGHT_RED; // �б���ǣ�
+            i = k + 1;
+        }
+        while (i < L) { // �����д�����`
+            char c = vi_lines[line][i];
+            if (c == '`') {
+                vi_colbuf[i] = CLR_LIGHT_GREEN; i++;
+                while (i < L && vi_lines[line][i] != '`') { vi_colbuf[i] = CLR_LIGHT_GREEN; i++; }
+                if (i < L) { vi_colbuf[i] = CLR_LIGHT_GREEN; i++; }
+                continue;
+            }
+            i++;
+        }
+        return;
+    }
+
+    if (lang == 2) { // ===== ���� =====
+        static const char *mnem[] = {
+            "mov","add","sub","mul","div","and","or","xor","not","shl","shr","jmp",
+            "je","jne","jz","jnz","call","ret","push","pop","int","cmp","lea","inc",
+            "dec","test","nop","in","out","cli","sti","hlt","loop","syscall"
+        };
+        int n = (int)(sizeof(mnem) / sizeof(mnem[0]));
+        int i = 0;
+        while (i < L) {
+            char c = vi_lines[line][i];
+            if (c == ';' || c == '#') {
+                for (int j = i; j < L; j++) vi_colbuf[j] = CLR_DARK_GREY;
+                break;
+            }
+            if (c == '.') { // ���� .text .globl
+                int s = i; i++; while (i < L && vi_is_ident(vi_lines[line][i])) i++;
+                for (int j = s; j < i; j++) vi_colbuf[j] = CLR_LIGHT_CYAN;
+                continue;
+            }
+            if (c == '%') { // ����%eax
+                int s = i; i++; while (i < L && vi_is_ident(vi_lines[line][i])) i++;
+                for (int j = s; j < i; j++) vi_colbuf[j] = CLR_LIGHT_BLUE;
+                continue;
+            }
+            if (vi_is_digit(c) || (c == '$' && i + 1 < L && vi_is_digit(vi_lines[line][i + 1]))) {
+                if (c == '$') { vi_colbuf[i] = CLR_LIGHT_RED; i++; }
+                while (i < L && (vi_is_digit(vi_lines[line][i]) || vi_lines[line][i] == 'x' ||
+                       vi_lines[line][i] == 'X' ||
+                       (vi_lines[line][i] >= 'a' && vi_lines[line][i] <= 'f') ||
+                       (vi_lines[line][i] >= 'A' && vi_lines[line][i] <= 'F') ||
+                       vi_lines[line][i] == '.')) { vi_colbuf[i] = CLR_LIGHT_RED; i++; }
+                continue;
+            }
+            if (vi_is_ident_start(c)) {
+                int s = i; while (i < L && vi_is_ident(vi_lines[line][i])) i++;
+                if (vi_match_list(&vi_lines[line][s], i - s, mnem, n))
+                    for (int j = s; j < i; j++) vi_colbuf[j] = CLR_LIGHT_GREEN;
+                continue;
+            }
+            i++;
+        }
+        return;
+    }
+
+    // ===== C (.c/.h) =====
+    static const char *kw[] = {
+        "int","char","void","if","else","for","while","do","return","struct",
+        "typedef","static","const","unsigned","signed","long","short","float","double",
+        "switch","case","break","continue","default","enum","union","sizeof","goto",
+        "extern","volatile","register","auto","size_t","uint8_t","uint32_t","uint64_t","int32_t"
+    };
+    int n = (int)(sizeof(kw) / sizeof(kw[0]));
+    // Ԥ����: �����հ�'#' -> # ������������ɫ
+    int i = 0;
+    int p = 0; while (p < L && vi_lines[line][p] == ' ') p++;
+    if (p < L && vi_lines[line][p] == '#') {
+        vi_colbuf[p] = CLR_LIGHT_CYAN;
+        int q = p + 1; while (q < L && vi_is_ident(vi_lines[line][q])) { vi_colbuf[q] = CLR_LIGHT_CYAN; q++; }
+        i = q;
+    }
+    while (i < L) {
+        char c = vi_lines[line][i];
+        if (in_block) {
+            if (i + 1 < L && c == '*' && vi_lines[line][i + 1] == '/') {
+                vi_colbuf[i] = CLR_DARK_GREY; vi_colbuf[i + 1] = CLR_DARK_GREY;
+                in_block = 0; i += 2; continue;
+            }
+            vi_colbuf[i] = CLR_DARK_GREY; i++; continue;
+        }
+        if (c == '/' && i + 1 < L && vi_lines[line][i + 1] == '/') {
+            for (int j = i; j < L; j++) vi_colbuf[j] = CLR_DARK_GREY;
+            break;
+        }
+        if (c == '/' && i + 1 < L && vi_lines[line][i + 1] == '*') {
+            vi_colbuf[i] = CLR_DARK_GREY; vi_colbuf[i + 1] = CLR_DARK_GREY;
+            in_block = 1; i += 2; continue;
+        }
+        if (c == '"') { // �ַ�����
+            vi_colbuf[i] = CLR_LIGHT_GREEN; i++;
+            while (i < L) {
+                char d = vi_lines[line][i]; vi_colbuf[i] = CLR_LIGHT_GREEN;
+                if (d == '\\' && i + 1 < L) { vi_colbuf[i + 1] = CLR_LIGHT_GREEN; i += 2; continue; }
+                if (d == '"') { i++; break; }
+                i++;
+            }
+            continue;
+        }
+        if (c == '\'') { // �ַ�����
+            vi_colbuf[i] = CLR_LIGHT_GREEN; i++;
+            while (i < L) {
+                char d = vi_lines[line][i]; vi_colbuf[i] = CLR_LIGHT_GREEN;
+                if (d == '\\' && i + 1 < L) { vi_colbuf[i + 1] = CLR_LIGHT_GREEN; i += 2; continue; }
+                if (d == '\'') { i++; break; }
+                i++;
+            }
+            continue;
+        }
+        if (vi_is_digit(c) || (c == '.' && i + 1 < L && vi_is_digit(vi_lines[line][i + 1]))) {
+            int s = i;
+            while (i < L && (vi_is_digit(vi_lines[line][i]) || vi_lines[line][i] == '.' ||
+                   vi_lines[line][i] == 'x' || vi_lines[line][i] == 'X' ||
+                   (vi_lines[line][i] >= 'a' && vi_lines[line][i] <= 'f') ||
+                   (vi_lines[line][i] >= 'A' && vi_lines[line][i] <= 'F'))) i++;
+            for (int j = s; j < i; j++) vi_colbuf[j] = CLR_LIGHT_RED;
+            continue;
+        }
+        if (vi_is_ident_start(c)) {
+            int s = i; while (i < L && vi_is_ident(vi_lines[line][i])) i++;
+            if (vi_match_list(&vi_lines[line][s], i - s, kw, n)) {
+                for (int j = s; j < i; j++) vi_colbuf[j] = CLR_LIGHT_BLUE;
+            }
+            continue;
+        }
+        i++;
+    }
+}
+
 // ȷ������ںϷ����?
 static void vi_clamp_cursor(void) {
     if (vi_count == 0) { vi_row = 0; vi_col = 0; return; }
@@ -1606,17 +1902,26 @@ static void vi_scroll_into_view(void) {
     if (vi_top < 0) vi_top = 0;
 }
 
-// ��Ⱦ����
+// ��Ⱦ����(���������뷨��ɫ)
 static void vi_render(void) {
     terminal_initialize();
+    int lang = vi_get_lang();
+    if (lang == 1) vi_compute_block_states(); // �С��ע��跨��״̬
     for (int i = 0; i < VI_SCREEN_ROWS; i++) {
         int line = vi_top + i;
         if (line < vi_count) {
             terminal_set_cursor((size_t)i, 0);
             int L = vi_len[line];
+            if (L < 0) L = 0;
+            int in_block = (lang == 1 && line >= 0 && line < VI_MAX_LINES) ? vi_block_comment[line] : 0;
+            vi_color_line(line, lang, in_block);
+            int cur_color = -1; // ����ɫʱ�ŵ� terminal_setcolor
             for (int x = 0; x < VI_SCREEN_COLS - 1; x++) {
                 int src = vi_left + x;
-                terminal_putchar(src < L ? vi_lines[line][src] : ' ');
+                char ch = (src < L) ? vi_lines[line][src] : ' ';
+                int col = (src < L) ? (int)vi_colbuf[src] : CLR_LIGHT_GREY;
+                if (col != cur_color) { shell_fg((uint8_t)col); cur_color = col; }
+                terminal_putchar(ch);
             }
         }
     }
