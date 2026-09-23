@@ -17,6 +17,78 @@
 #include "kmalloc.h"
 #include "keyboard.h"
 #include "tty.h"
+#include "task.h"          /* task_sleep / task_wake_all：pipe 阻塞读写的唯一睡眠路径 */
+
+/* ---------- pipe（匿名管道，步骤 6c 用户态生态第一步） ----------
+ * 静态对象池、无动态分配：用尽则 fail closed 返回 -1。每个 pipe 一个 4096
+ * 字节环形缓冲，读/写端各有独立引用计数；两端计数都为 0 时释放回池。
+ * 阻塞/唤醒走 task_sleep / task_wake_all，且"条件判定 → 入队"全程 cli，
+ * 单核下 cli 即原子，丢失唤醒在结构上不可能（项目在网络部分真实踩过这个坑）。
+ *
+ * fd_entry 复用约定（与标准流一致，避免同名被宏替换）：
+ *   type   = FD_TYPE_PIPE
+ *   writable= 1 表示这是"写端"，0 表示"读端"（FILE 类型里 writable 是写权限，
+ *             此处语义不同但仅在 FD_TYPE_PIPE 分支内解释）
+ *   data   = 指向 pipe_t 对象（共享，跨两个 fd 端） */
+#define PIPE_MAX   16u             /* 池中 pipe 对象上限 */
+#define PIPE_BUF   4096u           /* 每 pipe 环形缓冲字节数 */
+
+typedef struct {
+    uint8_t   used;               /* 1 = 已分配；0 = 空闲（释放回池） */
+    uint16_t  ref_r;              /* 读端打开数 */
+    uint16_t  ref_w;              /* 写端打开数 */
+    uint32_t  head;               /* 写位置（环形，[0,PIPE_BUF)） */
+    uint32_t  tail;               /* 读位置（环形，[0,PIPE_BUF)） */
+    uint32_t  count;              /* 缓冲中可用字节数（区分"满/空"靠它，不靠 head==tail） */
+    uint8_t  *buf;                /* 环形缓冲：**运行时 kmalloc**，不放静态 */
+    wait_queue_t wq;              /* 读/写端共用一队列：唤醒后各自重查自身条件 */
+} pipe_t;
+
+/* BSS 零初始化：used=0（全部空闲）；wq.head 仅在 fd_pipe 分配时置 -1，
+ * 空闲对象不会被引用，故初值 0 无碍。
+ *
+ * 环形缓冲为什么不静态：16 个 × 4096B = 64KB，落进低 .bss 会顶穿
+ * linker.ld:41 的 `__bss_end <= 0x90000`（全量链接已实测失败一次）；
+ * 挪去 .bss.hi 也不行——那个段只剩 ~21KB 余量。所以元数据静态、
+ * 缓冲运行时从 kmalloc 申请，失败即 fail closed。 */
+static pipe_t g_pipes[PIPE_MAX];
+
+/* 从池里取一个空闲 pipe 对象（含缓冲），成功返回下标，
+ * 池耗尽或 kmalloc 失败返回 -1。任何失败路径都不残留半成品（used 不许被
+ * 置 1 后又不回收）。 */
+static int pipe_alloc(void) {
+    for (uint32_t i = 0; i < PIPE_MAX; i++) {
+        if (g_pipes[i].used == 0) {
+            uint8_t *buf = (uint8_t *)kmalloc(PIPE_BUF);
+            if (buf == 0) return -1;            /* 没内存就别占槽 */
+            for (uint32_t k = 0; k < PIPE_BUF; k++) buf[k] = 0;
+            g_pipes[i].used = 1;
+            g_pipes[i].buf = buf;
+            g_pipes[i].ref_r = 0;
+            g_pipes[i].ref_w = 0;
+            g_pipes[i].head = 0;
+            g_pipes[i].tail = 0;
+            g_pipes[i].count = 0;
+            g_pipes[i].wq.head = 0;
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+/* 释放 pipe 对象：两端引用都归零时调用。
+ * 顺序很重要：先摘掉 used 标记并让 wq 失活，再 kfree —— 单核但有抢占和
+ * IRQ，先释放内存的话，被抢占到别的路径上时它可能拿到一个已回池的对象。 */
+static void pipe_free(pipe_t *p) {
+    if (p->buf != 0) kfree(p->buf);
+    p->buf = 0;
+    p->head = 0;
+    p->tail = 0;
+    p->count = 0;
+    p->ref_r = 0;
+    p->ref_w = 0;
+    p->used = 0;
+}
 
 /* ---------- 小工具 ---------- */
 static uint32_t fd_strlen(const char *s) {
@@ -115,6 +187,31 @@ int fd_close(fd_table_t *t, int fd) {
     if (t == 0 || fd < 0 || (uint32_t)fd >= MAX_OPEN_FDS) return -1;
     fd_entry_t *e = &t->fds[fd];
     if (e->type == FD_TYPE_FREE) return -1;
+
+    /* pipe 端关闭：递减对应引用计数，两端皆 0 时释放回池，并唤醒对端
+     * 重判 EOF（读端全关）/ 无读者（写端全关）。整段关中断避免与睡眠方
+     * 的"判定→入队"窗口交错（丢失唤醒）。 */
+    if (e->type == FD_TYPE_PIPE) {
+        pipe_t *p = (pipe_t *)e->data;
+        if (p != 0) {
+            asm volatile("cli" ::: "memory");
+            if (e->writable) { if (p->ref_w > 0) p->ref_w--; }
+            else            { if (p->ref_r > 0) p->ref_r--; }
+            if (p->ref_r == 0 && p->ref_w == 0)
+                pipe_free(p);                      /* 两端皆关：释放回池 + 还缓冲 */
+            task_wake_all(&p->wq);                 /* 唤醒对端重判条件 */
+            asm volatile("sti" ::: "memory");
+        }
+        e->type    = FD_TYPE_FREE;
+        e->writable= 0;
+        e->dirty   = 0;
+        e->size    = 0;
+        e->offset  = 0;
+        e->data    = 0;
+        e->name[0] = '\0';
+        return 0;
+    }
+
     if (e->type != FD_TYPE_FILE) return -1;   /* 标准流不参与 close */
 
     if (e->dirty && e->name[0] != '\0') {
@@ -131,6 +228,62 @@ int fd_close(fd_table_t *t, int fd) {
     e->offset = 0;
     e->data = 0;
     e->name[0] = '\0';
+    return 0;
+}
+
+/* ---------- pipe 创建 ---------- */
+
+int fd_pipe(fd_table_t *t, int *u_fds) {
+    if (t == 0 || u_fds == 0) return -1;
+
+    /* 1) 从静态池取一个 pipe 对象；池耗尽直接 fail closed。 */
+    int pi = pipe_alloc();
+    if (pi < 0) return -1;
+    pipe_t *p = &g_pipes[pi];
+
+    /* 2) 在本任务 fd 表找两个空槽（≥3，0/1/2 永远留给标准流）。
+     *    若找不到两个空槽，须把刚取的池对象还回去，避免泄漏。 */
+    int rfd = -1, wfd = -1;
+    for (uint32_t i = 3; i < MAX_OPEN_FDS; i++) {
+        if (t->fds[i].type == FD_TYPE_FREE) {
+            if (rfd < 0) rfd = (int)i;
+            else { wfd = (int)i; break; }
+        }
+    }
+    if (rfd < 0 || wfd < 0) {
+        pipe_free(p);             /* 释放回池并把已申请的缓冲还回去 */
+        return -1;
+    }
+
+    /* 3) 初始化 pipe 对象：环形缓冲空，读/写端各 1 个引用。 */
+    p->used  = 1;
+    p->ref_r = 1;
+    p->ref_w = 1;
+    p->head  = 0;
+    p->tail  = 0;
+    p->count = 0;
+    p->wq.head = -1;
+
+    /* 4) 登记两端 fd（writable 复用为"是否写端"）。 */
+    t->fds[rfd].type    = FD_TYPE_PIPE;
+    t->fds[rfd].writable= 0;
+    t->fds[rfd].dirty   = 0;
+    t->fds[rfd].size    = 0;
+    t->fds[rfd].offset  = 0;
+    t->fds[rfd].data    = (uint8_t *)p;
+    t->fds[rfd].name[0] = '\0';
+
+    t->fds[wfd].type    = FD_TYPE_PIPE;
+    t->fds[wfd].writable= 1;
+    t->fds[wfd].dirty   = 0;
+    t->fds[wfd].size    = 0;
+    t->fds[wfd].offset  = 0;
+    t->fds[wfd].data    = (uint8_t *)p;
+    t->fds[wfd].name[0] = '\0';
+
+    /* 5) 写回用户（u_fds 已由 syscall.c 经 user_range_ok(...,1) 校验可写）。 */
+    u_fds[0] = rfd;
+    u_fds[1] = wfd;
     return 0;
 }
 
@@ -158,6 +311,34 @@ int fd_read(fd_table_t *t, int fd, uint8_t *buf, uint32_t n) {
         return (int)i;
     }
 
+    /* pipe 读端：读空且有写端 → 睡等数据；写端全关 → EOF(0)；
+     * 有数据则读最多 min(n,count) 字节（部分读允许，不阻塞读满）。 */
+    if (e->type == FD_TYPE_PIPE) {
+        pipe_t *p = (pipe_t *)e->data;
+        if (p == 0) return -1;
+        if (e->writable) return -1;                 /* 写端不可读 */
+        if (n == 0) return 0;
+        for (;;) {
+            asm volatile("cli" ::: "memory");       /* 条件判定与入队原子 */
+            if (p->count > 0) {
+                uint32_t k = (n < p->count) ? n : p->count;
+                for (uint32_t i = 0; i < k; i++)
+                    buf[i] = p->buf[(p->tail + i) % PIPE_BUF];
+                p->tail  = (p->tail + k) % PIPE_BUF;
+                p->count -= k;
+                task_wake_all(&p->wq);              /* 腾出空间，唤醒写端 */
+                asm volatile("sti" ::: "memory");
+                return (int)k;
+            }
+            if (p->ref_w == 0) {                    /* 全部写端关闭 → EOF */
+                asm volatile("sti" ::: "memory");
+                return 0;
+            }
+            task_sleep(&p->wq, 0);                  /* 有写端，睡等数据 */
+            /* 回到这里循环重查（task_sleep 内已平衡 cli/sti；下一轮再 cli） */
+        }
+    }
+
     if (e->type != FD_TYPE_FILE) return -1;               /* stdout/stderr 不可读 */
     if (e->offset >= e->size) return 0;              /* EOF */
     uint32_t avail = e->size - e->offset;
@@ -174,6 +355,34 @@ int fd_write(fd_table_t *t, int fd, const uint8_t *buf, uint32_t n) {
     if (e->type == FD_TYPE_STDOUT || e->type == FD_TYPE_STDERR) {
         terminal_write((const char *)buf, n);
         return (int)n;
+    }
+
+    /* pipe 写端：无读者 → 返回 -1（SIGPIPE 等价，不杀进程）；缓冲满且有读者
+     * → 睡等空间；有空间则写最多 min(n,空闲) 字节（部分写允许）。 */
+    if (e->type == FD_TYPE_PIPE) {
+        pipe_t *p = (pipe_t *)e->data;
+        if (p == 0) return -1;
+        if (!e->writable) return -1;                /* 读端不可写 */
+        if (n == 0) return 0;
+        for (;;) {
+            asm volatile("cli" ::: "memory");       /* 条件判定与入队原子 */
+            if (p->ref_r == 0) {                    /* 无读者 → SIGPIPE 等价 */
+                asm volatile("sti" ::: "memory");
+                return -1;
+            }
+            if (p->count < PIPE_BUF) {
+                uint32_t free = PIPE_BUF - p->count;
+                uint32_t k = (n < free) ? n : free;
+                for (uint32_t i = 0; i < k; i++)
+                    p->buf[(p->head + i) % PIPE_BUF] = buf[i];
+                p->head  = (p->head + k) % PIPE_BUF;
+                p->count += k;
+                task_wake_all(&p->wq);              /* 有数据，唤醒读端 */
+                asm volatile("sti" ::: "memory");
+                return (int)k;
+            }
+            task_sleep(&p->wq, 0);                  /* 满且有读者，睡等空间 */
+        }
     }
 
     if (e->type != FD_TYPE_FILE) return -1;
@@ -289,6 +498,56 @@ int fd_selftest(void (*out)(const char *)) {
     out(ok6 ? "yes [OK]\n" : "NO [FAIL]\n");
     if (!ok6) fail++;
     if (fd >= 0) fd_close(&t, fd);
+
+    /* ===== 7..10) pipe =====
+     * 注意：这些用例必须保证不会真的睡下去——写端关掉后读才返回 0(EOF)，
+     * 有数据可读时读不会阻塞。一旦顺序写错，自检会把整机挂在 task_sleep 上，
+     * 而 selftest 是在 shell 之前的开机自检里跑的，卡住就再也进不了 shell。 */
+    int pfd[2];
+    int ok7 = (fd_pipe(&t, pfd) == 0);
+    out("  pipe() creates r/w pair: ");
+    out(ok7 ? "yes [OK]\n" : "NO [FAIL]\n");
+    if (!ok7) {
+        fail++;
+    } else {
+        const char *msg = "pipe payload";
+        int ml = (int)fd_strlen(msg);
+
+        /* 8) 写 -> 读回：内容一致，且读端不可写 / 写端不可读 */
+        int w = fd_write(&t, pfd[1], (const uint8_t *)msg, (uint32_t)ml);
+        uint8_t pb[32];
+        int r = fd_read(&t, pfd[0], pb, sizeof(pb));
+        int ok8 = (w == ml) && (r == ml) && (pb[0] == 'p') && (pb[ml - 1] == 'd')
+                  && (fd_write(&t, pfd[0], (const uint8_t *)"x", 1) == -1)
+                  && (fd_read(&t, pfd[1], pb, 1) == -1);
+        out("  pipe write->read roundtrip: ");
+        out(ok8 ? "yes [OK]\n" : "NO [FAIL]\n");
+        if (!ok8) fail++;
+
+        /* 9) 写端关掉后，读端必须读到 EOF(0) 而不是一直睡 */
+        fd_close(&t, pfd[1]);
+        int r2 = fd_read(&t, pfd[0], pb, sizeof(pb));
+        int ok9 = (r2 == 0);
+        out("  pipe read returns EOF(0) after write end closed: ");
+        out(ok9 ? "yes [OK]\n" : "NO [FAIL]\n");
+        if (!ok9) {
+            fail++;
+            /* 读到 0 之外的结果说明状态机坏了：直接把读端也关掉止损，
+             * 别让后面的用例继续引用这个 pipe。 */
+        }
+        fd_close(&t, pfd[0]);
+
+        /* 10) 读端关掉后，写必须失败（SIGPIPE 的等价语义：返回 -1，不杀进程） */
+        int ok10 = 0;
+        if (fd_pipe(&t, pfd) == 0) {
+            fd_close(&t, pfd[0]);
+            ok10 = (fd_write(&t, pfd[1], (const uint8_t *)"x", 1) == -1);
+            fd_close(&t, pfd[1]);
+        }
+        out("  pipe write fails after read end closed: ");
+        out(ok10 ? "yes [OK]\n" : "NO [FAIL]\n");
+        if (!ok10) fail++;
+    }
 
     out(fail == 0 ? "  result: PASS\n" : "  result: FAIL\n");
     return fail;

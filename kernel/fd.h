@@ -48,7 +48,8 @@ typedef enum {
     FD_TYPE_STDIN,
     FD_TYPE_STDOUT,
     FD_TYPE_STDERR,
-    FD_TYPE_FILE
+    FD_TYPE_FILE,
+    FD_TYPE_PIPE            /* 匿名管道端（读/写端同类型，方向由 writable 字段区分） */
 } fd_type_t;
 
 typedef struct {
@@ -79,6 +80,10 @@ int fd_close(fd_table_t *t, int fd);
 int fd_read(fd_table_t *t, int fd, uint8_t *buf, uint32_t n);
 int fd_write(fd_table_t *t, int fd, const uint8_t *buf, uint32_t n);
 int fd_lseek(fd_table_t *t, int fd, int32_t offset, int whence);
+
+/* 创建一对管道 fd：u_fds[0]=只读端，u_fds[1]=只写端（u_fds 已由 syscall.c
+ * 用 user_range_ok 校验可写）。成功返回 0，池耗尽/无空 fd 返回 -1。 */
+int fd_pipe(fd_table_t *t, int *u_fds);
 
 /* 自检：open/read/lseek/write/close 走真实文件系统跑一遍 */
 int fd_selftest(void (*out)(const char *));

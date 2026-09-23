@@ -103,6 +103,14 @@ int syscall_handler(uint32_t num, uint32_t a1, uint32_t a2, uint32_t a3) {
         if (cur == 0) return -1;
         return fd_close(&cur->fds, (int)fd);
     }
+    case SYS_PIPE: {
+        /* ebx = 用户态 int fds[2]，内核写回两个 fd 号（须可写）。
+         * 与 read 同一风格：失败返回 -1。 */
+        int *fds = (int *)a1;
+        if (!user_range_ok(a1, 2u * sizeof(int), 1)) return -1;
+        if (cur == 0) return -1;
+        return fd_pipe(&cur->fds, fds);
+    }
     case SYS_LSEEK: {
         uint32_t fd = a1;
         int32_t offset = (int32_t)a2;
