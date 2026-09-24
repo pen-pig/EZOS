@@ -554,7 +554,22 @@ void cmd_utest(const char *args) {
 
 /* pagetest：分页自检（identity 一致性 + 动态映射/读写/解映射）。
  * 不主动触发 #PF——破坏性缺页测试用 `crash pf`。 */
-static void pg_puts(const char *s) { ezos_console_write(s); }
+/* 自检明细输出：带简单着色——块里含 FAIL 整块红、含 [OK]/PASS 整块绿，
+ * 其余默认色。只改 VGA 属性，文本字符一个不动（E2E 靠 OCR 断言文本）。 */
+static void pg_puts(const char *s) {
+    int has_fail = 0, has_ok = 0;
+    for (const char *q = s; q[0]; q++) {
+        if (q[0] == 'F' && q[1] == 'A' && q[2] == 'I' && q[3] == 'L')
+            has_fail = 1;
+        if ((q[0] == '[' && q[1] == 'O' && q[2] == 'K' && q[3] == ']') ||
+            (q[0] == 'P' && q[1] == 'A' && q[2] == 'S' && q[3] == 'S'))
+            has_ok = 1;
+    }
+    if (has_fail)      terminal_setcolor(0x0C);
+    else if (has_ok)   terminal_setcolor(0x0A);
+    ezos_console_write(s);
+    terminal_setcolor(0x07);
+}
 
 /* elftest：ELF 加载器自检（步骤 5b） */
 void cmd_elftest(const char *args) {
@@ -683,7 +698,9 @@ static void st_putd(char *b, uint32_t *p, uint32_t cap, uint32_t v) {
     while (n && *p + 1 < cap) b[(*p)++] = t[--n];
 }
 
-/* 一行自检结果：<prefix><name>: PASS|FAIL  (<detail>)  [<ms> ms] */
+/* 一行自检结果：<prefix><name>: PASS|FAIL  (<detail>)  [<ms> ms]
+ * 终端输出时 PASS 绿 / FAIL 红（只改 VGA 属性，文本字符不变）；
+ * dmesg 那份保持完整纯文本。 */
 static void st_report(const char *prefix, const char *name, int fails,
                       uint32_t t0, const char *detail) {
     char line[200];
@@ -691,7 +708,9 @@ static void st_report(const char *prefix, const char *name, int fails,
     st_puts(line, &p, sizeof(line), prefix);
     st_puts(line, &p, sizeof(line), name);
     st_puts(line, &p, sizeof(line), ": ");
+    uint32_t mark = p;                       /* 判定词起点 */
     st_puts(line, &p, sizeof(line), fails ? "FAIL" : "PASS");
+    uint32_t mark2 = p;                      /* 判定词终点 */
     if (detail && detail[0]) {
         st_puts(line, &p, sizeof(line), "  (");
         st_puts(line, &p, sizeof(line), detail);
@@ -701,13 +720,23 @@ static void st_report(const char *prefix, const char *name, int fails,
     st_putd(line, &p, sizeof(line), g_pit_ticks - t0);
     st_puts(line, &p, sizeof(line), " ms]\n");
     line[p] = '\0';
-    ezos_console_write(line);
-    dmesg_write(line);
+    dmesg_write(line);                       /* 完整纯文本行进日志 */
+    char save0 = line[mark], save1 = line[mark2];
+    line[mark] = '\0';
+    ezos_console_write(line);                /* 前半段：默认色 */
+    line[mark] = save0;
+    line[mark2] = '\0';
+    terminal_setcolor((uint8_t)(fails ? 0x0C : 0x0A));
+    ezos_console_write(line + mark);         /* 判定词：红/绿 */
+    terminal_setcolor(0x07);
+    line[mark2] = save1;
+    ezos_console_write(line + mark2);        /* 余下：默认色 */
 }
 
 void cmd_selftest(const char *args) {
     (void)args;
     ezos_console_write("EZOS full self-test:\n");
+
     struct { const char *name; int run; uint32_t ms; const char *detail; } r[8];
     /* detail 要活到最后的汇总循环，不能指向块内局部数组 */
     static char det[8][80];
@@ -902,12 +931,16 @@ void cmd_selftest(const char *args) {
         st_puts(sum, &sp, sizeof(sum),
                 failed == 0 ? "ALL PASS" : "SYSTEM UNSTABLE");
         sum[sp] = '\0';
+        dmesg_write(sum);
+        dmesg_write("\n");
+        /* 末行整体着色：全绿过 / 有红未过（文本不变，dmesg 已先记纯文本） */
+        terminal_setcolor((uint8_t)(failed == 0 ? 0x0A : 0x0C));
         ezos_console_write("  ");
         ezos_console_write(sum);
         ezos_console_write("\n");
-        dmesg_write(sum);
-        dmesg_write("\n");
+        terminal_setcolor(0x07);
     }
+
 }
 
 /* boot_selftest：开机自检（kernel_main 调用）。

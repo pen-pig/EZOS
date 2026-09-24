@@ -214,10 +214,16 @@ int fd_close(fd_table_t *t, int fd) {
 
     if (e->type != FD_TYPE_FILE) return -1;   /* 标准流不参与 close */
 
+    int rc = 0;
     if (e->dirty && e->name[0] != '\0') {
-        /* 落盘：写回失败不阻塞释放内存（避免泄漏）；失败在返回值无感，
-         * 因为 close 的 POSIX 语义不保证 fsync 成功。 */
-        fs_create_file(e->name, e->data ? e->data : (const uint8_t *)"", e->size);
+        /* 落盘：先显式删除旧条目，再整文件写入。
+         * fs_create_file 内部虽是"先 delete 再 create"，但覆盖已存在的同名
+         * 文件时该替换会静默失效（见 selftest ok5：写回后重开仍读到旧内容），
+         * 造成数据不一致。这里先 fs_delete_file 清掉残留条目，使随后的
+         * fs_create_file 在“无同名条目”的前提下新建，覆盖写语义才正确。
+         * 落盘结果如实返回（原先被忽略，hypothesis 3）。 */
+        fs_delete_file(e->name);
+        rc = fs_create_file(e->name, e->data ? e->data : (const uint8_t *)"", e->size);
     }
     if (e->data != 0) kfree(e->data);
 
@@ -228,7 +234,7 @@ int fd_close(fd_table_t *t, int fd) {
     e->offset = 0;
     e->data = 0;
     e->name[0] = '\0';
-    return 0;
+    return rc;
 }
 
 /* ---------- pipe 创建 ---------- */

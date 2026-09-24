@@ -11,6 +11,7 @@ static uint32_t exfat_bitmap_cluster = 3;   // Allocation Bitmap 簇号（0x81 �
 static uint8_t exfat_drive = 1;   // 默认从盘，可修改
 
 static uint32_t current_dir_cluster = 0;   // 当前工作目录簇，0 表示尚未初始化
+
 static char cwd_path[256] = "/";           // 当前工作目录路径字符串
 static uint32_t dir_stack[32];             // 目录栈（父目录簇），dir_stack[0] 恒为根
 static int dir_depth = 0;                  // 当前目录深度（根=0）
@@ -150,10 +151,18 @@ static int exfat_entry_set_count(int name_len) {
     return 2 + (name_len + 14) / 15;
 }
 
-// 在目录缓冲区中找连续空闲条目区（空闲=0x00 或已删除=最高位为0）
-static int exfat_find_free_set(uint8_t *dir_buf, uint32_t cluster_size, int need_entries) {
+// 在目录缓冲区中找连续空闲条目区（空闲=0x00 或已删除=最高位为0）。
+// 关键约束：返回的空闲区【绝不允许跨簇边界】。exFAT 的一个 entry set
+// （1 个 0x85 + N 个 0xC0/0xC1）必须落在同一簇内；否则 exfat_find_entry
+// 每次只读一簇进 buffer，exfat_parse_entry_set 读次级项时会越过簇尾、落到
+// 下一簇的陈旧数据上，名字解析成乱码 → 匹配失败 → 文件“写成功却读不到”
+// （FDTEST.TXT 复现：落盘后从盘逐字节能找到，但 find_entry 跳过该条目）。
+// 因此遇到簇边界必须重置连续空闲计数。
+static int exfat_find_free_set(uint8_t *dir_buf, uint32_t total_size,
+                              uint32_t cluster_sz, int need_entries) {
     int run = 0;
-    for (uint32_t off = 0; off < cluster_size; off += 32) {
+    for (uint32_t off = 0; off < total_size; off += 32) {
+        if (off > 0 && off % cluster_sz == 0) run = 0;   // 簇边界：禁止跨簇拼接空闲区
         uint8_t *e = dir_buf + off;
         if (e[0] == 0x00 || (e[0] & 0x80) == 0) {
             run++;
@@ -307,6 +316,7 @@ static int exfat_find_entry(uint32_t dir_cluster, const char *name, uint8_t *out
 
     uint32_t cur = dir_cluster;
     uint32_t steps = 0;
+    uint32_t tlen = 0; { const char *tp = name; while (*tp) { tlen++; tp++; } }
     while (cur >= 2 && cur < exfat_info.cluster_count + 2 &&
            steps < exfat_info.cluster_count + 2) {
         if (exfat_read_cluster(cur, buffer) != 0) return -1;
@@ -613,13 +623,13 @@ int exfat_mkdir(const char *name) {
     int name_len = 0;
     while (dir_name[name_len]) name_len++;
     int need = exfat_entry_set_count(name_len);
-    int free_off = exfat_find_free_set(dbuf, dir_clusters * cluster_size, need);
+    int free_off = exfat_find_free_set(dbuf, dir_clusters * cluster_size, cluster_size, need);
     if (free_off == -1) {
         // 目录已满，尝试扩展
         uint32_t new_dir_cl = exfat_extend_dir(parent_cluster);
         if (new_dir_cl == 0) goto restore;
         dir_clusters = exfat_read_dir_chain(parent_cluster, dbuf, 16);
-        free_off = exfat_find_free_set(dbuf, dir_clusters * cluster_size, need);
+        free_off = exfat_find_free_set(dbuf, dir_clusters * cluster_size, cluster_size, need);
         if (free_off == -1) goto restore;
     }
 
@@ -1109,19 +1119,23 @@ int exfat_create_file(const char *name, const uint8_t *data, uint32_t size) {
     uint32_t root_cluster = exfat_cwd_cluster();
     static uint8_t root_cluster_data[512 * 16] XF_HIBUF;
     uint8_t *root_buffer = root_cluster_data;
+    /* 数据写缓冲放到高内存静态区，避免 8KB 栈上分配压垮内核栈
+     * （实测：该 8KB 局部数组在开机自检 / selftest 调用点会溢出内核栈，
+     * 造成 create 返回 0 但文件未落盘，表现与栈布局相关的 heisenbug）。 */
+    static uint8_t cluster_buf[512 * 16] XF_HIBUF;
     uint32_t dir_clusters = exfat_read_dir_chain(root_cluster, root_buffer, 16);
     if (dir_clusters == 0) return -1;
 
     int need_entries = exfat_entry_set_count(name_len);
 
     uint32_t cluster_size = exfat_info.bytes_per_sector * exfat_info.sectors_per_cluster;
-    int free_entry_offset = exfat_find_free_set(root_buffer, dir_clusters * cluster_size, need_entries);
+    int free_entry_offset = exfat_find_free_set(root_buffer, dir_clusters * cluster_size, cluster_size, need_entries);
     if (free_entry_offset == -1) {
         // 目录已满，尝试扩展
         uint32_t new_dir_cl = exfat_extend_dir(root_cluster);
         if (new_dir_cl == 0) return -1;
         dir_clusters = exfat_read_dir_chain(root_cluster, root_buffer, 16);
-        free_entry_offset = exfat_find_free_set(root_buffer, dir_clusters * cluster_size, need_entries);
+        free_entry_offset = exfat_find_free_set(root_buffer, dir_clusters * cluster_size, cluster_size, need_entries);
         if (free_entry_offset == -1) return -1;
     }
 
@@ -1150,7 +1164,6 @@ int exfat_create_file(const char *name, const uint8_t *data, uint32_t size) {
     uint32_t bytes_written = 0;
     uint32_t cur_cluster = start_cluster;
     for (uint32_t i = 0; i < data_clusters; i++) {
-        uint8_t cluster_buf[512 * 16];
         for (uint32_t j = 0; j < cluster_size; j++) cluster_buf[j] = 0;
         uint32_t to_copy = size - bytes_written;
         if (to_copy > cluster_size) to_copy = cluster_size;
