@@ -176,6 +176,28 @@ static int exfat_find_free_set(uint8_t *dir_buf, uint32_t total_size,
     return -1;
 }
 
+// 维持目录的终结符不变量：活条目（type 0x80 位为 1）必须从头连续排列，
+// 且最后一个活条目之后紧跟一个 0x00 终结符。
+// 历史缺陷：extend_dir 扩簇后 find_free_set 在簇边界重置连续计数，entry set
+// 可能落到旧终结符之后，留下"活-0x00-活"夹心结构——线性扫描（read_dir /
+// list_root）遇到 0x00 就停，其后条目全部隐身；而 find_entry 逐簇扫描仍能
+// 找到 → "cat 得到、ls 看不见"（VITEST.C 复现，FDTEST.TXT 一直也是这样）。
+// 每次写完 entry set 后调用：夹心里的陈旧 0x00 改写成 0x05（已删除槽），
+// 并在最后一个活条目之后补一个终结符。O(槽位数)，目录 ≤16KB 开销可忽略。
+static void exfat_fix_dir_layout(uint8_t *dir_buf, uint32_t total_size) {
+    uint32_t last_live_end = 0;
+    for (uint32_t off = 0; off < total_size; off += 32) {
+        if ((dir_buf[off] & 0x80) != 0) last_live_end = off + 32;
+    }
+    for (uint32_t off = 0; off < last_live_end; off += 32) {
+        if (dir_buf[off] == 0x00) dir_buf[off] = 0x05;   // 陈旧终结符 → 已删除
+    }
+    if (last_live_end > 0 && last_live_end < total_size &&
+        (dir_buf[last_live_end] & 0x80) == 0) {
+        dir_buf[last_live_end] = 0x00;                    // 活条目后补终结符
+    }
+}
+
 // 读取目录链全部簇到 buffer，返回目录链占用的簇数（沿 FAT 链遍历）
 static uint32_t exfat_read_dir_chain(uint32_t dir_cluster, uint8_t *buffer, uint32_t buf_clusters) {
     uint32_t cluster_size = exfat_info.bytes_per_sector * exfat_info.sectors_per_cluster;
@@ -634,6 +656,7 @@ int exfat_mkdir(const char *name) {
     }
 
     exfat_write_entry_set(dbuf, free_off, dir_name, new_cluster, 0, 1);
+    exfat_fix_dir_layout(dbuf, dir_clusters * cluster_size);
     if (exfat_write_cluster(parent_cluster, dbuf) != 0) goto restore;
     if (dir_clusters > 1) {
         // 写回目录链其余簇
@@ -1182,6 +1205,7 @@ int exfat_create_file(const char *name, const uint8_t *data, uint32_t size) {
 
     // 写 entry set
     exfat_write_entry_set(root_buffer, free_entry_offset, name, start_cluster, size, 0);
+    exfat_fix_dir_layout(root_buffer, dir_clusters * cluster_size);
     if (exfat_write_cluster(root_cluster, root_buffer) != 0) {
         exfat_free_cluster_chain(start_cluster);
         return -1;
