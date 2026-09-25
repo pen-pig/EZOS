@@ -9,6 +9,7 @@
  * 特性刻意独立：不依赖 kmalloc/磁盘/中断，panic 路径可安全调用。
  */
 #include "dmesg.h"
+#include "serial.h"
 
 #define DM_BUF_SIZE  32768u
 #define DM_MAX_LINES 256u
@@ -66,6 +67,10 @@ static void dm_push_line(void) {
 
 void dmesg_write(const char *line) {
     if (!line) return;
+    /* 串口镜像（真机诊断通道）：serial 未 init/自检失败时内部 no-op。
+     * 放在最前——环形缓冲裁剪不影响串口侧拿到完整行。 */
+    serial_write(line);
+    serial_putc('\n');
     for (uint32_t i = 0; line[i]; i++) {
         char c = line[i];
         if (c == '\n') { dm_push_line(); continue; }

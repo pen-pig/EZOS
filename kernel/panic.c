@@ -18,6 +18,7 @@
 #include "tty.h"
 #include "port.h"
 #include "isr.h"
+#include "serial.h"
 
 extern void *isr_stub_table[];    /* kernel_entry.asm */
 
@@ -60,6 +61,7 @@ void panic_set_context(const char *what) {
 static void pputs(const char *s) {
     terminal_setcolor(PANIC_COLOR);
     terminal_writestring(s);
+    serial_write(s);   /* panic 现场镜像串口：真机上这是唯一能看到的通道 */
 }
 
 static void phex(uint32_t v, int width) {

@@ -19,6 +19,8 @@
 #include "fs.h"
 #include "mouse.h"
 #include "port.h"
+#include "serial.h"
+#include "acpi.h"
 #include "desktop.h"
 #include "gfxwin.h"
 #include "gfx.h"
@@ -306,6 +308,15 @@ void kernel_main(void) {
     terminal_initialize();
     gfx_text_font_init();     /* unify text-mode font with GUI/OCR font table */
 
+    /* 串口最先就绪：之后的每条 klog/dmesg 都同步镜像 COM1（真机通道） */
+    serial_init();
+    klog(serial_ready() ? "SERIAL: COM1 115200 8N1 loopback OK"
+                        : "SERIAL: COM1 not present - debug output disabled");
+
+    /* ACPI：解析 RSDP/FADT/DSDT-_S5，shutdown 在真机上才真正断电 */
+    acpi_init();
+    klog(acpi_status_line());
+
     kmalloc_init();           /* 内核堆（384KB @ .bss.hi，先于一切使用者） */
 
     /* 分页：identity map 0-32MB + VBE LFB 后开 CR0.PG。
@@ -319,7 +330,7 @@ void kernel_main(void) {
     pmm_init();
 
     klog("EZOS Kernel 0.9.0 loaded at 0x10000, i686 protected mode");
-    klog("Boot: 768 sectors kernel image read by BIOS INT 13h AH=42h (64-sector batches, 3 retries)");
+    klog("Boot: 992 sectors kernel image read by BIOS INT 13h AH=42h (64-sector batches, 3 retries)");
     klog("Boot: A20 gate enabled (BIOS int 15h / port 0x92 / KBC fallback)");
     klog("Boot: GDT rebuilt in kernel - 6 descriptors (null/kcode/kdata/ucode DPL3/udata DPL3/TSS), TSS esp0=0x900000");
     klog("VGA text mode: 80x25 active");

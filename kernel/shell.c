@@ -4,6 +4,7 @@
 #include "keyboard.h"
 #include "types.h"
 #include "port.h"
+#include "acpi.h"
 #include "ata.h"
 #include "fs.h"
 #include "gui.h"
@@ -1115,8 +1116,7 @@ void system_reboot(void) {
 
 void system_shutdown(void) {
     terminal_writestring("Shutting down...\n");
-    outw(0x604, 0x2000);
-    asm volatile("cli; hlt");
+    acpi_shutdown();   /* ACPI ready 走真实 PM1a_CNT；否则回退 QEMU 0x604 */
 }
 
 static void cmd_shutdown(const char *args) {
