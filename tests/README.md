@@ -1,5 +1,10 @@
 # EZOS E2E 回归套件
 
+> **真机启动与 U 盘制作见 [`docs/USB_BOOT.md`](../docs/USB_BOOT.md)**：把 `os-image.bin`
+> 整盘写进 U 盘（禁止拷成文件）、三平台步骤、BIOS 设置与"无屏只有串口"的排查清单。
+> 配套安全写盘工具：`python3 tools/make_usb_boot.py`（默认只读检查，必须显式
+> `--write --disk N` 并二次确认才真写，绝不自动选盘）。
+
 在 **src 根目录**下运行（脚本自己按 `ROOT = 上级目录` 定位 os-image.bin / disk.img）。
 前置：`ninja -f build.ninja` 已产出 `os-image.bin`、`disk.img`。
 退出码 0 = 全部断言通过。
