@@ -14,6 +14,8 @@ typedef int32_t  INT32;
 typedef uint32_t UINT32;
 typedef int64_t  INT64;
 typedef uint64_t UINT64;
+typedef uint64_t EFI_PHYSICAL_ADDRESS;  /* 物理地址（64 位，IA32 下高 32 位为 0） */
+typedef uint16_t CHAR16;                /* EFI 字符串元素（UTF-16） */
 typedef uint32_t UINTN;    /* IA32 下指针/状态为 32 位 */
 typedef int32_t  INTN;
 
@@ -161,6 +163,90 @@ typedef struct {
   void *LocateHandleBuffer;
   EFI_LOCATE_PROTOCOL LocateProtocol; /* 第 37 个函数指针，Hdr 之后偏移 168 字节 */
 } EFI_BOOT_SERVICES;
+
+/* ---- 文件/镜像/内存相关协议与 BootServices 调用类型 ---- */
+typedef enum { AllocateAnyPages = 0, AllocateMaxAddress = 1, AllocateAddress = 2, MaxAllocateType } EFI_ALLOCATE_TYPE;
+typedef enum {
+  EfiReservedMemoryType = 0, EfiLoaderCode = 1, EfiLoaderData = 2, EfiBootServicesCode = 3,
+  EfiBootServicesData = 4, EfiRuntimeServicesCode = 5, EfiRuntimeServicesData = 6,
+  EfiConventionalMemory = 7, EfiUnusableMemory = 8, EfiACPIReclaimMemory = 9,
+  EfiACPIMemoryNVS = 10, EfiMemoryMappedIO = 11, EfiMemoryMappedIOPortSpace = 12,
+  EfiPalCode = 13, EfiPersistentMemory = 14, EfiMaxMemoryType = 15
+} EFI_MEMORY_TYPE;
+
+typedef EFI_STATUS (EFIAPI *EFI_ALLOCATE_PAGES)(
+  EFI_ALLOCATE_TYPE Type, EFI_MEMORY_TYPE MemoryType, UINTN Pages, EFI_PHYSICAL_ADDRESS *Memory);
+typedef EFI_STATUS (EFIAPI *EFI_FREE_PAGES)(EFI_PHYSICAL_ADDRESS Memory, UINTN Pages);
+typedef EFI_STATUS (EFIAPI *EFI_ALLOCATE_POOL)(EFI_MEMORY_TYPE PoolType, UINTN Size, void **Buffer);
+typedef EFI_STATUS (EFIAPI *EFI_FREE_POOL)(void *Buffer);
+typedef EFI_STATUS (EFIAPI *EFI_GET_MEMORY_MAP)(
+  UINTN *MemoryMapSize, void *MemoryMap, UINTN *MapKey, UINTN *DescriptorSize, UINT32 *DescriptorVersion);
+typedef EFI_STATUS (EFIAPI *EFI_OPEN_PROTOCOL)(
+  EFI_HANDLE Handle, EFI_GUID *Protocol, void **Interface,
+  EFI_HANDLE AgentHandle, EFI_HANDLE ControllerHandle, UINT32 Attributes);
+typedef EFI_STATUS (EFIAPI *EFI_EXIT_BOOT_SERVICES)(EFI_HANDLE ImageHandle, UINTN MapKey);
+
+#define EFI_OPEN_PROTOCOL_GET_PROTOCOL   0x00000002
+#define EFI_FILE_MODE_READ               0x0000000000000001ULL
+
+typedef struct {
+  UINT32 Type;
+  UINT32 Pad;
+  EFI_PHYSICAL_ADDRESS PhysicalStart;
+  UINT64 VirtualStart;
+  UINT64 NumberOfPages;
+  UINT64 Attribute;
+} EFI_MEMORY_DESCRIPTOR;  /* 仅用于缓冲区大小，本步不逐条解析 */
+
+/* Loaded Image Protocol（本步仅用 DeviceHandle 找到启动设备） */
+typedef struct {
+  UINT32    Revision;
+  EFI_HANDLE ParentHandle;
+  void     *SystemTable;
+  EFI_HANDLE DeviceHandle;
+  /* 之后字段本步不使用 */
+} EFI_LOADED_IMAGE_PROTOCOL;
+
+/* Simple File System Protocol */
+typedef struct _EFI_FILE_PROTOCOL EFI_FILE_PROTOCOL;
+typedef struct _EFI_SIMPLE_FILE_SYSTEM_PROTOCOL EFI_SIMPLE_FILE_SYSTEM_PROTOCOL;
+typedef EFI_STATUS (EFIAPI *EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_OPEN_VOLUME)(
+  EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *This, EFI_FILE_PROTOCOL **Root);
+struct _EFI_SIMPLE_FILE_SYSTEM_PROTOCOL {
+  UINT64 Revision;
+  EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_OPEN_VOLUME OpenVolume;
+};
+
+/* File Protocol */
+typedef struct _EFI_FILE_PROTOCOL EFI_FILE_PROTOCOL;
+typedef EFI_STATUS (EFIAPI *EFI_FILE_OPEN)(
+  EFI_FILE_PROTOCOL *This, EFI_FILE_PROTOCOL **NewHandle,
+  CHAR16 *FileName, UINT64 OpenMode, UINT64 Attributes);
+typedef EFI_STATUS (EFIAPI *EFI_FILE_CLOSE)(EFI_FILE_PROTOCOL *This);
+typedef EFI_STATUS (EFIAPI *EFI_FILE_READ)(
+  EFI_FILE_PROTOCOL *This, UINTN *BufferSize, void *Buffer);
+struct _EFI_FILE_PROTOCOL {
+  UINT64 Revision;
+  EFI_FILE_OPEN  Open;
+  EFI_FILE_CLOSE Close;
+  void *Delete;
+  EFI_FILE_READ  Read;
+  void *Write;
+  void *GetPosition;
+  void *SetPosition;
+  void *GetInfo;
+  void *SetInfo;
+  void *Flush;
+};
+
+/* UEFI 启动魔数：物理 0x5010 写 0x55454649（供 U3 内核判定 UEFI 启动） */
+#define UEFI_MAGIC 0x55454649u
+
+/* GUIDs */
+static const EFI_GUID gEfiLoadedImageProtocolGuid = {
+  0x5b1b31a1,0x9562,0x11d2,{0x8e,0x3f,0x00,0xa0,0xc9,0x69,0x72,0x3b}};
+static const EFI_GUID gEfiSimpleFileSystemProtocolGuid = {
+  0x964e5b22,0x6459,0x11d2,{0x8e,0x39,0x00,0xa0,0xc9,0x69,0x72,0x3b}};
 
 /* ---- 系统表 ---- */
 typedef struct {
