@@ -23,6 +23,8 @@ class SR:
         while self.running:
             try:
                 d = self.sock.recv(8192)
+            except socket.timeout:
+                continue   # 空闲超时不是错误（见 test_ahci.py 同款说明）
             except Exception:
                 break
             if not d:

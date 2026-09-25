@@ -50,6 +50,11 @@ class SerialReader(object):
         while self.running:
             try:
                 data = self.sock.recv(8192)
+            except socket.timeout:
+                # 关键：socket 建连时带 timeout=10，guest 空闲超过 10s 就会抛
+                # timeout——这不是错误。曾经把它当异常 break 掉，导致读线程
+                # 静默死亡、之后所有断言都收不到输出，看起来像"系统挂死"。
+                continue
             except Exception:
                 break
             if not data:
