@@ -16,6 +16,7 @@
 | `test_vi.py` | vi 功能回归：新建→插入→`:wq`→cat 回读→二次打开→退出后 shell 可用（防语法高亮渲染改动破坏编辑路径） | QMP 4482 | ~1 min |
 | `test_jobs.py` | 后台任务：`cmd &` 立即回提示符、`[n] pid`、jobs 列表、退出后 `[n] done` 收割、ps 无 zombie、前台不受影响 | QMP 4485 | ~1 min |
 | `test_power.py` | 真机点亮 H1a：COM1 串口镜像（自检/ACPI/banner）、ACPI S5 断电（QEMU 进程退出）、8042 重启后 shell 可用 | QMP 4486 + serial file | ~2 min |
+| `test_ahci.py` | 真机点亮 H1b：ich9-ahci 控制器探测 + 端口上线（IDENTIFY 型号）、`setdrive 4` 后 exFAT format/write/ls/cat/rm 全走 AHCI DMA；全程走串口不依赖 OCR | QMP 4487 + serial 4488 | ~2 min |
 
 `ezocr.py` 是前三个脚本共用的 VGA 文本截图 OCR（真字库像素匹配），不要单独删。
 
@@ -34,3 +35,13 @@
    提示符，`[-1]` 恒为空串（表现为 ls 假红、rm 假绿）。
 2. **等待用"屏幕文本稳定"而非固定秒数**：不同 FS 驱动快慢差数倍，固定 sleep
    会让同一份脚本忽红忽绿。
+3. **不要写"等一个不该出现的字符串"的断言**（如"等 15s 确认 ls 里没有某文件"）：
+   空转会撞上"shell 空闲 ~20s 后键盘输入不再进来"的内核问题，后续命令全部静默。
+   改成等必然出现的子串，再在拿到的输出里断言"没有"。
+
+## 已知内核问题（测试绕开但待修）
+
+- **键盘空闲 ~20 秒后失灵**：shell 空闲约 20s 后，注入的按键不再有回显，
+  shell 输入循环仍在跑（EIP 在 shell_run/keyboard_getchar 之间循环）。已用
+  QMP `query-status` + 多次 `info registers` 采样确认 guest 存活、IF=0 自旋。
+  与 AHCI 无关（ATA 路径同样可复现）。测试侧已靠断言写法规避，根因待查。

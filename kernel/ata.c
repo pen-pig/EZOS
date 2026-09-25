@@ -10,6 +10,7 @@
  *   - 写命令在数据阶段结束后额外等待 BSY 清除（flush）。
  */
 #include "ata.h"
+#include "ahci.h"
 #include "port.h"
 #include "tty.h"
 
@@ -89,6 +90,11 @@ static int ata_wait_drq(uint16_t base) {
  *   - ERR 置位（如 ATAPI 的 ABRT）→ 设备存在但不支持 IDENTIFY。
  */
 int ata_drive_present(uint8_t drive) {
+    if (drive >= AHCI_DRIVE_BASE) {
+        uint8_t p = (uint8_t)(drive - AHCI_DRIVE_BASE);
+        if (p >= AHCI_MAX_PORTS) return 0;
+        return ahci_port_present(p);
+    }
     if (drive > 3) return 0;
     uint16_t base = ata_io_base(drive);
     if (ata_select(drive) != 0) return 0;
@@ -123,6 +129,11 @@ int ata_drive_present(uint8_t drive) {
 }
 
 int ata_read_sector(uint8_t drive, uint32_t lba, uint8_t *buffer) {
+    if (drive >= AHCI_DRIVE_BASE) {
+        uint8_t p = (uint8_t)(drive - AHCI_DRIVE_BASE);
+        if (p >= AHCI_MAX_PORTS) return -1;
+        return ahci_read_sector(p, lba, buffer);
+    }
     uint16_t base = ata_io_base(drive);
     if (drive > 3) return -1;
     if (ata_select(drive) != 0) return -1;
@@ -146,6 +157,11 @@ int ata_read_sector(uint8_t drive, uint32_t lba, uint8_t *buffer) {
 }
 
 int ata_write_sector(uint8_t drive, uint32_t lba, const uint8_t *buffer) {
+    if (drive >= AHCI_DRIVE_BASE) {
+        uint8_t p = (uint8_t)(drive - AHCI_DRIVE_BASE);
+        if (p >= AHCI_MAX_PORTS) return -1;
+        return ahci_write_sector(p, lba, buffer);
+    }
     uint16_t base = ata_io_base(drive);
     if (drive > 3) return -1;
     if (ata_select(drive) != 0) return -1;

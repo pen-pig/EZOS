@@ -23,6 +23,7 @@
 #include "erofs.h"
 #include "refs.h"
 #include "ata.h"
+#include "ahci.h"
 
 /* 布局一致性编译期检查：三种目录项结构必须逐字节一致 */
 typedef char fs_layout_exfat[sizeof(fs_dir_entry_t) == sizeof(exfat_dir_entry_t) ? 1 : -1];
@@ -267,7 +268,7 @@ const char *fs_type_name(void) {
 const fs_info_t *fs_get_info(void) { return &fs_volume; }
 
 void fs_set_drive(uint8_t drive) {
-    if (drive > 3) return;
+    if (drive >= BLK_MAX_DRIVE) return;
     if (drive == fs_preferred_drive && fs_type_cur == FS_NONE) return;
     fs_preferred_drive = drive;
     if (fs_type_cur != FS_NONE) {

@@ -6,6 +6,7 @@
 #include "port.h"
 #include "acpi.h"
 #include "ata.h"
+#include "ahci.h"
 #include "fs.h"
 #include "gui.h"
 #include "mouse.h"
@@ -925,7 +926,7 @@ static void cmd_help(const char *args) {
     help_line("  about      - about this OS\n");
     help_line("  history    - show command history\n");
     help_line("  setcolor <fg> [bg] - set text color (0-15)\n");
-    help_line("  setdrive <0-3> - set filesystem drive\n");
+    help_line("  setdrive <0-11> - set filesystem drive (4-11 = AHCI ports)\n");
     help_line("  ls         - list root directory (exFAT)\n");
     help_line("  cat <file> - read file content (exFAT)\n");
     help_line("  write <file> <content> - create file with content\n");
@@ -1485,8 +1486,10 @@ static void cmd_format(const char *args) {
 
 static void cmd_setdrive(const char *args) {
     int drive = my_atoi(args);
-    if (drive < 0 || drive > 3) {
-        terminal_writestring("Usage: setdrive <0-3>\n");
+    if (drive < 0 || drive >= BLK_MAX_DRIVE) {
+        terminal_writestring("Usage: setdrive <0-");
+        ezos_console_print_dec((uint32_t)BLK_MAX_DRIVE - 1);
+        terminal_writestring(">\n");
         return;
     }
     fs_set_drive((uint8_t)drive);

@@ -1,5 +1,6 @@
 #include "tty.h"
 #include "port.h"        // ����������ṩ outb/inb
+#include "serial.h"     // H1a：串口是真机诊断主通道，控制台输出同步镜像 COM1
 
 #define VGA_WIDTH  80
 #define VGA_HEIGHT 25
@@ -131,6 +132,10 @@ void terminal_putchar(char c) {
         }
         return;
     }
+    /* H1a：控制台输出同步镜像到 COM1——真机无显存时仍能看到全部交互，
+     *      也是 AHCI 等驱动的 E2E 测试在无屏 QEMU 下读取结果的通道。
+     *      未初始化/自检失败时 serial_putc 为无害 no-op，不影响 VGA 渲染。 */
+    if (serial_ready()) serial_putc(c);
     if (c == '\n') {
         terminal_column = 0;
         if (++terminal_row == VGA_HEIGHT) {

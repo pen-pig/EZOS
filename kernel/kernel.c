@@ -25,6 +25,7 @@
 #include "gfxwin.h"
 #include "gfx.h"
 #include "rtl8139.h"
+#include "ahci.h"
 
 // �򵥳��Ⱥ��������Զ���ʽ��ʾ��ʹ��
 static size_t my_strlen(const char *s) {
@@ -388,6 +389,11 @@ void kernel_main(void) {
         int npci = pci_scan();
         klog_dec32("PCI: scanned bus, ", (uint32_t)npci, " device(s) found");
     }
+
+    /* AHCI/SATA 磁盘驱动（真机点亮 H1b）：PCI class 0x0106 扫描，
+     * 找不到控制器静默跳过，绝不破坏现有 ATA/FS 路径。必须在 fs_init
+     * 之前——让 setdrive 可选 AHCI 盘。dma 缓冲在 .bss 19MB 区。 */
+    ahci_init();
 
     /* RTL8139 NIC (step 7.2): claim + reset + MAC + 8K RX ring + 4 TX
      * descriptors + IRQ + ARP/ICMP echo reply. Returns -1 when QEMU has
