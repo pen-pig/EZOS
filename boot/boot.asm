@@ -3,7 +3,7 @@
 [bits 16]
 
 KERNEL_OFFSET equ 0x10000     ; �ں˼��ص�ַ
-KERNEL_SECTORS equ 768        ; �ں�����������384KB���� build �ű� --pad-to 393216 ��Ӧ��
+KERNEL_SECTORS equ 992        ; �ں�����������384KB���� build �ű� --pad-to 507904 ��Ӧ��
 
 start:
     xor ax, ax

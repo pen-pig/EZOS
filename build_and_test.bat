@@ -114,7 +114,7 @@ if errorlevel 1 goto error
 endlocal & set "OBJS="
 
 echo [5/6] padding kernel to 384KB...
-i686-elf-objcopy -I binary -O binary --pad-to 393216 kernel_raw.bin kernel.bin
+i686-elf-objcopy -I binary -O binary --pad-to 507904 kernel_raw.bin kernel.bin
 if errorlevel 1 goto error
 
 echo [6/6] generating system image...

@@ -47,7 +47,7 @@ rule link_user
     description = LINK-USER $out
 
 rule objcopy_pad
-    command = $OBJCOPY -I binary -O binary --pad-to 393216 $in $out
+    command = $OBJCOPY -I binary -O binary --pad-to 507904 $in $out
     description = PAD $out
 
 rule make_os_image

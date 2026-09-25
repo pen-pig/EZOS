@@ -28,17 +28,26 @@ SECTIONS
         *(.data)
     }
 
-    /* 镜像（text+data）受 boot.asm KERNEL_SECTORS=768 限制，最大 384KB */
-    ASSERT(. - 0x10000 <= 0x60000, "kernel image exceeds 384KB limit")
+    /* 镜像（text+data）受 boot.asm KERNEL_SECTORS=992 限制，最大 496KB。
+     * 镜像末尾 0x8C000 到栈顶 0x90000 之间留 16KB 作为主栈向下增长空间。 */
+    ASSERT(. - 0x10000 <= 0x7C000, "kernel image exceeds 496KB limit")
 
-    .bss : {
+    /* .bss 与镜像解耦：放到 19MB（16MB GUI 背缓冲 ~18.6MB 结束之后、
+     * 32MB identity 上界之前）。原因：低内存 0x10000-0x90000 被镜像+栈
+     * 挤满（file+bss 合计只有 ~501KB），bss 跟着镜像会把文件预算吃光；
+     * 而 2-4MB 虚拟段是 exec 装载的 PD[1] 暂存区、1-2MB 是 .bss.hi，
+     * 都不能碰。19MB 处 identity 映射覆盖、启动早期（尚未开分页、PM
+     * 平坦段）可直接访问，kernel_entry.asm 的清零循环走符号无需改动。
+     * NOBITS 不进镜像文件。 */
+    .bss 0x01300000 (NOLOAD) : {
         __bss_start = .;
         *(.bss)
         __bss_end = .;
     }
 
-    /* bss 未初始化数据不计入镜像，但内存中不得侵入 0x90000 的栈区 */
-    ASSERT(__bss_end <= 0x90000, "kernel bss exceeds stack area")
+    /* bss 上界 30MB：给 19-30MB 区间留出 11MB 余量，同时绝不触及
+     * 32MB identity 映射上界。 */
+    ASSERT(__bss_end <= 0x01E00000, "kernel bss exceeds 30MB limit")
 
     /* 高内存 bss（1MB 起，扩展内存）：放只读 FS 驱动的大块缓冲。
      * NOBITS 不进镜像；kernel_entry.asm 启动时一并清零。
