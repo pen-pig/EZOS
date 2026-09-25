@@ -343,7 +343,7 @@ void process_exit(int code) {
     for (;;) asm volatile("sti; hlt");
 }
 
-int task_wait_pid(int pid) {
+int task_wait_pid_opt(int pid, int options) {
     if (!g_ready || pid <= 0) return -1;
     if (task_find(pid) == 0) return -1;          /* 没有这个进程 */
 
@@ -359,10 +359,16 @@ int task_wait_pid(int pid) {
             t->name[0] = '\0';
             return code;
         }
+        /* 非阻塞变体：子进程还在跑，调用方自己决定何时再来收（后台任务收割）。 */
+        if (options & WNOHANG) return -2;
         /* 步骤 8a：真睡眠等子进程 ZOMBIE（process_exit 会 wake_all）。
          * 无超时——wait 语义就是无限等；对方消失由循环顶的 task_find 判定。 */
         task_sleep(&g_wq_reap, 0);
     }
+}
+
+int task_wait_pid(int pid) {
+    return task_wait_pid_opt(pid, 0);
 }
 
 /* ---------- fork（步骤 9：用户态生态第二步） ----------

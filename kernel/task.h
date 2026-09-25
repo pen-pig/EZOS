@@ -107,6 +107,15 @@ void process_exit(int code);
 int task_wait_pid(int pid);
 
 /*
+ * task_wait_pid 的可选项变体（后台任务收割用）。
+ *   options & WNOHANG：子进程仍在运行时不阻塞，返回 -2（不收割）；
+ *                       子进程已退出则照常回收并返回其退出码（>=0）。
+ *   options = 0        ：等价于 task_wait_pid(pid)（阻塞直到退出或被其它 waiter 收走）。
+ * 返回：>=0 退出码；-1 无效/已不存在的 pid；-2 WNOHANG 且仍在运行。
+ */
+int task_wait_pid_opt(int pid, int options);
+
+/*
  * fork 当前用户进程（SYS_FORK 实现）：复制父进程的用户地址空间（4-8MB 区间，
  * 逐页深拷贝、每页独立记账）与 fd 表（普通文件 data 深拷贝、pipe 递增引用计数），
  * 新建一个可运行子任务。父进程返回子 pid，子进程返回 0，失败返回 -1。

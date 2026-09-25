@@ -115,16 +115,17 @@ build kernel/games.o: cc kernel/games.c
 build kernel/hiscore.o: cc kernel/hiscore.c
 
 build user/crt0.o: asm_elf user/crt0.asm
+build user/libc.o: cc_user user/libc.c
 build user/hello.o: cc_user user/hello.c
-build user/hello.elf: link_user user/crt0.o user/hello.o | user/user.ld
+build user/hello.elf: link_user user/crt0.o user/hello.o user/libc.o | user/user.ld
 build user/forktest.o: cc_user user/forktest.c
-build user/forktest.elf: link_user user/crt0.o user/forktest.o | user/user.ld
+build user/forktest.elf: link_user user/crt0.o user/forktest.o user/libc.o | user/user.ld
 build user/fdtest.o: cc_user user/fdtest.c
-build user/fdtest.elf: link_user user/crt0.o user/fdtest.o | user/user.ld
+build user/fdtest.elf: link_user user/crt0.o user/fdtest.o user/libc.o | user/user.ld
 build user/spin.o: cc_user user/spin.c
-build user/spin.elf: link_user user/crt0.o user/spin.o | user/user.ld
+build user/spin.elf: link_user user/crt0.o user/spin.o user/libc.o | user/user.ld
 build user/fdleak.o: cc_user user/fdleak.c
-build user/fdleak.elf: link_user user/crt0.o user/fdleak.o | user/user.ld
+build user/fdleak.elf: link_user user/crt0.o user/fdleak.o user/libc.o | user/user.ld
 build user/netecho.o: cc_user user/netecho.c
 build user/netecho.elf: link_user user/crt0.o user/netecho.o | user/user.ld
 build user/nettcp.o: cc_user user/nettcp.c

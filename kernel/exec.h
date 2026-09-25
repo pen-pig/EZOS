@@ -38,4 +38,12 @@
  */
 int exec_file(const char *name, const char *args, const char **why);
 
+/*
+ * 后台启动：装载并切入 ring3，但**不等待**子进程结束就返回。
+ * 成功返回 0 并把子进程 pid 写入 *out_pid；失败返回 exec_file 同款负值
+ * （*out_pid 未定义）。调用方需自行（比如在每次提示符前用 WNOHANG）
+ * 收割退出的子进程，否则其 ZOMBIE 会占着 MAX_TASKS 的槽位。
+ */
+int exec_file_bg(const char *name, const char *args, int *out_pid);
+
 #endif

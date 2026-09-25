@@ -30,8 +30,12 @@
  * 沿用本项目"新号自己挑"的约定，不照搬 Linux 的 fork=2（已被 SYS_EXIT 占用）。 */
 #define SYS_FORK   43u
 /* waitpid(2)：等待指定 pid 结束并取退出码（阻塞睡眠，非忙等）。
- * ebx=pid，ecx=status 用户指针（可为 0），edx=options（本内核忽略，恒阻塞）。 */
+ * ebx=pid，ecx=status 用户指针（可为 0），edx=options（见下）。 */
 #define SYS_WAITPID 44u
+/* getpid(2)：返回当前进程的 pid（用户态 libc 用，后台任务打印 [n] pid）。 */
+#define SYS_GETPID  45u
+/* waitpid 的 options 标志位（内核侧与 libc 共用，必须一致） */
+#define WNOHANG     1               /* 非阻塞：子进程还在跑则立即返回（不收割） */
 /* socketcall 复用器（沿用 Linux i386 的 102 号）：
  * ebx=子命令（net.h SC_*），ecx=用户态 u32 args[5]。
  * 3 参数 ABI 不变，子命令的 5 个槽位经一个结构体传入。 */

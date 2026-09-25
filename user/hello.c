@@ -6,47 +6,26 @@
  *   - 运行在 ring3：任何越权访问（内核地址、只读段写入）都会 #PF 并被
  *     panic 捕获，不会污染内核
  *   - 链接到 0x00400000（USER_IMAGE_BASE），由内核 exec 从磁盘加载
+ *   - 复用 user/libc.h 提供的 puts/putdec/strlen（打印输出与重构前逐字节一致）
  */
-typedef unsigned int u32;
+#include "libc.h"
 
-int write(int fd, const void *buf, u32 n);
-int read(int fd, void *buf, u32 n);
-void _exit(int code) __attribute__((noreturn));
-
-static u32 kstrlen(const char *s) {
-    u32 n = 0;
-    while (s[n]) n++;
-    return n;
-}
-
-static void kputs(const char *s) { write(1, s, kstrlen(s)); }
-
-static void kputdec(u32 v) {
-    char b[12];
-    int n = 0;
-    if (v == 0) b[n++] = '0';
-    while (v) { b[n++] = (char)('0' + (v % 10u)); v /= 10u; }
-    char out[13];
-    int m = 0;
-    while (n) out[m++] = b[--n];
-    out[m] = 0;
-    kputs(out);
-}
+typedef unsigned int u32;     /* libc 用 unsigned int，这里保留别名仅用于调用点类型 */
 
 int umain(int argc, char **argv) {
-    kputs("hello from ELF user program!\n");
-    kputs("argc = ");
-    kputdec((u32)argc);
-    kputs("\n");
+    puts("hello from ELF user program!\n");
+    puts("argc = ");
+    putdec((u32)argc);
+    puts("\n");
     for (int i = 0; i < argc; i++) {
-        kputs("argv[");
-        kputdec((u32)i);
-        kputs("] = ");
-        kputs(argv[i] ? argv[i] : "(null)");
-        kputs("\n");
+        puts("argv[");
+        putdec((u32)i);
+        puts("] = ");
+        puts(argv[i] ? argv[i] : "(null)");
+        puts("\n");
     }
     /* 越权写自检：写只读的 .text 段必须触发 #PF（有意为之则本行应注释掉） */
-    kputs("argv terminator ok: ");
-    kputs(argv[argc] == 0 ? "yes\n" : "NO\n");
+    puts("argv terminator ok: ");
+    puts(argv[argc] == 0 ? "yes\n" : "NO\n");
     return 42;
 }

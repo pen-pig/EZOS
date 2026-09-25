@@ -97,7 +97,14 @@ static void restore_borrow(uint32_t save_pde1) {
     task_unlock();
 }
 
-int exec_file(const char *name, const char *args, const char **why) {
+/*
+ * 装载并切入 ring3，但**不等待**子进程结束。成功返回 0 并把子进程
+ * pid 写入 *out_pid；失败返回 exec_file 同款负值（*out_pid 未定义）。
+ *
+ * 抽出来的"spawn"部分被 exec_file（前台阻塞）和 exec_file_bg（后台）
+ * 共用：前者在它之后 task_wait_pid，后者直接返回让 shell 去管。
+ */
+static int exec_spawn(const char *name, const char *args, const char **why, int *out_pid) {
     #define FAIL(v, m) do { if (why) *why = (m); return (v); } while (0)
 
     if (name == 0 || name[0] == '\0') FAIL(-1, "missing file name");
@@ -261,11 +268,26 @@ int exec_file(const char *name, const char *args, const char **why) {
     restore_borrow(save_pde1);
     kfree(buf);                            /* 映像已进进程页表，缓冲可以还回去 */
 
-    /* ---- 7) 阻塞等待子进程结束（wait 语义），返回它的退出码 ---- */
-    panic_set_context(name);
-    int rc = task_wait_pid(pid);
-    panic_set_context("shell");
-    return rc;
+    *out_pid = pid;
+    return 0;
 
     #undef FAIL
+}
+
+int exec_file(const char *name, const char *args, const char **why) {
+    int pid;
+    int rc = exec_spawn(name, args, why, &pid);
+    if (rc < 0) return rc;
+    /* ---- 7) 阻塞等待子进程结束（wait 语义），返回它的退出码 ---- */
+    panic_set_context(name);
+    int code = task_wait_pid(pid);
+    panic_set_context("shell");
+    return code;
+}
+
+int exec_file_bg(const char *name, const char *args, int *out_pid) {
+    /* 后台启动：spawn 完立刻把 pid 交回调用方，不阻塞。
+     * why 仅内部用于失败诊断，调用方通常忽略。 */
+    const char *why = 0;
+    return exec_spawn(name, args, &why, out_pid);
 }

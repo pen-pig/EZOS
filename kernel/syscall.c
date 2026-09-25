@@ -151,16 +151,22 @@ int syscall_handler(uint32_t num, uint32_t a1, uint32_t a2, uint32_t a3) {
     }
     case SYS_WAITPID: {
         /* 等待指定 pid 退出并取退出码（阻塞睡眠，非忙等）。
-         * ebx=pid，ecx=status 用户指针（可为 0），edx=options（忽略，恒阻塞）。 */
+         * ebx=pid，ecx=status 用户指针（可为 0），edx=options：
+         *   0      阻塞直到退出（或被其它 waiter 收走）
+         *   WNOHANG 子进程还在跑则立即返回 0（不收割），已退出则回收并返回 pid */
         int pid = (int)a1;
         int *status = (int *)a2;
-        int options = (int)a3; (void)options;
+        int options = (int)a3;
         if (status != 0 && !user_range_ok(a2, sizeof(int), 1)) return -1;
-        int code = task_wait_pid(pid);
-        if (code < 0) return -1;          /* pid 不存在/已被收走 */
-        if (status != 0) *status = code;  /* 退出码写回用户空间 */
-        return pid;                       /* waitpid 成功返回被等进程的 pid */
+        int code = task_wait_pid_opt(pid, options);
+        if (code == -1) return -1;              /* pid 不存在/已被收走 */
+        if (code == -2) return 0;               /* WNOHANG：仍在运行，未收割 */
+        if (status != 0) *status = code;        /* 退出码写回用户空间 */
+        return pid;                             /* waitpid 成功返回被等进程的 pid */
     }
+    case SYS_GETPID:
+        /* libc getpid()：返回当前进程的 pid（用户态后台任务打印 [n] pid 用）。 */
+        return (cur != 0) ? (int)cur->pid : 0;
     case SYS_EXIT:
         if (cur != 0 && cur->is_user) {
             /* 用户进程退出（步骤 6c）：拆地址空间、关 fd、记退出码并让出 CPU。

@@ -13,6 +13,12 @@
 #include "games.h"
 #include "isr.h"
 #include "panic.h"
+#include "task.h"
+#include "exec.h"
+#include "syscall.h"
+
+/* shell.c 用到 shell_extra.c 中定义的终端数字打印器（无头文件声明） */
+extern void ezos_console_print_dec(uint32_t num);
 
 #define CMD_BUFFER_SIZE 128
 #define HISTORY_SIZE 8
@@ -201,6 +207,174 @@ typedef struct {
     void (*func)(const char *args);
 } command_t;
 
+/* ============ 后台任务（job control，用户态生态第③步）============
+ * `cmd &` 把用户 ELF 放到后台跑，shell 立即回提示符并打印 `[n] pid`；
+ * `jobs` 列出后台任务（号 / PID / RUNNING|DONE）；每次显示提示符前
+ * 用非阻塞方式（WNOHANG）收割已退出的后台子进程，打印 `[n] done`。
+ * 这样 ZOMBIE 不会长期占用 MAX_TASKS=8 的进程槽。
+ * 后台任务数受 MAX_TASKS 约束：超限时 shell 侧报错而不是 panic。
+ */
+#define MAX_BG_JOBS 8
+typedef struct {
+    int  used;        /* 槽位占用 */
+    int  job_id;      /* 用户可见任务号，从 1 递增 */
+    int  pid;         /* 子进程 pid（退出并被收割后仍为展示用，不强制清零） */
+    int  reaped;      /* 已被 shell 非阻塞收割（打印过 done） */
+    char name[64];    /* 启动文件名 */
+} bg_job_t;
+static bg_job_t g_bg_jobs[MAX_BG_JOBS];
+static int g_bg_next_id = 1;
+
+/* 统计当前仍在跑（未收割）的后台任务数 */
+static int shell_bg_count_live(void) {
+    int n = 0;
+    for (int i = 0; i < MAX_BG_JOBS; i++)
+        if (g_bg_jobs[i].used && !g_bg_jobs[i].reaped) n++;
+    return n;
+}
+
+/* 选一个可复用的槽位：优先空闲槽，其次已被收割（DONE）的旧槽 */
+static int shell_bg_alloc_slot(void) {
+    int free_slot = -1, reaped_slot = -1;
+    for (int i = 0; i < MAX_BG_JOBS; i++) {
+        if (!g_bg_jobs[i].used) { free_slot = i; break; }
+        if (g_bg_jobs[i].reaped && reaped_slot < 0) reaped_slot = i;
+    }
+    if (free_slot >= 0) return free_slot;
+    return reaped_slot;
+}
+
+/* 登记一个刚后台启动的任务，并打印 `[n] pid` */
+static void shell_bg_register(const char *name, int pid) {
+    int slot = shell_bg_alloc_slot();
+    if (slot < 0) return;                 /* 不该发生：调用方已先判上限 */
+    bg_job_t *j = &g_bg_jobs[slot];
+    j->used   = 1;
+    j->reaped = 0;
+    j->job_id = g_bg_next_id++;
+    j->pid    = pid;
+    for (int k = 0; k < 63 && name[k]; k++) j->name[k] = name[k];
+    j->name[63] = '\0';
+
+    terminal_writestring("[");
+    ezos_console_print_dec((uint32_t)j->job_id);
+    terminal_writestring("] ");
+    ezos_console_print_dec((uint32_t)pid);
+    terminal_writestring("\n");
+}
+
+/* 非阻塞收割：遍历后台任务，已退出的用 WNOHANG 收走并打印 `[n] done`。
+ * 在每次打印提示符前调用，保证 ZOMBIE 不长期占用进程槽。 */
+static void shell_reap_bg(void) {
+    for (int i = 0; i < MAX_BG_JOBS; i++) {
+        bg_job_t *j = &g_bg_jobs[i];
+        if (!j->used || j->reaped) continue;
+        int code = task_wait_pid_opt(j->pid, WNOHANG);
+        if (code >= 0) {                  /* 已退出（>=0 为退出码），成功收割 */
+            terminal_writestring("[");
+            ezos_console_print_dec((uint32_t)j->job_id);
+            terminal_writestring("] done\n");
+            j->reaped = 1;
+        }
+        /* code == -2 仍在运行；-1 表示该 pid 已由别处收走（理论上不会，
+         * 因为后台子进程只由本函数收割），这里忽略即可。 */
+    }
+}
+
+/* `jobs` 内置命令：列出后台任务 */
+static void cmd_jobs(const char *args) {
+    (void)args;
+    int any = 0;
+    for (int i = 0; i < MAX_BG_JOBS; i++) {
+        bg_job_t *j = &g_bg_jobs[i];
+        if (!j->used) continue;
+        any = 1;
+        const char *state = j->reaped ? "DONE" : "RUNNING";
+        terminal_writestring("[");
+        ezos_console_print_dec((uint32_t)j->job_id);
+        terminal_writestring("] ");
+        ezos_console_print_dec((uint32_t)j->pid);
+        terminal_writestring(" ");
+        terminal_writestring(state);
+        terminal_writestring(" ");
+        terminal_writestring(j->name);
+        terminal_writestring("\n");
+    }
+    if (!any)
+        terminal_writestring("no background jobs\n");
+}
+
+/* 去掉行尾 `&`（后台标记），命中返回 1 并从 cmd 中删除。
+ * 仅当 `&` 是最后一个 token（其后只有空白）、且不在引号内时生效。 */
+static int shell_strip_bg(char *cmd) {
+    int len = (int)my_strlen(cmd);
+    int end = len - 1;
+    while (end >= 0 && cmd[end] == ' ') end--;
+    if (end < 0 || cmd[end] != '&') return 0;
+    int q = 0;
+    for (int i = 0; i < end; i++)
+        if (cmd[i] == '"') q = !q;
+    if (q) return 0;
+    cmd[end] = '\0';
+    int p = end - 1;
+    while (p >= 0 && cmd[p] == ' ') p--;
+    cmd[p + 1] = '\0';
+    return 1;
+}
+
+/* 尝试把 cmd 当作磁盘上的可执行文件（.ELF/.COM/.BIN）直接运行。
+ * 命中返回 1（已处理，调用方不要再走 Unknown command）；未命中返回 0。 */
+static int shell_try_exec_file(const char *cmd, char *args, int bg) {
+    size_t n = my_strlen(cmd);
+    if (n < 4) return 0;
+    const char *ext = cmd + n - 4;
+    int is_exe = (my_strcasecmp(ext, ".ELF") == 0) ||
+                 (my_strcasecmp(ext, ".COM") == 0) ||
+                 (my_strcasecmp(ext, ".BIN") == 0);
+    if (!is_exe) return 0;
+    if (!fs_ready()) return 0;
+
+    /* exFAT 文件名查找大小写敏感（盘上为大写），这里统一转大写再查 */
+    char fname[64];
+    int i;
+    for (i = 0; cmd[i] && i < 63; i++) {
+        char c = cmd[i];
+        if (c >= 'a' && c <= 'z') c = (char)(c - ('a' - 'A'));
+        fname[i] = c;
+    }
+    fname[i] = '\0';
+    if (fs_get_file_size(fname) == 0) return 0;   /* 盘上无此文件 */
+
+    if (bg) {
+        /* 上限保护：并发后台任务数受 MAX_TASKS=8 约束，超限报错不 panic */
+        if (shell_bg_count_live() >= 7) {
+            terminal_writestring("background job limit reached\n");
+            return 1;
+        }
+        int pid = 0;
+        int rc = exec_file_bg(fname, args, &pid);
+        if (rc < 0) {
+            terminal_writestring("background launch failed: ");
+            terminal_writestring(fname);
+            terminal_writestring("\n");
+            return 1;
+        }
+        shell_bg_register(fname, pid);
+    } else {
+        const char *why = 0;
+        int rc = exec_file(fname, args, &why);
+        if (rc < 0) {
+            terminal_writestring("exec: ");
+            terminal_writestring(fname);
+            terminal_writestring(": ");
+            terminal_writestring(why ? why : "failed");
+            terminal_writestring("\n");
+            return 1;
+        }
+    }
+    return 1;
+}
+
 static const command_t commands[] = {
     {"help",     cmd_help},
     {"exit",     cmd_exit},
@@ -269,6 +443,7 @@ static const command_t commands[] = {
     {"pmmtest",  cmd_pmmtest},
     {"elftest",  cmd_elftest},
     {"exec",     cmd_exec},
+    {"jobs",     cmd_jobs},
     {"calc",     cmd_calc},
     {"selftest", cmd_selftest},
     {"ktask",     cmd_ktask},
@@ -374,7 +549,7 @@ static int is_exe_name(const char *name) {
 }
 
 /* ִ��ԭʼ��������ض���/�ܵ�Ԥ������ */
-static void shell_execute_raw(char *cmd);
+static void shell_execute_raw(char *cmd, int bg);
 
 /* shell ģʽ��1=�û� shell��GUI Terminal / User Shell����0=�ں� shell */
 /* 清除 exit 请求标志：GUI Terminal 里敲�?exit 后退出桌面时调用�?
@@ -391,6 +566,10 @@ static void shell_execute(char *cmd) {
         history_count++;
     }
     while (*cmd == ' ') cmd++;
+    if (*cmd == '\0') return;
+
+    /* 解析后台执行标记 `&`：去掉行尾的 `&`，记录到 bg 标志 */
+    int bg = shell_strip_bg(cmd);
     if (*cmd == '\0') return;
 
     /* �����ض��� >��>> �͹ܵ� |�����ַ���������ţ����������ڣ�?*/
@@ -420,7 +599,7 @@ static void shell_execute(char *cmd) {
             }
             static char cap[PIPE_BUF_SIZE];
             terminal_begin_capture(cap, PIPE_BUF_SIZE);
-            shell_execute_raw(cmd);
+            shell_execute_raw(cmd, 0);
             int n = terminal_end_capture();
             for (int i = 0; i < n && mn < 8191; i++) merged[mn++] = (uint8_t)cap[i];
             if (mn > 0 && fs_init() == 0) {
@@ -429,7 +608,7 @@ static void shell_execute(char *cmd) {
         } else {
             static char cap[PIPE_BUF_SIZE];
             terminal_begin_capture(cap, PIPE_BUF_SIZE);
-            shell_execute_raw(cmd);
+            shell_execute_raw(cmd, 0);
             int n = terminal_end_capture();
             if (n > 0 && fs_init() == 0) {
                 fs_create_file(fname, (const uint8_t*)cap, n);
@@ -446,19 +625,19 @@ static void shell_execute(char *cmd) {
         while (*right == ' ') right++;
         static char pbuf[PIPE_BUF_SIZE];
         terminal_begin_capture(pbuf, PIPE_BUF_SIZE);
-        shell_execute_raw(left);
+        shell_execute_raw(left, 0);
         pipe_len = terminal_end_capture();
         if (pipe_len > PIPE_BUF_SIZE) pipe_len = PIPE_BUF_SIZE - 1;
         for (int i = 0; i < pipe_len; i++) pipe_buffer[i] = pbuf[i];
-        shell_execute_raw(right);
+        shell_execute_raw(right, 0);
         pipe_len = 0;
         return;
     }
 
-    shell_execute_raw(cmd);
+    shell_execute_raw(cmd, bg);
 }
 
-static void shell_execute_raw(char *cmd) {
+static void shell_execute_raw(char *cmd, int bg) {
     while (*cmd == ' ') cmd++;
     if (*cmd == '\0') return;
 
@@ -510,6 +689,11 @@ static void shell_execute_raw(char *cmd) {
         terminal_writestring("\n");
         return;
     }
+
+    /* 不是内建命令、也不是别名：尝试当作磁盘上的可执行文件（.ELF/.COM/.BIN）
+     * 直接运行。命中则已处理并返回；否则才报 Unknown command。 */
+    if (shell_try_exec_file(cmd, space, bg))
+        return;
 
     terminal_writestring("Unknown command: ");
     terminal_writestring(cmd);
@@ -640,6 +824,7 @@ void shell_run(void) {
             cmd_pos = 0;
             cursor = 0;
             history_index = -1;
+            shell_reap_bg();              /* 回提示符前非阻塞收割已退出的后台任务 */
             shell_fg(CLR_HEADER);
             terminal_writestring("> ");
             shell_color_default();
