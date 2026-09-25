@@ -29,6 +29,7 @@ global syscall_entry
 global enter_usermode
 global g_kernel_esp_save
 global g_kernel_eflags
+global g_syscall_frame
 global g_user_exited
 
 _start:
@@ -233,6 +234,12 @@ g_user_exited:      resd 1
 ; enter_usermode 进入时的内核 EFLAGS：SYS_EXIT 返回路径据此精确恢复 IF
 ; （不能无条件 sti——那样会把"调用者本就关着中断"的上下文错误打开）
 g_kernel_eflags:    resd 1
+; 系统调用陷入时压好的完整寄存器帧地址（syscall_entry 在 call 之前存好）。
+; fork 要用它复制父进程现场。必须由**汇编**给出：以前是在 syscall_handler 的
+; 第一条语句读 esp 再按固定下标索引，那个下标依赖编译器给该 C 函数生成的
+; prologue（push 了几个 callee-saved、sub 了多少局部空间），
+; 函数一改就静默错位——是典型的脆弱约定。
+g_syscall_frame:    resd 1
 
 [section .text]
 
@@ -276,6 +283,11 @@ syscall_entry:
     push ecx
     push ebx
     push eax
+    ; frame base for fork: +0 eax +4 ebx +8 ecx +12 edx, +16..+44 pusha
+    ; area (edi..eax), +64 EIP +68 CS +72 EFLAGS +76 ESP +80 SS.
+    ; Must come from ASM: indexing from a C function's esp depends on the
+    ; compiler-generated prologue and silently shifts when the function changes.
+    mov [g_syscall_frame], esp
     mov ax, 0x10                 ; 鍒囧埌鍐呮牳鏁版嵁娈碉細鐢ㄦ埛娈甸�夋嫨瀛愪笉鑳界敤浜庡唴鏍稿瓨鍙?
     mov ds, ax
     mov es, ax

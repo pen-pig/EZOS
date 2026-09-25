@@ -56,8 +56,22 @@ static int user_range_ok(uint32_t va, uint32_t len, int writable) {
     return 1;
 }
 
+/* 系统调用陷入时压好的完整寄存器帧地址，由 syscall_entry 汇编在 call 之前存好
+ * （boot/kernel_entry.asm）。用它是为了**摆脱对 C 函数 prologue 的依赖**——
+ * 之前在 syscall_handler 第一条语句读 esp 再按固定下标索引，那个下标随编译器
+ * 生成的 prologue（push 几个 callee-saved、sub 多少局部空间）变化，函数一改就静默错位。
+ * 布局（相对该基址，单位字节）：
+ *   +0 eax  +4 ebx  +8 ecx  +12 edx        （syscall_handler 的四个参数槽）
+ *   +16 edi +20 esi +24 ebp +28 esp        （pusha 区前半）
+ *   +32 ebx +36 edx +40 ecx +44 eax        （pusha 区后半）
+ *   +48 gs  +52 fs  +56 es  +60 ds
+ *   +64 EIP +68 CS  +72 EFLAGS +76 ESP +80 SS   （int 0x80 从 ring3 陷入的 iret 帧）
+ */
+extern uint32_t g_syscall_frame;
+
 /* ---------- 系统调用分发 ---------- */
 int syscall_handler(uint32_t num, uint32_t a1, uint32_t a2, uint32_t a3) {
+
     g_syscalls++;
     task_t *cur = task_current();
 
@@ -127,6 +141,25 @@ int syscall_handler(uint32_t num, uint32_t a1, uint32_t a2, uint32_t a3) {
         if (!user_range_ok(a2, sizeof(ka), 0)) return -1;
         for (int i = 0; i < 5; i++) ka[i] = ua[i];
         return net_sockcall(a1, ka);
+    }
+    case SYS_FORK: {
+        /* 复制当前用户进程：父返回子 pid，子返回 0；非用户进程或失败返回 -1。
+         * fesp 携带父进程的用户寄存器帧，使子进程从 fork 调用点之后原样继续。 */
+        if (cur == 0 || cur->is_user == 0) return -1;
+        int rc_fork = task_fork((void *)g_syscall_frame);
+        return rc_fork;
+    }
+    case SYS_WAITPID: {
+        /* 等待指定 pid 退出并取退出码（阻塞睡眠，非忙等）。
+         * ebx=pid，ecx=status 用户指针（可为 0），edx=options（忽略，恒阻塞）。 */
+        int pid = (int)a1;
+        int *status = (int *)a2;
+        int options = (int)a3; (void)options;
+        if (status != 0 && !user_range_ok(a2, sizeof(int), 1)) return -1;
+        int code = task_wait_pid(pid);
+        if (code < 0) return -1;          /* pid 不存在/已被收走 */
+        if (status != 0) *status = code;  /* 退出码写回用户空间 */
+        return pid;                       /* waitpid 成功返回被等进程的 pid */
     }
     case SYS_EXIT:
         if (cur != 0 && cur->is_user) {

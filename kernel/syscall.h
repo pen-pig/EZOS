@@ -26,6 +26,12 @@
 /* pipe(2)：创建一对匿名管道 fd（ebx=用户 int fds[2]，内核写回两个 fd 号）。
  * 沿用网络部分踩过的坑：本调用可能阻塞睡眠，须走 task_sleep 的关中断路径。 */
 #define SYS_PIPE   42u
+/* fork(2)：复制当前用户进程（地址空间 + fd 表），父返回子 pid，子返回 0。
+ * 沿用本项目"新号自己挑"的约定，不照搬 Linux 的 fork=2（已被 SYS_EXIT 占用）。 */
+#define SYS_FORK   43u
+/* waitpid(2)：等待指定 pid 结束并取退出码（阻塞睡眠，非忙等）。
+ * ebx=pid，ecx=status 用户指针（可为 0），edx=options（本内核忽略，恒阻塞）。 */
+#define SYS_WAITPID 44u
 /* socketcall 复用器（沿用 Linux i386 的 102 号）：
  * ebx=子命令（net.h SC_*），ecx=用户态 u32 args[5]。
  * 3 参数 ABI 不变，子命令的 5 个槽位经一个结构体传入。 */

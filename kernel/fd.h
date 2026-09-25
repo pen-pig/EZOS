@@ -85,6 +85,20 @@ int fd_lseek(fd_table_t *t, int fd, int32_t offset, int whence);
  * 用 user_range_ok 校验可写）。成功返回 0，池耗尽/无空 fd 返回 -1。 */
 int fd_pipe(fd_table_t *t, int *u_fds);
 
+/*
+ * 复制一张 fd 表（fork 用）：dst 先整体清为空白表，再逐条复制 src 的条目。
+ *   - 标准流：直接浅拷贝（无共享可变状态）；
+ *   - 普通文件：data 缓冲**深拷贝**（各自独立 kmalloc，避免两边 close 导致
+ *     double free 或互相串改）；
+ *   - pipe：与父共享同一个 pipe_t 对象，但必须递增对应端的引用计数
+ *     （ref_r / ref_w）——否则父进程关闭写端后子进程会提前看到 EOF、或把
+ *     pipe 对象释放掉。调用方应已持有 task_lock（cli），本函数内部只做 cli
+ *     不再 sti，避免提前开中断。
+ * 返回 0 成功。文件 data 深拷贝若 kmalloc 失败，该 fd 退化为空缓冲（继续推进），
+ * 不整体失败——fork 的失败判定以地址空间复制为准。
+ */
+int fd_table_dup(fd_table_t *dst, const fd_table_t *src);
+
 /* 自检：open/read/lseek/write/close 走真实文件系统跑一遍 */
 int fd_selftest(void (*out)(const char *));
 

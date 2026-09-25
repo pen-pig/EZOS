@@ -190,7 +190,10 @@ def exfat_files():
     # SPIN.ELF / FDLEAK.ELF：步骤 6c 的多进程验证程序
     #   SPIN.ELF   —— ring3 忙等几秒，证明用户进程是可被抢占的任务
     #   FDLEAK.ELF —— 写完文件故意不 close，证明进程退出时内核代关并落盘
-    for fname in ('SPIN.ELF', 'FDLEAK.ELF'):
+    # 根目录只有 1024B（簇 2-3），已被 10 个 entry set 顶满。
+    # FORKTST.ELF 是 fork/waitpid 的用户态验证（用户态生态 ②），E2E 要用；
+    # 让位的是 FDLEAK.ELF（步骤 6c 的手工演示程序，没有任何 E2E 依赖）。
+    for fname in ('SPIN.ELF',):
         p = os.path.join(os.path.dirname(here), 'user', fname.lower())
         if os.path.isfile(p):
             with open(p, 'rb') as f:
@@ -205,8 +208,10 @@ def exfat_files():
     #   NETCLI.ELF   —— TCP 主动连接客户端（7.4：connect/乱序重组/重传）
     # 根目录只有 2 簇（1KB，约 10 个目录项），SEGPROBE 是 7.3 调试期的
     # 一次性探针，让位给 NETCLI（7.4 需要）；源码与构建规则仍保留。
-    for fname in ('NETECHO.ELF', 'NETTCP.ELF', 'NETCLI.ELF'):
-        p = os.path.join(os.path.dirname(here), 'user', fname.lower())
+    # FORKTST.ELF：fork/waitpid 的用户态验证（用户态生态 ②）
+    for fname in ('FORKTST.ELF', 'NETECHO.ELF', 'NETTCP.ELF', 'NETCLI.ELF'):
+        p = os.path.join(os.path.dirname(here), 'user',
+                         'forktest.elf' if fname == 'FORKTST.ELF' else fname.lower())
         if os.path.isfile(p):
             with open(p, 'rb') as f:
                 files.append((fname, f.read()))

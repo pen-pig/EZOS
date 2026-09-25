@@ -70,7 +70,14 @@ task_irq_trampoline:
     ; selectors, surviving only via stale descriptor caches).
     ; Load the data segments that match the frame's CS RPL so the
     ; first syscall pushes/pops a consistent, valid selector.
-    mov eax, [esp + 4]      ; CS from the iret frame
+    ;
+    ; 关键：popa 刚把 eax 恢复成"新任务出场时应拿到的值"——对 fork 子进程
+    ; 而言这就是 0（子进程 fork 返回值，见 task_fork 把 popa 的 eax 槽置 0）。
+    ; 下面这段原本用 `mov eax, [esp+4]` 把 CS 读进 eax 做段选择，会直接把 eax
+    ; 覆盖成 0x1B，导致子进程 fork 返回 27 而非 0。改用 push/pop 保护 eax，
+    ; 段选择用压栈/弹栈绕开对通用寄存器的污染。
+    push eax                 ; 保存 popa 恢复出的 eax（fork 子进程=0）
+    mov eax, [esp + 8]      ; CS（iret 帧已被 push eax 顶到 esp+4，CS 在 +8）
     test al, 3
     jz .ksegs
     mov ax, 0x23            ; user data | RPL3
@@ -82,4 +89,5 @@ task_irq_trampoline:
     mov es, ax
     mov fs, ax
     mov gs, ax
+    pop eax                 ; 还原 eax（fork 子进程=0），iret 帧回到 esp
     iret

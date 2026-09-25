@@ -117,6 +117,8 @@ build kernel/hiscore.o: cc kernel/hiscore.c
 build user/crt0.o: asm_elf user/crt0.asm
 build user/hello.o: cc_user user/hello.c
 build user/hello.elf: link_user user/crt0.o user/hello.o | user/user.ld
+build user/forktest.o: cc_user user/forktest.c
+build user/forktest.elf: link_user user/crt0.o user/forktest.o | user/user.ld
 build user/fdtest.o: cc_user user/fdtest.c
 build user/fdtest.elf: link_user user/crt0.o user/fdtest.o | user/user.ld
 build user/spin.o: cc_user user/spin.c
@@ -138,11 +140,11 @@ build kernel.bin: objcopy_pad kernel_raw.bin
 
 build os-image.bin: make_os_image boot/boot.bin kernel.bin
 
-build disk.img: make_disk user/hello.elf user/fdtest.elf user/spin.elf user/fdleak.elf user/netecho.elf user/nettcp.elf user/segprobe.elf user/netcli.elf
+build disk.img: make_disk user/hello.elf user/fdtest.elf user/forktest.elf user/spin.elf user/fdleak.elf user/netecho.elf user/nettcp.elf user/segprobe.elf user/netcli.elf
 
 build run: run_qemu os-image.bin disk.img
 
-default os-image.bin user/hello.elf user/fdtest.elf user/spin.elf user/fdleak.elf user/netecho.elf user/nettcp.elf user/segprobe.elf user/netcli.elf disk.img
+default os-image.bin user/hello.elf user/fdtest.elf user/forktest.elf user/spin.elf user/fdleak.elf user/netecho.elf user/nettcp.elf user/segprobe.elf user/netcli.elf disk.img
 
 build clean: phony
     command = cmd /c del /q boot\boot.bin boot\kernel_entry.o kernel\*.o kernel\*.d kernel_raw.bin kernel.bin os-image.bin 2>nul

@@ -8,6 +8,7 @@
 #include "fd.h"         /* task_reap_zombies / process_exit 里 fd_close */
 #include "paging.h"     /* PAGING_PD_ADDR / paging_switch_cr3（6c 地址空间切换） */
 #include "pmm.h"        /* 进程退出时按账回收物理页 */
+#include "syscall.h"    /* USER_STACK_TOP / USER_STACK_PAGES：task_fork 复制用户栈用 */
 
 /* ---------- 内核栈池 ----------
  * 每任务 16KB，位于 linker.ld 的 .bss.kstack（物理 0x904000 起）。
@@ -34,6 +35,23 @@ static int      g_ready;                /* task_init 是否已完成 */
 static wait_queue_t g_wq_reap = {-1};
 
 extern void switch_to(uint32_t *old_esp, uint32_t new_esp);
+
+/* ---------- 无 libc 小工具（fork 复制地址空间用） ---------- */
+static void t_memcpy(void *dst, const void *src, uint32_t n) {
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    for (uint32_t i = 0; i < n; i++) d[i] = s[i];
+}
+
+/*
+ * 在子进程私有用户页表里设一个 PTE（pt_phys 是子进程页表物理页，identity
+ * 映射下可直接当指针用）。flags 直接沿用父进程 PTE 的低 12 位属性位。
+ */
+static void child_pt_set(uint32_t pt_phys, uint32_t va, uint32_t phys, uint32_t flags) {
+    uint32_t *pt = (uint32_t *)pt_phys;
+    uint32_t pti = (va >> 12) & 0x3FFu;
+    pt[pti] = (phys & 0xFFFFF000u) | (flags & 0xFFFu) | PTE_P;
+}
 
 /* ---------- 栈初始化 ---------- */
 /*
@@ -345,6 +363,198 @@ int task_wait_pid(int pid) {
          * 无超时——wait 语义就是无限等；对方消失由循环顶的 task_find 判定。 */
         task_sleep(&g_wq_reap, 0);
     }
+}
+
+/* ---------- fork（步骤 9：用户态生态第二步） ----------
+ *
+ * 复制父进程（当前正在执行 fork 系统调用的用户进程）的用户地址空间与 fd 表，
+ * 建立一个可运行的子任务。设计要点：
+ *
+ * 1) 子进程的"出场帧"完全照搬父进程此刻的系统调用现场（syscall_entry 在
+ *    syscall_handler 入口压下的那一帧）。frame 是 syscall_handler 入口的 esp，
+ *    其下方布局由 kernel_entry.asm 固定：
+ *       idx  内容
+ *        5   edi (pusha)        6  esi       7  ebp
+ *        9   ebx (pusha)       10  edx      11  ecx      12  eax (pusha)
+ *       17   SS (iret 帧)      18  ESP      19  EFLAGS   20  CS   21  EIP
+ *    子进程栈上摆成与 task_create_process 同构的 ring3 帧，只是寄存器换成父进程
+ *    的真实值、且 eax 槽置 0（子进程 fork 返回值）。子进程被调度后沿
+ *    switch_to → trampoline → popa → iret 回到 ring3，EIP/CS/EFLAGS/ESP 与父
+ *    进程从同一 int 0x80 返回时完全一致——于是父子"同时"从 fork 调用点之后继续，
+ *    子进程 eax=0，父进程 eax=子 pid（由 syscall_handler 的返回值给出）。
+ *
+ * 2) 地址空间逐页深拷贝：新建页目录 + 用户区页表，内核区 PDE 与父/内核共享
+ *    （同一批内核页表）。父进程的 ELF 各段、用户栈在 4-8MB 区间，逐页分配新
+ *    物理页并 memcpy，按"谁分配谁记账"记到子进程 img/user_stack 上——这样
+ *    process_exit 的既有回收路径（连续块 pmm_free_pages）原样可用，无需改。
+ *    复制中途任何一步失败都按自己记的账对称回滚（已分配的子进程页/页表/页目录
+ *    全部归还），绝不回查页表。
+ *
+ * 3) 全程 task_lock()：关中断 + 禁调度，建子进程期间不被抢占（共享 g_tasks 与
+ *    页表）。fd 复制的 pipe 引用计数递增也依赖这个 cli 窗口。
+ */
+int task_fork(void *syscall_frame) {
+    if (!g_ready || syscall_frame == 0) return -1;
+    task_t *parent = &g_tasks[g_current];
+    if (!parent->is_user || parent->cr3 == 0) return -1;   /* 只有用户进程能 fork */
+
+    uint32_t *fr = (uint32_t *)syscall_frame;
+
+    task_lock();   /* cli + 禁调度，覆盖槽位分配 / 页表 / fd 复制 */
+
+    /* 找一个空闲任务槽（先于资源分配，避免占了内存却没地方挂） */
+    int slot = -1;
+    for (uint32_t i = 0; i < MAX_TASKS; i++) {
+        if (g_tasks[i].state == TASK_UNUSED) { slot = (int)i; break; }
+    }
+    if (slot < 0) { task_unlock(); return -1; }
+
+    /* 1) 子进程页目录 + 用户区页表 */
+    uint32_t pd_phys = pmm_alloc_page();
+    uint32_t pt_phys = pmm_alloc_page();
+    if (pd_phys == 0 || pt_phys == 0) {
+        if (pd_phys) pmm_free_page(pd_phys);
+        if (pt_phys) pmm_free_page(pt_phys);
+        task_unlock();
+        return -1;
+    }
+    {
+        uint32_t *cpd = (uint32_t *)pd_phys;
+        uint32_t *ppd = (uint32_t *)parent->cr3;
+        for (uint32_t i = 0; i < 1024u; i++) {
+            if (i == 1u) continue;
+            cpd[i] = ppd[i];                          /* 内核区 PDE 共享 */
+        }
+        cpd[1] = pt_phys | PTE_P | PTE_RW | PTE_US;
+        uint32_t *cpt = (uint32_t *)pt_phys;
+        for (uint32_t i = 0; i < 1024u; i++) cpt[i] = 0;
+    }
+
+    /* 2) 复制 ELF 各段（连续块分配，逐页拷贝 + 记子进程 PTE） */
+    uint32_t child_seg[ELF_MAX_SEG];
+    for (uint32_t s = 0; s < ELF_MAX_SEG; s++) child_seg[s] = 0;
+    uint32_t nseg = parent->img.nseg;
+    int fail = 0;
+    for (uint32_t s = 0; s < nseg; s++) {
+        uint32_t pages = parent->img.seg[s].pages;
+        uint32_t cphys = pmm_alloc_pages(pages);
+        if (cphys == 0) { fail = 1; break; }
+        child_seg[s] = cphys;
+        uint32_t va = parent->img.seg[s].va;
+        for (uint32_t k = 0; k < pages; k++) {
+            uint32_t p = va + k * PMM_PAGE_SIZE;
+            uint32_t phys = 0, flags = 0;
+            if (paging_query(p, &phys, &flags) != 0) {       /* 父页必在，失败即异常 */
+                pmm_free_pages(cphys, pages);
+                child_seg[s] = 0;
+                fail = 1;
+                break;
+            }
+            /* 源：父进程虚拟地址（当前 CR3=父，可直接读）；
+             * 目的：子进程新物理页（identity 映射，可直接写） */
+            t_memcpy((void *)(cphys + k * PMM_PAGE_SIZE), (const void *)p, PMM_PAGE_SIZE);
+            child_pt_set(pt_phys, p, cphys + k * PMM_PAGE_SIZE, flags);
+        }
+        if (fail) break;
+    }
+
+    /* 3) 复制用户栈（连续块） */
+    uint32_t child_stack = 0;
+    if (!fail) {
+        uint32_t pages = parent->user_stack_pages;
+        child_stack = pmm_alloc_pages(pages);
+        if (child_stack == 0) {
+            fail = 1;
+        } else {
+            uint32_t sva = USER_STACK_TOP - pages * PMM_PAGE_SIZE;
+            for (uint32_t k = 0; k < pages; k++) {
+                uint32_t p = sva + k * PMM_PAGE_SIZE;
+                uint32_t phys = 0, flags = 0;
+                if (paging_query(p, &phys, &flags) != 0) {
+                    pmm_free_pages(child_stack, pages);
+                    child_stack = 0;
+                    fail = 1;
+                    break;
+                }
+                t_memcpy((void *)(child_stack + k * PMM_PAGE_SIZE),
+                         (const void *)p, PMM_PAGE_SIZE);
+                child_pt_set(pt_phys, p, child_stack + k * PMM_PAGE_SIZE, flags);
+            }
+        }
+    }
+
+    /* 失败：按自己记的账对称回滚，绝不回查页表 */
+    if (fail) {
+        for (uint32_t s = 0; s < nseg; s++)
+            if (child_seg[s]) pmm_free_pages(child_seg[s], parent->img.seg[s].pages);
+        if (child_stack) pmm_free_pages(child_stack, parent->user_stack_pages);
+        pmm_free_page(pt_phys);
+        pmm_free_page(pd_phys);
+        task_unlock();
+        return -1;
+    }
+
+    /* 4) 登记子任务，复制 fd 表（pipe 递增引用计数在 fd_table_dup 内完成） */
+    task_t *c = &g_tasks[slot];
+    c->kstack     = (uint32_t)g_kstacks[slot];
+    c->kstack_top = c->kstack + TASK_KSIZE;
+    c->pid        = g_next_pid++;
+    c->state      = TASK_READY;
+    c->ticks      = TASK_TIMESLICE;
+    c->switches   = 0;
+    c->cr3        = pd_phys;
+    c->is_user    = 1;
+    c->exit_code  = 0;
+    c->user_stack_phys   = child_stack;
+    c->user_stack_pages  = parent->user_stack_pages;
+    c->pd_phys    = pd_phys;
+    c->pt_phys    = pt_phys;
+    c->img        = parent->img;                 /* 段布局/虚拟地址/页数一致 */
+    for (uint32_t s = 0; s < nseg; s++)
+        c->img.seg[s].phys = child_seg[s];        /* 物理页换成子进程自己的 */
+    c->wait_next  = -1;
+    c->wake_tick  = 0;
+    c->wait_q     = 0;
+    {
+        const char *n = parent->name;
+        int i = 0;
+        for (; n[i] && i < 15; i++) c->name[i] = n[i];
+        c->name[i] = '\0';
+    }
+    fd_table_dup(&c->fds, &parent->fds);
+
+    /* 5) 摆子进程内核栈：ring3 出场帧，寄存器照搬父进程，eax 槽置 0 */
+    /* 帧布局见 syscall.c 顶部注释（由 syscall_entry 汇编给出基址，不依赖 C prologue）：
+     *   16 edi  17 esi  18 ebp  19 esp  20 ebx  21 edx  22 ecx  23 eax（pusha 区，/4 后）
+     *   64/4=16 ... ; iret 帧：EIP=64 CS=68 EFLAGS=72 ESP=76 SS=80 -> 下标 16..20
+     * 注意 pusha 区起始是 +16 字节 = 下标 4，别把两套下标混了。 */
+    {
+        uint32_t *sp = (uint32_t *)c->kstack_top;
+        *--sp = fr[20];                  /* SS   （+80） */
+        *--sp = fr[19];                  /* ESP  （+76） */
+        *--sp = fr[18];                  /* EFLAGS（+72） */
+        *--sp = fr[17];                  /* CS   （+68） */
+        *--sp = fr[16];                  /* EIP  （+64） */
+        *--sp = 0u;                      /* popa: eax（子进程返回 0） */
+        *--sp = fr[10];                  /* ecx  （+40） */
+        *--sp = fr[9];                   /* edx  （+36） */
+        *--sp = fr[8];                   /* ebx  （+32） */
+        *--sp = 0u;                      /* esp 占位（+28，popa 会弹掉，值无意义） */
+        *--sp = fr[6];                   /* ebp  （+24） */
+        *--sp = fr[5];                   /* esi  （+20） */
+        *--sp = fr[4];                   /* edi  （+16） */
+        *--sp = (uint32_t)task_irq_trampoline;   /* switch_to ret 目标 */
+        *--sp = 0x0002u;                /* popfd 用 EFLAGS（IF=0） */
+        *--sp = 0u;                     /* ebp  */
+        *--sp = 0u;                     /* ebx  */
+        *--sp = 0u;                     /* esi  */
+        *--sp = 0u;                     /* edi  */
+        c->esp = (uint32_t)sp;
+    }
+
+    int child_pid = (int)c->pid;
+    task_unlock();                /* 此时子进程已完整（含栈帧），可被调度 */
+    return child_pid;             /* 父进程拿到子 pid；子进程经栈帧返回 0 */
 }
 
 /* ---------- 等待队列与可睡眠阻塞（步骤 8a） ----------

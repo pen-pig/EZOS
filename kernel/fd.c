@@ -404,6 +404,44 @@ int fd_write(fd_table_t *t, int fd, const uint8_t *buf, uint32_t n) {
     return (int)n;
 }
 
+/* ---------- fd 表复制（fork 用，步骤 9：用户态生态第二步） ----------
+ * 逐条复制 src 到 dst：标准流浅拷、文件 data 深拷、pipe 递增引用计数。
+ * 调用方已持有 task_lock（cli），此处只 cli 不 sti，避免提前开中断。 */
+int fd_table_dup(fd_table_t *dst, const fd_table_t *src) {
+    if (dst == 0 || src == 0) return -1;
+    fd_table_init(dst);
+    for (uint32_t i = 0; i < MAX_OPEN_FDS; i++) {
+        const fd_entry_t *s = &src->fds[i];
+        fd_entry_t *d = &dst->fds[i];
+        if (s->type == FD_TYPE_FREE) continue;
+
+        if (s->type == FD_TYPE_PIPE) {
+            pipe_t *p = (pipe_t *)s->data;
+            if (p != 0) {
+                asm volatile("cli" ::: "memory");   /* 调用方已 cli，这里是保险 */
+                if (s->writable) { if (p->ref_w < 0xFFFFu) p->ref_w++; }
+                else            { if (p->ref_r < 0xFFFFu) p->ref_r++; }
+                /* 不 sti：保持 IF=0 直到调用方 task_unlock */
+            }
+            *d = *s;                       /* 共享同一个 pipe_t，引用已递增 */
+        } else if (s->type == FD_TYPE_FILE) {
+            *d = *s;
+            d->data = 0;
+            if (s->data != 0 && s->size > 0) {
+                uint8_t *nd = (uint8_t *)kmalloc(s->size);
+                if (nd != 0) {
+                    for (uint32_t k = 0; k < s->size; k++) nd[k] = s->data[k];
+                    d->data = nd;
+                }
+                /* 分配失败：data 留 0（空缓冲），fork 仍以地址空间复制为准继续 */
+            }
+        } else {
+            *d = *s;                      /* 标准流：无共享可变状态，浅拷即可 */
+        }
+    }
+    return 0;
+}
+
 int fd_lseek(fd_table_t *t, int fd, int32_t offset, int whence) {
     if (t == 0 || fd < 0 || (uint32_t)fd >= MAX_OPEN_FDS) return -1;
     fd_entry_t *e = &t->fds[fd];

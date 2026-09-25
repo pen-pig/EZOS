@@ -106,6 +106,16 @@ void process_exit(int code);
  * pid 不存在返回 -1。 */
 int task_wait_pid(int pid);
 
+/*
+ * fork 当前用户进程（SYS_FORK 实现）：复制父进程的用户地址空间（4-8MB 区间，
+ * 逐页深拷贝、每页独立记账）与 fd 表（普通文件 data 深拷贝、pipe 递增引用计数），
+ * 新建一个可运行子任务。父进程返回子 pid，子进程返回 0，失败返回 -1。
+ * syscall_frame 必须是 syscall_handler 入口处的 esp（用于复制父进程的用户寄存器
+ * 帧，使子进程从 fork 调用点之后原样继续）。复制中途失败会对称回滚已分配资源。
+ * 调用者须为 is_user 的用户进程（内核线程无独立地址空间，fork 返回 -1）。
+ */
+int task_fork(void *syscall_frame);
+
 /* 当前任务主动放弃 CPU（协作式让位，抢占之外的补充） */
 void task_yield(void);
 
