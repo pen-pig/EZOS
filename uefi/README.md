@@ -59,7 +59,39 @@ LOG=$(cygpath -w /d/MyOS/src/uefi/serial.log)
 5. **串口与 ConOut 重复**：标记在串口出现两次——一次是我们直接 `out 0x3F8`，
    一次是 OVMF 把 ConOut 也镜像到同一串口。两路都生效，属预期。
 
+## U2b：GOP 帧缓冲（写入内核约定地址 0x5000）
+
+`main.c` 在 `EfiMain` 里用 `BootServices->LocateProtocol` 取
+`EFI_GRAPHICS_OUTPUT_PROTOCOL`（GUID `9042a9de-23dc-4a38-96fb-7aded080516a`），
+从 `Mode->Info` / `Mode->FrameBufferBase` 取分辨率、像素格式、帧缓冲物理地址、扫描行跨度。
+
+**内核约定布局（kernel/gfx.c:139-142 核对）**：物理地址 0x5000 处
+- `0x5000` uint32  LFB 物理地址（0=无 LFB，回退 VGA 0x13）
+- `0x5004` uint16  XRES
+- `0x5006` uint16  YRES
+- `0x5008` uint8   BPP（每像素字节数；当前 GOP 32bpp 写 32。注意 gfx.c 现仅接受 16=RGB565，
+  故 U3 改 gfx.c 前仍会走 VGA 0x13 回退——属预期，非本步 bug）
+- `0x5009` uint8   GOP PixelFormat 枚举值（0=RGBA 1=BGR 2=BitMask 3=BltOnly）
+- `0x500A` uint16  保留
+- `0x500C` uint32  PixelsPerScanLine（stride，单位像素）
+
+UEFI IA32 启动阶段为 1:1 映射，按物理地址直接写入即可。PixelFormat>=3 视为不可用，不写。
+
+串口输出两行（外加保留的 `EZEFI: hello`）：
+- `EZEFI:gop <w>x<h> fmt=<N> fb=0x<HEX> stride=<N>`
+- `EZEFI:gop write@0x5000 ok`
+
+实测（OVMF i386，默认 VGA）：`EZEFI:gop 1280x800 fmt=1 fb=0x80000000 stride=1280`
+（fmt=1=BGRA 32bpp，fb 落在 32 位空间）。
+
+### U2b 新增踩坑
+6. **EFI_BOOT_SERVICES 布局**：`LocateProtocol` 是第 38 个成员（Hdr 之后偏移 `0xac`/172 字节），
+   不是第 37 个。介于 `HandleProtocol` 与 `RegisterProtocolNotify` 之间还有一个 UEFI 2.0 兼容的
+   `Reserved` 槽（void*）——漏掉它偏移错位，会把别的 BS 函数当成 LocateProtocol，
+   表现为 `EFI_NOT_FOUND` 或返回 0 但接口指针为 NULL。已用探针在多个偏移实测确认 0xac 正确。
+7. 取不到 GOP（PixelFormat>=3 或 LocateProtocol 失败）时如实打 `FAIL`，不伪造数据。
+
 ## 结论
 
-32 位路径打通：BOOTIA32.EFI 在 OVMF 下自动加载、运行、向串口/屏幕输出标记。
-后续 U2b/U2c 才在此基础上加 GOP 帧缓冲、ExitBootServices、加载并跳转内核。
+32 位路径打通：BOOTIA32.EFI 在 OVMF 下自动加载、运行、打印标记并向 0x5000 写入 GOP 帧缓冲参数。
+后续 U2c 再加 ExitBootServices、加载并跳转内核（U3 改 gfx.c 接受 32bpp）。
