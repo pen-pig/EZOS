@@ -53,7 +53,10 @@ static uint64_t ver_u64(uint32_t addr) {
 
 /* ACPI 表头公共字段：签名(4) 长度(4) 修订(1) 校验和(1) */
 static int table_ok(uint32_t addr, const char sig[4]) {
-    if (addr < 0x100000 || addr > 0xFFFFF000u - 64u) return 0;
+    /* 只认 identity 映射（0-32MB）内的表：QEMU/真机常把 ACPI 表放
+     * RAM 顶部（如 128MB 机器的 0x7FE22E0），越出 identity 读它 =
+     * #PF panic。fail closed：按"表不可达"处理，走 legacy 回退。 */
+    if (addr < 0x100000 || addr + 0x40000 > 0x02000000u) return 0;
     for (int i = 0; i < 4; i++) {
         if (ver_u8(addr + i) != (uint8_t)sig[i]) return 0;
     }
@@ -67,11 +70,13 @@ static int table_ok(uint32_t addr, const char sig[4]) {
 /* 在 [base, base+span) 里找 RSDP 签名，按步长 16 对齐扫描 */
 static uint32_t find_rsdp_span(uint32_t base, uint32_t span) {
     for (uint32_t a = base; a + 36 <= base + span && a >= base; a += 16) {
+        /* 签名 8 字节 "RSD PTR "：R,S,D,空格,P,T,R,空格（下标 0-7）。
+         * 下标 8 起是校验和/OEMID。曾把 +8 也当空格校验（RSDP 永远扫
+         * 不到），又曾把 +3 当 'T'（同样扫不到）——两次都被自检揪出。 */
         if (ver_u8(a) != 'R' || ver_u8(a + 1) != 'S') continue;
-        if (ver_u8(a + 2) != 'D' || ver_u8(a + 3) != 'T') continue;
-        if (ver_u8(a + 4) != ' ' || ver_u8(a + 5) != 'P') continue;
-        if (ver_u8(a + 6) != 'T' || ver_u8(a + 7) != 'R') continue;
-        if (ver_u8(a + 8) != ' ' || ver_u8(a + 9) != ' ') continue;
+        if (ver_u8(a + 2) != 'D' || ver_u8(a + 3) != ' ') continue;
+        if (ver_u8(a + 4) != 'P' || ver_u8(a + 5) != 'T') continue;
+        if (ver_u8(a + 6) != 'R' || ver_u8(a + 7) != ' ') continue;
         /* v1 校验和：前 20 字节 */
         uint8_t sum = 0;
         for (int i = 0; i < 20; i++) sum += ver_u8(a + i);

@@ -32,10 +32,11 @@
 #include "pci.h"
 #include "rtl8139.h"
 #include "net.h"
+#include "serial.h"
+#include "acpi.h"
+#include "ata.h"
 
-/* ==================================================================
- * 1. ezos_console 适配层：把 EZOS tty / 键盘桥接为轻量 console 接口
- * ================================================================== */
+
 
 void ezos_console_putchar(char c) {
     terminal_putchar(c);
@@ -733,13 +734,332 @@ static void st_report(const char *prefix, const char *name, int fails,
     ezos_console_write(line + mark2);        /* 余下：默认色 */
 }
 
+/* ==================================================================
+ * 1b. 硬件/软件扩展自检探针（真机点亮配套）
+ *
+ * 约定：每个探针返回失败计数（0 = 通过）；detail 非空时填一行人话
+ * 指标（boot 静默路径传 NULL）。探针一律只读或自恢复，绝不破坏
+ * 系统状态；不可信输入（端口返回值）全部有上界/超时。
+ * ================================================================== */
+
+/* serial：COM1 环回自检已在 serial_init 做过，这里断言其结果 */
+static int st2_serial(char *detail, uint32_t ds) {
+    if (detail && ds) {
+        uint32_t p = 0;
+        st_puts(detail, &p, ds, serial_ready() ? "COM1 115200 loopback ok"
+                                               : "COM1 absent");
+        detail[p] = '\0';
+    }
+    return 0;   /* 无串口不判失败：仅降级诊断能力 */
+}
+
+/* pit：IRQ0 驱动的系统 tick 必须真的在走（忙等最多 ~200ms） */
+static int st2_pit(char *detail, uint32_t ds) {
+    uint32_t t0 = g_pit_ticks;
+    for (volatile uint32_t i = 0; i < 20000000u; i++) {
+        if (g_pit_ticks != t0) {
+            if (detail && ds) {
+                uint32_t p = 0;
+                st_puts(detail, &p, ds, "tick advanced in ");
+                st_putd(detail, &p, ds, g_pit_ticks - t0);
+                st_puts(detail, &p, ds, " ms");
+                detail[p] = '\0';
+            }
+            return 0;
+        }
+    }
+    return 1;   /* 200ms 内 tick 未动：PIT/IRQ0 挂了 */
+}
+
+/* CMOS 只读（NMI 位保护）。shell.c 里的 cmos_read 是 static，这里自持一份 */
+static uint8_t cmos_read_reg(uint8_t reg) {
+    outb(0x70, (uint8_t)(0x80 | reg));
+    return inb(0x71);
+}
+
+/* rtc：CMOS 时钟 BCD/二进制自洽（秒/分/时/日/月全部在合法范围） */
+static int st2_rtc(char *detail, uint32_t ds) {
+    uint8_t srb = cmos_read_reg(0x0B);
+    int bcd = (srb & 0x04) == 0;
+    uint8_t sec = cmos_read_reg(0x00), min = cmos_read_reg(0x02);
+    uint8_t hour = cmos_read_reg(0x04), day = cmos_read_reg(0x07);
+    uint8_t mon = cmos_read_reg(0x08);
+    if (bcd) {   /* BCD -> 二进制 */
+        sec = (uint8_t)((sec & 0x0F) + (sec >> 4) * 10);
+        min = (uint8_t)((min & 0x0F) + (min >> 4) * 10);
+        hour = (uint8_t)((hour & 0x0F) + (hour >> 4) * 10);
+        day = (uint8_t)((day & 0x0F) + (day >> 4) * 10);
+        mon = (uint8_t)((mon & 0x0F) + (mon >> 4) * 10);
+    }
+    int ok = (sec < 60 && min < 60 && hour < 24 && day >= 1 && day <= 31 &&
+              mon >= 1 && mon <= 12);
+    if (detail && ds) {
+        uint32_t p = 0;
+        st_puts(detail, &p, ds, ok ? "clock sane (24h)" : "clock garbage");
+        detail[p] = '\0';
+    }
+    return ok ? 0 : 1;
+}
+
+/* ata：每个在位盘读 LBA0，主引导扇区必须以 0x55AA 结尾 */
+static int st2_ata(char *detail, uint32_t ds) {
+    int present = 0, bad = 0;
+    uint8_t buf[512];
+    for (uint8_t d = 0; d < 2; d++) {
+        if (!ata_drive_present(d)) continue;
+        present++;
+        if (ata_read_sector(d, 0, buf) != 0) { bad++; continue; }
+        if (buf[510] != 0x55 || buf[511] != 0xAA) bad++;
+    }
+    if (detail && ds) {
+        uint32_t p = 0;
+        st_putd(detail, &p, ds, (uint32_t)present);
+        st_puts(detail, &p, ds, " drive(s), MBR sig ");
+        st_puts(detail, &p, ds, bad ? "BAD" : "ok");
+        detail[p] = '\0';
+    }
+    if (present == 0) return 1;      /* 一块盘都没有：存储子系统不可用 */
+    return bad;
+}
+
+/* pci：配置空间枚举至少要找到 1 个设备（QEMU 有桥+RTL8139 等） */
+static int st2_pci(char *detail, uint32_t ds) {
+    int cnt = pci_device_count();
+    if (detail && ds) {
+        uint32_t p = 0;
+        st_putd(detail, &p, ds, (uint32_t)(cnt < 0 ? 0 : cnt));
+        st_puts(detail, &p, ds, " device(s) enumerated");
+        detail[p] = '\0';
+    }
+    return (cnt >= 1) ? 0 : 1;
+}
+
+/* nic：在位则验证 MAC 非全 0/全 FF；不在位不算失败（真机可能没有） */
+static int st2_nic(char *detail, uint32_t ds) {
+    if (!rtl8139_present()) {
+        if (detail && ds) {
+            st_puts(detail, &ds, 0, "absent, skipped");
+            detail[ds] = '\0';
+        }
+        return 0;
+    }
+    const uint8_t *mac = rtl8139_mac();
+    int zero = 1, ff = 1;
+    for (int i = 0; i < 6; i++) {
+        if (mac[i] != 0x00) zero = 0;
+        if (mac[i] != 0xFF) ff = 0;
+    }
+    int ok = !(zero || ff);
+    if (detail && ds) {
+        uint32_t p = 0;
+        rtl8139_mac_str(detail + 16);
+        st_puts(detail, &p, ds, "mac ");
+        st_puts(detail, &p, ds, detail + 16);
+        detail[p] = '\0';
+    }
+    return ok ? 0 : 1;
+}
+
+/* acpi：断言子系统处于"明确定义的状态"之一：
+ *   FADT 解析成功（表在 identity 映射内）或 legacy 回退（无 RSDP/
+ *   表在映射外——QEMU 128MB 把表放 RAM 顶部 0x7FE22E0，内核只映射
+ *   32MB，读不到是已知限制而非故障）。两者都算 PASS，detail 如实
+ *   报告；只有 status 为空（init 没跑）才 FAIL。 */
+static int st2_acpi(char *detail, uint32_t ds) {
+    const char *s = acpi_status_line();
+    int ok = (s && s[0] != 0);
+    if (detail && ds) {
+        uint32_t p = 0;
+        st_puts(detail, &p, ds, s ? s : "no status");
+        detail[p] = '\0';
+    }
+    return ok ? 0 : 1;
+}
+
+/* kbd：8042 控制器自检（POST 同款）：命令 0xAA 必须回 0x55。
+ * 全程关中断：结果置 OBF 会触发 IRQ1，键盘 ISR 会把 0x55 当扫描码
+ * 读走（实测 58ms 超时 FAIL 的根因）。结束后重新使能键盘/辅助端口。 */
+static int st2_kbd(char *detail, uint32_t ds) {
+    int ok = 0;
+    asm volatile("cli");
+    for (uint32_t i = 0; i < 200000u; i++)
+        if ((inb(0x64) & 0x02) == 0) { ok = 1; break; }   /* 等 IBF 清空 */
+    if (ok) {
+        outb(0x64, 0xAA);                        /* controller self-test */
+        ok = 0;
+        for (uint32_t i = 0; i < 200000u; i++) {
+            if ((inb(0x64) & 0x01) != 0) {       /* OBF：结果可读 */
+                uint8_t r = inb(0x60);
+                ok = (r == 0x55);
+                break;
+            }
+        }
+        outb(0x64, 0xAE);                        /* 重新使能键盘端口 */
+        outb(0x64, 0xA8);                        /* 重新使能辅助端口 */
+    }
+    asm volatile("sti");
+    if (detail && ds) {
+        uint32_t p = 0;
+        st_puts(detail, &p, ds, ok ? "controller 0x55 ok" : "no response");
+        detail[p] = '\0';
+    }
+    return ok ? 0 : 1;
+}
+
+/* vga：文本内存非显示页（page 1 @0xB8000+4KB）写读回环 */
+static int st2_vga(char *detail, uint32_t ds) {
+    volatile uint16_t *page1 = (volatile uint16_t *)(0xB8000 + 4096);
+    int ok = 1;
+    for (int i = 0; i < 256; i++) page1[i] = (uint16_t)(0x5700u | (uint8_t)i);
+    for (int i = 0; i < 256; i++) {
+        if (page1[i] != (uint16_t)(0x5700u | (uint8_t)i)) { ok = 0; break; }
+    }
+    for (int i = 0; i < 256; i++) page1[i] = 0x0720u;   /* 清回空格 */
+    if (detail && ds) {
+        uint32_t p = 0;
+        st_puts(detail, &p, ds, ok ? "page1 512B pattern ok" : "pattern mismatch");
+        detail[p] = '\0';
+    }
+    return ok ? 0 : 1;
+}
+
+/* tsc：i686 必有 TSC；两次读数必须不同（时间在流动） */
+static int st2_tsc(char *detail, uint32_t ds) {
+    uint32_t a, d1, d2, a2;
+    asm volatile("rdtsc" : "=a"(a), "=d"(d1));
+    for (volatile uint32_t i = 0; i < 10000u; i++) { /* 少量延迟 */ }
+    asm volatile("rdtsc" : "=a"(a2), "=d"(d2));
+    (void)a; (void)d1;
+    uint64_t t1 = ((uint64_t)d1 << 32) | a;
+    uint64_t t2 = ((uint64_t)d2 << 32) | a2;
+    int ok = t2 > t1;
+    if (detail && ds) {
+        uint32_t p = 0;
+        st_puts(detail, &p, ds, ok ? "monotonic" : "static!");
+        detail[p] = '\0';
+    }
+    return ok ? 0 : 1;
+}
+
+/* div64：64 位除法软模拟（无 libgcc）已知答案。
+ * div64.c 暴露 libgcc 兼容接口；types.h 没有 u64 别名，用 uint64_t。 */
+static int st2_div64(char *detail, uint32_t ds) {
+    extern uint64_t __udivdi3(uint64_t, uint64_t);
+    extern uint64_t __umoddi3(uint64_t, uint64_t);
+    static const struct { uint64_t a, b, q, r; } v[] = {
+        { 0xFFFFFFFFFFFFFFFFull, 3, 0x5555555555555555ull, 0 },
+        { 0xFFFFFFFFFFFFFFFFull, 0x10000, 0x0000FFFFFFFFFFFFull, 0xFFFF },
+        { 1000000007ull, 13, 76923077ull, 6 },
+        { 0x8000000000000000ull, 2, 0x4000000000000000ull, 0 },
+        { 42, 100, 0, 42 },
+    };
+    int bad = 0;
+    uint32_t badcase = 0xFFFFFFFFu;
+    uint64_t got = 0, want = 0;
+    for (uint32_t i = 0; i < sizeof(v) / sizeof(v[0]); i++) {
+        if (__udivdi3(v[i].a, v[i].b) != v[i].q) {
+            bad++; badcase = i; got = __udivdi3(v[i].a, v[i].b); want = v[i].q;
+        }
+        if (__umoddi3(v[i].a, v[i].b) != v[i].r) {
+            bad++; badcase = i; got = __umoddi3(v[i].a, v[i].b); want = v[i].r;
+        }
+    }
+    if (detail && ds) {
+        static const char hx[] = "0123456789ABCDEF";
+        uint32_t p = 0;
+        st_putd(detail, &p, ds, (uint32_t)(sizeof(v) / sizeof(v[0])));
+        st_puts(detail, &p, ds, " vectors");
+        if (bad) {
+            st_puts(detail, &p, ds, ", case ");
+            st_putd(detail, &p, ds, badcase);
+            st_puts(detail, &p, ds, " got=0x");
+            for (int s = 60; s >= 0; s -= 4) detail[p++] = hx[(got >> s) & 0xF];
+            st_puts(detail, &p, ds, " want=0x");
+            for (int s = 60; s >= 0; s -= 4) detail[p++] = hx[(want >> s) & 0xF];
+        } else {
+            st_puts(detail, &p, ds, ", ok");
+        }
+        detail[p] = '\0';
+    }
+    return bad;
+}
+
+/* pipe：fd_pipe -> write -> read 数据一致 -> close（引用归零） */
+static int st2_pipe(char *detail, uint32_t ds) {
+    fd_table_t t;
+    fd_table_init(&t);
+    int fds[2];
+    static const uint8_t msg[] = "EZOS pipe selftest 0123456789";
+    uint8_t buf[64];
+    int bad = 0;
+    if (fd_pipe(&t, fds) != 0) return 1;
+    if (fd_write(&t, fds[1], msg, sizeof(msg) - 1) != (int)(sizeof(msg) - 1)) bad++;
+    if (fd_read(&t, fds[0], buf, sizeof(buf)) != (int)(sizeof(msg) - 1)) bad++;
+    for (uint32_t i = 0; i < sizeof(msg) - 1; i++)
+        if (buf[i] != msg[i]) { bad++; break; }
+    if (fd_close(&t, fds[0]) != 0) bad++;
+    if (fd_close(&t, fds[1]) != 0) bad++;
+    if (detail && ds) {
+        uint32_t p = 0;
+        st_putd(detail, &p, ds, (uint32_t)(sizeof(msg) - 1));
+        st_puts(detail, &p, ds, "B roundtrip");
+        st_puts(detail, &p, ds, bad ? " BAD" : " ok");
+        detail[p] = '\0';
+    }
+    return bad;
+}
+
+/* string：shell_extra 自有串/格式化助手已知答案 */
+static int st2_string(char *detail, uint32_t ds) {
+    int bad = 0;
+    if (x_strcasecmp("ABC", "abc") != 0) bad++;
+    if (x_strcasecmp("", "") != 0) bad++;
+    if (x_strcasecmp("abc", "abd") == 0) bad++;
+    if (x_strcasecmp("a", "") == 0) bad++;
+    if (x_strcasecmp("HELLO.ELF", "hello.elf") != 0) bad++;
+    char b[16];
+    uint32_t p = 0;
+    st_putd(b, &p, sizeof(b), 12345);
+    b[p] = '\0';
+    if (b[0] != '1' || b[4] != '5' || p != 5) bad++;
+    if (detail && ds) {
+        uint32_t p2 = 0;
+        st_putd(detail, &p2, ds, 6u * 2u);
+        st_puts(detail, &p2, ds, " asserts");
+        st_puts(detail, &p2, ds, bad ? ", BAD" : ", ok");
+        detail[p2] = '\0';
+    }
+    return bad;
+}
+
+typedef int (*st2_probe_t)(char *detail, uint32_t dsize);
+static const struct {
+    const char *name;      /* 与既有条目同宽：8 字符名 + 描述 */
+    st2_probe_t fn;
+} ST2_PROBES[] = {
+    { "serial   COM1 diagnostic",   st2_serial },
+    { "pit      system timer tick", st2_pit },
+    { "rtc      CMOS wall clock",   st2_rtc },
+    { "ata      block device MBR",  st2_ata },
+    { "pci      bus enumeration",   st2_pci },
+    { "nic      rtl8139 MAC",       st2_nic },
+    { "acpi     FADT/_S5 tables",   st2_acpi },
+    { "kbd      8042 controller",   st2_kbd },
+    { "vga      text mem page1",    st2_vga },
+    { "tsc      cycle counter",     st2_tsc },
+    { "div64    64-bit division",   st2_div64 },
+    { "pipe     kernel pipe pair",  st2_pipe },
+    { "string   str/fmt helpers",   st2_string },
+};
+#define ST2_COUNT (sizeof(ST2_PROBES) / sizeof(ST2_PROBES[0]))
+
 void cmd_selftest(const char *args) {
     (void)args;
     ezos_console_write("EZOS full self-test:\n");
 
-    struct { const char *name; int run; uint32_t ms; const char *detail; } r[8];
+    struct { const char *name; int run; uint32_t ms; const char *detail; } r[24];
     /* detail 要活到最后的汇总循环，不能指向块内局部数组 */
-    static char det[8][80];
+    static char det[24][80];
     int n = 0, failed = 0;
 
     /* kmalloc：分配/写入/回读/释放后 used 必须归零（验证合并） */
@@ -908,6 +1228,16 @@ void cmd_selftest(const char *args) {
         n++;
     }
 
+    /* 扩展探针（硬件/软件覆盖，表驱动）：8 个核心项之外的第二梯队 */
+    for (uint32_t i = 0; i < ST2_COUNT && n < 24; i++) {
+        uint32_t t0 = g_pit_ticks;
+        r[n].name = ST2_PROBES[i].name;
+        r[n].run = ST2_PROBES[i].fn(det[n], sizeof(det[n]));
+        r[n].ms = g_pit_ticks - t0;
+        r[n].detail = det[n];
+        n++;
+    }
+
     /* 汇总：每项一行（含指标与耗时），末尾给总耗时 */
     ezos_console_write("----------\n");
     for (int i = 0; i < n; i++) {
@@ -947,7 +1277,7 @@ void cmd_selftest(const char *args) {
  * 与 cmd_selftest 同一套判定逻辑，但全程静默，只返回失败子系统数。
  * 0 = 全部通过。 */
 int boot_selftest(void) {
-    struct { int run; uint32_t ms; } r[8];
+    struct { int run; uint32_t ms; } r[24];
     int n = 0;
 
     /* 每一项都记耗时：开机自检以前只留一行"all passed"，出了问题是哪一个
@@ -1010,9 +1340,11 @@ int boot_selftest(void) {
         n++;
     }
     ST_RUN(fd_selftest(0));             /* NULL = 静默 */
+    for (uint32_t i = 0; i < ST2_COUNT && n < 24; i++)
+        ST_RUN(ST2_PROBES[i].fn(0, 0)); /* 静默：detail 不填 */
 
     /* 逐项进 dmesg（顺序与上面 n 的递增顺序一致） */
-    static const char *const st_names[8] = {
+    static const char *const st_names[24] = {
         "kmalloc  kernel heap",
         "paging   identity + map/unmap",
         "pmm      page frame allocator",
@@ -1021,10 +1353,23 @@ int boot_selftest(void) {
         "calc     expression engine",
         "exec     ring3 ELF run",
         "fd       file descriptors",
+        "serial   COM1 diagnostic",
+        "pit      system timer tick",
+        "rtc      CMOS wall clock",
+        "ata      block device MBR",
+        "pci      bus enumeration",
+        "nic      rtl8139 MAC",
+        "acpi     FADT/_S5 tables",
+        "kbd      8042 controller",
+        "vga      text mem page1",
+        "tsc      cycle counter",
+        "div64    64-bit division",
+        "pipe     kernel pipe pair",
+        "string   str/fmt helpers",
     };
     int failed = 0;
     for (int i = 0; i < n; i++) {
-        const char *nm = (i < 8) ? st_names[i] : "subsystem";
+        const char *nm = (i < 24) ? st_names[i] : "subsystem";
         st_report("SELFTEST: ", nm, r[i].run, g_pit_ticks - r[i].ms, 0);
         if (r[i].run != 0) failed++;
     }
