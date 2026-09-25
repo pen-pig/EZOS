@@ -27,6 +27,7 @@
 #include "rtl8139.h"
 #include "ahci.h"
 #include "usb.h"
+#include "uhci.h"
 
 // �򵥳��Ⱥ��������Զ���ʽ��ʾ��ʹ��
 static size_t my_strlen(const char *s) {
@@ -400,6 +401,11 @@ void kernel_main(void) {
      * class 0x0C03 设备，按 ProgIF 分类 UHCI/OHCI/EHCI/xHCI 并 klog，
      * 绝不初始化任何硬件。必须在 fs_init 之前，与 ahci_init 同层。 */
     usb_scan_log();
+
+    /* UHCI 控制器初始化 + 端口连接检测（真机点亮 H2-2a）：定位 UHCI、
+     * 必要时自编程 I/O BAR、全局复位、建帧列表、启动调度、轮询端口并 klog。
+     * 不做设备枚举/传输/中断注册。必须在 fs_init 之前，与 ahci_init 同层。 */
+    uhci_init();
 
     /* RTL8139 NIC (step 7.2): claim + reset + MAC + 8K RX ring + 4 TX
      * descriptors + IRQ + ARP/ICMP echo reply. Returns -1 when QEMU has
