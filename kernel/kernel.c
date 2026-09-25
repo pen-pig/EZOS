@@ -26,6 +26,7 @@
 #include "gfx.h"
 #include "rtl8139.h"
 #include "ahci.h"
+#include "usb.h"
 
 // �򵥳��Ⱥ��������Զ���ʽ��ʾ��ʹ��
 static size_t my_strlen(const char *s) {
@@ -394,6 +395,11 @@ void kernel_main(void) {
      * 找不到控制器静默跳过，绝不破坏现有 ATA/FS 路径。必须在 fs_init
      * 之前——让 setdrive 可选 AHCI 盘。dma 缓冲在 .bss 19MB 区。 */
     ahci_init();
+
+    /* USB 主机控制器普查（真机点亮 H2：USB HID 前置）：只读枚举 PCI
+     * class 0x0C03 设备，按 ProgIF 分类 UHCI/OHCI/EHCI/xHCI 并 klog，
+     * 绝不初始化任何硬件。必须在 fs_init 之前，与 ahci_init 同层。 */
+    usb_scan_log();
 
     /* RTL8139 NIC (step 7.2): claim + reset + MAC + 8K RX ring + 4 TX
      * descriptors + IRQ + ARP/ICMP echo reply. Returns -1 when QEMU has
