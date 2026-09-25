@@ -21,14 +21,12 @@ static void serial_putc(char c) {
 static void serial_puts(const char *s) {
   for (; *s; ++s) serial_putc(*s);
 }
-/* 十进制无符号 32 位 */
 static void serial_dec(uint32_t v) {
   char buf[12]; int i = 0;
   if (v == 0) { serial_putc('0'); return; }
   while (v) { buf[i++] = (char)('0' + (v % 10)); v /= 10; }
   while (i > 0) serial_putc(buf[--i]);
 }
-/* 十六进制 32 位，零填充 8 位，带 0x 前缀 */
 static void serial_hex(uint32_t v) {
   static const char h[] = "0123456789abcdef";
   serial_putc('0'); serial_putc('x');
@@ -55,49 +53,90 @@ static const UINT16 msg16[] = {
 EFI_STATUS EFIAPI EfiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *ST) {
   (void)ImageHandle;
 
-  /* 1) 屏幕输出 */
   ST->ConOut->OutputString(ST->ConOut, (UINT16 *)msg16);
-  /* 2) 串口输出，便于自动化抓取 */
   serial_puts("EZEFI: hello\r\n");
 
-  /* 3) 取 GOP 帧缓冲信息 */
   EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = 0;
   EFI_STATUS st = ST->BootServices->LocateProtocol(
       (EFI_GUID *)&gEfiGraphicsOutputProtocolGuid, 0, (void **)&gop);
-
   if (st != EFI_SUCCESS || gop == 0 || gop->Mode == 0) {
     serial_puts("EZEFI:gop FAIL loc\r\n");
-  } else {
-    EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *m = gop->Mode;
-    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *info = m->Info;
-    uint32_t w   = info->HorizontalResolution;
-    uint32_t h   = info->VerticalResolution;
-    uint32_t fmt = (uint32_t)info->PixelFormat;
-    uint32_t fb  = (uint32_t)(m->FrameBufferBase & 0xFFFFFFFFu);
-    uint32_t stride = info->PixelsPerScanLine;
+    return EFI_SUCCESS;
+  }
 
-    /* 校验行 */
-    serial_puts("EZEFI:gop ");
-    serial_dec(w); serial_putc('x'); serial_dec(h);
-    serial_puts(" fmt="); serial_dec(fmt);
-    serial_puts(" fb="); serial_hex(fb);
-    serial_puts(" stride="); serial_dec(stride);
-    serial_puts("\r\n");
-
-    if (fmt >= (uint32_t)PixelBltOnly) {
-      /* PixelBltOnly / Max：无可用线性帧缓冲，不写 */
-      serial_puts("EZEFI:gop unsupported fmt\r\n");
-    } else {
-      /* 写入内核约定的 0x5000 区域（按 gfx.c 真实字段宽度） */
-      *(volatile uint32_t *)GFX_INFO_PHYS        = fb;                 /* 0x5000 */
-      *(volatile uint16_t *)(GFX_INFO_PHYS + 4)  = (uint16_t)w;        /* 0x5004 */
-      *(volatile uint16_t *)(GFX_INFO_PHYS + 6)  = (uint16_t)h;        /* 0x5006 */
-      *(volatile uint8_t  *)(GFX_INFO_PHYS + 8)  = (uint8_t)32;        /* 0x5008 BPP=32 */
-      *(volatile uint8_t  *)(GFX_INFO_PHYS + 9)  = (uint8_t)fmt;       /* 0x5009 */
-      *(volatile uint16_t *)(GFX_INFO_PHYS + 10) = (uint16_t)0;        /* 0x500A 保留 */
-      *(volatile uint32_t *)(GFX_INFO_PHYS + 12) = stride;             /* 0x500C */
-      serial_puts("EZEFI:gop write@0x5000 ok\r\n");
+  /* 枚举所有 GOP 模式，打印并查找 RGB565 (fmt=2 且掩码 F800/07E0/001F) */
+  int rgb565_idx = -1;
+  UINT32 maxmode = gop->Mode->MaxMode;
+  for (UINT32 i = 0; i < maxmode; ++i) {
+    UINTN sz = 0;
+    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *info = 0;
+    EFI_STATUS qs = gop->QueryMode(gop, i, &sz, &info);
+    if (qs != EFI_SUCCESS || info == 0) {
+      serial_puts("EZEFI:mode "); serial_dec(i);
+      serial_puts(" query_fail\r\n");
+      continue;
     }
+    serial_puts("EZEFI:mode ");
+    serial_dec(i);
+    serial_putc(' ');
+    serial_dec(info->HorizontalResolution); serial_putc('x');
+    serial_dec(info->VerticalResolution);
+    serial_puts(" fmt="); serial_dec((uint32_t)info->PixelFormat);
+    serial_puts(" stride="); serial_dec(info->PixelsPerScanLine);
+    if (info->PixelFormat == PixelBitMask) {
+      serial_puts(" mask=R="); serial_hex(info->PixelInformation.RedMask);
+      serial_puts("/G="); serial_hex(info->PixelInformation.GreenMask);
+      serial_puts("/B="); serial_hex(info->PixelInformation.BlueMask);
+      if (info->PixelInformation.RedMask == 0xF800u &&
+          info->PixelInformation.GreenMask == 0x07E0u &&
+          info->PixelInformation.BlueMask == 0x001Fu) {
+        rgb565_idx = (int)i;
+      }
+    }
+    serial_puts("\r\n");
+  }
+
+  /* 若找到 RGB565，切到它；否则保持默认 32bpp 模式 */
+  int use_rgb565 = 0;
+  if (rgb565_idx >= 0) {
+    EFI_STATUS ss = gop->SetMode(gop, (UINT32)rgb565_idx);
+    if (ss == EFI_SUCCESS) {
+      use_rgb565 = 1;
+      serial_puts("EZEFI:mode set rgb565 idx="); serial_dec((uint32_t)rgb565_idx);
+      serial_puts("\r\n");
+    } else {
+      serial_puts("EZEFI:mode set rgb565 FAILED\r\n");
+    }
+  }
+
+  /* 读取当前（激活）模式信息 */
+  EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *m = gop->Mode;
+  EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *info = m->Info;
+  uint32_t w   = info->HorizontalResolution;
+  uint32_t h   = info->VerticalResolution;
+  uint32_t fmt = (uint32_t)info->PixelFormat;
+  uint32_t fb  = (uint32_t)(m->FrameBufferBase & 0xFFFFFFFFu);
+  uint32_t stride = info->PixelsPerScanLine;
+  uint8_t  bpp = use_rgb565 ? (uint8_t)16 : (uint8_t)32;
+
+  serial_puts("EZEFI:gop ");
+  serial_dec(w); serial_putc('x'); serial_dec(h);
+  serial_puts(" fmt="); serial_dec(fmt);
+  serial_puts(" fb="); serial_hex(fb);
+  serial_puts(" stride="); serial_dec(stride);
+  serial_puts("\r\n");
+
+  if (fmt >= (uint32_t)PixelBltOnly) {
+    serial_puts("EZEFI:gop unsupported fmt\r\n");
+  } else {
+    *(volatile uint32_t *)GFX_INFO_PHYS        = fb;                 /* 0x5000 */
+    *(volatile uint16_t *)(GFX_INFO_PHYS + 4)  = (uint16_t)w;        /* 0x5004 */
+    *(volatile uint16_t *)(GFX_INFO_PHYS + 6)  = (uint16_t)h;        /* 0x5006 */
+    *(volatile uint8_t  *)(GFX_INFO_PHYS + 8)  = bpp;                /* 0x5008 */
+    *(volatile uint8_t  *)(GFX_INFO_PHYS + 9)  = (uint8_t)fmt;       /* 0x5009 */
+    *(volatile uint16_t *)(GFX_INFO_PHYS + 10) = (uint16_t)0;        /* 0x500A */
+    *(volatile uint32_t *)(GFX_INFO_PHYS + 12) = stride;             /* 0x500C */
+    serial_puts("EZEFI:gop write@0x5000 ok\r\n");
   }
 
   return EFI_SUCCESS;

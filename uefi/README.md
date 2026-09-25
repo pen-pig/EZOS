@@ -91,7 +91,30 @@ UEFI IA32 启动阶段为 1:1 映射，按物理地址直接写入即可。Pixel
    表现为 `EFI_NOT_FOUND` 或返回 0 但接口指针为 NULL。已用探针在多个偏移实测确认 0xac 正确。
 7. 取不到 GOP（PixelFormat>=3 或 LocateProtocol 失败）时如实打 `FAIL`，不伪造数据。
 
+## U2b-ext：枚举 GOP 全部模式，判断 RGB565 可用性
+
+`main.c` 遍历 `Mode->MaxMode`，对每个模式调 `QueryMode` 打印
+`EZEFI:mode <i> <w>x<h> fmt=<N> stride=<N>`（`fmt==2` 追加
+`mask=R=0x.../G=0x.../B=0x...`）。判断 RGB565：`fmt==2 && RedMask==0xF800 && GreenMask==0x07E0 && BlueMask==0x001F`；
+存在则 `SetMode` 切过去并写 BPP=16，否则保持默认 32bpp、写 BPP=32。
+
+**实测结论（OVMF i386，edk2-i386-code.fd）**：共 30 个模式（0–29），**全部 `fmt=1`（PixelBlueGreenRedReserved8BitPerColor，32bpp）**，
+没有任何 `fmt==2`（BitMask）模式，更无 RGB565。GOP 的 PixelFormat 枚举里根本没有 RGB565 这一项
+（0/1=32bpp，2=BitMask 自定义掩码，3=BltOnly）。
+→ **OVMF 不提供 RGB565 模式，U3 必须改 `kernel/gfx.c` 支持 32bpp（读 0x5008 的 BPP 并走 32bpp 渲染/调色板路径）**，
+而不是指望 UEFI 切到 16bpp。本步不伪造模式，如实保持 32bpp 写入。
+
+### U3 前置风险（仅记录，本步不动内核）
+
+实测帧缓冲物理地址 `fb=0x80000000`，位于 **2GB 处**，远超内核当前 identity 映射范围（0–32MB）。
+U3 加载并跳转内核后，要让内核能访问该 LFB，必须：
+- 用分页把区间 `[fb, fb + stride * height * bpp]` 映射进内核地址空间，
+- 且映射页表项带**不可缓存**属性（`PTE_PCD` / `PTE_PWT`），否则 CPU 缓存与显卡写入不一致会花屏/卡死。
+（或在 UEFI 侧把帧缓冲 memcpy 到内核可见的低端内存，但会牺牲性能且需额外约定缓冲区。）
+此问题 U3 解决，这里只建档。
+
 ## 结论
 
 32 位路径打通：BOOTIA32.EFI 在 OVMF 下自动加载、运行、打印标记并向 0x5000 写入 GOP 帧缓冲参数。
-后续 U2c 再加 ExitBootServices、加载并跳转内核（U3 改 gfx.c 接受 32bpp）。
+已确认 OVMF（32 位）只给 32bpp 模式、无 RGB565，故 0x5008 当前写 32；后续 U2c 加 ExitBootServices/
+加载跳转内核，U3 改 `gfx.c` 接受 32bpp 并解决 2GB 帧缓冲的映射/缓存属性问题。
