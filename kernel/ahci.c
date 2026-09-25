@@ -14,6 +14,7 @@
 #include "pci.h"
 #include "paging.h"
 #include "dmesg.h"
+#include "isr.h"        /* g_pit_ticks：1ms 真实时间基准（ahci_init 在 pit_init+sti 之后） */
 
 /* ---------- 寄存器偏移（相对 ABAR） ---------- */
 #define GHC_CAP   0x00
@@ -59,6 +60,24 @@
 
 #define AHCI_CMD_TIMEOUT 2000000u
 
+/* ---- 真实时间上限（毫秒）----
+ * 曾经全部用"迭代次数"当时间：等 SSTS.DET 的上限是 500 万次 MMIO 读，
+ * 5 个空口每次都跑满 = 2500 万次读 ≈ 2.9 秒开机延迟（实测 PCI->FS 从
+ * 0.006s 涨到 2.87s）。MMIO 读一次的成本在不同机器上差一个数量级，
+ * 所以等待一律用 g_pit_ticks(1ms) 计时，并让没有设备的口早退。
+ */
+#define AHCI_LINK_WAIT_MS   150u   /* 链路建立（DET==3）上限 */
+#define AHCI_ABSENT_MS       20u   /* DET==0 持续这么久即判空口，不再傻等 */
+#define AHCI_ENGINE_MS       50u   /* FRE/ST 起停上限 */
+#define AHCI_SIG_MS          50u   /* 等设备回签名 FIS 上限 */
+#define AHCI_CMD_MS        2000u   /* 单条命令完成上限（慢盘/真机留足） */
+
+/* 以 g_pit_ticks 为基准的忙等（1ms 粒度） */
+static void ahci_delay_ms(uint32_t ms) {
+    uint32_t t0 = g_pit_ticks;
+    while ((uint32_t)(g_pit_ticks - t0) < ms) { }
+}
+
 /* ---------- DMA 缓冲（.bss 19MB 区，identity 映射 == 物理地址） ---------- */
 static uint8_t g_cl[AHCI_MAX_PORTS][1024] __attribute__((aligned(1024)));
 static uint8_t g_fb[AHCI_MAX_PORTS][256]  __attribute__((aligned(256)));
@@ -75,6 +94,26 @@ static int      g_first_write_done;
 /* ---------- 寄存器访问（ABAR 已被映射到虚拟==物理的高地址空间） ---------- */
 static inline uint32_t ar(uint32_t off) { return g_abar[off >> 2]; }
 static inline void     aw(uint32_t off, uint32_t v) { g_abar[off >> 2] = v; }
+
+/* 在时间窗内等 mask 的位全部置起；返回最后读到的值（调用方自己判断成败） */
+static uint32_t ahci_wait_set(uint32_t off, uint32_t mask, uint32_t ms) {
+    uint32_t t0 = g_pit_ticks, v = ar(off);
+    while ((v & mask) != mask) {
+        if ((uint32_t)(g_pit_ticks - t0) >= ms) break;
+        v = ar(off);
+    }
+    return v;
+}
+
+/* 在时间窗内等 mask 的位全部清空 */
+static uint32_t ahci_wait_clear(uint32_t off, uint32_t mask, uint32_t ms) {
+    uint32_t t0 = g_pit_ticks, v = ar(off);
+    while ((v & mask) != 0) {
+        if ((uint32_t)(g_pit_ticks - t0) >= ms) break;
+        v = ar(off);
+    }
+    return v;
+}
 
 /* ---------- klog 打点 ---------- */
 static void aklog(const char *s) { dmesg_write(s); }
@@ -114,14 +153,12 @@ static void ahci_stop_port(uint32_t pr) {
     uint32_t c = ar(pr + PX_CMD);
     if (c & PXCMD_ST) {
         aw(pr + PX_CMD, c & ~PXCMD_ST);
-        for (uint32_t t = 0; t < 500000u; t++)
-            if (!(ar(pr + PX_CMD) & PXCMD_CR)) break;
+        ahci_wait_clear(pr + PX_CMD, PXCMD_CR, AHCI_ENGINE_MS);
     }
     c = ar(pr + PX_CMD);
     if (c & PXCMD_FRE) {
         aw(pr + PX_CMD, c & ~PXCMD_FRE);
-        for (uint32_t t = 0; t < 500000u; t++)
-            if (!(ar(pr + PX_CMD) & PXCMD_FR)) break;
+        ahci_wait_clear(pr + PX_CMD, PXCMD_FR, AHCI_ENGINE_MS);
     }
 }
 
@@ -131,9 +168,9 @@ static void ahci_stop_port(uint32_t pr) {
 static void ahci_comreset(uint32_t pr) {
     aw(pr + PX_SERR, ~0u);
     aw(pr + PX_SCTL, 0x00000001u);   /* DET=1：发起 COMRESET */
-    for (volatile uint32_t i = 0; i < 3000000u; i++) { }
+    ahci_delay_ms(2);                /* 规范：保持 >=1ms */
     aw(pr + PX_SCTL, 0x00000000u);   /* DET=0：恢复，开始链路检测 */
-    for (volatile uint32_t i = 0; i < 3000000u; i++) { }
+    ahci_delay_ms(2);
 }
 
 /* ---------- 提交一条 DMA 命令（槽 0，PRDT 长度 1） ---------- */
@@ -196,20 +233,16 @@ static int ahci_submit(uint8_t port, uint8_t ata_cmd, int is_write,
     /* 结构写好后再发命令（UC MMIO 强序 + 编译器屏障） */
     asm volatile("" ::: "memory");
 
-    /* 清错误状态，等槽 0 空闲 */
+    /* 清错误状态，等槽 0 空闲（时间上限，不是迭代次数） */
     aw(pr + PX_SERR, ~0u);
     aw(pr + PX_IS, ~0u);
-    for (uint32_t t = 0; t < AHCI_CMD_TIMEOUT; t++)
-        if (!(ar(pr + PX_CI) & 1u)) break;
+    ahci_wait_clear(pr + PX_CI, 1u, AHCI_CMD_MS);
 
     asm volatile("" ::: "memory");
     aw(pr + PX_CI, ar(pr + PX_CI) | 1u);   /* 发出命令 */
 
     /* 轮询 CI 位清零 = 完成；超时 fail closed */
-    for (uint32_t t = 0; t < AHCI_CMD_TIMEOUT; t++) {
-        if (!(ar(pr + PX_CI) & 1u)) break;
-    }
-    if (ar(pr + PX_CI) & 1u) return -1;     /* 超时 */
+    if (ahci_wait_clear(pr + PX_CI, 1u, AHCI_CMD_MS) & 1u) return -1;
 
     uint32_t tfd = ar(pr + PX_TFD);
     if (tfd & (TFD_ERR | TFD_BSY)) return -1;
@@ -233,30 +266,40 @@ static int ahci_probe_port(uint8_t port) {
 
     /* FIS 接收使能（收签名 FIS 必需），等 FR */
     aw(pr + PX_CMD, ar(pr + PX_CMD) | PXCMD_FRE);
-    for (uint32_t t = 0; t < 500000u; t++)
-        if (ar(pr + PX_CMD) & PXCMD_FR) break;
-    if (!(ar(pr + PX_CMD) & PXCMD_FR)) {
+    if (!(ahci_wait_set(pr + PX_CMD, PXCMD_FR, AHCI_ENGINE_MS) & PXCMD_FR)) {
         aklog_dec("AHCI: port ", port, " FIS receive enable failed");
         return 0;
     }
     /* 命令列表启动，等 CR */
     aw(pr + PX_CMD, ar(pr + PX_CMD) | PXCMD_ST);
-    for (uint32_t t = 0; t < 500000u; t++)
-        if (ar(pr + PX_CMD) & PXCMD_CR) break;
     if (pr == 0x100)
         aklog_hex("AHCI: after ST PXCMD=0x", ar(pr + PX_CMD), "");
-    if (!(ar(pr + PX_CMD) & PXCMD_CR)) {
+    if (!(ahci_wait_set(pr + PX_CMD, PXCMD_CR, AHCI_ENGINE_MS) & PXCMD_CR)) {
         aklog_dec("AHCI: port ", port, " command start failed");
         return 0;
     }
 
     /* 等链路就绪：SSTS.DET == 3（设备存在 + 协商完成）。
      * 在 QEMU ich9-ahci 上，DET 升到 3 需要端口已 start（ST=1）+ FIS 接收使能，
-     * 故放在 FRE/ST 之后轮询。 */
+     * 故放在 FRE/ST 之后轮询。
+     * 时间按真实毫秒计：DET==0（PHY 上没有任何东西）持续 AHCI_ABSENT_MS
+     * 就判空口立刻走人——空口曾经每个都傻等 500 万次 MMIO 读，是开机变慢主因。 */
     uint32_t ssts = 0;
-    for (uint32_t t = 0; t < 5000000u; t++) {
-        ssts = ar(pr + PX_SSTS);
-        if (SSTS_DET(ssts) == 3) break;
+    {
+        uint32_t t0 = g_pit_ticks, absent_t0 = 0;
+        for (;;) {
+            ssts = ar(pr + PX_SSTS);
+            uint32_t det = SSTS_DET(ssts);
+            if (det == 3) break;
+            uint32_t el = g_pit_ticks - t0;
+            if (det == 0) {
+                if (absent_t0 == 0) absent_t0 = g_pit_ticks;
+                if ((uint32_t)(g_pit_ticks - absent_t0) >= AHCI_ABSENT_MS) break;
+            } else {
+                absent_t0 = 0;      /* 设备有反应，重新开始计时 */
+            }
+            if (el >= AHCI_LINK_WAIT_MS) break;
+        }
     }
     aklog_hex("AHCI: port ", (uint32_t)port, " SSTS=0x");
     aklog_hex("        SSTS=0x", ssts, "");
@@ -267,9 +310,13 @@ static int ahci_probe_port(uint8_t port) {
 
     /* 等签名：ATA 直连 = 0x00000101（FIS 接收使能后设备会回签名 FIS） */
     uint32_t sig = 0;
-    for (uint32_t t = 0; t < 1000000u; t++) {
-        sig = ar(pr + PX_SIG);
-        if (sig != 0) break;
+    {
+        uint32_t t0 = g_pit_ticks;
+        for (;;) {
+            sig = ar(pr + PX_SIG);
+            if (sig != 0) break;
+            if ((uint32_t)(g_pit_ticks - t0) >= AHCI_SIG_MS) break;
+        }
     }
     if (sig != SIG_ATA) {
         if (sig == SIG_ATAPI)
