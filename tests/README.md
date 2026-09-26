@@ -24,6 +24,7 @@
 | `test_ahci.py` | 真机点亮 H1b：ich9-ahci 控制器探测 + 端口上线（IDENTIFY 型号）、`setdrive 4` 后 exFAT format/write/ls/cat/rm 全走 AHCI DMA；全程走串口不依赖 OCR | QMP 4487 + serial 4488 | ~2 min |
 | `test_usb.py` | 真机点亮 H2-1：USB 主机控制器只读普查，按 ProgIF 分类 UHCI/OHCI/EHCI/xHCI 四组 + 不挂控制器的空组；只枚举不碰硬件 | QMP 4471 + serial 4472 | ~1 min |
 | `test_uhci.py` | 真机点亮 H2-2a：UHCI 控制器复位 + 帧列表 + 启动调度，读 PORTSC 判连接。挂 `usb-kbd` 时 port0 conn=1，不挂时 conn=0（两组结果必须相反，防止硬编码假阳性） | QMP 4473 + serial 4474 | ~2 min |
+| `test_lock.py` | P1 修复回归网：断言开机自检 6 项 LOCKTEST 全 PASS——irqflags 原语语义（save/restore，含"关中断时不得误开"）、模拟 IRQ 上下文调 kmalloc/pmm、压力记账不变量。`nested keep` 项专抓"把 irq_restore 改成无条件 sti"的回归（变异测试已证明抓得到） | QMP 4495 + serial 4494 | ~1 min |
 
 `ezocr.py` 是前三个脚本共用的 VGA 文本截图 OCR（真字库像素匹配），不要单独删。
 

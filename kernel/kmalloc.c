@@ -13,6 +13,7 @@
  */
 #include "kmalloc.h"
 #include "panic.h"
+#include "irqflags.h"
 
 #define KM_POOL_SIZE   (384 * 1024)     /* 384KB 池 */
 #define KM_ALIGN        16u
@@ -53,6 +54,12 @@ void *kmalloc(uint32_t size) {
     if (size == 0) return NULL;
     uint32_t need = round_up(size + KM_HDR, KM_ALIGN);
 
+    /* 空闲链表的遍历、分割、摘除必须是原子的。net.c 的收发路径会在
+     * IRQ11 上下文进入这里（net.c:185-186 的懒分配），若允许嵌套会撕裂
+     * 链表——典型症状是同一块被分配两次。约束见 irqflags.h。 */
+    uint32_t f = irq_save_disable();
+    void *res = NULL;
+
     km_block_t *prev = NULL;
     for (km_block_t *b = km_head; b; prev = b, b = b->next) {
         if (!blk_is_free(b)) continue;
@@ -68,7 +75,8 @@ void *kmalloc(uint32_t size) {
             else km_head = rest;
             *km_magic_of(b) = KM_MAGIC;
             km_used_bytes += need;
-            return (uint8_t *)b + KM_HDR;
+            res = (uint8_t *)b + KM_HDR;
+            break;
         }
 
         b->size |= KM_ALLOCATED;
@@ -76,24 +84,35 @@ void *kmalloc(uint32_t size) {
         else km_head = b->next;
         *km_magic_of(b) = KM_MAGIC;
         km_used_bytes += bs;
-        return (uint8_t *)b + KM_HDR;
+        res = (uint8_t *)b + KM_HDR;
+        break;
     }
-    return NULL;
+    irq_restore(f);
+    return res;
 }
 
 void kfree(void *ptr) {
     if (!ptr) return;
     km_block_t *b = (km_block_t *)((uint8_t *)ptr - KM_HDR);
 
+    /* 下面的校验、插回、合并共用一段临界区：任何一步被 IRQ 上下文的另一次
+     * kfree/kmalloc 打断，都会让空闲链表暂时处于不一致的中间态并被对方
+     * 观察到（例如刚插回还没合并的块被当成两块分别分配出去）。
+     * 各 panic 分支在赴死前先把中断状态恢复，不影响 panic 屏输出。 */
+    uint32_t f = irq_save_disable();
+
     if ((uint8_t *)b < km_pool || (uint8_t *)b >= km_pool + KM_POOL_SIZE) {
+        irq_restore(f);
         panic_set_context("kfree: pointer outside heap");
         asm volatile("ud2");
     }
     if (blk_is_free(b)) {
+        irq_restore(f);
         panic_set_context("kfree: double free");
         asm volatile("ud2");
     }
     if (*km_magic_of(b) != KM_MAGIC) {
+        irq_restore(f);
         panic_set_context("kfree: heap corruption (header smashed)");
         asm volatile("ud2");
     }
@@ -102,6 +121,7 @@ void kfree(void *ptr) {
      * 合并会算出越界地址。必须在合并之前拦下。 */
     if (bs < KM_HDR || bs > KM_POOL_SIZE ||
         (uint8_t *)b + bs > km_pool + KM_POOL_SIZE) {
+        irq_restore(f);
         panic_set_context("kfree: corrupt block size");
         asm volatile("ud2");
     }
@@ -129,6 +149,8 @@ void kfree(void *ptr) {
         b->size = blk_size(b) + blk_size(b->next);
         b->next = b->next->next;
     }
+
+    irq_restore(f);
 }
 
 uint32_t kmalloc_total(void)    { return KM_POOL_SIZE; }

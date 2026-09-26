@@ -23,6 +23,7 @@
 #include "paging.h"
 #include "syscall.h"
 #include "pmm.h"
+#include "lockselftest.h"
 #include "elf.h"
 #include "exec.h"
 #include "fpu.h"
@@ -1127,6 +1128,22 @@ void cmd_selftest(const char *args) {
         n++;
     }
 
+    /* lock：分配器临界区保护（irqflags 原语 + IRQ 上下文嵌套 + 压力不变量）。
+     * 细项结果由 lock_selftest 自己逐行 klog（LOCKTEST: ...），这里汇总。 */
+    {
+        uint32_t t0 = g_pit_ticks, dpos = 0;
+        int bad = lock_selftest();
+        st_puts(det[n], &dpos, sizeof(det[n]), "6 cases, ");
+        st_putd(det[n], &dpos, sizeof(det[n]), (uint32_t)bad);
+        st_puts(det[n], &dpos, sizeof(det[n]), " bad");
+        det[n][dpos] = '\0';
+        r[n].name = "lock     alloc critical sec";
+        r[n].run = bad;
+        r[n].ms = g_pit_ticks - t0;
+        r[n].detail = det[n];
+        n++;
+    }
+
     /* elf：装载器（校验/装载/W^X/卸载） */
     {
         uint32_t t0 = g_pit_ticks;
@@ -1307,6 +1324,7 @@ int boot_selftest(void) {
     }
     ST_RUN(paging_selftest(0));                 /* NULL = 静默 */
     ST_RUN(pmm_selftest(0));
+    ST_RUN(lock_selftest());                    /* 分配器临界区保护 */
     ST_RUN(elf_selftest(0));
     ST_RUN(fpu_selftest(0));
     {   /* calc：已知答案 + 必须拒绝的畸形 */

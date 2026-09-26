@@ -5,6 +5,7 @@
  * 位图放 .bss（内核启动时随 .bss 一并清零 = 全部空闲）。
  */
 #include "pmm.h"
+#include "irqflags.h"
 
 #define BITS_PER_WORD   32u
 #define BITMAP_WORDS    ((PMM_POOL_PAGES + BITS_PER_WORD - 1u) / BITS_PER_WORD)
@@ -56,6 +57,12 @@ uint32_t pmm_alloc_page(void) {
 uint32_t pmm_alloc_pages(uint32_t n) {
     if (!g_ready || n == 0 || n > PMM_POOL_PAGES) return 0;
 
+    /* 「找到连续空位」与「置位占用」之间不能断开：否则两次并发分配会选中
+     * 同一段物理页——典型的 double allocation，同一块内存同时给两个所有者，
+     * 比泄漏难查得多。约束见 irqflags.h。 */
+    uint32_t f = irq_save_disable();
+    uint32_t res = 0;
+
     /* 首次适配：找 n 个连续空闲位。位图小（48 字），线性扫描足够。 */
     uint32_t run = 0;
     for (uint32_t i = 0; i < PMM_POOL_PAGES; i++) {
@@ -65,13 +72,15 @@ uint32_t pmm_alloc_pages(uint32_t n) {
                 uint32_t first = i + 1u - n;
                 for (uint32_t k = 0; k < n; k++) bit_set(first + k);
                 g_used += n;
-                return PMM_POOL_START + first * PMM_PAGE_SIZE;
+                res = PMM_POOL_START + first * PMM_PAGE_SIZE;
+                break;
             }
         } else {
             run = 0;
         }
     }
-    return 0;                       /* 池耗尽 */
+    irq_restore(f);
+    return res;                         /* 0 = 池耗尽 */
 }
 
 int pmm_free_page(uint32_t phys) {
@@ -84,13 +93,22 @@ int pmm_free_pages(uint32_t phys, uint32_t n) {
     uint32_t first = idx_of(phys);
     if (first + n > PMM_POOL_PAGES) return -1;
 
+    /* 「检测是否已空闲」与「清位」必须一气呵成：否则同一区间的两次并发
+     * 释放都会通过重复释放检测（两者都读到 bit=1），各自清位后 g_used
+     * 被多减，真正的 double free 反而被漏掉。 */
+    uint32_t f = irq_save_disable();
+    int res = 0;
+
     /* 重复释放检测：只要有一位已经是 0（空闲），说明调用方给错了范围 */
     for (uint32_t k = 0; k < n; k++) {
-        if (!bit_get(first + k)) return -1;
+        if (!bit_get(first + k)) { res = -1; break; }
     }
-    for (uint32_t k = 0; k < n; k++) bit_clear(first + k);
-    g_used -= n;
-    return 0;
+    if (res == 0) {
+        for (uint32_t k = 0; k < n; k++) bit_clear(first + k);
+        g_used -= n;
+    }
+    irq_restore(f);
+    return res;
 }
 
 uint32_t pmm_total_pages(void) { return PMM_POOL_PAGES; }
