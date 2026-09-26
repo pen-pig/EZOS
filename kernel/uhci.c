@@ -222,7 +222,7 @@ static int uhci_control_xfer(uint16_t io, uint8_t addr, uint8_t ep,
                | ((uint32_t)addr << 8)
                | ((uint32_t)ep    << 15)
                | (1u << 19)                   /* DATA1 */
-               | (0u << 21);                  /* maxlen = 0 */
+               | (0x7FFu << 21);               /* maxlen=0 字节的 UHCI 编码 */
     g_td[2][1] = UHCI_TD_ACTIVE | UHCI_TD_ERR3 | ls;
     g_td[2][0] = 0x1u;                        /* T terminate，链表尾 */
 
@@ -280,7 +280,9 @@ static int uhci_control_xfer(uint16_t io, uint8_t addr, uint8_t ep,
     }
 
     /* 取数据阶段实际长度（control/status dword bit0-10）并拷回（IN） */
-    int al = (int)(s1 & 0x7FFu);
+    /* UHCI 实际长度字段同样编码为 length-1；0x7FF 表示零字节。 */
+    uint32_t al_field = s1 & 0x7FFu;
+    int al = (al_field == 0x7FFu) ? 0 : (int)al_field + 1;
     if (actlen) *actlen = al;
     if (dir_in && buf && al > 0) {
         int n = al; if (n > blen) n = blen;          /* 上界保护 */
