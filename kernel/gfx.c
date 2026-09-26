@@ -8,6 +8,12 @@
 #include "shell.h"
 #include "vga_font.h"
 
+/* U3 additions for 32bpp UEFI GOP (see gfx.h): scanline stride, direct-color
+ * LUT and channel order. Defaults keep the legacy 16bpp/8bpp behavior. */
+int gfx_stride = 320;                  /* scanline stride in pixels (VBE path = width; GOP may exceed) */
+uint32_t gfx_palette32[256];           /* 32bpp LUT: index -> 0xAARRGGBB, channel order per gfx_fmt */
+int gfx_fmt = 1;                       /* 32bpp order: 1=BGRA (GOP fmt=1, QEMU), 0=RGBA (GOP fmt=0) */
+
 /* runtime resolution & framebuffer (declared in gfx.h; boot.asm stores VBE LFB at 0x5000) */
 int GFX_W = 320;
 int GFX_H = 200;
@@ -141,6 +147,40 @@ void gfx_init(void) {
     uint16_t vyr  = *(volatile uint16_t*)0x5006;
     uint8_t  vbpp = *(volatile uint8_t*)0x5008;
 
+    /* U3: UEFI boot path (loader wrote params @0x5000 + magic @0x5010).
+     * Takes priority over legacy VBE probing. When bochs-vbe is present
+     * (QEMU: same PCI VGA as GOP) reprogram the same resolution via DISPI
+     * so text<->graphics switching keeps working; on real firmware without
+     * bochs-vbe, trust the GOP mode set by the loader and touch no register. */
+    if (*(volatile uint32_t*)0x5010 == 0x55454649u
+        && lfb >= 0x00100000u && lfb < 0xFFF00000u
+        && vxr >= 320 && vyr >= 200 && (vbpp == 16 || vbpp == 32)) {
+        uint32_t gstride = *(volatile uint32_t*)0x500C;
+        gfx_fmt = (*(volatile uint8_t*)0x5009 == 0) ? 0 : 1;
+        GFX_W = vxr;
+        GFX_H = vyr;
+        gfx_fb = (uint8_t*)(uint32_t)lfb;
+        gfx_bpp = (vbpp == 32) ? 4 : 2;
+        gfx_stride = (gstride >= (uint32_t)vxr) ? (int)gstride : (int)vxr;
+        outw(0x1CE, 0x00);
+        {
+            uint16_t _vbepid = inw(0x1CF);
+            if ((_vbepid & 0xFFF0u) == 0xB0C0u) {
+                /* bochs-vbe: reprogram same res/bpp (hardware stride becomes
+                 * XRES; GOP PixelsPerScanLine no longer applies) */
+                outw(0x1CE, 0x04); outw(0x1CF, 0x00);  /* VBE_DISPI_ENABLE = 0 */
+                outw(0x1CE, 0x01); outw(0x1CF, vxr);   /* XRES */
+                outw(0x1CE, 0x02); outw(0x1CF, vyr);   /* YRES */
+                outw(0x1CE, 0x03); outw(0x1CF, vbpp);  /* BPP = 16 or 32 */
+                outw(0x1CE, 0x04); outw(0x1CF, 0x01);  /* VBE_DISPI_ENABLE = 1 */
+                gfx_stride = vxr;
+            }
+        }
+        gfx_set_palette();                     /* build gfx_palette32 / gfx_palette16 */
+        gfx_load_font();
+        return;
+    }
+
     /* Probe VBE_DISPI ID (bochs-vbe only). If absent (e.g. real HW without
      * Bochs VBE), force VGA 0x13 fallback - writing to the LFB would be
      * invisible. */
@@ -158,6 +198,7 @@ void gfx_init(void) {
             GFX_H = vyr;
             gfx_fb = (uint8_t*)(uint32_t)lfb;
             gfx_bpp = 2;
+            gfx_stride = vxr;          /* U3: VBE dispi hardware stride = XRES */
             /* activate via VBE_DISPI registers (bochs-vbe/QEMU).
              * Index map: 0=ID 1=XRES 2=YRES 3=BPP 4=ENABLE. Sequence: disable,
              * program XRES/YRES/BPP, then enable. */
@@ -176,6 +217,7 @@ void gfx_init(void) {
     GFX_H = 200;
     gfx_fb = (uint8_t*)0xA0000;
     gfx_bpp = 1;
+    gfx_stride = 320;
     outb(0x3C2, 0x63);
 
     // Sequencer
@@ -308,6 +350,14 @@ void gfx_text_font_init(void) {
 }
 
 void gfx_restore_text(void) {
+    /* U3: UEFI boots on firmware without bochs-vbe (real GOP hardware) have
+     * no VGA text mode to restore - keep GOP and rely on serial output. */
+    {
+        uint32_t magic = *(volatile uint32_t*)0x5010;
+        outw(0x1CE, 0x00);
+        if ((inw(0x1CF) & 0xFFF0u) != 0xB0C0u && magic == 0x55454649u) return;
+        gfx_save_font();   /* U3: stage builtin font if gfx_init never ran (idempotent) */
+    }
     /* disable VBE (bochs-vbe) first so VGA register sequence restores text mode */
     outw(0x1CE, 0x04); outw(0x1CF, 0x00);  /* VBE_DISPI_ENABLE = 0 */
     // Misc Output: enable color, 25.175MHz, 400-line
@@ -415,6 +465,33 @@ void gfx_set_palette(void) {
     static const uint8_t std_r[16] = {0,0,0,0,170,170,170,170,85,85,85,85,255,255,255,255};
     static const uint8_t std_g[16] = {0,0,170,170,0,0,170,170,85,85,255,255,85,85,255,255};
     static const uint8_t std_b[16] = {0,170,0,170,0,170,0,170,85,255,85,255,85,255,85,255};
+    if (gfx_bpp == 4) {
+        /* U3: 32bpp direct color LUT. gfx_fmt 1=BGRA (QEMU GOP fmt=1, byte
+         * order B,G,R,X - channel layout matches 0x00RRGGBB), 0=RGBA. */
+        for (int i = 0; i < 256; i++) {
+            uint8_t r, g, b;
+            if (i < 16) {
+                r = std_r[i]; g = std_g[i]; b = std_b[i];
+            } else if (i >= 0xF0 && i <= 0xF7) {
+                /* Win10 palette (gfxwin convention) */
+                static const uint8_t wr[8]  = {0x00,0x00,0x3C,0xF3,0xE1,0xCD,0x99,0xE8};
+                static const uint8_t wg[8]  = {0x78,0x5A,0x9B,0xF3,0xE1,0xCD,0x99,0x11};
+                static const uint8_t wb[8]  = {0xD7,0x9E,0xE8,0xF3,0xE1,0xCD,0x99,0x23};
+                r = wr[i-0xF0]; g = wg[i-0xF0]; b = wb[i-0xF0];
+            } else if (i == 0xF8) { r=0x20; g=0x20; b=0x20; }  /* taskbar */
+            else if (i == 0xF9) { r=0x40; g=0x40; b=0x40; }  /* taskbar hover */
+            else {
+                r = (uint8_t)((i * 3) & 0x3F);
+                g = (uint8_t)((i * 5) & 0x3F);
+                b = (uint8_t)((i * 7) & 0x3F);
+            }
+            if (gfx_fmt == 1)
+                gfx_palette32[i] = (uint32_t)b | ((uint32_t)g << 8) | ((uint32_t)r << 16) | 0xFF000000u;
+            else
+                gfx_palette32[i] = (uint32_t)r | ((uint32_t)g << 8) | ((uint32_t)b << 16) | 0xFF000000u;
+        }
+        return;
+    }
     if (gfx_bpp == 2) {
         /* VBE 16bpp: �� RGB565 ���ұ�����ɫ���� -> ���? */
         for (int i = 0; i < 256; i++) {
@@ -490,10 +567,13 @@ void gfx_load_font(void) {
 }
 void gfx_putpixel(int x, int y, uint8_t color) {
     if (x < 0 || x >= GFX_W || y < 0 || y >= GFX_H) return;
-    if (gfx_bpp == 2) {
-        ((uint16_t*)gfx_fb)[y * GFX_W + x] = gfx_palette16[color];
+    if (gfx_bpp == 4) {
+        /* U3: 32bpp direct color, scanline stride aware */
+        ((uint32_t*)gfx_fb)[(uint32_t)y * gfx_stride + x] = gfx_palette32[color];
+    } else if (gfx_bpp == 2) {
+        ((uint16_t*)gfx_fb)[(uint32_t)y * gfx_stride + x] = gfx_palette16[color];
     } else {
-        gfx_fb[y * GFX_W + x] = color;
+        gfx_fb[(uint32_t)y * gfx_stride + x] = color;
     }
 }
 

@@ -10,6 +10,12 @@ extern int GFX_H;
 extern uint8_t *gfx_fb;
 /* 每像素字节数：1=VGA 0x13 8bpp，2=VBE 16bpp RGB565 */
 extern int gfx_bpp;
+/* U3: scanline stride in pixels (VBE path = width; UEFI GOP PixelsPerScanLine may exceed width) */
+extern int gfx_stride;
+/* U3: 32bpp direct color LUT (index -> 0xAARRGGBB, channel order per gfx_fmt) */
+extern uint32_t gfx_palette32[256];
+/* U3: 32bpp channel order: 1=BGRA (GOP fmt=1, QEMU), 0=RGBA (GOP fmt=0) */
+extern int gfx_fmt;
 /* 颜色索引 -> RGB565 查找表（VBE 16bpp 模式使用；8bpp 走 DAC 调色板） */
 extern uint16_t gfx_palette16[256];
 

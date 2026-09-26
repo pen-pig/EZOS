@@ -309,6 +309,11 @@ void kernel_main(void) {
     }
 
     terminal_initialize();
+    /* U3: UEFI boot starts in GOP graphics mode - switch back to VGA text
+     * mode right away so the shell is visible (gfx_restore_text early-
+     * returns and keeps GOP on firmware without bochs-vbe). */
+    if (*(volatile uint32_t*)0x5010 == 0x55454649u)
+        gfx_restore_text();
     gfx_text_font_init();     /* unify text-mode font with GUI/OCR font table */
 
     /* 串口最先就绪：之后的每条 klog/dmesg 都同步镜像 COM1（真机通道） */
@@ -363,7 +368,15 @@ void kernel_main(void) {
     klog_cpuinfo();
 
     /* �ڴ�̽�⣺RTC CMOS ��ʵ���������鹹 */
-    {
+    if (*(volatile uint32_t*)0x5010 == 0x55454649u) {
+        /* U3: UEFI boot - loader handed off GetMemoryMap (0x5020/0x5100).
+         * The CMOS 16-bit extended field overflows above 64MB anyway. */
+        uint32_t usable_kb = 0;
+        int marked = pmm_apply_uefi_map(&usable_kb);
+        klog_ok("Memory: UEFI GetMemoryMap handoff applied (header 0x5020)");
+        klog_dec32("Memory: usable ", usable_kb, "K (reclaimable after EBS)");
+        klog_dec32("PMM: UEFI-reserved pages marked in 10-16MB pool: ", (uint32_t)marked, "");
+    } else {
         uint16_t conv = cmos_read16(0x15);
         uint16_t ext  = cmos_read16(0x17);
         klogf("Memory: conventional ", conv, 0, "K, extended ", ext, 0, "K (CMOS 16-bit field)");
@@ -424,6 +437,11 @@ void kernel_main(void) {
         rtl8139_ip_str(l2 + n2);
         klog_ok(l2);
     }
+
+    /* UEFI boot: the OS image lives on the USB esp, so ATA drive 0 is a
+     * plain data disk rather than the boot disk - point the FS layer at it
+     * (legacy keeps drive 0 reserved for the boot image). */
+    if (*(volatile uint32_t *)0x5010u == 0x55454649u) fs_set_drive(0);
 
     int ret = fs_init();
     if (ret == -2) {
@@ -501,7 +519,13 @@ void kernel_main(void) {
         uint16_t vxr  = *(volatile uint16_t*)0x5004;
         uint16_t vyr  = *(volatile uint16_t*)0x5006;
         uint8_t  vbpp = *(volatile uint8_t*)0x5008;
-        if (lfb >= 0x00100000u && lfb < 0xFFF00000u && vxr >= 320 && vyr >= 200 && vbpp == 16) {
+        if (*(volatile uint32_t*)0x5010 == 0x55454649u
+            && lfb >= 0x00100000u && lfb < 0xFFF00000u && vxr >= 320 && vyr >= 200
+            && (vbpp == 16 || vbpp == 32)) {
+            klog_hex32("GOP: UEFI boot, LFB 0x", lfb,
+                       (vbpp == 32) ? " (32bpp direct color)" : " (16bpp RGB565)");
+            klogf("GOP: resolution ", vxr, 0, "x", vyr, 0, ", activated at user-mode");
+        } else if (lfb >= 0x00100000u && lfb < 0xFFF00000u && vxr >= 320 && vyr >= 200 && vbpp == 16) {
             klog_hex32("VBE: boot probe OK, LFB 0x", lfb, " (16bpp RGB565)");
             klogf("VBE: resolution ", vxr, 0, "x", vyr, 0, ", activated at user-mode");
             klog("VBE: probed 0x11A/0x117/0x115/0x110 in order, first LFB match wins");

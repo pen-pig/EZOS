@@ -174,10 +174,10 @@ static int map_lfb(void) {
     uint8_t  vbpp = *(volatile uint8_t  *)0x5008u;
 
     if (lfb < 0x00100000u || lfb >= 0xFFF00000u) return -1;   /* 无 LFB 模式 */
-    if (vxr < 320u || vyr < 200u || vbpp != 16u) return -1;   /* 非 16bpp 线性模式 */
+    if (vxr < 320u || vyr < 200u || (vbpp != 16u && vbpp != 32u)) return -1;   /* 非 16bpp 线性模式 */
 
     /* 按需计算窗口：ceil(w*h*2, 4KB)，再取 8MB 上限内的较大者 */
-    uint32_t need = (uint32_t)vxr * (uint32_t)vyr * 2u;
+    uint32_t need = (uint32_t)vxr * (uint32_t)vyr * (uint32_t)(vbpp / 8u);
     need = (need + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
     if (need < PAGING_LFB_WINDOW) need = PAGING_LFB_WINDOW;
 

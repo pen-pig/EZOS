@@ -1366,6 +1366,7 @@ int boot_selftest(void) {
         "kmalloc  kernel heap",
         "paging   identity + map/unmap",
         "pmm      page frame allocator",
+        "lock     allocator irq-safe",
         "elf      ELF32 loader",
         "fpu      x87 arithmetic",
         "calc     expression engine",

@@ -128,6 +128,22 @@ static uint16_t gw_rgb565(uint8_t r, uint8_t g, uint8_t b)
     return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
 }
 
+/* U3: 32bpp direct color. gfx_fmt 1=BGRA (QEMU GOP fmt=1: byte order
+ * B,G,R,X - the low 24 bits of a 0x00RRGGBB rgb are already in BGR order);
+ * 0=RGBA needs a channel swap. */
+static uint32_t gw_rgb2pix32(uint32_t rgb)
+{
+    if (gfx_fmt == 1)
+        return (rgb & 0x00FFFFFFu) | 0xFF000000u;
+    return ((rgb & 0xFFu) << 16) | (rgb & 0xFF00u) | ((rgb >> 16) & 0xFFu) | 0xFF000000u;
+}
+static uint32_t gw_pix2rgb32(uint32_t pix)
+{
+    if (gfx_fmt == 1)
+        return pix & 0x00FFFFFFu;
+    return ((pix & 0xFFu) << 16) | (pix & 0xFF00u) | ((pix >> 16) & 0xFFu);
+}
+
 /* 8bpp 回退：rgb -> 最接近的可用索引色（0x00-0x0F + 0xF0-0xF9） */
 static uint8_t gw_idx_near(uint32_t rgb)
 {
@@ -153,6 +169,8 @@ static void gw_px(int x, int y, uint32_t rgb)
     if (x < 0 || x >= GFX_W || y < 0 || y >= GFX_H) return;
     if (gfx_bpp == 2)
         ((uint16_t*)gfx_fb)[y * GFX_W + x] = gw_rgb565((uint8_t)(rgb >> 16), (uint8_t)(rgb >> 8), (uint8_t)rgb);
+    else if (gfx_bpp == 4)
+        ((uint32_t*)gfx_fb)[(uint32_t)y * gfx_stride + x] = gw_rgb2pix32(rgb);
     else
         gfx_putpixel(x, y, gw_idx_near(rgb));
 }
@@ -160,6 +178,20 @@ static void gw_px(int x, int y, uint32_t rgb)
 static void gw_fill(int x, int y, int w, int h, uint32_t rgb)
 {
     if (w <= 0 || h <= 0) return;
+    if (gfx_bpp == 4) {
+        uint32_t c = gw_rgb2pix32(rgb);
+        for (int j = 0; j < h; j++) {
+            int yy = y + j;
+            if (yy < 0 || yy >= GFX_H) continue;
+            uint32_t *row = &((uint32_t*)gfx_fb)[(uint32_t)yy * gfx_stride];
+            for (int i = 0; i < w; i++) {
+                int xx = x + i;
+                if (xx < 0 || xx >= GFX_W) continue;
+                row[xx] = c;
+            }
+        }
+        return;
+    }
     if (gfx_bpp == 2) {
         uint16_t c = gw_rgb565((uint8_t)(rgb >> 16), (uint8_t)(rgb >> 8), (uint8_t)rgb);
         for (int j = 0; j < h; j++) {
@@ -201,7 +233,28 @@ static void gw_fill_vgrad(int x, int y, int w, int h, uint32_t top, uint32_t bot
 static void gw_fill_rgba(int x, int y, int w, int h, uint32_t rgb, int alpha)
 {
     if (w <= 0 || h <= 0) return;
-    if (gfx_bpp != 2) { gw_fill(x, y, w, h, rgb); return; }
+    if (gfx_bpp != 2 && gfx_bpp != 4) { gw_fill(x, y, w, h, rgb); return; }
+    if (gfx_bpp == 4) {
+        int r = (int)((rgb >> 16) & 0xFF), g = (int)((rgb >> 8) & 0xFF), b = (int)(rgb & 0xFF);
+        for (int j = 0; j < h; j++) {
+            int yy = y + j;
+            if (yy < 0 || yy >= GFX_H) continue;
+            uint32_t *row = &((uint32_t*)gfx_fb)[(uint32_t)yy * gfx_stride];
+            for (int i = 0; i < w; i++) {
+                int xx = x + i;
+                if (xx < 0 || xx >= GFX_W) continue;
+                uint32_t base = gw_pix2rgb32(row[xx]);
+                int br = (int)((base >> 16) & 0xFF);
+                int bgc = (int)((base >> 8) & 0xFF);
+                int bb = (int)(base & 0xFF);
+                int nr = (r * alpha + br * (255 - alpha)) / 255;
+                int ng = (g * alpha + bgc * (255 - alpha)) / 255;
+                int nb = (b * alpha + bb * (255 - alpha)) / 255;
+                row[xx] = gw_rgb2pix32(((uint32_t)nr << 16) | ((uint32_t)ng << 8) | (uint32_t)nb);
+            }
+        }
+        return;
+    }
     int r = (int)((rgb >> 16) & 0xFF), g = (int)((rgb >> 8) & 0xFF), b = (int)(rgb & 0xFF);
     for (int j = 0; j < h; j++) {
         int yy = y + j;
@@ -398,7 +451,7 @@ static void gw_cursor_draw(int mx, int my)
 
 /* 光标背景缓存（8bpp 与 16bpp 均生效）：移动光标前先擦除旧光标，避免残影；
  * 使鼠标移动只需局部重绘 hover 区域，无需触发全屏重绘（闪烁根因之一） */
-static uint16_t gw_cursor_bg[256];   /* 16bpp 存 RGB565，8bpp 存索引色 */
+static uint32_t gw_cursor_bg[256];   /* 16bpp 存 RGB565，8bpp 存索引色 */
 static int gw_cursor_bg_valid = 0;
 static int gw_cursor_bg_x = -1, gw_cursor_bg_y = -1;
 
@@ -407,12 +460,14 @@ static void gw_cursor_save_bg(int mx, int my)
     for (int j = 0; j < 16; j++) {
         for (int i = 0; i < 16; i++) {
             int x = mx + i, y = my + j;
-            uint16_t v = 0;
+            uint32_t v = 0;
             if (x >= 0 && x < GFX_W && y >= 0 && y < GFX_H) {
                 if (gfx_bpp == 2)
                     v = ((uint16_t*)gfx_fb)[y * GFX_W + x];
+                else if (gfx_bpp == 4)
+                    v = ((uint32_t*)gfx_fb)[(uint32_t)y * gfx_stride + x];
                 else
-                    v = (uint16_t)gfx_fb[y * GFX_W + x];
+                    v = (uint32_t)gfx_fb[y * GFX_W + x];
             }
             gw_cursor_bg[j * 16 + i] = v;
         }
@@ -430,7 +485,9 @@ static void gw_cursor_restore_bg(void)
             int x = gw_cursor_bg_x + i, y = gw_cursor_bg_y + j;
             if (x < 0 || x >= GFX_W || y < 0 || y >= GFX_H) continue;
             if (gfx_bpp == 2)
-                ((uint16_t*)gfx_fb)[y * GFX_W + x] = gw_cursor_bg[j * 16 + i];
+                ((uint16_t*)gfx_fb)[y * GFX_W + x] = (uint16_t)gw_cursor_bg[j * 16 + i];
+            else if (gfx_bpp == 4)
+                ((uint32_t*)gfx_fb)[(uint32_t)y * gfx_stride + x] = gw_cursor_bg[j * 16 + i];
             else
                 gfx_fb[y * GFX_W + x] = (uint8_t)gw_cursor_bg[j * 16 + i];
         }
@@ -452,11 +509,12 @@ static void gw_cursor_restore_bg(void)
  * 16MB 是 QEMU 默认内存内无人使用的空闲 DRAM。上限 1600x1200。
  * ================================================================== */
 #define GW_BB_ADDR   0x1000000u    /* 16MB 空闲 DRAM */
-#define GW_BB_CAP    (1600u * 1200u)
+#define GW_BB_BYTES  (3u * 1024u * 1024u)   /* U3: 16-19MB free DRAM (.bss at 19MB) */
 #define GW_BB_FPS_MS 16            /* 重绘节流：约 60FPS */
 
 static uint16_t *g_gw_bb = (uint16_t*)GW_BB_ADDR;
 static uint8_t *g_gw_real_fb = NULL;
+static int g_gw_real_stride = 0;      /* U3: real LFB stride while offscreen (bb is packed) */
 static uint32_t gw_game_last_draw_ms = 0;
 
 /* 进入离屏绘制：成功返回 1 并把 gfx_fb 切到后备缓冲，调用方随后用常规
@@ -464,9 +522,11 @@ static uint32_t gw_game_last_draw_ms = 0;
  * 失败（8bpp 回退或分辨率超限）返回 0，调用方走旧直绘路径。 */
 static int gw_bb_begin(void)
 {
-    if (gfx_bpp != 2) return 0;
-    if ((uint32_t)GFX_W * (uint32_t)GFX_H > GW_BB_CAP) return 0;
+    if (gfx_bpp != 2 && gfx_bpp != 4) return 0;
+    if ((uint32_t)GFX_W * (uint32_t)GFX_H * (uint32_t)(gfx_bpp == 4 ? 4 : 2) > GW_BB_BYTES) return 0;
     g_gw_real_fb = gfx_fb;
+    g_gw_real_stride = gfx_stride;
+    gfx_stride = GFX_W;               /* offscreen buffer is packed (stride == width) */
     gfx_fb = (uint8_t*)g_gw_bb;
     return 1;
 }
@@ -475,16 +535,25 @@ static int gw_bb_begin(void)
 static void gw_bb_end(int x, int y, int w, int h)
 {
     gfx_fb = g_gw_real_fb;
+    gfx_stride = g_gw_real_stride;    /* U3: back to real LFB stride (GOP may exceed width) */
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
     if (x + w > GFX_W) w = GFX_W - x;
     if (y + h > GFX_H) h = GFX_H - y;
     if (w <= 0 || h <= 0) return;
-    uint16_t *dst = (uint16_t*)gfx_fb + (uint32_t)y * GFX_W + x;
+    if (gfx_bpp == 4) {
+        uint32_t *dst = (uint32_t*)gfx_fb + (uint32_t)y * gfx_stride + x;
+        uint32_t *src = (uint32_t*)g_gw_bb + (uint32_t)y * GFX_W + x;
+        for (int j = 0; j < h; j++)
+            for (int i = 0; i < w; i++)
+                dst[(uint32_t)j * gfx_stride + i] = src[(uint32_t)j * GFX_W + i];
+        return;
+    }
+    uint16_t *dst = (uint16_t*)gfx_fb + (uint32_t)y * gfx_stride + x;
     uint16_t *src = g_gw_bb + (uint32_t)y * GFX_W + x;
     for (int j = 0; j < h; j++) {
         for (int i = 0; i < w; i++)
-            dst[(uint32_t)j * GFX_W + i] = src[(uint32_t)j * GFX_W + i];
+            dst[(uint32_t)j * gfx_stride + i] = src[(uint32_t)j * GFX_W + i];
     }
 }
 
@@ -1797,6 +1866,8 @@ static void paint_draw(gw_window_t *w)
             if (gfx_bpp == 2)
                 ((uint16_t*)gfx_fb)[(y0 + y) * GFX_W + x0 + x] =
                     gw_rgb565((uint8_t)(rgb >> 16), (uint8_t)(rgb >> 8), (uint8_t)rgb);
+            else if (gfx_bpp == 4)
+                ((uint32_t*)gfx_fb)[(uint32_t)(y0 + y) * gfx_stride + x0 + x] = gw_rgb2pix32(rgb);
             else
                 gfx_putpixel(x0 + x, y0 + y, gw_idx_near(rgb));
         }

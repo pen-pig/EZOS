@@ -54,4 +54,13 @@ uint32_t pmm_free_count(void);
 typedef void (*pmm_puts_fn)(const char *s);
 int pmm_selftest(pmm_puts_fn out);
 
+/* U3: apply the UEFI memory map handed off by the loader (header 0x5020 +
+ * descriptors 0x5100): mark firmware-occupied pages inside the 10-16MB
+ * pool as allocated. Reusable types: EfiConventionalMemory(7) plus the
+ * post-ExitBootServices OS-owned range 1-4 (Loader/BootServices code+data
+ * - OVMF's DXE heap is type 4). Returns number of newly marked pages;
+ * *usable_kb (nullable) receives the total reusable size in KB.
+ * Non-UEFI boots return 0. */
+int pmm_apply_uefi_map(uint32_t *usable_kb);
+
 #endif

@@ -140,6 +140,9 @@ int pmm_selftest(pmm_puts_fn out) {
     /* out==NULL：静默模式（开机自检用），只跑断言不打印 */
     if (!out) { out = pmm_null_puts; }
     int fail = 0;
+    /* UEFI boots enter with firmware pages pre-marked; leak check must
+     * compare against this baseline, not absolute zero. */
+    uint32_t used_base = pmm_used_pages();
 
     out("pmm self-test:\n");
     out("  pool 0x"); phex(out, PMM_POOL_START);
@@ -191,11 +194,74 @@ int pmm_selftest(pmm_puts_fn out) {
     /* 6) 统计收尾：全部归还后 used 应为 0（自检自身不泄漏页） */
     out("  used after test: "); pdec(out, pmm_used_pages());
     out(" / "); pdec(out, pmm_total_pages()); out("\n");
-    if (pmm_used_pages() != 0) {
+    if (pmm_used_pages() != used_base) {
         out("  [FAIL] selftest leaked pages\n");
         fail++;
     }
 
     out(fail == 0 ? "  result: PASS\n" : "  result: FAIL\n");
     return fail;
+}
+
+/* ---------- U3: UEFI memory map application ---------- */
+
+/* Loader handoff layout (uefi/main.c):
+ *   0x5010: uint32 UEFI magic 0x55454649
+ *   0x5020: uint32 map_size / +0x04 desc_size / +0x08 desc_version / +0x0C data phys
+ *   0x5100: EFI_MEMORY_DESCRIPTOR[] (40 bytes on IA32:
+ *           +0 Type, +8 PhysicalStart(u64), +24 NumberOfPages(u64)) */
+#define PMM_UEFI_MAGIC_ADDR 0x5010u
+#define PMM_UEFI_HDR        0x5020u
+#define PMM_UEFI_DATA       0x5100u
+#define PMM_UEFI_END        0x6000u
+#define PMM_UEFI_MAGIC      0x55454649u
+#define PMM_EFI_LOADER_CODE 1u   /* EfiLoaderCode  - OS-owned after EBS */
+#define PMM_EFI_BOOT_DATA   4u   /* EfiBootServicesData - OS-owned after EBS */
+#define PMM_EFI_CONV        7u   /* EfiConventionalMemory = available */
+
+int pmm_apply_uefi_map(uint32_t *usable_kb) {
+    if (usable_kb) *usable_kb = 0;
+    if (!g_ready) return 0;
+    if (*(volatile uint32_t *)PMM_UEFI_MAGIC_ADDR != PMM_UEFI_MAGIC) return 0;
+    uint32_t map_size  = *(volatile uint32_t *)(PMM_UEFI_HDR + 0x00);
+    uint32_t desc_size = *(volatile uint32_t *)(PMM_UEFI_HDR + 0x04);
+    uint32_t data      = *(volatile uint32_t *)(PMM_UEFI_HDR + 0x0C);
+    if (map_size == 0 || desc_size < 40 || data == 0) return 0;
+    if (data < PMM_UEFI_DATA || data >= PMM_UEFI_END) return 0;
+    if (map_size > PMM_UEFI_END - data) map_size = PMM_UEFI_END - data;
+    uint32_t marked = 0;
+    uint32_t usable_pages = 0;
+    for (uint32_t off = 0; off + desc_size <= map_size; off += desc_size) {
+        volatile uint8_t *d = (volatile uint8_t *)(data + off);
+        uint32_t type  = *(volatile uint32_t *)(d + 0);
+        uint32_t start = *(volatile uint32_t *)(d + 8);   /* PhysicalStart (low 32 bits) */
+        uint32_t pages = *(volatile uint32_t *)(d + 24);  /* NumberOfPages  (low 32 bits) */
+        /* UEFI spec: after ExitBootServices, EfiLoaderCode/Data (1/2) and
+         * EfiBootServicesCode/Data (3/4) belong to the OS and are reusable.
+         * OVMF parks its 14.5MB DXE heap at 0x900000-0x1780000 as type 4,
+         * covering the whole 10-16MB pool - reserving it starved every alloc
+         * (elf/fd selftests died with "out of physical pages"). */
+        if (type >= PMM_EFI_LOADER_CODE && type <= PMM_EFI_BOOT_DATA) {
+            usable_pages += pages;
+            continue;
+        }
+        if (pages == 0) continue;
+        if (start >= PMM_POOL_END) continue;
+        /* end = start + pages*4096, saturated to avoid 32-bit overflow */
+        uint32_t end;
+        if (pages >= 0x100000u) end = 0xFFFFFFFFu;
+        else {
+            end = start + pages * 4096u;
+            if (end < start) end = 0xFFFFFFFFu;
+        }
+        if (end <= PMM_POOL_START) continue;
+        uint32_t s = (start > PMM_POOL_START) ? start : PMM_POOL_START;
+        uint32_t e = (end < PMM_POOL_END) ? end : PMM_POOL_END;
+        for (uint32_t p = s; p < e; p += 4096u) {
+            uint32_t i = (p - PMM_POOL_START) / 4096u;
+            if (!bit_get(i)) { bit_set(i); marked++; g_used++; }
+        }
+    }
+    if (usable_kb) *usable_kb = usable_pages * 4u;   /* pages * 4096 / 1024 */
+    return (int)marked;
 }

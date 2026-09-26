@@ -26,6 +26,7 @@
 | `test_usb.py` | 真机点亮 H2-1：USB 主机控制器只读普查，按 ProgIF 分类 UHCI/OHCI/EHCI/xHCI 四组 + 不挂控制器的空组；只枚举不碰硬件 | QMP 4471 + serial 4472 | ~1 min |
 | `test_uhci.py` | 真机点亮 H2-2a：UHCI 控制器复位 + 帧列表 + 启动调度，读 PORTSC 判连接。挂 `usb-kbd` 时 port0 conn=1，不挂时 conn=0（两组结果必须相反，防止硬编码假阳性） | QMP 4473 + serial 4474 | ~2 min |
 | `test_lock.py` | P1 修复回归网：断言开机自检 6 项 LOCKTEST 全 PASS——irqflags 原语语义（save/restore，含"关中断时不得误开"）、模拟 IRQ 上下文调 kmalloc/pmm、压力记账不变量。`nested keep` 项专抓"把 irq_restore 改成无条件 sti"的回归（变异测试已证明抓得到） | QMP 4495 + serial 4494 | ~1 min |
+| `test_uefi3.py` | U3 双路径：OVMF 32 位启动（EZEFI gop/magic/EBS/mmap handoff 标记链）→ 内核接收 GOP 1280x800 → selftest 全 PASS（OCR）→ 32bpp GUI 像素断言（任务栏深灰/壁纸蓝渐变）→ 开始菜单『返回终端』回切 720x400 文本 shell → 回切后 ver 可用；全程无 kernel panic | QMP 4464 + serial file | ~3 min |
 
 `ezocr.py` 是前三个脚本共用的 VGA 文本截图 OCR（真字库像素匹配），不要单独删。
 
