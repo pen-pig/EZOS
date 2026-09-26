@@ -1874,6 +1874,13 @@ static int vi_match_list(const char *s, int len, const char *const *list, int n)
     return 0;
 }
 
+/* token equality: s[0..len) must equal t exactly */
+static int vi_tok_is(const char *s, int len, const char *t) {
+    int k = 0;
+    while (k < len && t[k]) { if (s[k] != t[k]) return 0; k++; }
+    return (k == len && t[k] == '\0');
+}
+
 static int vi_get_lang(void) {
     int len = 0;
     while (len < 128 && vi_filename[len]) len++;
@@ -1893,17 +1900,39 @@ static int vi_get_lang(void) {
     if (vi_streq(ext, "c") || vi_streq(ext, "h")) return 1;
     if (vi_streq(ext, "s") || vi_streq(ext, "asm")) return 2;
     if (vi_streq(ext, "md")) return 3;
+    if (vi_streq(ext, "cpp") || vi_streq(ext, "cc") ||
+        vi_streq(ext, "cxx") || vi_streq(ext, "hpp") ||
+        vi_streq(ext, "hh")) return 4;
+    if (vi_streq(ext, "py")) return 5;
     return 0; // δ֪����ΪĬ�Ϻ�ɫ
 }
 
 // һ�δ�量ɨ�����и�进�뿪 /* */ ״̬����O(总行*列) ����כ����и�
-static void vi_compute_block_states(void) {
+static void vi_compute_block_states(int lang) {
     int in_block = 0;
+    char trip = 0; /* python triple-quote char while in_block */
     for (int line = 0; line < vi_count && line < VI_MAX_LINES; line++) {
         vi_block_comment[line] = in_block ? 1 : 0;
         int L = vi_len[line];
         if (L < 0) L = 0;
         int i = 0;
+        if (lang == 5) { /* python: track """/''' state across lines */
+            while (i < L) {
+                char c = vi_lines[line][i];
+                if (in_block) {
+                    if (c == trip && i + 2 < L &&
+                        vi_lines[line][i + 1] == c && vi_lines[line][i + 2] == c) {
+                        in_block = 0; trip = 0; i += 3;
+                    } else i++;
+                } else {
+                    if ((c == '"' || c == '\'') && i + 2 < L &&
+                        vi_lines[line][i + 1] == c && vi_lines[line][i + 2] == c) {
+                        in_block = 1; trip = c; i += 3;
+                    } else i++;
+                }
+            }
+            continue; /* C-style scan below is for C/C++ only */
+        }
         while (i < L) {
             char c = vi_lines[line][i];
             if (in_block) {
@@ -1998,6 +2027,88 @@ static void vi_color_line(int line, int lang, int in_block) {
         return;
     }
 
+    if (lang == 5) { // ===== Python =====
+        static const char *pkw[] = {
+            "def","class","return","if","elif","else","for","while","import","from",
+            "as","pass","break","continue","global","nonlocal","lambda","try",
+            "except","finally","raise","assert","with","yield","in","is","not",
+            "and","or","del","True","False","None","async","await"
+        };
+        int np = (int)(sizeof(pkw) / sizeof(pkw[0]));
+        int prev_def = 0; /* highlight the name after def/class */
+        int i = 0;
+        while (i < L) {
+            char c = vi_lines[line][i];
+            if (in_block) { /* inside a triple-quoted string from an earlier line */
+                if ((c == '"' || c == '\'') && i + 2 < L &&
+                    vi_lines[line][i + 1] == c && vi_lines[line][i + 2] == c) {
+                    vi_colbuf[i] = CLR_LIGHT_GREEN;
+                    vi_colbuf[i + 1] = CLR_LIGHT_GREEN;
+                    vi_colbuf[i + 2] = CLR_LIGHT_GREEN;
+                    in_block = 0; i += 3; continue;
+                }
+                vi_colbuf[i] = CLR_LIGHT_GREEN; i++;
+                continue;
+            }
+            if (c == '#') { /* comment to end of line */
+                for (int j = i; j < L; j++) vi_colbuf[j] = CLR_DARK_GREY;
+                break;
+            }
+            if (c == '@') { /* decorator */
+                int s = i; i++;
+                while (i < L && vi_is_ident(vi_lines[line][i])) i++;
+                for (int j = s; j < i; j++) vi_colbuf[j] = CLR_LIGHT_CYAN;
+                continue;
+            }
+            if (c == '"' || c == '\'') {
+                if (i + 2 < L && vi_lines[line][i + 1] == c && vi_lines[line][i + 2] == c) {
+                    /* triple-quoted string: paint rest of line (state via compute) */
+                    for (int j = i; j < L; j++) vi_colbuf[j] = CLR_LIGHT_GREEN;
+                    break;
+                }
+                vi_colbuf[i] = CLR_LIGHT_GREEN; i++;
+                while (i < L) {
+                    char d = vi_lines[line][i]; vi_colbuf[i] = CLR_LIGHT_GREEN;
+                    if (d == '\\' && i + 1 < L) {
+                        vi_colbuf[i + 1] = CLR_LIGHT_GREEN; i += 2; continue;
+                    }
+                    if (d == c) { i++; break; }
+                    i++;
+                }
+                continue;
+            }
+            if (vi_is_digit(c)) {
+                int s = i;
+                while (i < L && (vi_is_digit(vi_lines[line][i]) || vi_lines[line][i] == '.' ||
+                       vi_lines[line][i] == 'x' || vi_lines[line][i] == 'X' ||
+                       (vi_lines[line][i] >= 'a' && vi_lines[line][i] <= 'f') ||
+                       (vi_lines[line][i] >= 'A' && vi_lines[line][i] <= 'F') ||
+                       vi_lines[line][i] == 'e' || vi_lines[line][i] == 'E' ||
+                       vi_lines[line][i] == 'o' || vi_lines[line][i] == 'b' ||
+                       vi_lines[line][i] == 'j' || vi_lines[line][i] == '_')) i++;
+                for (int j = s; j < i; j++) vi_colbuf[j] = CLR_LIGHT_RED;
+                continue;
+            }
+            if (vi_is_ident_start(c)) {
+                int s = i;
+                while (i < L && vi_is_ident(vi_lines[line][i])) i++;
+                if (vi_match_list(&vi_lines[line][s], i - s, pkw, np)) {
+                    for (int j = s; j < i; j++) vi_colbuf[j] = CLR_LIGHT_BLUE;
+                    prev_def = (vi_tok_is(&vi_lines[line][s], i - s, "def") ||
+                                vi_tok_is(&vi_lines[line][s], i - s, "class")) ? 1 : 0;
+                } else if (prev_def) {
+                    prev_def = 0;
+                    for (int j = s; j < i; j++) vi_colbuf[j] = CLR_LIGHT_CYAN;
+                } else {
+                    prev_def = 0;
+                }
+                continue;
+            }
+            i++;
+        }
+        return;
+    }
+
     // ===== C (.c/.h) =====
     static const char *kw[] = {
         "int","char","void","if","else","for","while","do","return","struct",
@@ -2005,7 +2116,25 @@ static void vi_color_line(int line, int lang, int in_block) {
         "switch","case","break","continue","default","enum","union","sizeof","goto",
         "extern","volatile","register","auto","size_t","uint8_t","uint32_t","uint64_t","int32_t"
     };
+    static const char *kwcpp[] = {
+        /* C subset */
+        "int","char","void","if","else","for","while","do","return","struct",
+        "typedef","static","const","unsigned","signed","long","short","float","double",
+        "switch","case","break","continue","default","enum","union","sizeof","goto",
+        "extern","volatile","register","auto","size_t","uint8_t","uint32_t","uint64_t","int32_t",
+        /* C++ extensions */
+        "class","public","private","protected","virtual","template","typename",
+        "namespace","using","new","delete","this","try","catch","throw","bool",
+        "true","false","inline","operator","friend","constexpr","nullptr","override",
+        "final","mutable","explicit","decltype","noexcept","static_cast","dynamic_cast",
+        "const_cast","reinterpret_cast"
+    };
+    const char *const *kwt = kw;
     int n = (int)(sizeof(kw) / sizeof(kw[0]));
+    if (lang == 4) {
+        kwt = kwcpp;
+        n = (int)(sizeof(kwcpp) / sizeof(kwcpp[0]));
+    }
     // Ԥ����: �����հ�'#' -> # ������������ɫ
     int i = 0;
     int p = 0; while (p < L && vi_lines[line][p] == ' ') p++;
@@ -2062,7 +2191,7 @@ static void vi_color_line(int line, int lang, int in_block) {
         }
         if (vi_is_ident_start(c)) {
             int s = i; while (i < L && vi_is_ident(vi_lines[line][i])) i++;
-            if (vi_match_list(&vi_lines[line][s], i - s, kw, n)) {
+            if (vi_match_list(&vi_lines[line][s], i - s, kwt, n)) {
                 for (int j = s; j < i; j++) vi_colbuf[j] = CLR_LIGHT_BLUE;
             }
             continue;
@@ -2094,14 +2223,14 @@ static void vi_scroll_into_view(void) {
 static void vi_render(void) {
     terminal_initialize();
     int lang = vi_get_lang();
-    if (lang == 1) vi_compute_block_states(); // �С��ע��跨��״̬
+    if (lang == 1 || lang == 4 || lang == 5) vi_compute_block_states(lang); // �С��ע��跨��״̬
     for (int i = 0; i < VI_SCREEN_ROWS; i++) {
         int line = vi_top + i;
         if (line < vi_count) {
             terminal_set_cursor((size_t)i, 0);
             int L = vi_len[line];
             if (L < 0) L = 0;
-            int in_block = (lang == 1 && line >= 0 && line < VI_MAX_LINES) ? vi_block_comment[line] : 0;
+            int in_block = ((lang == 1 || lang == 4 || lang == 5) && line >= 0 && line < VI_MAX_LINES) ? vi_block_comment[line] : 0;
             vi_color_line(line, lang, in_block);
             int cur_color = -1; // ����ɫʱ�ŵ� terminal_setcolor
             for (int x = 0; x < VI_SCREEN_COLS - 1; x++) {

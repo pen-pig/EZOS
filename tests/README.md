@@ -19,6 +19,7 @@
 | `test_step7_sock.py` | 7.3：UDP/TCP echo 服务端，pcap 逐帧断言校验和、三次握手、四次挥手 | monitor 55555 + hostfwd 7000/7001 | ~1 min |
 | `test_step7_tcp.py` | 7.4：主动 connect、乱序重组、重传（`-netdev socket` 直连对端） | netdev 4476 + monitor 55666 | ~1 min |
 | `test_vi.py` | vi 功能回归：新建→插入→`:wq`→cat 回读→二次打开→退出后 shell 可用（防语法高亮渲染改动破坏编辑路径） | QMP 4482 | ~1 min |
+| `test_vi_color.py` | vi 语法高亮回归：`.c/.h` 既有 C 高亮 + 新增 `.cpp/.cc/.cxx/.hpp/.hh`（复用 C 扫描、扩展关键字表）与 `.py`（注释/字符串/三引号/数字/关键字/def-class 函数名/装饰器）13 组像素色断言 | QMP 4483 | ~2 min |
 | `test_jobs.py` | 后台任务：`cmd &` 立即回提示符、`[n] pid`、jobs 列表、退出后 `[n] done` 收割、ps 无 zombie、前台不受影响 | QMP 4485 | ~1 min |
 | `test_power.py` | 真机点亮 H1a：COM1 串口镜像（自检/ACPI/banner）、ACPI S5 断电（QEMU 进程退出）、8042 重启后 shell 可用 | QMP 4486 + serial file | ~2 min |
 | `test_ahci.py` | 真机点亮 H1b：ich9-ahci 控制器探测 + 端口上线（IDENTIFY 型号）、`setdrive 4` 后 exFAT format/write/ls/cat/rm 全走 AHCI DMA；全程走串口不依赖 OCR | QMP 4487 + serial 4488 | ~2 min |
