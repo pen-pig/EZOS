@@ -31,6 +31,7 @@
 #include "usbenum.h"
 #include "usbkbd.h"
 #include "usbmsc.h"
+#include "usbmouse.h"
 
 // �򵥳��Ⱥ��������Զ���ʽ��ʾ��ʹ��
 static size_t my_strlen(const char *s) {
@@ -440,6 +441,13 @@ void kernel_main(void) {
      * INT 13h emulation is gone (protected mode). */
     usbmsc_init();
 
+    /* H2-2e: claim a HID boot mouse (subclass=1 / protocol=2) among the
+     * enumerated devices and switch it to the boot protocol. Movement
+     * arrives by polling the interrupt IN endpoint and is injected into the
+     * shared pointer state (mouse.c), so the GUI sees one cursor no matter
+     * which bus it came from. */
+    usbmouse_init();
+
     /* RTL8139 NIC (step 7.2): claim + reset + MAC + 8K RX ring + 4 TX
      * descriptors + IRQ + ARP/ICMP echo reply. Returns -1 when QEMU has
      * no NIC attached; that is not an error, so we stay silent then. */
@@ -496,9 +504,12 @@ void kernel_main(void) {
     klog_ok("Keyboard: PS/2 keyboard initialized (8042 IRQ1 enabled)");
     mouse_init();
     if (mouse_present()) {
-        klog_ok("PS/2 mouse: detected");
+        /* H2-2e：PS/2 与 USB 共用同一份指针状态，诊断要分清来源——
+         * mouse_present() 只要有一条总线可用就返回 1。 */
+        klog_ok(mouse_usb_present() ? "Mouse: USB HID boot mouse active"
+                                   : "PS/2 mouse: detected");
     } else {
-        klog("PS/2 mouse: not detected, keyboard only");
+        klog("Mouse: not detected (no PS/2, no USB), keyboard only");
     }
 
     /* 任务与抢占式调度器（步骤 6a）。

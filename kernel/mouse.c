@@ -4,9 +4,11 @@
  *       mouse_get_x/y/buttons/wheel 查询接口；无鼠标时优雅降级
  */
 #include "mouse.h"
+#include "usbmouse.h"
 #include "port.h"
 #include "types.h"
 #include "gfx.h"
+#include "irqflags.h"
 
 #define MOUSE_WHEEL_BUF_SIZE 64
 
@@ -16,6 +18,7 @@ static int wheel_end = 0;
 
 static int mouse_available = 0;
 static int has_wheel = 0;
+static int usb_present = 0;     /* H2-2e：USB boot 鼠标已认领（mouse_present 用） */
 
 /* 当前指针坐标（范围随 GFX_W/GFX_H 自适应，初始化时置屏幕中心） */
 static int mouse_x = 0;
@@ -66,9 +69,11 @@ static void mouse_cmd(uint8_t cmd) {
     mouse_read();
 }
 
-/* 位移累积 + 分辨率自适应裁剪：
- * PS/2 X 向右为正、Y 向上为正；屏幕 Y 向下为正，故 dy 取反。
- * 钳位范围随 GFX_W/GFX_H 动态变化：320x200 或 640x480 均正确。
+/*
+ * 位移累积 + 分辨率自适应裁剪。
+ * 参数统一为**屏幕坐标**：dx > 0 向右，dy > 0 向下。
+ * PS/2 原生 Y 是"正=向上"，调用方负责取反（见 mouse_handler）；
+ * USB boot 报告原生 Y 就是"正=向下"，usbmouse 侧直接传。
  */
 static int mouse_speed = 256;   /* 灵敏度倍率 256=1.0x */
 
@@ -83,7 +88,7 @@ static void mouse_accumulate(int dx, int dy) {
     dx = (int)((dx * mouse_speed) / 256);
     dy = (int)((dy * mouse_speed) / 256);
     mouse_x += dx;
-    mouse_y -= dy;
+    mouse_y += dy;
     int max_x = (GFX_W > 0) ? (GFX_W - 1) : 319;   /* 未初始化时按 320x200 兜底 */
     int max_y = (GFX_H > 0) ? (GFX_H - 1) : 199;
     if (mouse_x < 0) mouse_x = 0;
@@ -208,7 +213,8 @@ void mouse_handler(void) {
             packet_index = 0;
             pkt_cnt++;
 
-            // PS/2 位移累积（带符号），并按当前分辨率裁剪
+            // PS/2 位移累积（带符号），并按当前分辨率裁剪。
+            // PS/2 约定 Y 正=向上，屏幕坐标 Y 正=向下，故传入 -dy。
             int dx = (int)(int8_t)packet[1];
             int dy = (int)(int8_t)packet[2];
             mouse_buttons = packet[0] & 0x07;
@@ -219,7 +225,7 @@ void mouse_handler(void) {
                 outb(0x20, 0x20);
                 return;
             }
-            mouse_accumulate(dx, dy);
+            mouse_accumulate(dx, -dy);
 
             if (has_wheel) {
                 int8_t z = (int8_t)packet[3];
@@ -245,11 +251,44 @@ int mouse_get_wheel(void) {
 }
 
 int mouse_present(void) {
-    return mouse_available;
+    /* USB 鼠标是轮询驱动的（usbmouse_poll），这里顺带驱动一次，
+     * 让 GUI/诊断在第一次查询前就能拿到最新的指针状态。 */
+    usbmouse_poll();
+    return (mouse_available || usb_present) ? 1 : 0;
 }
 
 int mouse_get_x(void) {
+    /* 轮询钩子：GUI 每帧都会读坐标，USB 鼠标因此获得稳定的轮询机会
+     *（内部 5ms 节流 + IF=0 直接返回，不会拖慢也不会挂死）。 */
+    usbmouse_poll();
     return mouse_x;
+}
+
+/* ---- H2-2e：USB 鼠标注入（与 IRQ12 的 PS/2 路径共用状态） ----
+ * 参数已由 usbmouse 转成屏幕坐标（dy>0 向下），这里只做灵敏度缩放、
+ * 钳位与关中断保护。
+ */
+void mouse_inject_report(int dx, int dy, int buttons, int dz) {
+    uint32_t flags = irq_save_disable();
+    mouse_buttons = buttons & 0x07;
+    mouse_accumulate(dx, dy);
+    pkt_cnt++;
+    if (dz != 0) {
+        int next = (wheel_end + 1) % MOUSE_WHEEL_BUF_SIZE;
+        if (next != wheel_start) {
+            wheel_buf[wheel_end] = dz;
+            wheel_end = next;
+        }
+    }
+    irq_restore(flags);
+}
+
+void mouse_usb_set_present(int present) {
+    usb_present = present ? 1 : 0;
+}
+
+int mouse_usb_present(void) {
+    return usb_present;
 }
 
 /* 直接设置指针位置（用于 GUI 启动时按实际分辨率居中） */

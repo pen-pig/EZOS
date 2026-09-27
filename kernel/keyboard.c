@@ -4,6 +4,7 @@
 #include "types.h"
 #include "task.h"
 #include "usbkbd.h"
+#include "usbmouse.h"
 #include "irqflags.h"
 #include "isr.h"
 
@@ -188,6 +189,11 @@ int keyboard_getchar(void) {
      * All existing get-and-loop callers (shell / desktop / games) pick up
      * USB keystrokes through this one hook; throttling lives in usbkbd_poll. */
     usbkbd_poll();
+    /* H2-2e: the USB mouse is polled too, for the same reason as the keyboard
+     * - a text-mode shell never calls mouse_get_x(), so this busy-wait hook is
+     * the only place the pointer gets serviced. Throttling/IF guard live in
+     * usbmouse_poll. */
+    usbmouse_poll();
     if (buffer_start == buffer_end) return 0;
     int c = keyboard_buffer[buffer_start];
     buffer_start = (buffer_start + 1) % KEYBOARD_BUFFER_SIZE;

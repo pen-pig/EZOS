@@ -1,4 +1,6 @@
-# UEFI 最小启动链路验证（H2-U2a）
+# UEFI 启动链路（H2：U2a → U2b → U2c → U3，32 位 OVMF）
+
+## U2a：最小 EFI 应用（历史第一节，下文"目标/产出/踩坑"均属这一步）
 
 目标：验证本机工具链能产出可在 OVMF 下启动的 32 位 EFI 应用（BOOTIA32.EFI），
 并成功打印标记 `EZEFI: hello`。不改内核、不改 boot.asm。
@@ -113,8 +115,46 @@ U3 加载并跳转内核后，要让内核能访问该 LFB，必须：
 （或在 UEFI 侧把帧缓冲 memcpy 到内核可见的低端内存，但会牺牲性能且需额外约定缓冲区。）
 此问题 U3 解决，这里只建档。
 
+## U2c：ExitBootServices + 加载内核并跳转（提交 ba3dc5e）
+
+`main.c` 走完 GOP 之后：用 LoadedImage 取自身所在 ESP 的 `SimpleFileSystem`，
+从 ESP 根目录读 `KERNEL.BIN` 到 EFI 分配的内存，然后 `ExitBootServices()`，
+最后以物理地址 `0x10000` 为目标跳进内核入口。
+
+串口标记链（顺序即依赖顺序）：
+
+- `EZEFI:kernel size=<N>`      读到内核镜像（N 字节）
+- `EZEFI:uefi magic@0x5010 ok` 在 0x5010 写下 `'UEFI'`（0x55454649）供内核识别启动路径
+- `EZEFI:map n=<N>`            ExitBootServices 前取到内存映射描述符
+- `EZEFI:ebs ok`               ExitBootServices 成功
+- `EZEFI:mmap handoff size=<N>`把内存映射交接给内核（头 @0x5020，表 @0x5100）
+
+## U3：内核接收 UEFI 启动参数 + legacy/UEFI 双路径（提交 9bd0c3a）
+
+内核侧按 0x5010 的 magic 分两条路，legacy（SeaBIOS/INT 13h）行为完全不变：
+
+- **gfx**：新增 32bpp BGRA 直色路径（`gw_px` / `gfx_init` / 调色板），因为
+  U2b-ext 实测 OVMF 只有 32bpp、无 RGB565。GOP 帧缓冲实测在 **2GB 处**，
+  identity 映射（0-32MB）够不着，改由 paging 显式映射并带 `PTE_PCD`/`PTE_PWT`
+  （不可缓存，否则缓存一致性问题会花屏/卡死）。
+- **pmm**：UEFI 分支直接消费 loader 交接的 `GetMemoryMap`，不再依赖 CMOS 溢出探测。
+  **坑**：OVMF 有 14.5MB DXE 堆落在 0x900000 且类型是 `EfiConventionalMemory` 之外的
+  type 4（boot services data）——EBS 之后它们已可回收，只认 type 7 会让 10-16MB 的
+  物理内存池直接耗尽。
+- **一致性断言**：`pmm_selftest` 的泄漏断言改成以"进入时的基线"为准（UEFI 启动
+  自带一批 loader 保留页，用 0 作基线必然误报）；`boot_selftest` 的名字表补了
+  lock 项（顺带修掉全表错位一格的既有 bug）。
+- **FS**：UEFI 下引导介质是 USB esp，所以 FS 指向 ATA drive 0；legacy 保持
+  drive 0 为引导盘保留。
+
+E2E：`tests/test_uefi3.py`（QMP 4464 + serial file），17 项断言覆盖
+EZEFI 标记链 → GOP 1280x800 → selftest 全 PASS（OCR）→ 32bpp GUI 像素断言
+（任务栏深灰 / 壁纸蓝渐变）→ 开始菜单『返回终端』回切 720x400 文本 shell →
+回切后 `ver` 仍可用，全程无 kernel panic。
+
 ## 结论
 
-32 位路径打通：BOOTIA32.EFI 在 OVMF 下自动加载、运行、打印标记并向 0x5000 写入 GOP 帧缓冲参数。
-已确认 OVMF（32 位）只给 32bpp 模式、无 RGB565，故 0x5008 当前写 32；后续 U2c 加 ExitBootServices/
-加载跳转内核，U3 改 `gfx.c` 接受 32bpp 并解决 2GB 帧缓冲的映射/缓存属性问题。
+32 位 UEFI 路径已完整打通：BOOTIA32.EFI 在 OVMF 下自动加载、取 GOP、加载内核、
+ExitBootServices、把帧缓冲与内存映射交接给内核并跳转；内核按 0x5010 magic 走
+UEFI 分支（32bpp + 高地址 fb 映射 + EBS 后内存映射），legacy 路径不受影响。
+USB 侧（H2-2c 枚举 / H2-2d 键盘 / H2-2e 鼠标 / H1c 大容量存储）也已全部完成。
