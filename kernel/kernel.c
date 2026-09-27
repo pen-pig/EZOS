@@ -28,6 +28,7 @@
 #include "ahci.h"
 #include "usb.h"
 #include "uhci.h"
+#include "ehci.h"
 #include "usbenum.h"
 #include "usbkbd.h"
 #include "usbmsc.h"
@@ -429,6 +430,11 @@ void kernel_main(void) {
      * endpoint parsing -> SET_CONFIGURATION). Evidence goes to dmesg/COM1;
      * no device attached means a clean skip with zero success lines. */
     usbenum_init();
+
+    /* A1 第一阶段：EHCI（USB 2.0 高速）控制器。与 UHCI 并列、互不干扰——
+     * FS/LS 设备（键盘/鼠标）会被 EHCI 交还 companion UHCI，高速设备
+     *（U 盘）由 EHCI 自己接管。找不到控制器静默跳过。 */
+    ehci_init();
 
     /* H2-2d: claim a HID boot keyboard among the enumerated devices and
      * switch it to the boot protocol. Input arrives by polling the interrupt
