@@ -16,6 +16,7 @@
 #define AHCI_H
 
 #include "types.h"
+#include "usbmsc.h"
 
 /* AHCI port 在块设备层里的 drive 编号起点：drive = AHCI_DRIVE_BASE + port */
 #define AHCI_DRIVE_BASE 4
@@ -24,8 +25,14 @@
  * 实测控制器（ich9-ahci）通常 6 个；取 8 足够且缓冲开销极小。 */
 #define AHCI_MAX_PORTS 8
 
-/* 块设备层最大 drive 编号（ATA 4 个 + AHCI_MAX_PORTS 个） */
-#define BLK_MAX_DRIVE (AHCI_DRIVE_BASE + AHCI_MAX_PORTS)
+/* USB 盘排在 AHCI 之后：drive = USBMSC_DRIVE_BASE + unit（见 usbmsc.h）。
+ * 编译期一致性断言：USBMSC_DRIVE_BASE 必须正好是 AHCI 区间的结束，
+ * 若只改了 AHCI_MAX_PORTS 而忘改 USBMSC_DRIVE_BASE（或反之）这里立刻报错。 */
+_Static_assert(USBMSC_DRIVE_BASE == AHCI_DRIVE_BASE + AHCI_MAX_PORTS,
+               "USBMSC_DRIVE_BASE must follow the AHCI drive range");
+
+/* 块设备层最大 drive 编号（ATA 4 + AHCI 8 + USBMSC USBMSC_MAX_DEV） */
+#define BLK_MAX_DRIVE (USBMSC_DRIVE_BASE + USBMSC_MAX_DEV)
 
 /* 控制器探测与端口初始化。找不到控制器（PCI class 0x0106）时静默跳过，
  * 返回 0；找到并完成初始化返回 1；找到但初始化失败返回 -1（不影响 ATA）。 */

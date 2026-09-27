@@ -169,6 +169,31 @@ static volatile uint32_t g_itd[8]      __attribute__((aligned(16)));
 static volatile uint8_t  g_ibuf[16]    __attribute__((aligned(16)));
 #define UHCI_INTR_TO_MS  3u             /* 中断轮询超时（毫秒） */
 
+/* H1c：bulk 传输结构（bulk QH 常驻 + TD 池 + 数据缓冲）。
+ *
+ * 调度骨架更新（改这里前先想清楚）：
+ *   帧列表 -> 中断 QH --Q=1--> 控制 QH --Q=1--> bulk QH --水平链--> T
+ * 三个 QH 都常驻：帧列表初始化后永不再改；控制/中断/bulk 传输只改各自 QH 的
+ * element（挂上/撤下一个 dword）。bulk 挂在水平链最末端——UHCI 带宽模型里
+ * bulk 正是"用完中断+控制剩下的带宽"，QEMU 全速 1ms 帧足够单帧跑完一笔。
+ *
+ * 全速（12Mbps）bulk 端点 mps 上限 64 字节（低速无 bulk）。512B 扇区按
+ * mps=64 拆 8 包；TD 池按 16 备（mps>=32 都能单笔 512B），越界 fail closed。
+ * 数据缓冲 512B 放 .bss（identity 映射区，虚拟==物理，HC DMA 直接用）。 */
+static volatile uint32_t g_bqh[8]       __attribute__((aligned(16)));
+static volatile uint32_t g_btd[16][8]   __attribute__((aligned(16)));
+static volatile uint8_t  g_bulkbuf[512] __attribute__((aligned(16)));
+#define UHCI_BULK_TD_MAX 16
+#define UHCI_BULK_TO_MS  1000u          /* 一笔 bulk 传输超时（毫秒） */
+#define UHCI_BULK_NAK_MAX 2000          /* 单 TD NAK 重试上界（约 2s） */
+
+/* bulk 端点 DATA toggle：按 USB 地址索引、IN/OUT 各一份（一设备最多一对
+ * bulk 端点）。与中断端点的 g_toggle 相互独立——不同端点的 toggle 序列
+ * 本来就是独立的。ClearFeature(HALT)/BOT reset 后必须双清零（规范要求
+ * toggle 回到 DATA0）。 */
+static uint8_t g_btog_in[128];
+static uint8_t g_btog_out[128];
+
 /* 中断端点的 DATA toggle（按 USB 地址索引，每设备一个中断端点够用）。
  * UHCI 不做自动 toggle：TD token 的 bit19 必须由软件给，给错设备就丢包。 */
 static uint8_t g_toggle[128];
@@ -275,8 +300,10 @@ int uhci_control_xfer(uint16_t io, uint8_t addr, uint8_t ep,
 
     /* 挂接控制队列：控制 QH 的 element -> TD0（Q=0 纵向）。
      * H2-2d 起**不再改写帧列表**——帧列表常驻指向中断 QH，中断 QH 水平链到
-     * 控制 QH（见 g_iqh 处的骨架注释），控制传输只动自己 QH 的 element。 */
-    g_qh[0] = 0x1u;                              /* 水平链接 terminate */
+     * 控制 QH（见 g_iqh 处的骨架注释），控制传输只动自己 QH 的 element。
+     * H1c 起控制 QH 的水平链后面还挂着常驻 bulk QH，这里**绝不能碰
+     * g_qh[0]**（曾把它清成 terminate，把 bulk QH 从链上摘掉——症状是
+     * 控制传输全部正常而 bulk 传输一个包都发不出去）。 */
     g_qh[1] = U32PTR(&g_td[0]);                  /* 元素指针 -> TD0 (vertical) */
 
     /* 轮询完成（以 g_pit_ticks 1ms 为基准，超时 fail closed 不挂死） */
@@ -396,9 +423,144 @@ int uhci_interrupt_in(uint16_t io, uint8_t addr, uint8_t ep,
     return 0;
 }
 
+/*
+ * 一笔 bulk 传输（H1c：USB Mass Storage 的 BOT 通道）。
+ *
+ * 方向由 ep 的方向位决定（0x01=OUT，0x81=IN），与 interrupt_in 一致。
+ * 数据阶段按 mps 拆包逐包发：每包一个 TD（toggle 软件交替），TD 纵向链在
+ * 常驻 bulk QH 下，传完撤下。语义要点：
+ *  - NAK 不算错误：BOT 在处理 CBW/数据/CSW 时设备可长时间 NAK，TD 保持
+ *    ACTIVE 由 HC 逐帧重试（QEMU 如此），真机若报"完成+NAK"则软件重激活，
+ *    重试上界 UHCI_BULK_NAK_MAX（约 2s），超时 fail closed。
+ *  - toggle 只在事务真正完成时翻转（NAK 不翻），且 IN/OUT 各自独立。
+ *  - IN 短包（实收 < 请求）= 数据阶段提前结束，后续 TD 不再执行（BOT 的
+ *    dCBWDataTransferLength 精确约定了数据量，少发即错误，按实际收到算）。
+ *  - STALL = 端点挂起，返回 <0，由上层走 BOT Reset + ClearFeature(HALT)
+ *    恢复（恢复后必须调 uhci_bulk_tog_reset 把 toggle 清回 DATA0）。
+ * 返回 0 成功（*actlen=实际字节数），<0 失败。
+ */
+int uhci_bulk_xfer(uint16_t io, uint8_t addr, uint8_t ep,
+                   uint8_t *buf, int blen, int mps,
+                   int lowspeed, int *actlen) {
+    (void)io;   /* 与控制传输相同：走常驻调度，不经直接端口 IO */
+    if (actlen) *actlen = 0;
+    if (addr == 0u || addr > 127u) return -1;
+    if (blen < 0 || blen > (int)sizeof(g_bulkbuf)) return -1;   /* 缓冲上界 */
+    if (blen > 0 && !buf) return -1;
+    if (mps != 8 && mps != 16 && mps != 32 && mps != 64) return -1;
+    if ((ep & 0x7Fu) == 0u || (ep & 0x7Fu) > 15u) return -1;   /* 非端点0 */
+
+    int dir_in = (ep & 0x80u) ? 1 : 0;
+    uint8_t *togp = dir_in ? &g_btog_in[addr] : &g_btog_out[addr];
+    uint32_t tog = *togp ? (1u << 19) : 0u;
+
+    /* 拆包：n = ceil(blen/mps)。TD 池上界校验（mps=8 且 512B 时 n=64>16，
+     * fail closed——MSC 端点 mps 恒为 64，这只在坏配置下才会发生）。 */
+    int n = 0;
+    if (blen > 0) {
+        n = (blen + mps - 1) / mps;
+        if (n > UHCI_BULK_TD_MAX) return -1;
+    }
+    if (blen == 0) return 0;                     /* 零数据阶段：无事可做 */
+
+    /* 数据搬进 DMA 缓冲（IN 清零防陈旧值，OUT 拷入待发数据） */
+    for (int i = 0; i < blen; i++) g_bulkbuf[i] = dir_in ? 0 : buf[i];
+
+    uint32_t ls = lowspeed ? UHCI_TD_LS : 0u;    /* 低速无 bulk，保守保留 */
+    uint32_t pid = dir_in ? UHCI_PID_IN : UHCI_PID_OUT;
+    int remain = blen;
+
+    for (int i = 0; i < n; i++) {
+        int want = (remain > mps) ? mps : remain;
+        remain -= want;
+        for (int k = 0; k < 8; k++) g_btd[i][k] = 0;
+        g_btd[i][3] = U32PTR(&g_bulkbuf[i * mps]);
+        g_btd[i][2] = pid
+                   | ((uint32_t)addr << 8)
+                   | (((uint32_t)(ep & 0x7Fu)) << 15)
+                   | tog
+                   | (((uint32_t)(want - 1)) << 21);      /* maxlen = len-1 */
+        g_btd[i][1] = UHCI_TD_ACTIVE | UHCI_TD_ERR3 | ls
+                   | (dir_in ? UHCI_TD_SPD : 0u);
+        g_btd[i][0] = (i + 1 < n) ? U32PTR(&g_btd[i + 1]) : 0x1u;
+        tog ^= (1u << 19);                                 /* 后续包翻转 */
+    }
+
+    /* 挂上 bulk QH（element -> TD0，Q=0 纵向），逐包串行等待 */
+    g_bqh[1] = U32PTR(&g_btd[0]);
+
+    int total = 0;
+    int fail = 0;
+    for (int i = 0; i < n && !fail; i++) {
+        uint32_t t0 = g_pit_ticks;
+        int naks = 0;
+        int done = 0;
+        while ((uint32_t)(g_pit_ticks - t0) < UHCI_BULK_TO_MS) {
+            uint32_t st = g_btd[i][1];
+            if (st & UHCI_TD_ACTIVE) continue;             /* HC 还在跑 */
+            if (st & UHCI_TD_NAK) {
+                /* 设备忙：规范里 NAK 的 TD 置完成+NAK 位，HC 不再重试——
+                 * 软件重激活同一个 TD（toggle/token 不变，设备期待的
+                 * toggle 序列也没变），上界防设备永久忙。 */
+                if (++naks > UHCI_BULK_NAK_MAX) { fail = 1; break; }
+                g_btd[i][1] = (st & ~(uint32_t)UHCI_TD_NAK & ~0x7FFu)
+                            | UHCI_TD_ACTIVE | UHCI_TD_ERR3 | ls
+                            | (dir_in ? UHCI_TD_SPD : 0u);
+                continue;
+            }
+            if (st & (UHCI_TD_FATAL | UHCI_TD_STALL)) { fail = 1; break; }
+            done = 1;
+            break;
+        }
+        if (!done) { fail = 1; break; }
+
+        uint32_t st = g_btd[i][1];
+        uint32_t al = st & 0x7FFu;
+        int got = (al == 0x7FFu) ? 0 : (int)al + 1;
+        total += got;
+        *togp ^= 1u;                                       /* 事务完成，翻 toggle */
+
+        int want = (blen - total + got > mps) ? mps : (blen - total + got);
+        if (dir_in && got < want) break;                   /* IN 短包：阶段结束 */
+    }
+
+    /* 撤下：防 HC 反复重跑已完成的 TD 链 */
+    g_bqh[1] = 0x1u;
+
+    if (fail) {
+        char line[128]; int li = 0; int lim = (int)sizeof(line) - 1;
+        u_app_str(line, &li, lim, "UHCI-BULK: xfer fail addr=");
+        u_app_dec(line, &li, lim, (uint32_t)addr);
+        u_app_str(line, &li, lim, " ep=0x");
+        u_app_hex(line, &li, lim, (uint32_t)ep, 2);
+        u_app_str(line, &li, lim, " want=");
+        u_app_dec(line, &li, lim, (uint32_t)blen);
+        u_app_str(line, &li, lim, " got=");
+        u_app_dec(line, &li, lim, (uint32_t)total);
+        if (li < lim) line[li] = 0; else line[lim] = 0;
+        dmesg_write(line);
+        return -1;
+    }
+
+    if (dir_in && total > 0) {
+        int cpy = total;
+        if (cpy > blen) cpy = blen;
+        for (int i = 0; i < cpy; i++) buf[i] = (uint8_t)g_bulkbuf[i];
+    }
+    if (actlen) *actlen = total;
+    return 0;
+}
+
+/* BOT reset / ClearFeature(HALT) 之后调用：bulk 两个方向的 toggle 清回
+ * DATA0（USB 规范要求端点复位时 toggle 重置）。 */
+void uhci_bulk_tog_reset(uint8_t addr) {
+    if (addr > 127u) return;
+    g_btog_in[addr]  = 0;
+    g_btog_out[addr] = 0;
+}
+
 /* 确保 HC 处于运行态（见 uhci.h 注释）：GRESET/端口复位之后、发起传输之前
- * 必须调一次，否则 CF/RS 被清掉时 HC 只发 SOF 不执行 TD。 */
-int uhci_hc_start(uint16_t io) {
+ * 必须调一次，否则 CF/RS 被清掉时 HC 只发 SOF 不执行 TD。 */int uhci_hc_start(uint16_t io) {
     u_outl(io, 0x08, UHCI_FRAME_PHYS);   /* 重锁存帧列表物理地址 */
     uint16_t cmd = u_inw(io, 0x00);
     u_outw(io, 0x00, (uint16_t)(cmd | 0x0001u | 0x0100u));  /* RS=1, CF=1 */
@@ -738,8 +900,10 @@ static int uhci_setup_one(const pci_device_t *d) {
      * dword。帧列表建好之后**永不改写**，也不必每次传输重刷 4KB。 */
     g_iqh[0] = U32PTR(&g_qh[0]) | 0x2u;          /* 水平链 -> 控制 QH (Q=1) */
     g_iqh[1] = 0x1u;                             /* element = T（暂无中断 TD） */
-    g_qh[0]  = 0x1u;                             /* 控制 QH 水平链终止 */
+    g_qh[0]  = U32PTR(&g_bqh[0]) | 0x2u;         /* 控制 QH 水平链 -> bulk QH */
     g_qh[1]  = 0x1u;                             /* element = T（暂无控制 TD） */
+    g_bqh[0] = 0x1u;                             /* bulk QH 水平链终止 */
+    g_bqh[1] = 0x1u;                             /* element = T（暂无 bulk TD） */
     for (int k = 0; k < 1024; k++)
         g_frame[k] = U32PTR(&g_iqh[0]) | 0x2u;   /* frame -> 中断 QH (Q=1) */
     u_outl(io, 0x08, UHCI_FRAME_PHYS);          /* FLBASEADD = 帧列表物理地址 */

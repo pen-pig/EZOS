@@ -178,18 +178,35 @@ static void parse_config(const uint8_t *c, int n, usb_dev_t *d) {
                 d->hid_sub   = sub;
                 d->hid_proto = proto;
             }
+            /* H1c：Mass Storage 接口（class 0x08）同样只记第一个 */
+            if (cls == 0x08u && d->msc_if < 0) {
+                d->msc_if    = cur_if;
+                d->msc_sub   = sub;
+                d->msc_proto = proto;
+            }
             e_log_if(cur_if, cls, sub, proto, is_hid);
-        } else if (type == 0x05 && len >= 7 && cur_if >= 0 && cur_if == d->hid_if) {
+        } else if (type == 0x05 && len >= 7 && cur_if >= 0) {
             uint8_t  ep   = c[off + 2];
             uint8_t  attr = c[off + 3];
             uint16_t mps  = (uint16_t)(c[off + 4] | (c[off + 5] << 8));
             uint8_t  iv   = c[off + 6];
             e_log_ep(cur_if, ep, attr, mps, iv);
             /* 中断 IN（bit7=1 且 attr&3==3）才给 HID 用；只取第一个 */
-            if (d->hid_ep == 0u && (ep & 0x80u) != 0u && (attr & 0x03u) == 0x03u) {
+            if (d->hid_ep == 0u && cur_if == d->hid_if &&
+                (ep & 0x80u) != 0u && (attr & 0x03u) == 0x03u) {
                 d->hid_ep          = ep;
                 d->hid_ep_mps      = mps;
                 d->hid_ep_interval = iv;
+            }
+            /* bulk 端点（attr&3==2）给 MSC 用：IN/OUT 各记第一个 */
+            if (cur_if == d->msc_if && (attr & 0x03u) == 0x02u) {
+                if ((ep & 0x80u) != 0u && d->msc_ep_in == 0u) {
+                    d->msc_ep_in     = ep;
+                    d->msc_ep_in_mps = mps;
+                } else if ((ep & 0x80u) == 0u && d->msc_ep_out == 0u) {
+                    d->msc_ep_out     = ep;
+                    d->msc_ep_out_mps = mps;
+                }
             }
         } else if (type == 0x21 && len >= 9 && cur_if >= 0 && cur_if == d->hid_if) {
             /* HID 类描述符（0x21）是配置描述符的一部分，紧跟在接口描述符后。
@@ -216,6 +233,7 @@ static int enum_one(uint16_t io, int port, int ls, uint8_t addr, usb_dev_t *out)
     out->addr     = addr;
     out->lowspeed = (uint8_t)(ls ? 1 : 0);
     out->hid_if   = -1;
+    out->msc_if   = -1;
 
     /* 0) 端口复位：设备回到默认态（地址 0）。未连设备直接 fail closed 返回。 */
     if (!uhci_port_reset(io, port)) {
@@ -371,6 +389,9 @@ void usbenum_init(void) {
         d->nif = 0; d->hid_if = -1; d->hid_sub = 0; d->hid_proto = 0;
         d->hid_ep = 0; d->hid_ep_mps = 0; d->hid_ep_interval = 0;
         d->hid_rep_len = 0; d->configured = 0;
+        d->msc_if = -1; d->msc_sub = 0; d->msc_proto = 0;
+        d->msc_ep_in = 0; d->msc_ep_in_mps = 0;
+        d->msc_ep_out = 0; d->msc_ep_out_mps = 0;
     }
 
     if (nports <= 0) {

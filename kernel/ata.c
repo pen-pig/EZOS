@@ -11,6 +11,7 @@
  */
 #include "ata.h"
 #include "ahci.h"
+#include "usbmsc.h"
 #include "port.h"
 #include "tty.h"
 
@@ -90,6 +91,9 @@ static int ata_wait_drq(uint16_t base) {
  *   - ERR 置位（如 ATAPI 的 ABRT）→ 设备存在但不支持 IDENTIFY。
  */
 int ata_drive_present(uint8_t drive) {
+    if (drive >= USBMSC_DRIVE_BASE) {
+        return usbmsc_present((uint8_t)(drive - USBMSC_DRIVE_BASE)) ? 1 : 0;
+    }
     if (drive >= AHCI_DRIVE_BASE) {
         uint8_t p = (uint8_t)(drive - AHCI_DRIVE_BASE);
         if (p >= AHCI_MAX_PORTS) return 0;
@@ -129,6 +133,10 @@ int ata_drive_present(uint8_t drive) {
 }
 
 int ata_read_sector(uint8_t drive, uint32_t lba, uint8_t *buffer) {
+    if (drive >= USBMSC_DRIVE_BASE) {
+        return usbmsc_read_sector((uint8_t)(drive - USBMSC_DRIVE_BASE),
+                                  lba, buffer);
+    }
     if (drive >= AHCI_DRIVE_BASE) {
         uint8_t p = (uint8_t)(drive - AHCI_DRIVE_BASE);
         if (p >= AHCI_MAX_PORTS) return -1;
@@ -157,6 +165,10 @@ int ata_read_sector(uint8_t drive, uint32_t lba, uint8_t *buffer) {
 }
 
 int ata_write_sector(uint8_t drive, uint32_t lba, const uint8_t *buffer) {
+    if (drive >= USBMSC_DRIVE_BASE) {
+        return usbmsc_write_sector((uint8_t)(drive - USBMSC_DRIVE_BASE),
+                                   lba, buffer);
+    }
     if (drive >= AHCI_DRIVE_BASE) {
         uint8_t p = (uint8_t)(drive - AHCI_DRIVE_BASE);
         if (p >= AHCI_MAX_PORTS) return -1;

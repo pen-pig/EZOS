@@ -21,11 +21,13 @@
 ```
 os-image.bin = boot/boot.bin (512 字节，引导扇区)
              + kernel.bin     (507904 字节，已 pad 到 KERNEL_SECTORS=992 扇区)
+             + pad            (零填充，写 U 盘时凑整到 1024 扇区 = 512KB)
 ```
 
-- 总大小 508416 字节 = 993 扇区（512 × 993）。其中第 0 扇区是引导代码，
-  第 1~992 扇区是内核。
+- 核心内容 508416 字节 = 993 扇区（512 × 993）。其中第 0 扇区是引导代码，
+  第 1~992 扇区是内核；第 993~1023 扇区是**纯零填充**（见下方"关键坑"）。
 - 引导扇区以 `0x55 0xAA` 结尾（BIOS 据此判定"这是可引导设备"）。
+- `tools/make_usb_boot.py` 写盘时自动补零到 1024 扇区，无需手工处理。
 
 引导流程（`boot/boot.asm`）：
 
@@ -69,6 +71,30 @@ BIOS 把 U 盘当成 **USB-HDD** 或 **USB-ZIP** 来枚举，取决于主板和 
   **Removable / FDD 模式**；反过来，有些机器选了 USB-ZIP 反而起不来。
   **如果 USB-HDD 起不来，第一件事就是换一个启动项（ZIP/FDD/HDD）试试**，
   而不是怀疑镜像。
+
+### 关键坑：镜像扇区数必须是偶数（现在默认 pad 到 1024 扇区）
+
+实测（QEMU SeaBIOS 1.16.3）：993 扇区（奇数）的镜像会被 BIOS 认出
+（`USB MSC ... sectors=993`）、排进启动顺序，但 `Booting from Hard Disk`
+后**读盘失败**（"could not read the boot disk"）；pad 到 **1024 扇区
+（512KB 整）** 立即成功。真机 BIOS 的 USB 启动实现各有各的怪癖，
+对齐到整 KB 是零成本的保险。
+
+`tools/make_usb_boot.py` 现在**写盘前自动 pad 到 1024 扇区**（只多写
+15KB 零，kernel.bin/UEFI 契约不受影响）；`tests/test_usbmsc.py` 用动态
+pad 的镜像做 E2E。
+
+### 引导之后：内核自己就是 U 盘的主人（H1c 已完成）
+
+BIOS 的 INT 13h 仿真只活在实模式——内核一进保护模式那条通路就没了。
+EZOS 内核现在自带 **USB Mass Storage 驱动（BOT + SCSI 子集）**：
+- 启动时自动认领 U 盘：`USB-MSC: unit0 ... sectors=... blksize=512 ready`
+- U 盘注册成块设备 **drive 12 起**（IDE 0-3、AHCI 4-11 之后），
+  shell 里 `setdrive 12` 即可挂 U 盘上的文件系统、`ls`/`cat`/`write` 全通。
+- 也就是说：**从这块 U 盘启动，读写还是这块 U 盘**，引导盘即数据盘。
+
+USB HID 键盘同样已支持（H2-2d），真机上 U 口键盘可以直接用；老机器
+进不了内核前仍靠 BIOS 的 USB Legacy 模拟（见排查表第 10 行）。
 
 ---
 

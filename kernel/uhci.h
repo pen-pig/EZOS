@@ -63,6 +63,22 @@ int uhci_interrupt_in(uint16_t io, uint8_t addr, uint8_t ep,
                       uint8_t *buf, int blen, int lowspeed, int *actlen);
 
 /*
+ * 一笔 bulk 传输（H1c：USB Mass Storage 的 BOT 通道）。
+ * 方向由 ep 方向位决定（0x01=OUT / 0x81=IN）；数据按 mps 拆包、toggle 软件
+ * 交替（只在事务完成时翻转）。NAK 不算错误（设备处理 BOT 时可长时间忙），
+ * 上界内软件重激活；STALL 返回 <0，上层须走 BOT Reset + ClearFeature(HALT)
+ * 并调 uhci_bulk_tog_reset。blen 上界 512（数据缓冲），mps 只认 8/16/32/64。
+ * 返回 0 成功（*actlen=实际字节数），<0 失败。
+ */
+int uhci_bulk_xfer(uint16_t io, uint8_t addr, uint8_t ep,
+                   uint8_t *buf, int blen, int mps,
+                   int lowspeed, int *actlen);
+
+/* bulk 端点 toggle 清零（回到 DATA0）。BOT reset / ClearFeature(HALT) 之后
+ * 必须调用，否则后续传输会因 toggle 失配被设备丢弃。 */
+void uhci_bulk_tog_reset(uint8_t addr);
+
+/*
  * 确保控制器处于运行态：重新锁存帧列表物理地址并置 RS=1/CF=1。
  * GRESET 会清掉 CF/RS，任何在复位之后发起的传输都必须先调这个，
  * 否则 HC 只发 SOF、不执行 TD（表现为"调度在跑但传输永不完成"）。

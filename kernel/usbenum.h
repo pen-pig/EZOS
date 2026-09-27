@@ -56,6 +56,16 @@ typedef struct {
     uint8_t  hid_ep_interval;   /* 轮询间隔（ms） */
     uint16_t hid_rep_len;       /* HID 报告描述符长度（字节） */
     uint8_t  configured;        /* SET_CONFIGURATION 已成功 */
+
+    /* Mass Storage（bInterfaceClass == 0x08，BOT 需 proto==0x50）
+     * H1c：U 盘认领用的接口/端点记录。只记第一个 MSC 接口的第一对 bulk
+     * 端点（BOT 协议本身只允许一对）。 */
+    int      msc_if;            /* MSC 接口号；-1 = 没有 MSC 接口 */
+    uint8_t  msc_sub, msc_proto;/* subclass(0x06=SCSI 透明) / protocol(0x50=BOT) */
+    uint8_t  msc_ep_in;         /* bulk IN 端点地址（bit7=1）；0 = 没找到 */
+    uint16_t msc_ep_in_mps;
+    uint8_t  msc_ep_out;        /* bulk OUT 端点地址（bit7=0）；0 = 没找到 */
+    uint16_t msc_ep_out_mps;
 } usb_dev_t;
 
 /* 入口：在 kernel_main 的 uhci_init() 之后调用一次。

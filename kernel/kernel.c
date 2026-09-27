@@ -30,6 +30,7 @@
 #include "uhci.h"
 #include "usbenum.h"
 #include "usbkbd.h"
+#include "usbmsc.h"
 
 // �򵥳��Ⱥ��������Զ���ʽ��ʾ��ʹ��
 static size_t my_strlen(const char *s) {
@@ -432,6 +433,12 @@ void kernel_main(void) {
      * switch it to the boot protocol. Input arrives by polling the interrupt
      * IN endpoint (hooked into keyboard_getchar, see usbkbd.c). */
     usbkbd_init();
+
+    /* H1c: claim USB mass storage devices (BOT + SCSI subset) among the
+     * enumerated ones and register them as block drives 12..15 so setdrive
+     * and the FS layer can use the boot USB stick after legacy BIOS
+     * INT 13h emulation is gone (protected mode). */
+    usbmsc_init();
 
     /* RTL8139 NIC (step 7.2): claim + reset + MAC + 8K RX ring + 4 TX
      * descriptors + IRQ + ARP/ICMP echo reply. Returns -1 when QEMU has

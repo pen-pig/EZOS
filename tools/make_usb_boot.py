@@ -158,12 +158,23 @@ def _list_darwin():
 # --------------------------------------------------------------------------
 # 镜像校验
 # --------------------------------------------------------------------------
+# 写入目标：pad 到 1024 扇区（512KB 整）。
+# 实测（QEMU SeaBIOS 1.16.3）：993 扇区（奇数）的镜像 U 盘引导失败
+# （BIOS 认出设备但读盘报错），pad 到 1024 立即成功；真机 BIOS 实现各有
+# 怪癖，对齐整 KB 是零成本保险。多写的 15KB 全是零，不影响引导。
+# kernel.bin / UEFI 契约（kernel.bin 固定 507904 字节）不受影响。
+PAD_SECTORS = 1024
+
+
 def validate_image(image_path):
     if not os.path.isfile(image_path):
         return None, "镜像文件不存在: %s" % image_path
     size = os.path.getsize(image_path)
     if size % 512 != 0:
         return None, "镜像大小 %d 不是 512 的倍数（引导扇区必须 512 对齐）" % size
+    if size > PAD_SECTORS * 512:
+        return None, ("镜像 %d 字节超过 %d 扇区预算（%d 字节）——内核超预算了，"
+                      "先回链接脚本查" % (size, PAD_SECTORS, PAD_SECTORS * 512))
     with open(image_path, "rb") as f:
         first = f.read(512)
     if len(first) < 512 or first[510] != 0x55 or first[511] != 0xAA:
@@ -172,7 +183,7 @@ def validate_image(image_path):
 
 
 # --------------------------------------------------------------------------
-# 写入（1 MiB 块，原样）
+# 写入（1 MiB 块；末尾自动补零到 PAD_SECTORS 扇区）
 # --------------------------------------------------------------------------
 def write_image(image_path, device_path, verify):
     flags = os.O_WRONLY
@@ -190,6 +201,8 @@ def write_image(image_path, device_path, verify):
         raise SystemExit("无法打开设备 %s：%s\n提示：确认盘号/设备名正确、且不是系统盘。" % (device_path, e))
 
     written = 0
+    img_size = os.path.getsize(image_path)
+    pad_total = PAD_SECTORS * 512
     try:
         with open(image_path, "rb") as fsrc:
             while True:
@@ -198,6 +211,15 @@ def write_image(image_path, device_path, verify):
                     break
                 os.write(fd, buf)
                 written += len(buf)
+        # 补零到 1024 扇区（见 PAD_SECTORS 注释）
+        if written < pad_total:
+            zero = b"\x00" * min(CHUNK, pad_total - written)
+            while written < pad_total:
+                n = min(len(zero), pad_total - written)
+                os.write(fd, zero[:n])
+                written += n
+            print("已补零到 %d 扇区（+%d 字节，奇数扇区数会让部分 BIOS 的 U 盘引导失败）"
+                  % (PAD_SECTORS, pad_total - img_size))
         # 落盘
         try:
             os.fsync(fd)
@@ -208,9 +230,11 @@ def write_image(image_path, device_path, verify):
 
     if verify:
         written_back = _verify_readback(image_path, device_path)
-        if written_back != written:
-            raise SystemExit("回读校验失败：写入 %d 字节，回读 %d 字节。" % (written, written_back))
-        print("校验通过：回读 %d 字节与镜像一致。" % written_back)
+        # 回读只比对镜像本体（img_size）；pad 出去的零不在比对范围
+        if written_back != img_size:
+            raise SystemExit("回读校验失败：写入 %d 字节，回读 %d 字节。" % (img_size, written_back))
+        print("校验通过：回读 %d 字节与镜像一致（另有 %d 字节零填充）。"
+              % (written_back, written - img_size))
     return written
 
 

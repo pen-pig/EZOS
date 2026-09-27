@@ -29,6 +29,7 @@
 | `test_lock.py` | P1 修复回归网：断言开机自检 6 项 LOCKTEST 全 PASS——irqflags 原语语义（save/restore，含"关中断时不得误开"）、模拟 IRQ 上下文调 kmalloc/pmm、压力记账不变量。`nested keep` 项专抓"把 irq_restore 改成无条件 sti"的回归（变异测试已证明抓得到） | QMP 4495 + serial 4494 | ~1 min |
 | `test_usbenum.py` | 真机点亮 H2-2c：完整 USB 枚举——端口复位→设备描述符(8/18)→SET_ADDRESS→按新地址重读→配置描述符两级读→接口/端点解析（HID cls=03 + 中断 IN 端点）→SET_CONFIGURATION→HID 报告描述符长度。A(usb-kbd)/C(usb-tablet) 必须枚举成功且两者 vid/pid 不同，B(不挂设备) 必须 `no connected port, skip` + `0 device(s) enumerated` 且不出现任何成功证据 | QMP 4497 + serial 4498 | ~3 min |
 | `test_usbkbd.py` | 真机点亮 H2-2d：USB HID 键盘——认领 boot 键盘（`boot kbd ... proto=ok idle=ok`）+ 中断 IN 轮询读到报告（`report ok len=8`）+ 报告解析并注入（`key=97` = 'a'）。A 组挂 `usb-kbd` 并经 HMP `sendkey a` 触发；B 组不挂设备，绝不能出现 `report ok` / `key=`（fail closed）。注意 QEMU 的 sendkey 会同时喂 PS/2，所以只把串口的 USB-KBD 行当证据 | QMP 4499 + serial 4500 | ~6 min |
+| `test_usbmsc.py` | 真机点亮 H1c：USB Mass Storage（BOT+SCSI）——A 组挂**两个** usb-storage（引导盘+数据盘，bootindex=0 从 U 盘启动），断言 2 个 `unit ready`（READ CAPACITY 拿到扇区数）+ `2 drive(s) registered as drive 12..13` + `setdrive 13`/`ls`/`cat README.TXT`（BOT 读）+ `write USBTEST.TXT`/cat 回读（BOT 写）；B 组只挂 IDE 引导盘不带 U 盘，必须 `no mass storage device` 且绝不出现成功证据。镜像需 pad 到 1024 扇区（SeaBIOS U 盘引导实测拒绝 993 奇数扇区，见 docs/USB_BOOT.md） | QMP 4503 + serial 4504 | ~4 min |
 | `test_uefi3.py` | U3 双路径：OVMF 32 位启动（EZEFI gop/magic/EBS/mmap handoff 标记链）→ 内核接收 GOP 1280x800 → selftest 全 PASS（OCR）→ 32bpp GUI 像素断言（任务栏深灰/壁纸蓝渐变）→ 开始菜单『返回终端』回切 720x400 文本 shell → 回切后 ver 可用；全程无 kernel panic | QMP 4464 + serial file | ~3 min |
 
 `ezocr.py` 是前三个脚本共用的 VGA 文本截图 OCR（真字库像素匹配），不要单独删。
