@@ -143,11 +143,16 @@ static void u_delay_ms(uint32_t ms) {
 #define U32PTR(p)       ((uint32_t)(unsigned long)(p))
 
 /* 控制传输结构（.bss，16 字节对齐）。单 QH + 3 个 TD（SETUP/DATA/STATUS），
- * 同一时刻只跑一笔控制传输，故这些缓冲进程级复用、无需逐次分配。 */
+ * 同一时刻只跑一笔控制传输，故这些缓冲进程级复用、无需逐次分配。
+ * H2-2c：数据缓冲 64 -> 256 字节——配置描述符（HID 键盘 34B、复合设备更大）
+ * 一次取全需要 >64 的窗口；UHCI 的 TD maxlen 是 11 位字段（0x7FF 表示 0），
+ * 255 完全在编码范围内，且 HC 会把多个最大包自动拼进同一个 TD 缓冲，
+ * 低速设备（8 字节/包）也无需软件分包。 */
 static volatile uint32_t g_qh[8]       __attribute__((aligned(16))); /* 32B QH */
 static volatile uint32_t g_td[3][8]    __attribute__((aligned(16))); /* 3×32B TD */
 static volatile uint8_t  g_setup[8]    __attribute__((aligned(16)));
-static volatile uint8_t  g_rbuf[64]    __attribute__((aligned(16)));
+static volatile uint8_t  g_rbuf[256]   __attribute__((aligned(16)));
+#define UHCI_XFER_MAX    256            /* 数据阶段缓冲上界 */
 
 /* 帧列表：1024 项，4KB 对齐（UHCI 要求）。放在 .bss（与 AHCI 的 DMA 缓冲同区，
  * 已验证对设备 DMA 一致），不依赖 pmm 池——pmm 页在本 QEMU 下经 FLBASEADD
@@ -160,16 +165,39 @@ static uint16_t g_ctrl_io    = 0;     /* 控制器 I/O 基址（0=未初始化�
 static int      g_ctrl_port  = -1;    /* 首个已连接端口（-1=无） */
 static int      g_ctrl_ls    = 0;     /* 该端口是否低速设备 */
 
+/* H2-2c：已连接端口表（静态，无动态分配）。uhci_setup_one 期间填充，
+ * 供上层枚举模块 usbenum 逐个消费。g_plist_n 为有效条数。 */
+typedef struct {
+    uint16_t io;        /* 控制器 I/O 基址 */
+    int      port;      /* 根口编号（0/1） */
+    int      ls;        /* 低速设备（LSDA） */
+} uhci_port_t;
+static uhci_port_t g_plist[UHCI_MAX_PORTS];
+static int         g_plist_n = 0;
+
+int uhci_port_count(void) {
+    return g_plist_n;
+}
+
+int uhci_port_get(int i, uint16_t *io_out, int *port_out, int *ls_out) {
+    if (i < 0 || i >= g_plist_n) return -1;
+    if (io_out)   *io_out   = g_plist[i].io;
+    if (port_out) *port_out = g_plist[i].port;
+    if (ls_out)   *ls_out   = g_plist[i].ls;
+    return 0;
+}
+
 /* 通用控制传输：SETUP + DATA + STATUS 三阶段，链表挂到单一 QH 上跑。
  * 返回 0 成功，<0 失败（超时/硬件错误）；绝不静默挂死（超时上界 fail closed）。
- * 不可信字段上界：addr<=127、ep<=15、blen∈[0,64]，越界直接放弃。 */
-static int uhci_control_xfer(uint16_t io, uint8_t addr, uint8_t ep,
-                             const uint8_t *setup, int dir_in,
-                             volatile uint8_t *buf, int blen, int lowspeed, int *actlen) {
+ * 不可信字段上界：addr<=127、ep<=15、blen∈[0,UHCI_XFER_MAX]，越界直接放弃。
+ * H2-2b 起对外导出（uhci.h）：上层枚举模块（usbenum）靠它走 USB 标准请求。 */
+int uhci_control_xfer(uint16_t io, uint8_t addr, uint8_t ep,
+                      const uint8_t *setup, int dir_in,
+                      uint8_t *buf, int blen, int lowspeed, int *actlen) {
     (void)io;   /* 控制传输由 HC 走调度（帧列表->QH->TD），不经直接端口 IO */
     if (actlen) *actlen = 0;
     if (addr > 127 || ep > 15) return -1;          /* 不可信上界 */
-    if (blen < 0 || blen > 64) return -1;          /* 缓冲上界（防写越界） */
+    if (blen < 0 || blen > UHCI_XFER_MAX) return -1; /* 缓冲上界（防写越界） */
     if (blen > 0 && !buf) return -1;
 
     /* SETUP 包拷到对齐缓冲；数据缓冲：IN 先清零避免读到陈旧值，OUT 拷入用户数据 */
@@ -291,6 +319,17 @@ static int uhci_control_xfer(uint16_t io, uint8_t addr, uint8_t ep,
     return 0;
 }
 
+/* 确保 HC 处于运行态（见 uhci.h 注释）：GRESET/端口复位之后、发起传输之前
+ * 必须调一次，否则 CF/RS 被清掉时 HC 只发 SOF 不执行 TD。 */
+int uhci_hc_start(uint16_t io) {
+    u_outl(io, 0x08, UHCI_FRAME_PHYS);   /* 重锁存帧列表物理地址 */
+    uint16_t cmd = u_inw(io, 0x00);
+    u_outw(io, 0x00, (uint16_t)(cmd | 0x0001u | 0x0100u));  /* RS=1, CF=1 */
+    u_delay_ms(2);
+    uint16_t sts = u_inw(io, 0x02);
+    return (sts & 0x0020u) ? -1 : 0;     /* bit5 HCH=1 仍 halted */
+}
+
 /* 端口级复位：置 PR(bit9)=1 保持 >=10ms 再清 0，使设备进入默认态（地址 0）。
  * QEMU UHCI 端口位（与官方 uhci-regs.h 一致）：
  *   bit0 CCS 连接(只读)  bit1 CSC 连接变化(写1清)  bit2 EN 端口使能(可写)
@@ -302,8 +341,9 @@ static int uhci_control_xfer(uint16_t io, uint8_t addr, uint8_t ep,
  * HC 永不向该口发事务，表现为 TD 永不执行、Active 不清除、无错误位（"死寂"）。
  * 故清 PR 那一步必须同时清 SUSPEND(bit12) 并置 EN(bit2)=1。端口无设备时(QEMU
  * 在写时按 CCS 判定) EN 会被忽略，属正常——fail closed 跳过。
- * 返回复位后是否仍连接（CCS bit0）；不连设备时返回 0。 */
-static int uhci_port_reset(uint16_t io, int p) {
+ * 返回复位后是否仍连接（CCS bit0）；不连设备时返回 0。
+ * H2-2b 起对外导出（uhci.h）：枚举前必须先复位，让设备回到默认态/地址 0。 */
+int uhci_port_reset(uint16_t io, int p) {
     uint16_t poff = (uint16_t)(0x10 + p * 2);
     uint16_t pv = u_inw(io, poff);
     /* 置 PR(bit9)=1 触发设备复位（QEMU 在 PR 上升沿调用 usb_device_reset）。
@@ -413,7 +453,8 @@ static void uhci_control_probe(void) {
     /* 2) SET_ADDRESS(1) @addr0（数据阶段 OUT 无数据；状态阶段 IN） */
     uint8_t sa[8] = {0x00,0x05,0x01,0x00,0x00,0x00,0x00,0x00};
     int a = 0;
-    int rs = uhci_control_xfer(io, 0, 0, sa, 0, g_rbuf, 0, ls, &a);
+    /* blen=0（无数据阶段），缓冲传 NULL 即可（xfer 只在 blen>0 时要求非 NULL） */
+    int rs = uhci_control_xfer(io, 0, 0, sa, 0, NULL, 0, ls, &a);
     {
         char line[128]; int li = 0; int lim = (int)sizeof(line) - 1;
         u_app_str(line, &li, lim, "UHCI-CTRL: SET_ADDRESS(1) ");
@@ -662,6 +703,14 @@ static int uhci_setup_one(const pci_device_t *d) {
         uint32_t ls   = (pv & 0x0100u) ? 1u : 0u;   /* bit8 LSDA */
         uint32_t rst  = (pv & 0x0200u) ? 1u : 0u;   /* bit9 PR */
         if (conn && first_conn < 0) { first_conn = p; first_ls = (int)ls; }
+        /* H2-2c：登记进端口表供枚举模块消费（表满则丢弃多余条目，
+         * 不扩表、不动态分配——UHCI 根口本来只有 2 个）。 */
+        if (conn && g_plist_n < UHCI_MAX_PORTS) {
+            g_plist[g_plist_n].io   = io;
+            g_plist[g_plist_n].port = p;
+            g_plist[g_plist_n].ls   = (int)ls;
+            g_plist_n++;
+        }
         char line[128];
         int li = 0; int lim = (int)sizeof(line) - 1;
         u_app_str(line, &li, lim, "UHCI: port");

@@ -28,6 +28,7 @@
 #include "ahci.h"
 #include "usb.h"
 #include "uhci.h"
+#include "usbenum.h"
 
 // �򵥳��Ⱥ��������Զ���ʽ��ʾ��ʹ��
 static size_t my_strlen(const char *s) {
@@ -419,6 +420,12 @@ void kernel_main(void) {
      * 必要时自编程 I/O BAR、全局复位、建帧列表、启动调度、轮询端口并 klog。
      * 不做设备枚举/传输/中断注册。必须在 fs_init 之前，与 ahci_init 同层。 */
     uhci_init();
+
+    /* H2-2c: enumerate devices on connected ports (port reset -> device
+     * descriptor -> SET_ADDRESS -> configuration descriptor -> interface/
+     * endpoint parsing -> SET_CONFIGURATION). Evidence goes to dmesg/COM1;
+     * no device attached means a clean skip with zero success lines. */
+    usbenum_init();
 
     /* RTL8139 NIC (step 7.2): claim + reset + MAC + 8K RX ring + 4 TX
      * descriptors + IRQ + ARP/ICMP echo reply. Returns -1 when QEMU has
