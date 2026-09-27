@@ -2,8 +2,9 @@
  * usbenum.c - USB 设备枚举与描述符解析（真机点亮 H2-2c）
  *
  * 流程与边界见 usbenum.h。这里只补充实现层面的要点：
- *  - 本模块不碰 UHCI 寄存器，全部经 uhci_control_xfer() / uhci_port_reset() /
- *    uhci_hc_start() 三个原语完成，保持"传输层 / 枚举层"分层。
+ *  - 本模块不碰任何主机控制器寄存器，全部经 usbhc_control_xfer() /
+ *    usbhc_port_reset() / usbhc_hc_start() 三个原语完成（usbhc 层按设备
+ *    所属控制器分派到 UHCI 或 EHCI），保持"传输层 / 枚举层"分层。
  *  - 每步失败都打印一条带端口号的失败行并放弃该端口（fail closed），
  *    绝不在没拿到真实描述符的情况下报成功——E2E 靠"插/不插设备结果相反"
  *    来证明这一点。
@@ -12,7 +13,7 @@
  *  - 没有 sprintf，行缓冲 128 字节、所有写入以上界为准，末尾保 '\0'。
  */
 #include "usbenum.h"
-#include "uhci.h"
+#include "usbhc.h"
 #include "isr.h"
 #include "dmesg.h"
 
@@ -223,12 +224,14 @@ static void parse_config(const uint8_t *c, int n, usb_dev_t *d) {
 }
 
 /* 单个端口的完整枚举。成功返回 0 并填 *out。 */
-static int enum_one(uint16_t io, int port, int ls, uint8_t addr, usb_dev_t *out) {
+static int enum_one(const usbhc_t *bus, uint8_t addr, usb_dev_t *out) {
+    int port = (int)bus->port;
+    int ls   = (int)bus->ls;
     uint8_t buf[256];
     int act = 0;
 
     for (int i = 0; i < (int)sizeof(buf); i++) buf[i] = 0;
-    out->io       = io;
+    out->bus      = *bus;
     out->port     = (uint8_t)port;
     out->addr     = addr;
     out->lowspeed = (uint8_t)(ls ? 1 : 0);
@@ -236,12 +239,12 @@ static int enum_one(uint16_t io, int port, int ls, uint8_t addr, usb_dev_t *out)
     out->msc_if   = -1;
 
     /* 0) 端口复位：设备回到默认态（地址 0）。未连设备直接 fail closed 返回。 */
-    if (!uhci_port_reset(io, port)) {
+    if (!usbhc_port_reset(bus)) {
         e_fail(port, "port reset", 0);
         return -1;
     }
     /* GRESET/端口复位后 HC 的 CF/RS 可能已被清掉，传输前必须重新起调度 */
-    if (uhci_hc_start(io) != 0) {
+    if (usbhc_hc_start(bus) != 0) {
         e_fail(port, "hc start", 0);
         return -1;
     }
@@ -250,7 +253,7 @@ static int enum_one(uint16_t io, int port, int ls, uint8_t addr, usb_dev_t *out)
     {
         uint8_t r8[8] = {0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x08, 0x00};
         act = 0;
-        if (uhci_control_xfer(io, 0, 0, r8, 1, buf, 8, ls, &act) != 0 || act < 8) {
+        if (usbhc_control_xfer(bus, 0, 0, r8, 1, buf, 8, &act) != 0 || act < 8) {
             e_fail(port, "GET_DESCRIPTOR(dev,8)", act);
             return -1;
         }
@@ -263,7 +266,7 @@ static int enum_one(uint16_t io, int port, int ls, uint8_t addr, usb_dev_t *out)
     {
         uint8_t r18[8] = {0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 18, 0x00};
         act = 0;
-        if (uhci_control_xfer(io, 0, 0, r18, 1, buf, 18, ls, &act) != 0 || act < 18) {
+        if (usbhc_control_xfer(bus, 0, 0, r18, 1, buf, 18, &act) != 0 || act < 18) {
             e_fail(port, "GET_DESCRIPTOR(dev,18)", act);
             return -1;
         }
@@ -279,7 +282,7 @@ static int enum_one(uint16_t io, int port, int ls, uint8_t addr, usb_dev_t *out)
     /* 3) SET_ADDRESS：之后按规范等 >=2ms 设备才真正切到新地址 */
     {
         uint8_t sa[8] = {0x00, 0x05, addr, 0x00, 0x00, 0x00, 0x00, 0x00};
-        if (uhci_control_xfer(io, 0, 0, sa, 0, NULL, 0, ls, NULL) != 0) {
+        if (usbhc_control_xfer(bus, 0, 0, sa, 0, NULL, 0, NULL) != 0) {
             e_fail(port, "SET_ADDRESS", 0);
             return -1;
         }
@@ -292,7 +295,7 @@ static int enum_one(uint16_t io, int port, int ls, uint8_t addr, usb_dev_t *out)
         uint8_t chk[32];
         act = 0;
         for (int i = 0; i < (int)sizeof(chk); i++) chk[i] = 0;
-        if (uhci_control_xfer(io, addr, 0, r18, 1, chk, 18, ls, &act) != 0 || act < 18) {
+        if (usbhc_control_xfer(bus, addr, 0, r18, 1, chk, 18, &act) != 0 || act < 18) {
             e_fail(port, "GET_DESCRIPTOR(dev)@addr", act);
             return -1;
         }
@@ -311,7 +314,7 @@ static int enum_one(uint16_t io, int port, int ls, uint8_t addr, usb_dev_t *out)
         uint8_t c[16];
         act = 0;
         for (int i = 0; i < (int)sizeof(c); i++) c[i] = 0;
-        if (uhci_control_xfer(io, addr, 0, c9, 1, c, 9, ls, &act) != 0 || act < 9) {
+        if (usbhc_control_xfer(bus, addr, 0, c9, 1, c, 9, &act) != 0 || act < 9) {
             e_fail(port, "GET_DESCRIPTOR(cfg,9)", act);
             return -1;
         }
@@ -328,7 +331,7 @@ static int enum_one(uint16_t io, int port, int ls, uint8_t addr, usb_dev_t *out)
         uint8_t cf[8] = {0x80, 0x06, 0x00, 0x02, 0x00, 0x00,
                          (uint8_t)(total & 0xFFu), (uint8_t)((total >> 8) & 0xFFu)};
         act = 0;
-        if (uhci_control_xfer(io, addr, 0, cf, 1, buf, (int)total, ls, &act) != 0 || act < 9) {
+        if (usbhc_control_xfer(bus, addr, 0, cf, 1, buf, (int)total, &act) != 0 || act < 9) {
             e_fail(port, "GET_DESCRIPTOR(cfg,full)", act);
             return -1;
         }
@@ -340,7 +343,7 @@ static int enum_one(uint16_t io, int port, int ls, uint8_t addr, usb_dev_t *out)
     /* 7) SET_CONFIGURATION：让设备进入配置态（端点可用） */
     {
         uint8_t sc[8] = {0x00, 0x09, out->cfg_value, 0x00, 0x00, 0x00, 0x00, 0x00};
-        if (uhci_control_xfer(io, addr, 0, sc, 0, NULL, 0, ls, NULL) != 0) {
+        if (usbhc_control_xfer(bus, addr, 0, sc, 0, NULL, 0, NULL) != 0) {
             e_fail(port, "SET_CONFIGURATION", 0);
             return -1;
         }
@@ -360,7 +363,7 @@ static int enum_one(uint16_t io, int port, int ls, uint8_t addr, usb_dev_t *out)
                          (uint8_t)(out->hid_if & 0xFFu), 0x00,
                          (uint8_t)(want & 0xFFu), 0x00};
         act = 0;
-        if (uhci_control_xfer(io, addr, 0, rr, 1, buf, (int)want, ls, &act) != 0
+        if (usbhc_control_xfer(bus, addr, 0, rr, 1, buf, (int)want, &act) != 0
             || act < 4) {
             e_fail(port, "GET_DESCRIPTOR(report)", act);
         } else {
@@ -378,12 +381,13 @@ static int enum_one(uint16_t io, int port, int ls, uint8_t addr, usb_dev_t *out)
 
 /* ---------- 入口 ---------- */
 void usbenum_init(void) {
-    int nports = uhci_port_count();
+    int nports = usbhc_port_count();
 
     g_dev_n = 0;
     for (int i = 0; i < USBENUM_MAX_DEV; i++) {
         usb_dev_t *d = &g_dev[i];
-        d->io = 0; d->port = 0; d->addr = 0; d->lowspeed = 0;
+        d->bus.hc = 0; d->bus.ctl = 0; d->bus.port = 0; d->bus.ls = 0;
+        d->bus.io = 0; d->port = 0; d->addr = 0; d->lowspeed = 0;
         d->vid = 0; d->pid = 0; d->cls = 0; d->sub = 0; d->proto = 0;
         d->mps0 = 0; d->ncfg = 0; d->cfg_value = 0; d->cfg_total = 0;
         d->nif = 0; d->hid_if = -1; d->hid_sub = 0; d->hid_proto = 0;
@@ -405,12 +409,10 @@ void usbenum_init(void) {
         e_emit(line, n, lim);
 
         for (int i = 0; i < nports && g_dev_n < USBENUM_MAX_DEV; i++) {
-            uint16_t io = 0;
-            int port = 0;
-            int ls = 0;
-            if (uhci_port_get(i, &io, &port, &ls) != 0) continue;
+            usbhc_t bus;
+            if (usbhc_port_get(i, &bus) != 0) continue;
             uint8_t addr = (uint8_t)(g_dev_n + 1);   /* 地址 1..127 顺序分配 */
-            if (enum_one(io, port, ls, addr, &g_dev[g_dev_n]) == 0)
+            if (enum_one(&bus, addr, &g_dev[g_dev_n]) == 0)
                 g_dev_n++;
         }
     }

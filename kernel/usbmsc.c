@@ -21,7 +21,7 @@
  */
 #include "usbmsc.h"
 #include "usbenum.h"
-#include "uhci.h"
+#include "usbhc.h"
 #include "isr.h"
 #include "dmesg.h"
 
@@ -63,6 +63,13 @@ static int       g_msc_n = 0;
 
 /* ---------- BOT 底层 ---------- */
 
+/* bulk 端点最大包长的合法值：全速/低速 8..64，高速 512（一个扇区）。
+ * 低速设备没有 bulk 端点，天然走不到这里。 */
+static int msc_mps_ok(uint16_t mps) {
+    return (mps == 8u || mps == 16u || mps == 32u || mps == 64u ||
+            mps == 512u) ? 1 : 0;
+}
+
 /* 一笔完整 BOT 命令：CBW -> 数据 -> CSW。
  * 返回 0 成功；<0 传输失败；1 = CSW 报命令失败（设备要求 REQUEST SENSE）。
  * datalen==0 时跳过数据阶段。dir_in 与 CBW.flags 一致。 */
@@ -90,8 +97,8 @@ static int bot_command(msc_dev_t *u, const uint8_t *cb, int cblen,
     cbw[14] = (uint8_t)cblen;
     for (int i = 0; i < cblen && i < 16; i++) cbw[15 + i] = cb[i];
 
-    if (uhci_bulk_xfer(d->io, d->addr, d->msc_ep_out, cbw, 31,
-                       (int)d->msc_ep_out_mps, d->lowspeed, NULL) != 0)
+    if (usbhc_bulk_xfer(&d->bus, d->addr, d->msc_ep_out, cbw, 31,
+                        (int)d->msc_ep_out_mps, NULL) != 0)
         return -1;
 
     /* ---- 数据阶段（长度精确 = dCBWDataTransferLength） ---- */
@@ -99,15 +106,15 @@ static int bot_command(msc_dev_t *u, const uint8_t *cb, int cblen,
         uint8_t ep = dir_in ? d->msc_ep_in : d->msc_ep_out;
         int mps = (int)(dir_in ? d->msc_ep_in_mps : d->msc_ep_out_mps);
         int act = 0;
-        if (uhci_bulk_xfer(d->io, d->addr, ep, data, (int)datalen,
-                           mps, d->lowspeed, &act) != 0)
+        if (usbhc_bulk_xfer(&d->bus, d->addr, ep, data, (int)datalen,
+                            mps, &act) != 0)
             return -1;
     }
 
     /* ---- CSW（13 字节） ---- */
     for (int i = 0; i < 13; i++) csw[i] = 0;
-    if (uhci_bulk_xfer(d->io, d->addr, d->msc_ep_in, csw, 13,
-                       (int)d->msc_ep_in_mps, d->lowspeed, NULL) != 0)
+    if (usbhc_bulk_xfer(&d->bus, d->addr, d->msc_ep_in, csw, 13,
+                        (int)d->msc_ep_in_mps, NULL) != 0)
         return -1;
 
     /* 签名/tag 校验：错位/相位错误直接按传输失败处理 */
@@ -130,10 +137,10 @@ static void bot_reset_recovery(const msc_dev_t *u) {
                        (uint8_t)(d->msc_if & 0xFFu), 0x00, 0x00, 0x00};
     uint8_t cin[8]  = {0x02, 0x01, 0x00, 0x00, d->msc_ep_in,  0x00, 0x00, 0x00};
     uint8_t cout[8] = {0x02, 0x01, 0x00, 0x00, d->msc_ep_out, 0x00, 0x00, 0x00};
-    (void)uhci_control_xfer(d->io, d->addr, 0, rst, 0, NULL, 0, d->lowspeed, NULL);
-    (void)uhci_control_xfer(d->io, d->addr, 0, cin, 0, NULL, 0, d->lowspeed, NULL);
-    (void)uhci_control_xfer(d->io, d->addr, 0, cout, 0, NULL, 0, d->lowspeed, NULL);
-    uhci_bulk_tog_reset(d->addr);
+    (void)usbhc_control_xfer(&d->bus, d->addr, 0, rst, 0, NULL, 0, NULL);
+    (void)usbhc_control_xfer(&d->bus, d->addr, 0, cin, 0, NULL, 0, NULL);
+    (void)usbhc_control_xfer(&d->bus, d->addr, 0, cout, 0, NULL, 0, NULL);
+    usbhc_bulk_tog_reset(&d->bus, d->addr);
 }
 
 /* 带一次恢复重试的 BOT 命令封装 */
@@ -224,7 +231,12 @@ int usbmsc_init(void) {
         if (d->msc_if < 0 || d->msc_sub != 0x06u || d->msc_proto != 0x50u)
             continue;
         if (d->msc_ep_in == 0u || d->msc_ep_out == 0u) continue;
-        if (d->msc_ep_in_mps != 64u || d->msc_ep_out_mps != 64u) continue;
+        /* bulk 端点 mps 只做**合法性**校验：全速/低速是 8/16/32/64，高速
+         *（EHCI）恒为 512。早先这里硬编码"必须 64"，结果高速 U 盘（mps=512）
+         * 被静默拒掉——认领不了又不报错，最难受的那种失败。真正的"这条总线
+         * 支不支持这个 mps"由传输层（usbhc_bulk_xfer -> uhci/ehci）判定。 */
+        if (!msc_mps_ok(d->msc_ep_in_mps) || !msc_mps_ok(d->msc_ep_out_mps))
+            continue;
 
         msc_dev_t *u = &g_msc[g_msc_n];
         u->d = d;

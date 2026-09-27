@@ -22,7 +22,7 @@
  */
 #include "usbmouse.h"
 #include "usbenum.h"
-#include "uhci.h"
+#include "usbhc.h"
 #include "mouse.h"
 #include "isr.h"
 #include "irqflags.h"
@@ -81,6 +81,11 @@ void usbmouse_init(void) {
          * 注意 hid_ep_mps 可能小于 8，真正的报告长度以实际 actlen 为准。 */
         if (d->hid_if >= 0 && d->hid_sub == 1u && d->hid_proto == 2u &&
             d->hid_ep != 0u && d->configured) {
+            /* 同 usbkbd：EHCI 侧还没有中断 IN，认领了也读不到报告 */
+            if (!usbhc_supports_interrupt(&d->bus)) {
+                dmesg_write("USB-MOU: HID on EHCI skipped (no interrupt IN yet)");
+                continue;
+            }
             g_mou = d;
             break;
         }
@@ -105,8 +110,8 @@ void usbmouse_init(void) {
      */
     uint8_t ifnum = (uint8_t)(g_mou->hid_if & 0xFFu);
     uint8_t sp[8] = {0x21, 0x0B, 0x00, 0x00, ifnum, 0x00, 0x00, 0x00};
-    int rp = uhci_control_xfer(g_mou->io, g_mou->addr, 0, sp, 0, NULL, 0,
-                               g_mou->lowspeed, NULL);
+    int rp = usbhc_control_xfer(&g_mou->bus, g_mou->addr, 0, sp, 0, NULL, 0,
+                                NULL);
 
     {
         char line[128];
@@ -136,8 +141,7 @@ static void poll_once(const usb_dev_t *d) {
     if (mps > (int)sizeof(rep)) mps = (int)sizeof(rep);
 
     for (int i = 0; i < (int)sizeof(rep); i++) rep[i] = 0;
-    int r = uhci_interrupt_in(d->io, d->addr, d->hid_ep, rep, mps,
-                              d->lowspeed, &act);
+    int r = usbhc_interrupt_in(&d->bus, d->addr, d->hid_ep, rep, mps, &act);
     if (r != 0) return;                          /* 超时/致命错误：静默 */
     if (act < (int)USBMOU_REPORT_MIN) return;    /* NAK 或报告不完整：静默 */
 

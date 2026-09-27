@@ -27,13 +27,14 @@
 #define USBENUM_H
 
 #include "types.h"
+#include "usbhc.h"
 
 #define USBENUM_MAX_DEV 8
 
 /* 枚举结果（一个 USB 设备一份） */
 typedef struct {
-    uint16_t io;            /* 所属 UHCI 控制器 I/O 基址 */
-    uint8_t  port;          /* 根口编号 */
+    usbhc_t  bus;           /* 所属主机控制器 + 根口（UHCI/EHCI 统一句柄） */
+    uint8_t  port;          /* 根口编号（与 bus.port 同值，日志用） */
     uint8_t  addr;          /* 分配到的 USB 地址（1..127） */
     uint8_t  lowspeed;      /* 低速设备 */
 

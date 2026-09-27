@@ -74,6 +74,19 @@ int ehci_control_xfer(int ctl, uint8_t addr, uint8_t ep,
                       uint8_t *buf, int blen, int *actlen);
 
 /*
+ * 一笔 bulk 传输（U 盘的 BOT 通道，A1 第二阶段）。
+ * 方向由 ep 方向位决定（0x01=OUT / 0x81=IN）；toggle 软件维护（只在真的
+ * 收发到数据时按包数推进），BOT Reset / ClearFeature 后必须调
+ * ehci_bulk_tog_reset 清回 DATA0。blen 上界 512，mps 认 8/16/32/64 与
+ * 高速的 512。返回 0 成功（*actlen=实际字节数），<0 失败。
+ */
+int ehci_bulk_xfer(int ctl, uint8_t addr, uint8_t ep,
+                   uint8_t *buf, int blen, int mps, int *actlen);
+
+/* bulk 端点 toggle 清零（回到 DATA0） */
+void ehci_bulk_tog_reset(int ctl, uint8_t addr);
+
+/*
  * 端口级复位：PR 置位保持 >=50ms 再清 0。
  * 返回 1 = 复位后仍是**高速**设备（端口被使能且由本控制器拥有）；
  *      0 = 不是高速（已交还 companion）或根本没有设备。

@@ -45,6 +45,10 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+KERNEL_DIR = os.path.join(ROOT, "kernel")
+sys.path.insert(0, HERE)
+import ezocr  # noqa: E402
+
 QEMU = "D:/MyOS/tools/qemu-portable-20241220/qemu-system-x86_64.exe"
 QMP_PORT = 4507
 SERIAL_PORT = 4508
@@ -53,6 +57,10 @@ BOOT_WAIT = 150
 
 IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
 DISK = os.path.join(ROOT, "disk.img")
+SHOT = os.path.join(HERE, "ehci_shot.ppm").replace("\\", "/")
+
+KEYMAP = {' ': 'spc', '.': 'dot', '-': 'minus', '_': 'shift-minus',
+          '/': 'slash', '*': 'kp_multiply', '+': 'kp_add', ':': 'shift-semicolon'}
 
 
 class SerialReader(object):
@@ -124,11 +132,45 @@ class Qmp(object):
             if "return" in r or "error" in r:
                 return r
 
+    def hmc(self, c):
+        return self.cmd("human-monitor-command", **{"command-line": c})
+
+    def type_line(self, s):
+        """往 shell 打一行字（shell 输入只走键盘，QMP 只能用 sendkey）。"""
+        for ch in s:
+            key = KEYMAP.get(ch)
+            if key is None:
+                key = ('shift-' + ch.lower()) if ('A' <= ch <= 'Z') else ch.lower()
+            r = self.hmc("sendkey " + key)
+            if "error" in r:
+                raise RuntimeError("sendkey %r failed: %r" % (key, r))
+            time.sleep(0.05)
+        self.hmc("sendkey ret")
+
+    def screendump(self):
+        self.cmd("screendump", filename=SHOT)
+        time.sleep(0.3)
+
     def quit(self):
         try:
             self.cmd("quit")
         except Exception:
             pass
+
+
+def ocr_text():
+    try:
+        with open(SHOT, "rb") as f:
+            dims = f.read(64).split(b"\n", 2)[1].decode()
+    except Exception:
+        return ""
+    if dims.strip() != "720 400":
+        return ""
+    return ezocr.ocr_text(SHOT, KERNEL_DIR)
+
+
+def flat(s):
+    return " ".join(s.lower().split())
 
 
 def port_in_use(port):
@@ -163,7 +205,8 @@ def kill_all_qemu():
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def run_case(name, extra_args, expect_device):
+def run_case(name, extra_args, mode):
+    """mode: "kbd"（只挂键盘）/ "msc"（只挂 U 盘）/ "empty"（什么都不挂）"""
     if not os.path.isfile(IMG) or not os.path.isfile(DISK):
         print("MISSING %s / %s - run ninja first" % (IMG, DISK))
         return False, []
@@ -189,18 +232,29 @@ def run_case(name, extra_args, expect_device):
         serial = SerialReader(SERIAL_PORT)
         qmp = Qmp(QMP_PORT)
 
+        # U 盘场景要等 BOT（bulk）跑完，比纯控制传输慢
         if not wait_for(serial, "EHCI:", BOOT_WAIT):
             print("  FAIL %s: no 'EHCI:' line in serial" % name)
             print("---- serial tail ----\n" + serial.snapshot()[-1500:])
             return False, []
 
-        # 探针跑在内核启动早期，拿到 "controller ready" 之后即可收全证据；
-        # 保险起见再等一小段，确保 SET_ADDRESS/二次 GET_DESCRIPTOR 也落地。
         wait_for(serial, "EHCI: controller ready", 60)
+        # 统一传输层里枚举/类驱动跑在 EHCI 之后：死等固定秒数会采样到半截日志
+        # （曾出现"只有 USB-HC 行、USB-ENUM 还没落地"的假 FAIL）。
+        # 改成"等该场景的最后一条证据行出现"再采样。
+        if mode == "msc":
+            wait_for(serial, "USB-MSC:", 60)
+            wait_for(serial, "registered as drive 12", 90)
+        elif mode == "kbd":
+            wait_for(serial, "USB-MSC:", 60)
         time.sleep(3.0)
 
         snap = serial.snapshot()
-        lines = [ln.strip() for ln in snap.splitlines() if "EHCI" in ln]
+        # 铁律：收集条件不能只认 "EHCI"。统一传输层落地后，证据散落在
+        # USB-HC / USB-ENUM / USB-MSC / USB-KBD 各行里，按 "EHCI" 过滤会
+        # 把它们全丢掉 -> 假 FAIL（2026-09 实测踩过一次）。
+        lines = [ln.strip() for ln in snap.splitlines()
+                 if ("EHCI" in ln or "USB-" in ln or "MSC" in ln)]
         ok = True
 
         # ---- 两组都要成立：控制器被认领、异步调度真的在跑 ----
@@ -211,7 +265,7 @@ def run_case(name, extra_args, expect_device):
             print("  FAIL %s: async schedule never reached ASS=1" % name)
             ok = False
 
-        if expect_device:
+        if mode == "kbd":
             # 高速自留：PE=1 且没被交还 companion
             pr = [l for l in lines if "post-reset" in l]
             if not any("conn=1 en=1" in l for l in pr):
@@ -220,6 +274,15 @@ def run_case(name, extra_args, expect_device):
                 ok = False
             if any("released to companion" in l for l in lines):
                 print("  FAIL %s: a 480Mb/s device was handed to companion"
+                      % name)
+                ok = False
+            # 键盘是高速 HID：EHCI 还没周期调度，必须如实说"认领不了"，
+            # 而不是假装能用（真机上键鼠是 FS/LS，走 companion UHCI）
+            if not any("HID on EHCI skipped" in l for l in lines):
+                print("  FAIL %s: expected explicit 'HID on EHCI skipped'" % name)
+                ok = False
+            if not any("USB-MSC: no mass storage device" in l for l in lines):
+                print("  FAIL %s: keyboard-only case must not claim a drive"
                       % name)
                 ok = False
 
@@ -256,6 +319,49 @@ def run_case(name, extra_args, expect_device):
                     print("  FAIL %s: VID changed %s -> %s after SET_ADDRESS"
                           % (name, vid0, vid1))
                     ok = False
+        elif mode == "msc":
+            # 统一传输层必须把这个口算到 EHCI 头上
+            if not any("USB-HC: 1 connected port(s) (UHCI 0 / EHCI 1)" in l
+                       for l in lines):
+                print("  FAIL %s: unified port table missed the EHCI port" % name)
+                ok = False
+            if not any("USB-ENUM: 1 device(s) enumerated" in l for l in lines):
+                print("  FAIL %s: enumeration over EHCI failed" % name)
+                ok = False
+            if not any("mps=512" in l for l in lines):
+                print("  FAIL %s: bulk endpoints are not high-speed (512)" % name)
+                ok = False
+            if not any("blksize=512 ready" in l for l in lines):
+                print("  FAIL %s: BOT (TEST UNIT READY + READ CAPACITY) failed"
+                      % name)
+                ok = False
+            if not any("registered as drive 12" in l for l in lines):
+                print("  FAIL %s: stick was not registered as a block drive"
+                      % name)
+                ok = False
+
+            # ---- FS 全链路（屏幕 OCR）：挂载 -> 列目录 -> 读文件 ----
+            # 这一段必须走真正的 512 字节扇区读，光有控制传输过不了。
+            time.sleep(3.0)
+            qmp.type_line("setdrive 12")
+            time.sleep(6.0)
+            qmp.type_line("ls")
+            time.sleep(4.0)
+            qmp.type_line("cat README.TXT")
+            time.sleep(4.0)
+            qmp.screendump()
+            txt = flat(ocr_text())
+            if "readme.txt" not in txt:
+                print("  FAIL %s: ls on the EHCI stick lacks readme.txt" % name)
+                print("  ocr> " + txt[:400])
+                ok = False
+            if "welcome to ezos" not in txt:
+                print("  FAIL %s: cat README.TXT lacks content (BOT read)" % name)
+                print("  ocr> " + txt[:400])
+                ok = False
+            if "panic" in txt:
+                print("  FAIL %s: panic on screen" % name)
+                ok = False
         else:
             # 空控制器：必须有"没有高速设备"的结论行，且绝不报任何成功
             if not any("0 high-speed device(s) attached" in l for l in lines):
@@ -297,14 +403,18 @@ def main():
     wait_port_free(SERIAL_PORT, 15)
 
     ehci = ["-device", "usb-ehci,id=ehci"]
+    msc = ["-drive", "format=raw,file=" + DISK.replace("\\", "/") +
+           ",if=none,id=usbdata",
+           "-device", "usb-storage,drive=usbdata,bus=ehci.0"]
     cases = [
-        ("A-kbd", ehci + ["-device", "usb-kbd,bus=ehci.0"], True),
-        ("B-empty", ehci, False),
+        ("A-kbd", ehci + ["-device", "usb-kbd,bus=ehci.0"], "kbd"),
+        ("C-msc", ehci + msc, "msc"),
+        ("B-empty", ehci, "empty"),
     ]
     results = []
-    for name, args, exp in cases:
+    for name, args, mode in cases:
         print("=== case: %s ===" % name)
-        ok, _ = run_case(name, args, exp)
+        ok, _ = run_case(name, args, mode)
         results.append((name, ok))
         print("  => %s" % ("PASS" if ok else "FAIL"))
         time.sleep(0.5)

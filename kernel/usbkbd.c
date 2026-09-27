@@ -22,7 +22,7 @@
  */
 #include "usbkbd.h"
 #include "usbenum.h"
-#include "uhci.h"
+#include "usbhc.h"
 #include "keyboard.h"
 #include "isr.h"
 #include "irqflags.h"
@@ -122,6 +122,13 @@ void usbkbd_init(void) {
          * 且枚举阶段已 SET_CONFIGURATION 成功、找到了中断 IN 端点。 */
         if (d->hid_if >= 0 && d->hid_sub == 1u && d->hid_proto == 1u &&
             d->hid_ep != 0u && d->configured) {
+            /* EHCI 上挂的 HID 认领不了：周期调度（中断 IN）还没实现。
+             * 真机不受影响——键鼠绝大多数是全速/低速，会被 EHCI 交还
+             * companion UHCI，走的正是已验证的 UHCI 路径。 */
+            if (!usbhc_supports_interrupt(&d->bus)) {
+                dmesg_write("USB-KBD: HID on EHCI skipped (no interrupt IN yet)");
+                continue;
+            }
             g_kbd = d;
             break;
         }
@@ -137,10 +144,10 @@ void usbkbd_init(void) {
     uint8_t ifnum = (uint8_t)(g_kbd->hid_if & 0xFFu);
     uint8_t sp[8] = {0x21, 0x0B, 0x00, 0x00, ifnum, 0x00, 0x00, 0x00};
     uint8_t si[8] = {0x21, 0x0A, 0x00, 0x00, ifnum, 0x00, 0x00, 0x00};
-    int rp = uhci_control_xfer(g_kbd->io, g_kbd->addr, 0, sp, 0, NULL, 0,
-                               g_kbd->lowspeed, NULL);
-    int ri = uhci_control_xfer(g_kbd->io, g_kbd->addr, 0, si, 0, NULL, 0,
-                               g_kbd->lowspeed, NULL);
+    int rp = usbhc_control_xfer(&g_kbd->bus, g_kbd->addr, 0, sp, 0, NULL, 0,
+                                NULL);
+    int ri = usbhc_control_xfer(&g_kbd->bus, g_kbd->addr, 0, si, 0, NULL, 0,
+                                NULL);
 
     {
         char line[128];
@@ -189,8 +196,7 @@ void usbkbd_poll(void) {
     if (mps > (int)sizeof(rep)) mps = (int)sizeof(rep);
 
     for (int i = 0; i < (int)sizeof(rep); i++) rep[i] = 0;
-    int r = uhci_interrupt_in(d->io, d->addr, d->hid_ep, rep, mps,
-                              d->lowspeed, &act);
+    int r = usbhc_interrupt_in(&d->bus, d->addr, d->hid_ep, rep, mps, &act);
     if (r != 0) return;              /* 超时/致命错误：静默（下一轮再来） */
     if (act < (int)USBKBD_REPORT_LEN) return;   /* NAK 或报告不完整：静默 */
 

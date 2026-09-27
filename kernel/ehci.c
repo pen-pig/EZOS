@@ -108,6 +108,7 @@
 
 /* QH info1 位（EHCI 3.6.2） */
 #define QH_EPS_HIGH   0x00002000u   /* bit13:12 = 10b 高速 */
+#define QH_DTC        0x00004000u   /* bit14  1=用 qTD 的 DT 位（软件维护 toggle） */
 #define QH_H          0x00008000u   /* bit15 回收链表头 */
 #define QH_MPL(m)     ((uint32_t)(m) << 16)   /* bit26:16 最大包长 */
 #define QH_C          0x08000000u   /* bit27 控制端点 */
@@ -197,11 +198,41 @@ static volatile uint32_t g_qtd[3][8] __attribute__((aligned(32)));  /* SETUP/DAT
 static volatile uint8_t  g_setup[8]  __attribute__((aligned(32)));
 static volatile uint8_t  g_rbuf[256] __attribute__((aligned(32)));
 
-/* 周期帧列表（本步为空，全部 T；PSE 开着也不产生流量，为第二阶段中断
+/* 周期帧列表（本步为空，全部 T；PSE 开着也不产生流量，为后续中断
  * 传输预留）。1024 项 × 4B = 4KB，必须 4KB 对齐。 */
 static volatile uint32_t g_flist[1024] __attribute__((aligned(4096)));
 
+/* bulk（U 盘 BOT 通道）：QH + 1 个 qTD + 512 字节数据缓冲。
+ * 512 = 一个扇区；HS bulk 端点 mps 就是 512，一笔扇区读写正好一包。 */
+static volatile uint32_t g_bqh[12]  __attribute__((aligned(32)));
+static volatile uint32_t g_btd[8]   __attribute__((aligned(32)));
+static volatile uint8_t  g_bulkbuf[512] __attribute__((aligned(32)));
+
+/* bulk 端点 DATA toggle（按 USB 地址索引，IN/OUT 各一份）。
+ * EHCI 侧用 DTC=1（toggle 由 qTD 的 DT 位给），所以必须软件维护：
+ * **只在事务真正完成时翻转**，BOT Reset / ClearFeature(HALT) 后清零。 */
+static uint8_t g_btog_in[128];
+static uint8_t g_btog_out[128];
+
 #define EH_PHYS(p)  ((uint32_t)(unsigned long)(p))
+
+/*
+ * 填 qTD 的缓冲页指针（EHCI 3.5.2）：qTD 只有 5 个页指针槽位（最多 20KB），
+ * 缓冲**跨 4KB 页**时必须逐页填写，且首槽低 12 位是"页内起始偏移"。
+ * 漏填第二页是最典型的静默错包来源（HC 会去下一页指针读 0 地址）。
+ */
+static void qtd_set_buf(volatile uint32_t *td, uint32_t phys, int len) {
+    uint32_t page = phys & 0xFFFFF000u;
+    uint32_t off  = phys & 0x00000FFFu;
+    int npages = 1;
+    if (len > 0) npages = (int)(((uint32_t)len + off + 0xFFFu) >> 12);
+    if (npages < 1) npages = 1;
+    if (npages > 5) npages = 5;                 /* qTD 只有 5 个槽位 */
+    for (int i = 0; i < 5; i++) td[3 + i] = 0;
+    td[3] = page | off;                         /* 页 0 + 页内偏移 */
+    for (int i = 1; i < npages; i++)
+        td[3 + i] = page + (uint32_t)i * 0x1000u;
+}
 
 /* ---------- 异步调度停/起（确定性优先，见文件头） ---------- */
 static int async_stop(int ctl) {
@@ -253,26 +284,26 @@ int ehci_control_xfer(int ctl, uint8_t addr, uint8_t ep,
     /* qTD0 SETUP：PID=SETUP，DATA0（bit31=0），8 字节 */
     g_qtd[0][0] = (blen > 0) ? qtd1 : qtd2;                /* next */
     g_qtd[0][1] = LINK_T;                                  /* alt next */
-    g_qtd[0][3] = EH_PHYS(&g_setup[0]);
     g_qtd[0][2] = QTD_PID_SETUP | (8u << 16) | QTD_CERR3 | QTD_ACTIVE;
+    qtd_set_buf(g_qtd[0], EH_PHYS(&g_setup[0]), 8);
 
     /* qTD1 DATA（仅 blen>0 时构建）：DATA1 */
     if (blen > 0) {
         g_qtd[1][0] = qtd2;
         g_qtd[1][1] = LINK_T;
-        g_qtd[1][3] = EH_PHYS(&g_rbuf[0]);
         g_qtd[1][2] = (dir_in ? QTD_PID_IN : QTD_PID_OUT)
                     | ((uint32_t)blen << 16)
                     | QTD_DT | QTD_CERR3 | QTD_ACTIVE;
+        qtd_set_buf(g_qtd[1], EH_PHYS(&g_rbuf[0]), blen);
     }
 
     /* qTD2 STATUS：方向取数据阶段反，零长度，DATA1，完成时中断 */
     g_qtd[2][0] = LINK_T;
     g_qtd[2][1] = LINK_T;
-    g_qtd[2][3] = 0;
     g_qtd[2][2] = (dir_in ? QTD_PID_OUT : QTD_PID_IN)
                 | (0u << 16)
                 | QTD_DT | QTD_CERR3 | QTD_ACTIVE | QTD_IOC;
+    for (int i = 0; i < 5; i++) g_qtd[2][3 + i] = 0;       /* 零长度：无缓冲 */
 
     /* 传输 QH：控制端点、高速、mps=64（USB2 规范对高速端点 0 的规定）。
      * 不置 QH_DTC：控制端点的 DATA toggle 由 HC 自己按 USB 规则推进
@@ -353,6 +384,110 @@ int ehci_control_xfer(int ctl, uint8_t addr, uint8_t ep,
     }
     if (actlen) *actlen = al;
     return 0;
+}
+
+/* ---------- bulk 传输（U 盘的 BOT 通道） ----------
+ * 与 UHCI 侧的语义完全一致（NAK 由 HC 逐微帧重试、toggle 软件维护、
+ * STALL 交上层走 BOT Reset + ClearFeature），只是载体换成异步环 + qTD。
+ * 返回 0 成功（*actlen=实际字节数），<0 失败。 */
+int ehci_bulk_xfer(int ctl, uint8_t addr, uint8_t ep,
+                   uint8_t *buf, int blen, int mps, int *actlen) {
+    if (actlen) *actlen = 0;
+    if (ctl < 0 || ctl >= EHCI_MAX_CTL || !g_ctl[ctl].valid) return -1;
+    if (addr == 0u || addr > 127u) return -1;
+    if (blen < 0 || blen > (int)sizeof(g_bulkbuf)) return -1;   /* 缓冲上界 */
+    if (blen > 0 && !buf) return -1;
+    if ((ep & 0x7Fu) == 0u || (ep & 0x7Fu) > 15u) return -1;    /* 非端点 0 */
+    /* full-speed bulk mps 只到 64；高速 bulk 端点 mps 恒为 512（一个扇区） */
+    if (mps != 8 && mps != 16 && mps != 32 && mps != 64 && mps != 512) return -1;
+    if (blen == 0) return 0;
+
+    int dir_in = (ep & 0x80u) ? 1 : 0;
+    uint8_t *togp = dir_in ? &g_btog_in[addr] : &g_btog_out[addr];
+
+    for (int i = 0; i < blen; i++) g_bulkbuf[i] = dir_in ? 0 : buf[i];
+
+    for (int k = 0; k < 8; k++) g_btd[k] = 0;
+    g_btd[0] = LINK_T;                                  /* next = T */
+    g_btd[1] = LINK_T;                                  /* alt next = T */
+    g_btd[2] = (dir_in ? QTD_PID_IN : QTD_PID_OUT)
+             | ((uint32_t)blen << 16)
+             | (*togp ? QTD_DT : 0u)
+             | QTD_CERR3 | QTD_ACTIVE;
+    qtd_set_buf(g_btd, EH_PHYS(&g_bulkbuf[0]), blen);
+
+    for (int k = 0; k < 12; k++) g_bqh[k] = 0;
+    g_bqh[0] = LINK_QH(&g_head[0]);                     /* 水平链回 head */
+    g_bqh[1] = (uint32_t)addr
+             | ((uint32_t)(ep & 0x7Fu) << 8)
+             | QH_EPS_HIGH
+             | QH_MPL(mps)
+             | QH_DTC;            /* DTC=1：toggle 取 qTD 的 DT 位（软件维护） */
+    g_bqh[2] = QH_MULT1;
+    g_bqh[4] = EH_PHYS(&g_btd[0]);                      /* next qTD */
+    g_bqh[5] = LINK_T;
+    g_bqh[6] = 0;
+
+    if (async_stop(ctl) != 0) return -1;
+    g_head[0] = LINK_QH(&g_bqh[0]);
+    if (async_start(ctl) != 0) {
+        g_head[0] = LINK_QH(&g_head[0]);
+        return -1;
+    }
+
+    uint32_t t0 = g_pit_ticks;
+    int done = 0;
+    while ((uint32_t)(g_pit_ticks - t0) < EHCI_TO_XFER) {
+        uint32_t st = g_btd[2];
+        if ((st & QTD_ACTIVE) == 0u) { done = 1; break; }
+        if (st & QTD_FATAL) break;
+        if (e_mmio_rd(ctl, EH_USBSTS) & (STS_HCH | STS_HSE)) break;
+    }
+
+    async_stop(ctl);
+    g_head[0] = LINK_QH(&g_head[0]);
+    async_start(ctl);
+
+    uint32_t st = g_btd[2];
+    if (!done || (st & QTD_FATAL)) {
+        char line[128]; int li = 0; int lim = (int)sizeof(line) - 1;
+        e_str(line, &li, lim, "EHCI-BULK: xfer fail addr=");
+        e_dec(line, &li, lim, (uint32_t)addr);
+        e_str(line, &li, lim, " ep=0x");
+        e_hex(line, &li, lim, (uint32_t)ep, 2);
+        e_str(line, &li, lim, " want=");
+        e_dec(line, &li, lim, (uint32_t)blen);
+        e_str(line, &li, lim, " sts=0x");
+        e_hex(line, &li, lim, st, 8);
+        if (li < lim) line[li] = 0; else line[lim] = 0;
+        dmesg_write(line);
+        return -1;
+    }
+
+    uint32_t remain = (st >> 16) & 0x7FFFu;
+    int actual = (int)((uint32_t)blen - remain);
+    if (actual < 0) actual = 0;
+    if (actual > blen) actual = blen;
+
+    /* toggle 只在真的收发到数据时推进：包数 = ceil(实际字节 / mps)。
+     * 高速 bulk 的 mps=512，一笔扇区（512B）正好一包，故通常翻一次。 */
+    if (actual > 0) {
+        int npk = (actual + mps - 1) / mps;
+        if (npk > 0 && (npk & 1)) *togp = (uint8_t)(*togp ^ 1u);
+    }
+
+    if (dir_in && actual > 0) {
+        for (int i = 0; i < actual; i++) buf[i] = (uint8_t)g_bulkbuf[i];
+    }
+    if (actlen) *actlen = actual;
+    return 0;
+}
+
+void ehci_bulk_tog_reset(int ctl, uint8_t addr) {
+    (void)ctl;
+    if (addr > 127u) return;
+    g_btog_in[addr]  = 0;
+    g_btog_out[addr] = 0;
 }
 
 /* ---------- 端口复位 + 高速判定 ---------- */

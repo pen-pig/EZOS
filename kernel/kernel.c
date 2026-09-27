@@ -29,6 +29,7 @@
 #include "usb.h"
 #include "uhci.h"
 #include "ehci.h"
+#include "usbhc.h"
 #include "usbenum.h"
 #include "usbkbd.h"
 #include "usbmsc.h"
@@ -425,16 +426,23 @@ void kernel_main(void) {
      * 不做设备枚举/传输/中断注册。必须在 fs_init 之前，与 ahci_init 同层。 */
     uhci_init();
 
+    /* A1 第一阶段：EHCI（USB 2.0 高速）控制器。与 UHCI 并列、互不干扰——
+     * FS/LS 设备（键盘/鼠标）会被 EHCI 交还 companion UHCI，高速设备
+     *（U 盘）由 EHCI 自己接管。找不到控制器静默跳过。
+     * 顺序红线：必须在 usbenum_init() **之前**——端口表要先建好，
+     * 枚举才有端口可走（曾放在枚举之后，结果高速设备一个都没被枚举）。 */
+    ehci_init();
+
+    /* A1 第二阶段：合并 UHCI/EHCI 两边的已连接端口，向上层（枚举、HID、
+     * U 盘）提供统一的 usbhc_t 句柄。 */
+    usbhc_scan();
+
     /* H2-2c: enumerate devices on connected ports (port reset -> device
      * descriptor -> SET_ADDRESS -> configuration descriptor -> interface/
      * endpoint parsing -> SET_CONFIGURATION). Evidence goes to dmesg/COM1;
-     * no device attached means a clean skip with zero success lines. */
+     * no device attached means a clean skip with zero success lines.
+     * 走的是 usbhc 统一端口表：同一个枚举流程既能跑 UHCI 也能跑 EHCI。 */
     usbenum_init();
-
-    /* A1 第一阶段：EHCI（USB 2.0 高速）控制器。与 UHCI 并列、互不干扰——
-     * FS/LS 设备（键盘/鼠标）会被 EHCI 交还 companion UHCI，高速设备
-     *（U 盘）由 EHCI 自己接管。找不到控制器静默跳过。 */
-    ehci_init();
 
     /* H2-2d: claim a HID boot keyboard among the enumerated devices and
      * switch it to the boot protocol. Input arrives by polling the interrupt
