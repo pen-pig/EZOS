@@ -37,14 +37,36 @@ static void kb_wait_read(void) {
 void keyboard_init(void) {
     uint8_t status;
 
-    /* ����ǰ�����ֽ� */
+    /* Read the current controller command byte. */
     kb_wait_write();
     outb(0x64, 0x20);
     kb_wait_read();
     status = inb(0x60);
 
-    /* ��λ bit0�������ж�ʹ�ܣ���-��-д��������� bit1 ������λ�� */
-    status |= 0x01;
+    /* HOT-REBOOT FIX (must not be a plain "|=" on bit0 only):
+     *
+     * system_reboot() pulses CPU reset through the 8042 (outb(0x64,0xFE)).
+     * That resets the CPU but NOT the keyboard controller, and a warm BIOS
+     * boot does not always reprogram the KBC. The translation bit (bit6,
+     * set-2 -> set-1) can therefore be LOST across reboot, leaving the
+     * keyboard emitting native set-2 bytes while every table in this driver
+     * is built for set 1.
+     *
+     * Measured symptom: after `reboot`, typing "ver" shows "JJXX" on screen
+     * and the command never runs -- set-2 'v' is 0x2A, which this driver
+     * reads as "left shift pressed", so everything after it is misdecoded.
+     * Before reboot the same keystrokes arrive as 2F AF 12 92 13 93 1C 9C
+     * (correct set 1).
+     *
+     * So: force translation ON and the keyboard interface ENABLED instead of
+     * preserving whatever the BIOS left behind.
+     *   bit0 (INT)  = 1 : keyboard IRQ1 enabled
+     *   bit4 (KDIS) = 0 : keyboard interface enabled (1 would disable it)
+     *   bit6 (XLATE)= 1 : translate scan code set 2 -> set 1
+     * bit5 (AUX/mouse interface) is deliberately left untouched. */
+    status |= 0x01;         /* IRQ1 enable */
+    status &= (uint8_t)~0x10;   /* keyboard interface enabled */
+    status |= 0x40;         /* translate to scan code set 1 */
     kb_wait_write();
     outb(0x64, 0x60);
     kb_wait_write();
