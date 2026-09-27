@@ -1492,6 +1492,16 @@ static void cmd_setdrive(const char *args) {
         terminal_writestring(">\n");
         return;
     }
+    /* 盘**本身不存在**时不能报成功：fs_init() 有"探测不到文件系统就回退到
+     * 现有数据盘"的既有逻辑，只看它的返回值会让 setdrive 到一个压根没有的
+     * drive（比如没插 NVMe 时的 16）打印 "FS drive set to 16"，用户会误以为
+     * 已经切过去。这里先一步按块层存在性 fail closed。 */
+    if (ata_drive_present((uint8_t)drive) == 0) {
+        terminal_writestring("Drive ");
+        print_dec(drive);
+        terminal_writestring(": not present\n");
+        return;
+    }
     fs_set_drive((uint8_t)drive);
     if (fs_init() == 0) {
         terminal_writestring("FS drive set to ");

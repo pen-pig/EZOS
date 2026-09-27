@@ -12,6 +12,7 @@
 #include "ata.h"
 #include "ahci.h"
 #include "usbmsc.h"
+#include "nvme.h"
 #include "port.h"
 #include "tty.h"
 
@@ -91,6 +92,11 @@ static int ata_wait_drq(uint16_t base) {
  *   - ERR 置位（如 ATAPI 的 ABRT）→ 设备存在但不支持 IDENTIFY。
  */
 int ata_drive_present(uint8_t drive) {
+    /* NVMe 区间编号最大，必须**先判**：drive 16+ 若先落到 USBMSC 分支
+     * 会被当成 unit 4+ 而越界返回 0，NVMe 盘就永远"不存在"。 */
+    if (drive >= NVME_DRIVE_BASE) {
+        return nvme_ns_present((uint8_t)(drive - NVME_DRIVE_BASE)) ? 1 : 0;
+    }
     if (drive >= USBMSC_DRIVE_BASE) {
         return usbmsc_present((uint8_t)(drive - USBMSC_DRIVE_BASE)) ? 1 : 0;
     }
@@ -133,6 +139,9 @@ int ata_drive_present(uint8_t drive) {
 }
 
 int ata_read_sector(uint8_t drive, uint32_t lba, uint8_t *buffer) {
+    if (drive >= NVME_DRIVE_BASE) {
+        return nvme_read_sector((uint8_t)(drive - NVME_DRIVE_BASE), lba, buffer);
+    }
     if (drive >= USBMSC_DRIVE_BASE) {
         return usbmsc_read_sector((uint8_t)(drive - USBMSC_DRIVE_BASE),
                                   lba, buffer);
@@ -165,6 +174,9 @@ int ata_read_sector(uint8_t drive, uint32_t lba, uint8_t *buffer) {
 }
 
 int ata_write_sector(uint8_t drive, uint32_t lba, const uint8_t *buffer) {
+    if (drive >= NVME_DRIVE_BASE) {
+        return nvme_write_sector((uint8_t)(drive - NVME_DRIVE_BASE), lba, buffer);
+    }
     if (drive >= USBMSC_DRIVE_BASE) {
         return usbmsc_write_sector((uint8_t)(drive - USBMSC_DRIVE_BASE),
                                    lba, buffer);

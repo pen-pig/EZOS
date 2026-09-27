@@ -26,6 +26,7 @@
 #include "gfx.h"
 #include "rtl8139.h"
 #include "ahci.h"
+#include "nvme.h"
 #include "usb.h"
 #include "uhci.h"
 #include "ehci.h"
@@ -415,6 +416,12 @@ void kernel_main(void) {
      * 找不到控制器静默跳过，绝不破坏现有 ATA/FS 路径。必须在 fs_init
      * 之前——让 setdrive 可选 AHCI 盘。dma 缓冲在 .bss 19MB 区。 */
     ahci_init();
+
+    /* A2: NVMe（PCIe SSD）驱动。现代笔记本的内置盘基本都是 NVMe，AHCI
+     * 通路看不到它。与 ahci_init 同层、必须在 fs_init 之前——让 setdrive
+     * 能选到 drive 16..19。找不到控制器打一行日志并静默跳过。
+     * 32 位无 PAE 的硬约束：BAR 基址 >= 4GB 时 fail closed（够不到）。 */
+    nvme_init();
 
     /* USB 主机控制器普查（真机点亮 H2：USB HID 前置）：只读枚举 PCI
      * class 0x0C03 设备，按 ProgIF 分类 UHCI/OHCI/EHCI/xHCI 并 klog，

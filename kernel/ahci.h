@@ -17,6 +17,7 @@
 
 #include "types.h"
 #include "usbmsc.h"
+#include "nvme.h"      /* BLK_MAX_DRIVE 要按 NVMe 区间（最后一段）算 */
 
 /* AHCI port 在块设备层里的 drive 编号起点：drive = AHCI_DRIVE_BASE + port */
 #define AHCI_DRIVE_BASE 4
@@ -31,8 +32,9 @@
 _Static_assert(USBMSC_DRIVE_BASE == AHCI_DRIVE_BASE + AHCI_MAX_PORTS,
                "USBMSC_DRIVE_BASE must follow the AHCI drive range");
 
-/* 块设备层最大 drive 编号（ATA 4 + AHCI 8 + USBMSC USBMSC_MAX_DEV） */
-#define BLK_MAX_DRIVE (USBMSC_DRIVE_BASE + USBMSC_MAX_DEV)
+/* 块设备层最大 drive 编号（ATA 4 + AHCI 8 + USBMSC 4 + NVMe 4 = 20）。
+ * NVMe 是最后一段，故按它的区间末端算（见 nvme.h 里的相邻性断言）。 */
+#define BLK_MAX_DRIVE (NVME_DRIVE_BASE + NVME_MAX_NS)
 
 /* 控制器探测与端口初始化。找不到控制器（PCI class 0x0106）时静默跳过，
  * 返回 0；找到并完成初始化返回 1；找到但初始化失败返回 -1（不影响 ATA）。 */
