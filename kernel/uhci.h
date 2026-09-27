@@ -50,6 +50,19 @@ int uhci_control_xfer(uint16_t io, uint8_t addr, uint8_t ep,
 int uhci_port_reset(uint16_t io, int port);
 
 /*
+ * 从中断 IN 端点轮询一次（H2-2d：HID 键盘报告通道）。
+ * 返回 0 = 轮询完成（**可能没有数据**：设备 NAK 是常态，此时 *actlen=0）；
+ *      <0 = 失败（超时 / STALL / CRC 等致命位）。
+ * 语义要点：
+ *   - NAK 不算错误：没有新报告时设备恒 NAK，调用方必须容忍 actlen==0。
+ *   - DATA toggle 由本模块按地址维护，**只在真的收到数据时翻转**（NAK/零长度
+ *     不翻），否则设备会因 toggle 不匹配拒绝后续报告。
+ *   - blen 上界 16（HID boot 报告 8 字节，留余量）。
+ */
+int uhci_interrupt_in(uint16_t io, uint8_t addr, uint8_t ep,
+                      uint8_t *buf, int blen, int lowspeed, int *actlen);
+
+/*
  * 确保控制器处于运行态：重新锁存帧列表物理地址并置 RS=1/CF=1。
  * GRESET 会清掉 CF/RS，任何在复位之后发起的传输都必须先调这个，
  * 否则 HC 只发 SOF、不执行 TD（表现为"调度在跑但传输永不完成"）。

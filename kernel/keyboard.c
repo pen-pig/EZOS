@@ -3,6 +3,9 @@
 #include "port.h"
 #include "types.h"
 #include "task.h"
+#include "usbkbd.h"
+#include "irqflags.h"
+#include "isr.h"
 
 #define KEYBOARD_BUFFER_SIZE 256
 static int keyboard_buffer[KEYBOARD_BUFFER_SIZE];  // 键存 int，支持扩展键码
@@ -163,7 +166,28 @@ void keyboard_handler(void) {
     outb(0x20, 0x20);
 }
 
+/*
+ * USB HID 键盘路径（H2-2d）的注入口。与 IRQ1 共用同一个环形缓冲，所以必须
+ * 用 irq_save_disable 保护索引（IRQ1 可能在任意时刻插入）。
+ * 缓冲满时丢弃（与 IRQ1 行为一致），绝不覆盖未读数据。
+ */
+void keyboard_inject(int key) {
+    if (key == 0) return;
+    uint32_t f = irq_save_disable();
+    int next = (buffer_end + 1) % KEYBOARD_BUFFER_SIZE;
+    if (next != buffer_start) {
+        keyboard_buffer[buffer_end] = key;
+        buffer_end = next;
+    }
+    irq_restore(f);
+    task_wake_all(&kb_wq);    /* 有新数据：踢醒阻塞读 */
+}
+
 int keyboard_getchar(void) {
+    /* H2-2d: poll the USB HID keyboard before handing out buffered keys.
+     * All existing get-and-loop callers (shell / desktop / games) pick up
+     * USB keystrokes through this one hook; throttling lives in usbkbd_poll. */
+    usbkbd_poll();
     if (buffer_start == buffer_end) return 0;
     int c = keyboard_buffer[buffer_start];
     buffer_start = (buffer_start + 1) % KEYBOARD_BUFFER_SIZE;
@@ -173,9 +197,22 @@ int keyboard_getchar(void) {
 /* 步骤 8a：任务上下文的阻塞等待——睡到下一个按键（IRQ1 唤醒）或
  * 30s 超时。超时兜底是给"永远没人打字"的调用方（如用户进程阻塞
  * read(stdin)）留一条退出路径，避免任务永久滞留 BLOCKED。
- * 不可在 IRQ / task_lock 临界区调用（task_sleep 会拒绝并立即返回）。 */
+ * 不可在 IRQ / task_lock 临界区调用（task_sleep 会拒绝并立即返回）。
+ *
+ * H2-2d：USB 键盘是**轮询**的，一次睡满 30s 期间它的按键根本进不来。
+ * 改成 50ms 短睡循环，每轮醒来做一次 usbkbd_poll()；PS/2（IRQ1）仍然
+ * 立即唤醒，行为不变。退化保护：task_sleep 在 IRQ / task_lock 里会立即
+ * 返回，此时 tick 不推进，连试几次就直接返回，避免退化成几百次空转。 */
 void keyboard_block(void) {
-    task_sleep(&kb_wq, 30000);
+    uint32_t t0 = g_pit_ticks;
+    int spins = 0;
+    while ((uint32_t)(g_pit_ticks - t0) < 30000u) {
+        usbkbd_poll();
+        if (buffer_start != buffer_end) return;
+        uint32_t before = g_pit_ticks;
+        task_sleep(&kb_wq, 50);
+        if (g_pit_ticks == before && ++spins > 4) return;   /* 根本没睡着 */
+    }
 }
 
 void irq1_handler(void) {

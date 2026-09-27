@@ -24,6 +24,8 @@
 void keyboard_init(void);
 void keyboard_handler(void);
 int keyboard_getchar(void);   // 键存 int，支持扩展键码
+/* 注入一个键（USB HID 键盘路径用）：与 IRQ1 共用环形缓冲，内部自保护。 */
+void keyboard_inject(int key);
 void keyboard_block(void);    /* 步骤 8a：任务睡到下一按键或 30s 超时 */
 void irq1_handler(void);
 

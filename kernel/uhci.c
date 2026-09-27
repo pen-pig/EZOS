@@ -154,6 +154,25 @@ static volatile uint8_t  g_setup[8]    __attribute__((aligned(16)));
 static volatile uint8_t  g_rbuf[256]   __attribute__((aligned(16)));
 #define UHCI_XFER_MAX    256            /* 数据阶段缓冲上界 */
 
+/* H2-2d：中断传输结构（中断 QH + 1 个中断 TD + 报告缓冲）。
+ *
+ * 调度骨架（关键，改这里前先想清楚）：
+ *   帧列表(1024 项) -> 中断 QH --(水平链 Q=1)--> 控制 QH
+ *                         |                         |
+ *                     中断 TD(Q=0 纵向)          控制 TD 链(Q=0 纵向)
+ *   两个 QH 都是常驻的：帧列表初始化后**永不再改**，控制/中断传输只改各自
+ *   QH 的 element 指针（挂上/撤下一个 dword）。这样两种传输互不踩帧列表，
+ *   也不必每次传输重写 4KB 帧列表（shell 每秒轮询上千次时这点很要紧）。
+ *   两个队列都空时 HC 只是每帧走过两个终止项，零开销。 */
+static volatile uint32_t g_iqh[8]      __attribute__((aligned(16)));
+static volatile uint32_t g_itd[8]      __attribute__((aligned(16)));
+static volatile uint8_t  g_ibuf[16]    __attribute__((aligned(16)));
+#define UHCI_INTR_TO_MS  3u             /* 中断轮询超时（毫秒） */
+
+/* 中断端点的 DATA toggle（按 USB 地址索引，每设备一个中断端点够用）。
+ * UHCI 不做自动 toggle：TD token 的 bit19 必须由软件给，给错设备就丢包。 */
+static uint8_t g_toggle[128];
+
 /* 帧列表：1024 项，4KB 对齐（UHCI 要求）。放在 .bss（与 AHCI 的 DMA 缓冲同区，
  * 已验证对设备 DMA 一致），不依赖 pmm 池——pmm 页在本 QEMU 下经 FLBASEADD
  * 给 HC 做 DMA 读时未被证实一致，故改用 BSS 静态区。 */
@@ -254,14 +273,11 @@ int uhci_control_xfer(uint16_t io, uint8_t addr, uint8_t ep,
     g_td[2][1] = UHCI_TD_ACTIVE | UHCI_TD_ERR3 | ls;
     g_td[2][0] = 0x1u;                        /* T terminate，链表尾 */
 
-    /* 标准挂接（QH/TD 纵向链）：QH0 水平链接 T；QH0 元素指针 -> TD0（Q=0
-     * 纵向）。帧列表全部 1024 项指向 QH0（Q=1 = 指向 QH，HC 每帧都处理本
-     * 队列，否则每秒仅 1 帧碰到）。挂在 .bss 帧列表 g_frame（与 AHCI 的 DMA
-     * 缓冲同区，已验证对设备 DMA 一致）。 */
+    /* 挂接控制队列：控制 QH 的 element -> TD0（Q=0 纵向）。
+     * H2-2d 起**不再改写帧列表**——帧列表常驻指向中断 QH，中断 QH 水平链到
+     * 控制 QH（见 g_iqh 处的骨架注释），控制传输只动自己 QH 的 element。 */
     g_qh[0] = 0x1u;                              /* 水平链接 terminate */
     g_qh[1] = U32PTR(&g_td[0]);                  /* 元素指针 -> TD0 (vertical) */
-    for (int fi = 0; fi < 1024; fi++)
-        g_frame[fi] = U32PTR(&g_qh[0]) | 0x2u;   /* frame -> QH0 (Q=1) */
 
     /* 轮询完成（以 g_pit_ticks 1ms 为基准，超时 fail closed 不挂死） */
     uint32_t t0 = g_pit_ticks;
@@ -277,8 +293,7 @@ int uhci_control_xfer(uint16_t io, uint8_t addr, uint8_t ep,
         if ((s0 & UHCI_TD_FATAL) || (s1 & UHCI_TD_FATAL) || (s2 & UHCI_TD_FATAL))
             break;
     }
-    /* 不论成功失败，先把帧列表与 QH 元素拉回空闲（T 终止），防 HC 反复重跑本链路 */
-    for (int fi = 0; fi < 1024; fi++) g_frame[fi] = 0x1u;
+    /* 不论成功失败，把控制 QH 的 element 拉回终止（T），防 HC 反复重跑本链路 */
     g_qh[1] = 0x1u;
 
     if (!done) {
@@ -316,6 +331,68 @@ int uhci_control_xfer(uint16_t io, uint8_t addr, uint8_t ep,
         int n = al; if (n > blen) n = blen;          /* 上界保护 */
         for (int i = 0; i < n; i++) buf[i] = (uint8_t)g_rbuf[i];
     }
+    return 0;
+}
+
+/*
+ * 中断 IN 轮询（H2-2d：HID 键盘的报告通道）。语义见 uhci.h。
+ *
+ * 与设备约定：
+ *  - 没有新报告时设备回 NAK —— 这不是错误，返回 0 且 *actlen=0。
+ *  - DATA toggle 必须软件维护（UHCI TD token bit19），且**只有真正收到数据
+ *    才翻转**：NAK/零长度传输不算完成一次数据包，翻了就会与设备失步，
+ *    表现为"第一次能读到报告，之后永远读不到"。
+ *  - 轮询窗口 UHCI_INTR_TO_MS（6ms）：低速设备每帧最多一次事务，1ms/帧，
+ *    6ms 足够 HC 重试完；超时 fail closed 返回 -1，绝不挂死。
+ */
+int uhci_interrupt_in(uint16_t io, uint8_t addr, uint8_t ep,
+                      uint8_t *buf, int blen, int lowspeed, int *actlen) {
+    (void)io;   /* same as control xfer: routed by the schedule, not port IO */
+    if (actlen) *actlen = 0;
+    if (!buf || addr == 0u || addr > 127u) return -1;
+    if ((ep & 0x80u) == 0u || (ep & 0x7Fu) > 15u) return -1;  /* 必须是 IN 端点 */
+    if (blen < 1 || blen > (int)sizeof(g_ibuf)) return -1;    /* 缓冲上界 */
+
+    uint32_t ls = lowspeed ? UHCI_TD_LS : 0u;
+    uint32_t tog = g_toggle[addr] ? (1u << 19) : 0u;   /* DATA0/DATA1 */
+
+    for (int i = 0; i < (int)sizeof(g_ibuf); i++) g_ibuf[i] = 0;
+
+    g_itd[0] = 0x1u;                                    /* T：链表尾 */
+    g_itd[1] = UHCI_TD_ACTIVE | UHCI_TD_SPD | UHCI_TD_ERR3 | ls;
+    g_itd[2] = UHCI_PID_IN
+             | ((uint32_t)addr << 8)
+             | (((uint32_t)(ep & 0x7Fu)) << 15)
+             | tog
+             | (((uint32_t)(blen - 1)) << 21);          /* maxlen = len-1 */
+    g_itd[3] = U32PTR(&g_ibuf[0]);
+
+    /* 挂上：中断 QH 的 element -> 中断 TD（Q=0 纵向） */
+    g_iqh[1] = U32PTR(&g_itd[0]);
+
+    uint32_t t0 = g_pit_ticks;
+    int done = 0;
+    while ((uint32_t)(g_pit_ticks - t0) < UHCI_INTR_TO_MS) {
+        uint32_t s = g_itd[1];
+        if ((s & UHCI_TD_ACTIVE) == 0u) { done = 1; break; }
+        if (s & UHCI_TD_FATAL) break;                   /* fail closed，不空等 */
+    }
+    /* 撤下：防 HC 反复重跑同一个已完成的 TD */
+    g_iqh[1] = 0x1u;
+
+    uint32_t st = g_itd[1];
+    if (!done) return -1;
+    if (st & UHCI_TD_FATAL) return -1;
+
+    uint32_t al_field = st & 0x7FFu;
+    int al = (al_field == 0x7FFu) ? 0 : (int)al_field + 1;
+    if (al <= 0) return 0;                              /* NAK / 零长度：无数据 */
+
+    g_toggle[addr] = (uint8_t)(g_toggle[addr] ^ 1u);    /* 收到数据才翻 toggle */
+    int n = al;
+    if (n > blen) n = blen;
+    for (int i = 0; i < n; i++) buf[i] = (uint8_t)g_ibuf[i];
+    if (actlen) *actlen = n;
     return 0;
 }
 
@@ -655,7 +732,16 @@ static int uhci_setup_one(const pci_device_t *d) {
 
     /* ---------- 建立帧列表（BSS，4KB 对齐，与 AHCI DMA 缓冲同区，已验证对
      * 设备 DMA 一致；不依赖 pmm 池，免去资源失败回滚的额外复杂度） ---------- */
-    for (int k = 0; k < 1024; k++) g_frame[k] = 0x00000001u;   /* bit0=T 终止空帧 */
+    /* 建立帧列表 + 常驻调度骨架（见 g_iqh 处的骨架注释）：
+     *   帧列表全部 1024 项 -> 中断 QH(Q=1) -> 水平链 -> 控制 QH(Q=1)
+     * 两个 QH 的 element 初始都是 T（空队列），后续各传各的、只改自己那一个
+     * dword。帧列表建好之后**永不改写**，也不必每次传输重刷 4KB。 */
+    g_iqh[0] = U32PTR(&g_qh[0]) | 0x2u;          /* 水平链 -> 控制 QH (Q=1) */
+    g_iqh[1] = 0x1u;                             /* element = T（暂无中断 TD） */
+    g_qh[0]  = 0x1u;                             /* 控制 QH 水平链终止 */
+    g_qh[1]  = 0x1u;                             /* element = T（暂无控制 TD） */
+    for (int k = 0; k < 1024; k++)
+        g_frame[k] = U32PTR(&g_iqh[0]) | 0x2u;   /* frame -> 中断 QH (Q=1) */
     u_outl(io, 0x08, UHCI_FRAME_PHYS);          /* FLBASEADD = 帧列表物理地址 */
     u_outw(io, 0x06, 0x0000);                   /* FRNUM = 0 */
 

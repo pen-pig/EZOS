@@ -29,6 +29,7 @@
 #include "usb.h"
 #include "uhci.h"
 #include "usbenum.h"
+#include "usbkbd.h"
 
 // �򵥳��Ⱥ��������Զ���ʽ��ʾ��ʹ��
 static size_t my_strlen(const char *s) {
@@ -426,6 +427,11 @@ void kernel_main(void) {
      * endpoint parsing -> SET_CONFIGURATION). Evidence goes to dmesg/COM1;
      * no device attached means a clean skip with zero success lines. */
     usbenum_init();
+
+    /* H2-2d: claim a HID boot keyboard among the enumerated devices and
+     * switch it to the boot protocol. Input arrives by polling the interrupt
+     * IN endpoint (hooked into keyboard_getchar, see usbkbd.c). */
+    usbkbd_init();
 
     /* RTL8139 NIC (step 7.2): claim + reset + MAC + 8K RX ring + 4 TX
      * descriptors + IRQ + ARP/ICMP echo reply. Returns -1 when QEMU has
