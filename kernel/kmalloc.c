@@ -157,9 +157,14 @@ uint32_t kmalloc_total(void)    { return KM_POOL_SIZE; }
 uint32_t kmalloc_used(void)     { return km_used_bytes; }
 
 uint32_t kmalloc_largest_free(void) {
+    /* 遍历空闲链表也要在临界区内：IRQ 上下文的 kmalloc/kfree 可能正改到
+     * 一半（例如 prev->size 已合并、prev->next 还没摘），此时读到的最大
+     * 空闲块是错的，shell `mem` 会报出与真实堆不一致的数字。 */
+    uint32_t f = irq_save_disable();
     uint32_t max = 0;
     for (km_block_t *b = km_head; b; b = b->next)
         if (blk_is_free(b) && blk_size(b) > max) max = blk_size(b);
+    irq_restore(f);
     return max;
 }
 

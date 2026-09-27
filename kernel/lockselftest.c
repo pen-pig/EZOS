@@ -176,6 +176,61 @@ static int lt_pmm_stress(void) {
     return ok ? 0 : 1;
 }
 
+/* ---------- 6) dmesg（IRQ 与进程共用的输出通道）临界区 ----------
+ *
+ * 为什么单列：dmesg_write 是全系统唯一被 IRQ 上下文（net/rtl8139 的 IRQ11、
+ * ehci/nvme/usb 中断路径）与进程上下文（shell）同时调用的输出通道。它若
+ * 无保护，串口侧两行字符会交错——而本项目所有 E2E 都是**按行**断言串口
+ * 输出的，交错会直接造成难以复现的假红假绿。
+ *
+ * 这里只验证一件能真正失败的事：
+ *   a) 在"已关中断"的模拟 IRQ 上下文里调用，返回后中断必须仍是关的。
+ *      若有人把 dmesg 改成用 task_lock()（全局深度计数、归零无条件 sti），
+ *      这一项立刻变红——与 kmalloc/pmm 那两项是同一个回归网。
+ *
+ * 刻意**不**测"两行字符交错"：单核自检里两次 dmesg_write 天然串行，
+ * 无论有没有临界区结果都一样，属于加了也测不出回归的弱断言。真正的交错
+ * 需要 IRQ11 在进程上下文写串口的中途抢入，自检构造不出来——那一层靠
+ * 代码审查 + dmesg.c 顶部的并发注释守住。 */
+
+static int lt_dmesg_irq_nested(void) {
+    asm volatile("cli" ::: "memory");
+    int ok = 1;
+    /* 前缀刻意不用 "LOCKTEST:"——那是以 lt_result 打出的**结果行**专用前缀，
+     * tests/test_lock.py 靠它统计用例数，自检自己写的数据行不能用同名前缀。 */
+    dmesg_write("LOCKDBG: dmesg-irq-ctx");
+    if (lt_read_if() != 0) ok = 0;    /* 返回后不得提前开中断 */
+    asm volatile("sti" ::: "memory");
+    return ok ? 0 : 1;
+}
+
+/* 读路径回归：dmesg_dump/tail 被改成了"快照 + 逐行加锁拷贝"，这里验证
+ * 改写后仍能按原顺序读回完整行（抓的是 dm_first 漏快照、idx 算错、
+ * 拷贝截断这类把读路径改坏的错误）。 */
+static int lt_expect2(const char *buf, const char *a, const char *b) {
+    int i = 0;
+    for (int k = 0; a[k]; k++) {
+        if (buf[i] == 0 || buf[i] != a[k]) return 1;
+        i++;
+    }
+    for (int k = 0; b[k]; k++) {
+        if (buf[i] == 0 || buf[i] != b[k]) return 1;
+        i++;
+    }
+    return 0;
+}
+
+static int lt_dmesg_tail_readback(void) {
+    /* 必须带 '\n'：dmesg_write 只在遇到换行时才把 dm_cur 刷成一行，
+     * 不带换行的内容会留在"正在积累的行"里，dmesg_tail 根本看不到它。 */
+    dmesg_write("LOCKDBG: row-alpha\n");
+    dmesg_write("LOCKDBG: row-bravo\n");
+    char buf[160];
+    int got = dmesg_tail(buf, sizeof(buf), 2);
+    if (got <= 0) return 1;
+    return lt_expect2(buf, "LOCKDBG: row-alpha\n", "LOCKDBG: row-bravo\n");
+}
+
 /* ---------- 主入口 ---------- */
 
 int lock_selftest(void) {
@@ -193,6 +248,10 @@ int lock_selftest(void) {
     r = lt_km_stress();          lt_result("kmalloc stress", r == 0);
     if (r) nfail++;
     r = lt_pmm_stress();         lt_result("pmm stress", r == 0);
+    if (r) nfail++;
+    r = lt_dmesg_irq_nested();   lt_result("dmesg in IRQ ctx", r == 0);
+    if (r) nfail++;
+    r = lt_dmesg_tail_readback(); lt_result("dmesg tail readback", r == 0);
     if (r) nfail++;
 
     return nfail;

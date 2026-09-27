@@ -1,16 +1,22 @@
 # -*- coding: utf-8 -*-
 """test_lock.py - 分配器临界区保护自检的 E2E 验证（P1 无锁隐患回归网）
 
-开机自检（boot_selftest）会自动跑 lock_selftest()，串口输出 6 行：
+开机自检（boot_selftest）会自动跑 lock_selftest()，串口输出 8 行结果：
     LOCKTEST: irqflags save(IF=1) PASS
     LOCKTEST: irqflags nested keep PASS
     LOCKTEST: kmalloc in IRQ ctx PASS
     LOCKTEST: pmm in IRQ ctx PASS
     LOCKTEST: kmalloc stress PASS
     LOCKTEST: pmm stress PASS
+    LOCKTEST: dmesg in IRQ ctx PASS
+    LOCKTEST: dmesg tail readback PASS
+
+前缀约定（别改）：只有 lt_result() 打出的**结果行**用 "LOCKTEST:"；
+自检自己写的数据行用 "LOCKDBG:"。tests 靠 "LOCKTEST:" 统计用例数，
+两者混用会让这里 N_CASES 与实际行数对不上（2026-09 加 dmesg 两项时踩过）。
 
 断言三件事：
-  1) 恰好 6 行 LOCKTEST（防自检项被静默删掉/没注册）；
+  1) 恰好 8 行 LOCKTEST（防自检项被静默删掉/没注册）；
   2) 无任何 FAIL；
   3) 含关键的 "irqflags nested keep PASS"——该项专抓"把 irq_restore
      改成无条件 sti"这类回归（等价于 task_unlock 语义），变异测试已
@@ -32,7 +38,7 @@ QEMU = "D:/MyOS/tools/qemu-portable-20241220/qemu-system-x86_64.exe"
 QMP_PORT = 4495
 SERIAL_PORT = 4494
 BOOT_WAIT = 45
-N_CASES = 6
+N_CASES = 8
 
 IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
 DISK = os.path.join(ROOT, "disk.img")
