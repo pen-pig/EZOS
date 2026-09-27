@@ -411,6 +411,24 @@ static void udp_input(const uint8_t *ip, uint32_t ihl) {
                 u + UDP_HDR_LEN, dlen);
 }
 
+/* UDP 校验和（含 IPv4 伪首部）。源 IP 参数化：DHCP 在未取得地址时用
+ * 0.0.0.0 作源（net_udp_send 用本机 IP）。伪首部与段分别求 RAW 和再相加，
+ * 最后统一折叠取反；奇数字节按"高位字节 + 隐式 0 填充"处理（与在缓冲
+ * 尾部补 0 等价）。 */
+static uint16_t udp_checksum(uint32_t src_ip, uint32_t dst_ip,
+                             const uint8_t *p, uint32_t n) {
+    uint8_t ps[12];
+    put32(ps + 0, src_ip);
+    put32(ps + 4, dst_ip);
+    ps[8] = 0; ps[9] = 17;
+    put16(ps + 10, (uint16_t)n);
+    uint32_t s = cksum_raw(ps, 12) + cksum_raw(p, n);
+    if (n & 1) s += (uint32_t)p[n - 1] << 8;
+    while (s >> 16) s = (s & 0xFFFFu) + (s >> 16);
+    uint16_t c = (uint16_t)(~s);
+    return (c == 0) ? 0xFFFFu : c;
+}
+
 static int net_udp_send(uint32_t dst_ip, uint16_t dst_port, uint16_t src_port,
                         const uint8_t *data, uint32_t n) {
     if (n > NET_BUILD_MAX - IP_HDR_MIN - UDP_HDR_LEN) return -1;
@@ -421,24 +439,261 @@ static int net_udp_send(uint32_t dst_ip, uint16_t dst_port, uint16_t src_port,
     put16(p + 6, 0);
     for (uint32_t i = 0; i < n; i++) p[UDP_HDR_LEN + i] = data[i];
 
-    /* UDP 校验和含伪首部（IPv4 可选，算上更正规，对端可验证）。
-     * 伪首部与段分别求 RAW 和再相加，最后统一取反。 */
+    /* UDP 校验和含伪首部（IPv4 可选，算上更正规，对端可验证）。 */
     uint32_t need = UDP_HDR_LEN + n;
-    if (need & 1) p[need] = 0;
-    uint8_t ps[12];
-    put32(ps + 0, my_ip_be());
-    put32(ps + 4, dst_ip);
-    ps[8] = 0; ps[9] = 17;
-    put16(ps + 10, (uint16_t)need);
-    uint32_t s = cksum_raw(ps, 12) + cksum_raw(p, need + (need & 1));
-    while (s >> 16) s = (s & 0xFFFFu) + (s >> 16);
-    uint16_t c = (uint16_t)(~s);
-    if (c == 0) c = 0xFFFF;
-    put16(p + 6, c);
+    put16(p + 6, udp_checksum(my_ip_be(), dst_ip, p, need));
 
     if (ipv4_send(dst_ip, 17, p, need) != 0) return -1;
     g_udp_tx++;
     return (int)n;
+}
+
+/* ---------- DHCP 客户端（RFC 2131 简化版） ----------
+ *
+ * 为什么单独一段：DHCP 是唯一"本机还没有 IP 就要收发"的协议——
+ *   源 IP 0.0.0.0、目的 255.255.255.255、以太网广播、UDP 68<->67。
+ * 因此它不能走 ipv4_send()（那条路径会 arp_resolve(255.255.255.255)，
+ * 永远解析不到），也不走 socket 层（绑定前就要收包）。
+ *
+ * 收发两端的不对称：
+ *   发：dhcp_send() 直接组 eth+ip+udp+bootp 出帧，无 ARP、无路由。
+ *   收：net_input() 在 g_dhcp_w.active 期间对 UDP 67->68 **放宽目的 IP
+ *       检查**（见 net_input 里的注释），由 dhcp_input() 按 xid 过滤。
+ *       不放行的话，服务器广播回来的 OFFER（目的 255.255.255.255）
+ *       或单播到尚未生效的 yiaddr 都会被"不是我的 IP"直接丢掉。
+ *
+ * 状态机（能省则省）：DISCOVER -> OFFER -> REQUEST -> ACK，各 3 次重试。
+ * 刻意没做的：续租（T1/T2 定时器）、ARP 冲突检测、多 DNS、option 覆盖
+ * 长度 >4 的非法报文（fail closed 当不存在）。这些都是教学取舍，注释在此。
+ *
+ * 并发：与 ping 同一条 net 等待队列（g_netrx_wq），单等待者——
+ * shell 一次只跑一个 dhcp。dhcp_input 可能在 IRQ 上下文被调（rtl8139
+ * rx_drain → net_input），只做"拷包 + 置 got"，解析留给任务上下文。
+ */
+
+#define DHCP_SRV_PORT   67u
+#define DHCP_CLI_PORT   68u
+#define DHCP_MAGIC      0x63825363u   /* 99.130.83.99，options 起始标记 */
+#define BOOTP_FIXED     236u          /* BOOTP 固定部分长度（到 chaddr 结束） */
+#define BOOTP_MIN       300u          /* RFC 951：BOOTP 报文不得短于 300 */
+
+/* 一次会话的接收槽（512 > BOOTP_MIN + 常规 options） */
+static struct {
+    uint8_t  active;      /* 正在等响应（net_input 据此放宽目的 IP 检查） */
+    uint8_t  got;
+    uint32_t xid;         /* 只认自己发起的事务 */
+    uint8_t  msg_type;    /* option 53：2=OFFER 5=ACK 6=NAK */
+    uint32_t yiaddr;      /* BOOTP 头里的"你的地址"（网络序） */
+    uint8_t  buf[512];
+    uint32_t len;
+} g_dhcp_w;
+
+/* 已生效的租约（nic 命令显示；后续 DNS 客户端直接用 g_lease.dns） */
+static struct {
+    uint8_t  valid;
+    uint32_t ip, mask, router, dns, server;   /* 全部网络序 */
+    uint32_t lease;                            /* 秒；0 = 服务器没下发 */
+    uint32_t tick;                             /* 取得时刻（g_pit_ticks） */
+} g_lease;
+
+/* 发一份 DHCP 报文：以太网广播 + IP 源 0.0.0.0 目的 255.255.255.255。
+ * msg_type: 1=DISCOVER 3=REQUEST；REQUEST 需要 req_ip（option 50）与
+ * server_id（option 54，选中的那台服务器）。
+ * flags 置 broadcast(0x8000)：请求服务器用广播回，避免它单播到一个
+ * 二层上还解析不到的地址。返回 0 = 已提交网卡。 */
+static int dhcp_send(uint8_t msg_type, uint32_t req_ip, uint32_t server_id) {
+    uint8_t *p = g_build;
+    for (uint32_t i = 0; i < BOOTP_MIN; i++) p[i] = 0;   /* 含 sname/file 全零 */
+
+    p[0] = 1;                                 /* BOOTREQUEST */
+    p[1] = 1; p[2] = 6;                       /* htype=ethernet, hlen=6 */
+    p[3] = 0;                                 /* hops */
+    put32(p + 4, g_dhcp_w.xid);
+    put16(p + 8, 0);                          /* secs */
+    put16(p + 10, 0x8000);                    /* flags: broadcast */
+    const uint8_t *my = rtl8139_mac();
+    for (int i = 0; i < 6; i++) p[28 + i] = my[i];       /* chaddr[0..5] */
+    put32(p + 236, DHCP_MAGIC);
+
+    uint32_t o = 240;
+    p[o++] = 53; p[o++] = 1; p[o++] = msg_type;
+    if (msg_type == 3) {
+        p[o++] = 50; p[o++] = 4; put32(p + o, req_ip);    o += 4;
+        p[o++] = 54; p[o++] = 4; put32(p + o, server_id); o += 4;
+    }
+    p[o++] = 55; p[o++] = 4;                  /* 参数请求：掩码/路由/DNS/租期 */
+    p[o++] = 1; p[o++] = 3; p[o++] = 6; p[o++] = 51;
+    p[o++] = 61; p[o++] = 7; p[o++] = 1;      /* client id: 01 + MAC */
+    for (int i = 0; i < 6; i++) p[o++] = my[i];
+    p[o++] = 255;                             /* end */
+    if (o > BOOTP_MIN) return -1;             /* options 写穿了固定长度区 */
+
+    uint8_t *r = g_frame;
+    for (int i = 0; i < 6; i++) r[i] = 0xFF;              /* 以太网广播 */
+    for (int i = 0; i < 6; i++) r[6 + i] = my[i];
+    r[12] = 0x08; r[13] = 0x00;
+
+    uint8_t *u = r + ETH_HDR_LEN + IP_HDR_MIN;
+    uint32_t ulen = UDP_HDR_LEN + BOOTP_MIN;
+    put16(u + 0, DHCP_CLI_PORT);
+    put16(u + 2, DHCP_SRV_PORT);
+    put16(u + 4, (uint16_t)ulen);
+    put16(u + 6, 0);
+    for (uint32_t i = 0; i < BOOTP_MIN; i++) u[UDP_HDR_LEN + i] = p[i];
+    put16(u + 6, udp_checksum(0u, 0xFFFFFFFFu, u, ulen));
+
+    uint8_t *ip = r + ETH_HDR_LEN;
+    ip[0] = 0x45; ip[1] = 0;
+    put16(ip + 2, (uint16_t)(IP_HDR_MIN + ulen));
+    put16(ip + 4, ++g_ip_id);
+    put16(ip + 6, 0);                         /* 无分片 */
+    ip[8] = 64; ip[9] = 17;
+    put16(ip + 10, 0);
+    put32(ip + 12, 0u);                       /* 源 0.0.0.0：还没有地址 */
+    put32(ip + 16, 0xFFFFFFFFu);              /* 目的 255.255.255.255 */
+    put16(ip + 10, cksum(ip, IP_HDR_MIN));
+
+    g_udp_tx++;
+    return rtl8139_send(r, ETH_HDR_LEN + IP_HDR_MIN + ulen);
+}
+
+/* net_input 路径（可能 IRQ 上下文）：校验后整包收下并置 got。
+ * 只在这里认 xid + option 53，其余选项交给任务上下文的 net_dhcp()。 */
+static void dhcp_input(const uint8_t *ip, uint32_t ihl) {
+    uint32_t totlen = be16(ip + 2);
+    if (totlen < ihl + UDP_HDR_LEN) return;
+    const uint8_t *u = ip + ihl;
+    uint32_t ulen = be16(u + 4);
+    if (ulen < UDP_HDR_LEN || ulen > totlen - ihl) return;
+    uint32_t dlen = ulen - UDP_HDR_LEN;
+    if (dlen < BOOTP_FIXED + 4 || dlen > sizeof(g_dhcp_w.buf)) return;
+
+    const uint8_t *b = u + UDP_HDR_LEN;
+    if (be32(b + 236) != DHCP_MAGIC) return;       /* 非 RFC 2131 格式 */
+    if (be32(b + 4) != g_dhcp_w.xid) return;       /* 不是我这一轮的事务 */
+
+    uint8_t type = 0;
+    for (uint32_t i = 240; i + 1 < dlen; ) {
+        uint8_t code = b[i];
+        if (code == 0)  { i++; continue; }         /* pad */
+        if (code == 255) break;                    /* end */
+        uint32_t olen = b[i + 1];
+        if (i + 2 + olen > dlen) break;            /* 长度越界：截断当作结束 */
+        if (code == 53 && olen >= 1) type = b[i + 2];
+        i += 2 + olen;
+    }
+    if (type == 0) return;                         /* 没有消息类型：不认 */
+
+    for (uint32_t i = 0; i < dlen; i++) g_dhcp_w.buf[i] = b[i];
+    g_dhcp_w.len = dlen;
+    g_dhcp_w.yiaddr = be32(b + 16);
+    g_dhcp_w.msg_type = type;
+    g_dhcp_w.got = 1;
+}
+
+/* 从已收下的报文里取一个 option（返回拷贝字节数，0 = 没有/非法） */
+static uint32_t dhcp_opt(uint8_t code, uint8_t *out, uint32_t max) {
+    const uint8_t *b = g_dhcp_w.buf;
+    uint32_t dlen = g_dhcp_w.len;
+    for (uint32_t i = 240; i + 1 < dlen; ) {
+        uint8_t c = b[i];
+        if (c == 0)  { i++; continue; }
+        if (c == 255) break;
+        uint32_t olen = b[i + 1];
+        if (i + 2 + olen > dlen) break;
+        if (c == code) {
+            uint32_t n = (olen < max) ? olen : max;
+            for (uint32_t k = 0; k < n; k++) out[k] = b[i + 2 + k];
+            return n;
+        }
+        i += 2 + olen;
+    }
+    return 0;
+}
+
+/* 睡等一个响应（与 ping 共用 g_netrx_wq）。返回 1 = 收到，0 = 超时。 */
+static int dhcp_wait(uint32_t timeout_ms) {
+    uint32_t deadline = g_pit_ticks + timeout_ms;
+    for (;;) {
+        net_poll();
+        if (g_dhcp_w.got) return 1;
+        uint32_t now = g_pit_ticks;
+        if ((int32_t)(now - deadline) >= 0) return 0;
+        task_sleep(&g_netrx_wq, deadline - now);
+    }
+}
+
+/* DHCP 主流程（任务上下文，会睡最多 ~3*timeout_ms 每阶段）。
+ * 返回：0 = 已取得并应用租约、1 = 无服务器应答（超时）、2 = 被 NAK 或
+ * 服务器给的 IP 非法、-1 = 无网卡/缓冲不足/发送失败。 */
+int net_dhcp(uint32_t timeout_ms) {
+    if (!rtl8139_present()) return -1;
+    if (!build_ready()) return -1;
+    if (timeout_ms == 0) timeout_ms = 2500u;
+
+    g_lease.valid = 0;
+    const uint8_t *my = rtl8139_mac();
+    uint32_t xid = (uint32_t)g_pit_ticks;
+    for (int i = 0; i < 6; i++) xid = (xid << 5) ^ (xid >> 27) ^ my[i];
+    if (xid == 0) xid = 0x5A5A5A5Au;
+    g_dhcp_w.xid = xid;
+
+    /* 阶段 1：DISCOVER -> OFFER */
+    int offered = 0;
+    for (int attempt = 0; attempt < 3 && !offered; attempt++) {
+        g_dhcp_w.got = 0;
+        g_dhcp_w.active = 1;              /* 先置位再发：响应可能在发送途中到 */
+        if (dhcp_send(1, 0, 0) != 0) { g_dhcp_w.active = 0; return -1; }
+        if (dhcp_wait(timeout_ms) && g_dhcp_w.msg_type == 2) offered = 1;
+    }
+    if (!offered) { g_dhcp_w.active = 0; return 1; }
+
+    uint32_t offer_ip = g_dhcp_w.yiaddr;
+    if (offer_ip == 0) { g_dhcp_w.active = 0; return 2; }
+    uint8_t sid[4];
+    uint32_t server_id = (dhcp_opt(54, sid, 4) == 4) ? be32(sid) : 0u;
+
+    /* 阶段 2：REQUEST -> ACK（广播，让未被选中的服务器也收到并释放预留） */
+    int acked = 0;
+    for (int attempt = 0; attempt < 3 && !acked; attempt++) {
+        g_dhcp_w.got = 0;
+        g_dhcp_w.active = 1;
+        if (dhcp_send(3, offer_ip, server_id) != 0) { g_dhcp_w.active = 0; return -1; }
+        if (dhcp_wait(timeout_ms)) {
+            if (g_dhcp_w.msg_type == 5) acked = 1;
+            else if (g_dhcp_w.msg_type == 6) { g_dhcp_w.active = 0; return 2; }
+        }
+    }
+    g_dhcp_w.active = 0;
+    if (!acked) return 1;
+
+    uint32_t ip = g_dhcp_w.yiaddr;
+    if (ip == 0) return 2;                 /* ACK 里没给地址：不应用 */
+
+    uint8_t v[4];
+    g_lease.ip      = ip;
+    g_lease.mask    = (dhcp_opt(1, v, 4) == 4)  ? be32(v) : 0u;
+    g_lease.router  = (dhcp_opt(3, v, 4) == 4)  ? be32(v) : 0u;
+    g_lease.dns     = (dhcp_opt(6, v, 4) == 4)  ? be32(v) : 0u;  /* 只取第一个 */
+    g_lease.server  = server_id;
+    g_lease.lease   = (dhcp_opt(51, v, 4) == 4) ? be32(v) : 0u;
+    g_lease.tick    = g_pit_ticks;
+    g_lease.valid   = 1;
+
+    rtl8139_set_ip((uint8_t)(ip & 0xFFu), (uint8_t)((ip >> 8) & 0xFFu),
+                   (uint8_t)((ip >> 16) & 0xFFu), (uint8_t)((ip >> 24) & 0xFFu));
+    return 0;
+}
+
+int net_dhcp_valid(void) { return g_lease.valid; }
+
+void net_dhcp_lease(uint32_t *ip, uint32_t *mask, uint32_t *router,
+                    uint32_t *dns, uint32_t *lease) {
+    if (ip)     *ip     = g_lease.ip;
+    if (mask)   *mask   = g_lease.mask;
+    if (router) *router = g_lease.router;
+    if (dns)    *dns    = g_lease.dns;
+    if (lease)  *lease  = g_lease.lease;
 }
 
 /* ---------- TCP ---------- */
@@ -847,6 +1102,19 @@ int net_input(const uint8_t *f, uint32_t len) {
     /* 统一 ARP 学习：任何发到本机的 IPv4 帧都记录 (源 IP, 源 MAC)。
      * 同网段直连成立（教学环境无路由）；回包不再需要 ARP 解析。 */
     arp_learn(be32(ip + 12), f + 6);
+
+    /* DHCP 阶段特例：此时本机还没有 IP，服务器回的包目的可能是
+     * 255.255.255.255（我们置了 broadcast flag）或尚未生效的 yiaddr，
+     * 两者都会被下面的"不是我的 IP"丢掉。故会话活跃期间对 UDP 67->68
+     * 放宽检查，真正的合法性由 dhcp_input() 用 xid 把关（xid 由 MAC+tick
+     * 生成，别的客户机的包撞不上）。会话不活跃时本分支不生效。 */
+    if (g_dhcp_w.active && ip[9] == 17 && ihl + UDP_HDR_LEN <= totlen) {
+        const uint8_t *u = ip + ihl;
+        if (be16(u + 0) == DHCP_SRV_PORT && be16(u + 2) == DHCP_CLI_PORT) {
+            dhcp_input(ip, ihl);
+            return 0;
+        }
+    }
     if (be32(ip + 16) != my_ip_be()) return -1;
 
     if (ip[9] == 1)      icmp_input(ip, ihl);

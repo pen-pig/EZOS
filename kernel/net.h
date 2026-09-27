@@ -69,6 +69,20 @@ int net_ping(uint32_t dst_ip_be, uint32_t timeout_ms, uint32_t *rtt_ms);
  * 不做常驻监听：shell 无 Ctrl-C 中断机制，accept 常驻会让 shell 永久阻塞。 */
 int net_httpd_once(void);
 
+/* ---- DHCP 客户端（RFC 2131 简化：DISCOVER/OFFER/REQUEST/ACK） ----
+ * 只能在任务上下文调用（内部睡等响应）。会覆盖 rtl8139 的 IP 配置。
+ * 返回：0 = 已取得并应用租约、1 = 无服务器应答（超时）、2 = 被 NAK 或
+ * 服务器给的 IP 非法、-1 = 无网卡/缓冲不足/发送失败。
+ * timeout_ms 是每一轮等待的上限（DISCOVER 与 REQUEST 各最多 3 轮）。 */
+int net_dhcp(uint32_t timeout_ms);
+
+/* 租约是否生效（0 = 从未成功或尚未运行 dhcp） */
+int net_dhcp_valid(void);
+
+/* 取当前租约（网络序；未下发的字段为 0）。任一指针可为 0。 */
+void net_dhcp_lease(uint32_t *ip, uint32_t *mask, uint32_t *router,
+                    uint32_t *dns, uint32_t *lease);
+
 /* 步骤 8a：rtl8139 在 rx_drain 排完一批包后调用——踢醒睡在 net 等待
  * 队列上的 recvfrom/accept/ARP 解析（task_wake_all，IRQ 上下文安全）。
  * 轮询路径（syscall 内 net_poll）同样会走到，重复唤醒无害（惊群自查）。 */

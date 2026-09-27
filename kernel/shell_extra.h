@@ -41,6 +41,7 @@ void cmd_pci(const char *args);
 void cmd_nic(const char *args);
 void cmd_ping(const char *args);
 void cmd_httpd(const char *args);
+void cmd_dhcp(const char *args);
 
 /* 内核解引用"用户给的地址"前的必查项：整段区间是否都已映射。
  * 未做校验时 `mem 0xFFFFFFFF` 会在 ring0 缺页，整个内核停机。

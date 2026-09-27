@@ -455,6 +455,7 @@ static const command_t commands[] = {
     {"nic",       cmd_nic},
     {"ping",      cmd_ping},
     {"httpd",     cmd_httpd},
+    {"dhcp",      cmd_dhcp},
     {0, 0}
 };
 

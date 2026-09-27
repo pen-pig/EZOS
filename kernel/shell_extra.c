@@ -37,6 +37,9 @@
 #include "acpi.h"
 #include "ata.h"
 
+/* 网络地址格式化（定义在 cmd_ping 之后；cmd_nic 也要用，故提前声明） */
+static const char *ips_of(uint32_t be);
+
 
 
 void ezos_console_putchar(char c) {
@@ -2002,11 +2005,26 @@ void cmd_nic(const char *args) {
     ezos_console_write(" capr=0x");
     ezos_console_print_hex32(dc);
     ezos_console_write("\n");
+
+    if (net_dhcp_valid()) {
+        uint32_t ip = 0, mask = 0, gw = 0, dns = 0, lease = 0;
+        net_dhcp_lease(&ip, &mask, &gw, &dns, &lease);
+        ezos_console_write("DHCP: ip ");
+        ezos_console_write(ips_of(ip));
+        ezos_console_write(" mask ");
+        ezos_console_write(ips_of(mask));
+        ezos_console_write("\nDHCP: router ");
+        ezos_console_write(ips_of(gw));
+        ezos_console_write(" dns ");
+        ezos_console_write(ips_of(dns));
+        ezos_console_write(" lease ");
+        ezos_console_print_dec(lease);
+        ezos_console_write("s\n");
+    }
 }
 
 /* ---- ping <a.b.c.d>：发 4 个 ICMP echo request，打印往返时延 ---- */
 static wait_queue_t g_ping_gap_wq = {-1};   /* 两次 ping 之间的间歇睡这 */
-static const char *ips_of(uint32_t be);
 
 void cmd_ping(const char *args) {
     uint32_t ip[4];
@@ -2085,5 +2103,38 @@ void cmd_httpd(const char *args) {
     } else {
         ezos_console_write("httpd: failed (port busy / out of memory)\n");
     }
+}
+
+/* ---- dhcp：向局域网要一个地址（DISCOVER/OFFER/REQUEST/ACK） ----
+ * 输出行统一 "DHCP: " 前缀（E2E 与 dmesg 都按这个前缀取行）。
+ * 阻塞最长 ~3*2500ms（DISCOVER）+ 3*2500ms（REQUEST）；shell 无 Ctrl-C，
+ * 故不提供常驻重试，超时就是超时。 */
+void cmd_dhcp(const char *args) {
+    (void)args;
+    if (!rtl8139_present()) {
+        ezos_console_write("DHCP: no NIC\n");
+        return;
+    }
+    ezos_console_write("DHCP: discovering...\n");
+    int rc = net_dhcp(2500);
+    if (rc != 0) {
+        if (rc == 1)      ezos_console_write("DHCP: no response (timeout)\n");
+        else if (rc == 2) ezos_console_write("DHCP: NAK / bad offer\n");
+        else              ezos_console_write("DHCP: failed (no nic / tx error)\n");
+        return;
+    }
+    uint32_t ip = 0, mask = 0, gw = 0, dns = 0, lease = 0;
+    net_dhcp_lease(&ip, &mask, &gw, &dns, &lease);
+    ezos_console_write("DHCP: got ");
+    ezos_console_write(ips_of(ip));
+    ezos_console_write("\nDHCP: mask ");
+    ezos_console_write(ips_of(mask));
+    ezos_console_write("\nDHCP: router ");
+    ezos_console_write(ips_of(gw));
+    ezos_console_write("\nDHCP: dns ");
+    ezos_console_write(ips_of(dns));
+    ezos_console_write("\nDHCP: lease ");
+    ezos_console_print_dec(lease);
+    ezos_console_write("s\n");
 }
 
