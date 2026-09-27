@@ -25,6 +25,7 @@
 #include "exec.h"
 #include "elf.h"
 #include "fs.h"
+#include "sysvol.h"
 #include "paging.h"
 #include "pmm.h"
 #include "syscall.h"
@@ -108,17 +109,30 @@ static int exec_spawn(const char *name, const char *args, const char **why, int 
     #define FAIL(v, m) do { if (why) *why = (m); return (v); } while (0)
 
     if (name == 0 || name[0] == '\0') FAIL(-1, "missing file name");
-    if (!fs_ready())                  FAIL(-1, "no filesystem mounted");
 
-    uint32_t size = fs_get_file_size(name);
-    if (size == 0)                    FAIL(-2, "file not found or empty");
-    if (size > EXEC_MAX_IMAGE)        FAIL(-3, "file too large");
+    /* 系统程序在 /bin（内核内置只读卷）：先查它，命中就与磁盘是否挂载、
+     * 是否被 format 无关。解析失败再回落到数据盘上的同名文件。 */
+    char syspath[64];
+    const char *src = name;
+    int from_sysvol = 0;
+    if (sysvol_resolve_bin(name, syspath, sizeof(syspath)) == 0) {
+        src = syspath;
+        from_sysvol = 1;
+    }
+
+    if (!from_sysvol && !fs_ready())   FAIL(-1, "no filesystem mounted");
+
+    uint32_t size = from_sysvol ? sysvol_size(src) : fs_get_file_size(src);
+    if (size == 0)                     FAIL(-2, "file not found or empty");
+    if (size > EXEC_MAX_IMAGE)         FAIL(-3, "file too large");
 
     uint8_t *buf = (uint8_t *)kmalloc(size);
-    if (buf == 0)                     FAIL(-3, "out of kernel heap");
+    if (buf == 0)                      FAIL(-3, "out of kernel heap");
     /* fs_read_file 成功时返回读取字节数（>0），失败返回 -1：
      * 必须核对字节数而不是判 0——判 0 会把成功当失败。 */
-    if (fs_read_file(name, buf, size) != (int)size) {
+    int got = from_sysvol ? sysvol_read(src, buf, size)
+                          : fs_read_file(src, buf, size);
+    if (got != (int)size) {
         kfree(buf);
         FAIL(-2, "read failed");
     }

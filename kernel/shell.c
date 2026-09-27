@@ -8,6 +8,7 @@
 #include "ata.h"
 #include "ahci.h"
 #include "fs.h"
+#include "sysvol.h"
 #include "gui.h"
 #include "mouse.h"
 #include "gfx.h"
@@ -1306,19 +1307,37 @@ static void cmd_setcolor(const char *args) {
 
 static void cmd_ls(const char *args) {
     int verbose = 0;
-    if (args[0] == '-' && args[1] == 'l') verbose = 1;
-    if (fs_init() != 0) {
-        terminal_writestring("FS init failed. Is disk formatted?\n");
-        return;
-    }
-    terminal_writestring(fs_cwd_path());
-    terminal_writestring(":\n");
+    const char *p = args;
+    while (*p == ' ') p++;
+    if (p[0] == '-' && p[1] == 'l') { verbose = 1; p += 2; while (*p == ' ') p++; }
+
+    /* 取第一个参数。/bin 与 /system 走内核内置只读系统卷——它不需要
+     * 任何盘，所以这一支不能先要求 fs_init() 成功。 */
+    char target[64];
+    int t = 0;
+    while (*p && *p != ' ' && t < 63) target[t++] = *p++;
+    target[t] = 0;
+
     fs_dir_entry_t entries[64];
-    int n = fs_read_dir(entries, 64);
+    int n;
+    const char *title;
+    if (t > 0 && sysvol_is_path(target)) {
+        n = fs_read_dir_path(target, entries, 64);
+        title = target;
+    } else {
+        if (fs_init() != 0) {
+            terminal_writestring("FS init failed. Is disk formatted?\n");
+            return;
+        }
+        n = fs_read_dir(entries, 64);
+        title = fs_cwd_path();
+    }
     if (n < 0) {
         terminal_writestring("read dir failed\n");
         return;
     }
+    terminal_writestring(title);
+    terminal_writestring(":\n");
     if (verbose) {
         /* -l ��ϸģʽ������ + �Ҷ�����?+ ���ƣ����?MikanOS ListAllEntries�� */
         for (int i = 0; i < n; i++) {
@@ -1378,10 +1397,6 @@ static void cmd_ls(const char *args) {
 }
 
 static void cmd_cat(const char *args) {
-    if (fs_init() != 0) {
-        terminal_writestring("FS init failed.\n");
-        return;
-    }
     char filename[128];
     int i = 0;
     while (*args && *args != ' ' && i < 127) {
@@ -1395,6 +1410,11 @@ static void cmd_cat(const char *args) {
             return;
         }
         terminal_writestring("Usage: cat <filename>\n");
+        return;
+    }
+    /* 系统卷（/bin、/system）不需要磁盘挂载；只有数据盘路径才要求 fs_init */
+    if (!sysvol_is_path(filename) && fs_init() != 0) {
+        terminal_writestring("FS init failed.\n");
         return;
     }
     static uint8_t file_buffer[4096];

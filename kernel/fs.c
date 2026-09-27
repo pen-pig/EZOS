@@ -24,6 +24,7 @@
 #include "refs.h"
 #include "ata.h"
 #include "ahci.h"
+#include "sysvol.h"
 
 /* 布局一致性编译期检查：三种目录项结构必须逐字节一致 */
 typedef char fs_layout_exfat[sizeof(fs_dir_entry_t) == sizeof(exfat_dir_entry_t) ? 1 : -1];
@@ -472,6 +473,10 @@ static int fs_ro_abs(const char *name, char *out, uint32_t outsz) {
 /* ============ 分发 API ============ */
 
 int fs_read_file(const char *name, uint8_t *buffer, uint32_t max_size) {
+    /* 系统卷（内核内置只读）：/bin 与 /system 不走任何磁盘后端。
+     * 放在最前面——它是内存里的，与 fs_type_cur 是否挂载无关，
+     * 这样数据盘被 format 之后这些文件依然可读。 */
+    if (sysvol_is_path(name)) return sysvol_read(name, buffer, max_size);
     if (fs_type_cur == FS_EXFAT) return exfat_read_file(name, buffer, max_size);
     if (fs_is_fat()) return fat_read_file(name, buffer, max_size);
     if (fs_is_ro()) {
@@ -483,6 +488,7 @@ int fs_read_file(const char *name, uint8_t *buffer, uint32_t max_size) {
 }
 
 uint32_t fs_get_file_size(const char *name) {
+    if (sysvol_is_path(name)) return sysvol_size(name);
     if (fs_type_cur == FS_EXFAT) return exfat_get_file_size(name);
     if (fs_is_fat()) return fat_get_file_size(name);
     if (fs_is_ro()) {
@@ -494,6 +500,9 @@ uint32_t fs_get_file_size(const char *name) {
 }
 
 int fs_create_file(const char *name, const uint8_t *data, uint32_t size) {
+    /* 系统卷只读：写 /bin、/system 一律拒绝（哪怕是磁盘卷已挂载）。
+     * 这是"格式化数据分区不影响系统"的另一半——系统目录不可写。 */
+    if (sysvol_is_path(name)) return -1;
     if (fs_type_cur == FS_NONE) return -1;
     /* create-or-replace：先删旧文件（不存在则忽略），修复覆盖写 */
     if (fs_type_cur == FS_EXFAT) {
@@ -513,6 +522,7 @@ int fs_create_file(const char *name, const uint8_t *data, uint32_t size) {
 }
 
 int fs_delete_file(const char *name) {
+    if (sysvol_is_path(name)) return -1;        /* 系统卷只读 */
     if (fs_type_cur == FS_EXFAT) return exfat_delete_file(name);
     if (fs_is_fat()) return fat_delete_file(name);
     if (fs_is_ro()) {
@@ -542,7 +552,21 @@ int fs_read_dir(fs_dir_entry_t *entries, int max_entries) {
     return -1;
 }
 
+/* 带路径的列目录：/bin、/system 走系统卷，其余沿用当前磁盘卷的 cwd。
+ *
+ * 之所以另开一个入口而不是给 fs_read_dir 加参数：fs_read_dir 的签名被
+ * exFAT/FAT/只读三套后端和 shell、vi、desktop 等多处调用，改签名要动一条
+ * 长链；这里是新增能力，老行为一点不动，回归风险为零。 */
+int fs_read_dir_path(const char *path, fs_dir_entry_t *entries, int max_entries) {
+    if (sysvol_is_path(path)) return sysvol_list(path, entries, max_entries);
+    return fs_read_dir(entries, max_entries);
+}
+
 int fs_change_dir(const char *name) {
+    /* 系统卷只读且当前目录机制是磁盘卷的（fs_read_dir 无路径参数），
+     * 进了 /bin 之后再 ls 仍会列磁盘卷，语义会打架 —— 直接拒绝。
+     * 要看系统卷内容用 `ls /bin`。 */
+    if (sysvol_is_path(name)) return -1;
     if (fs_type_cur == FS_EXFAT) return exfat_change_dir(name);
     if (fs_is_fat()) return fat_change_dir(name);
     if (fs_is_ro()) {
@@ -558,6 +582,7 @@ int fs_change_dir(const char *name) {
 }
 
 int fs_mkdir(const char *name) {
+    if (sysvol_is_path(name)) return -1;        /* 系统卷只读 */
     if (fs_type_cur == FS_EXFAT) return exfat_mkdir(name);
     if (fs_is_fat()) return fat_mkdir(name);
     if (fs_is_ro()) {
@@ -569,6 +594,7 @@ int fs_mkdir(const char *name) {
 }
 
 int fs_rmdir(const char *name) {
+    if (sysvol_is_path(name)) return -1;        /* 系统卷只读 */
     if (fs_type_cur == FS_EXFAT) return exfat_rmdir(name);
     if (fs_is_fat()) return fat_rmdir(name);
     if (fs_is_ro()) {

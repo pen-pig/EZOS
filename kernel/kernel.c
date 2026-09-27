@@ -17,6 +17,7 @@
 #include "task.h"
 #include "fpu.h"
 #include "fs.h"
+#include "sysvol.h"
 #include "mouse.h"
 #include "port.h"
 #include "serial.h"
@@ -422,6 +423,11 @@ void kernel_main(void) {
      * 能选到 drive 16..19。找不到控制器打一行日志并静默跳过。
      * 32 位无 PAE 的硬约束：BAR 基址 >= 4GB 时 fail closed（够不到）。 */
     nvme_init();
+
+    /* 内置只读系统卷（/system + /bin）：把用户态程序编进内核镜像。
+     * 它不依赖任何盘，所以 format 数据卷擦不掉系统程序。
+     * 放在 fs_init 之前，让 fs_* 路由在挂载磁盘卷之前就已可用。 */
+    sysvol_init();
 
     /* USB 主机控制器普查（真机点亮 H2：USB HID 前置）：只读枚举 PCI
      * class 0x0C03 设备，按 ProgIF 分类 UHCI/OHCI/EHCI/xHCI 并 klog，

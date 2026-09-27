@@ -54,6 +54,11 @@ rule make_os_image
     command = cmd /c copy /b boot\boot.bin + kernel.bin os-image.bin >nul
     description = BUILD os-image.bin
 
+rule make_sysvol
+    # 系统卷数据源：把 user/*.elf 编成 kernel/sysvol_data.c（内置只读卷 /bin + /system）
+    command = cmd /c python tools/make_sysvol.py
+    description = SYSVOL kernel/sysvol_data.c
+
 rule make_disk
     command = cmd /c python temp/gen_diskimg.py disk.img
     description = CHECK DISK IMAGE
@@ -113,6 +118,9 @@ build kernel/shell_extra.o: cc kernel/shell_extra.c
 build kernel/exfat.o: cc kernel/exfat.c
 build kernel/fat.o: cc kernel/fat.c
 build kernel/fs.o: cc kernel/fs.c
+build kernel/sysvol_data.c: make_sysvol user/hello.elf user/fdtest.elf user/forktest.elf user/spin.elf user/fdleak.elf user/netecho.elf user/nettcp.elf user/segprobe.elf user/netcli.elf
+build kernel/sysvol.o: cc kernel/sysvol.c
+build kernel/sysvol_data.o: cc kernel/sysvol_data.c
 build kernel/ext4.o: cc kernel/ext4.c
 build kernel/ntfs.o: cc kernel/ntfs.c
 build kernel/f2fs.o: cc kernel/f2fs.c
@@ -148,7 +156,7 @@ build user/segprobe.elf: link_user user/crt0.o user/segprobe.o | user/user.ld
 build user/netcli.o: cc_user user/netcli.c
 build user/netcli.elf: link_user user/crt0.o user/netcli.o | user/user.ld
 
-build kernel_raw.bin: link boot/kernel_entry.o boot/task_switch.o kernel/kernel.o kernel/tty.o kernel/idt.o kernel/isr.o kernel/paging.o kernel/pmm.o kernel/task.o kernel/fd.o kernel/elf.o kernel/exec.o kernel/fpu.o kernel/calc.o kernel/gdt.o kernel/syscall.o kernel/panic.o kernel/kmalloc.o kernel/dmesg.o kernel/serial.o kernel/acpi.o kernel/ahci.o kernel/nvme.o kernel/keyboard.o kernel/ata.o kernel/pci.o kernel/usb.o kernel/uhci.o kernel/usbenum.o kernel/usbkbd.o kernel/usbmsc.o kernel/usbmouse.o kernel/ehci.o kernel/usbhc.o kernel/lockselftest.o kernel/rtl8139.o kernel/net.o kernel/shell.o kernel/shell_extra.o kernel/exfat.o kernel/fat.o kernel/fs.o kernel/ext4.o kernel/ntfs.o kernel/f2fs.o kernel/erofs.o kernel/refs.o kernel/div64.o kernel/gfx.o kernel/gui.o kernel/mouse.o kernel/gfxwin.o kernel/desktop.o kernel/games.o kernel/hiscore.o
+build kernel_raw.bin: link boot/kernel_entry.o boot/task_switch.o kernel/kernel.o kernel/tty.o kernel/idt.o kernel/isr.o kernel/paging.o kernel/pmm.o kernel/task.o kernel/fd.o kernel/elf.o kernel/exec.o kernel/fpu.o kernel/calc.o kernel/gdt.o kernel/syscall.o kernel/panic.o kernel/kmalloc.o kernel/dmesg.o kernel/serial.o kernel/acpi.o kernel/ahci.o kernel/nvme.o kernel/keyboard.o kernel/ata.o kernel/pci.o kernel/usb.o kernel/uhci.o kernel/usbenum.o kernel/usbkbd.o kernel/usbmsc.o kernel/usbmouse.o kernel/ehci.o kernel/usbhc.o kernel/lockselftest.o kernel/rtl8139.o kernel/net.o kernel/shell.o kernel/shell_extra.o kernel/exfat.o kernel/fat.o kernel/fs.o kernel/sysvol.o kernel/sysvol_data.o kernel/ext4.o kernel/ntfs.o kernel/f2fs.o kernel/erofs.o kernel/refs.o kernel/div64.o kernel/gfx.o kernel/gui.o kernel/mouse.o kernel/gfxwin.o kernel/desktop.o kernel/games.o kernel/hiscore.o
 
 build kernel.bin: objcopy_pad kernel_raw.bin
 
