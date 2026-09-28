@@ -256,18 +256,21 @@ static const uint8_t *arp_resolve(uint32_t ip, uint32_t timeout_ms) {
 /* ---------- IPv4 发送 ---------- */
 
 /* 构造并发送一个 IPv4 包（payload 为完整传输层报文，通常在 g_build）。
+ * hop_ip 是**下一跳**：与 dst_ip 相同时就是普通的同网段直连；不同时
+ * 走网关——以太网目的 MAC 解析 hop_ip，而 IP 头里的目的仍是 dst_ip
+ * （由网关转发）。目前只有 DNS 用得上（DNS 服务器常常不在本网段）。
  * 顺序（防别名/防重入）：先把 payload 拷进 g_frame 尾部，再做可能阻塞
  * 轮询的 ARP 解析（期间 net_input 重入只会动 g_build，不碰 g_frame），
  * 最后写 eth+ip 头并发送。
  * 返回 0 = 已提交网卡；-1 = ARP 解析失败/参数非法。 */
-static int ipv4_send(uint32_t dst_ip, uint8_t proto,
-                     const uint8_t *payload, uint32_t len) {
+static int ipv4_send_via(uint32_t dst_ip, uint32_t hop_ip, uint8_t proto,
+                         const uint8_t *payload, uint32_t len) {
     if (len == 0 || ETH_HDR_LEN + IP_HDR_MIN + len > NET_BUILD_MAX) return -1;
 
     uint8_t *ip = g_frame + ETH_HDR_LEN;
     for (uint32_t i = 0; i < len; i++) ip[IP_HDR_MIN + i] = payload[i];
 
-    const uint8_t *dst_mac = arp_resolve(dst_ip, 3000);
+    const uint8_t *dst_mac = arp_resolve(hop_ip, 3000);
     if (!dst_mac) return -1;
 
     uint8_t *r = g_frame;
@@ -287,6 +290,12 @@ static int ipv4_send(uint32_t dst_ip, uint8_t proto,
     put16(ip + 10, cksum(ip, IP_HDR_MIN));
 
     return rtl8139_send(r, ETH_HDR_LEN + IP_HDR_MIN + len);
+}
+
+/* 同网段直连（hop == dst）——绝大多数协议走这条，与改造前完全一致 */
+static int ipv4_send(uint32_t dst_ip, uint8_t proto,
+                     const uint8_t *payload, uint32_t len) {
+    return ipv4_send_via(dst_ip, dst_ip, proto, payload, len);
 }
 
 /* ---------- ICMP（echo reply + ping 客户端） ---------- */
@@ -423,7 +432,10 @@ static uint16_t udp_checksum(uint32_t src_ip, uint32_t dst_ip,
     ps[8] = 0; ps[9] = 17;
     put16(ps + 10, (uint16_t)n);
     uint32_t s = cksum_raw(ps, 12) + cksum_raw(p, n);
-    if (n & 1) s += (uint32_t)p[n - 1] << 8;
+    /* 不要在这里补奇数字节：cksum_raw() 末尾的 `if (n) s += p[0] << 8`
+     * 已经处理过了（它把最后一个字节当高 8 位、低 8 位补 0），再加一次
+     * 就是双重计数。DHCP 报文 308 字节是偶数所以没暴露，DNS 查询 41 字节
+     * 是奇数，一上来就校验和错、被对端丢弃。 */
     while (s >> 16) s = (s & 0xFFFFu) + (s >> 16);
     uint16_t c = (uint16_t)(~s);
     return (c == 0) ? 0xFFFFu : c;
@@ -680,8 +692,12 @@ int net_dhcp(uint32_t timeout_ms) {
     g_lease.tick    = g_pit_ticks;
     g_lease.valid   = 1;
 
-    rtl8139_set_ip((uint8_t)(ip & 0xFFu), (uint8_t)((ip >> 8) & 0xFFu),
-                   (uint8_t)((ip >> 16) & 0xFFu), (uint8_t)((ip >> 24) & 0xFFu));
+    /* IP 是网络序（大端打包）的 u32：字节 0（点分第一段）在**最高** 8 位。
+     * 写成 ip & 0xFF 取第一段会得到反过来的地址（10.0.2.66 -> 66.2.0.10），
+     * 屏幕上的租约看着对、实际发包全用错地址，且掩码算出的网络号与网关
+     * 对不上，跨网段判断会静默失效。 */
+    rtl8139_set_ip((uint8_t)((ip >> 24) & 0xFFu), (uint8_t)((ip >> 16) & 0xFFu),
+                   (uint8_t)((ip >> 8) & 0xFFu),  (uint8_t)(ip & 0xFFu));
     return 0;
 }
 
@@ -694,6 +710,203 @@ void net_dhcp_lease(uint32_t *ip, uint32_t *mask, uint32_t *router,
     if (router) *router = g_lease.router;
     if (dns)    *dns    = g_lease.dns;
     if (lease)  *lease  = g_lease.lease;
+}
+
+/* ---------- DNS 解析器（RFC 1035，只做 A 记录） ----------
+ *
+ * 与 DHCP 不同，DNS 是"已经有 IP 之后"的正常 UDP 流量，所以它能复用
+ * ipv4_send_via() 与 udp_checksum()，不需要自己组帧。两处仍然特殊：
+ *   1. 不走 socket 层：解析是内核自己的一次性查询，没必要占一个 socket，
+ *      也没有进程在等——和 ping/DHCP 一样用"等待者槽"（g_dns_w）。
+ *   2. 服务器可能不在本网段（8.8.8.8 之类）。ARP 问它没人答，必须把帧
+ *      交给网关（g_lease.router），IP 头里的目的仍写服务器地址。
+ *      判据是掩码：双方掩码下网络号不同、且网关与自己同网段才走网关。
+ *
+ * 只支持 A 记录；CNAME 会跳过继续找；响应名一律按压缩指针规则跳过
+ * （0xC0 开头两字节结束，0x00 是根 label），不展开、不比较名字——
+ * 正确性由"查询 ID 匹配 + 是应答 + 只认本端口"保证。
+ */
+
+#define DNS_PORT    53u
+#define DNS_BUF     512u        /* 传统 UDP DNS 上限 */
+
+static struct {
+    uint8_t  active;
+    uint8_t  got;
+    uint8_t  rcode;
+    uint16_t id;
+    uint16_t port;              /* 本轮查询用的源端口，响应必须回到它 */
+    uint8_t  buf[DNS_BUF];
+    uint32_t len;
+} g_dns_w;
+
+static uint32_t g_dns_server = 0;   /* 手动配置；0 = 用 DHCP 下发的那个 */
+
+/* "www.example.com" -> 03 77 77 77 07 ... 00
+ * 返回写入字节数；0 = 名字非法（空、空 label、label > 63、总长 > 255）。 */
+static uint32_t dns_encode_name(uint8_t *out, const char *name) {
+    if (name[0] == '\0') return 0;
+    uint32_t w = 0, lab = 0;
+    out[w++] = 0;                                  /* 第一个 label 的长度占位 */
+    for (;;) {
+        char c = *name;
+        if (c == '.' || c == '\0') {
+            uint32_t n = w - lab - 1;
+            if (n == 0 || n > 63) return 0;        /* 空 label / 超长 label */
+            out[lab] = (uint8_t)n;
+            if (c == '\0') break;
+            name++;
+            if (*name == '\0') return 0;           /* 以点结尾：非法 */
+            lab = w;
+            out[w++] = 0;                          /* 下一个 label 的长度占位 */
+            continue;
+        }
+        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);   /* 域名不区分大小写 */
+        out[w++] = (uint8_t)c;
+        if (w > 255) return 0;
+        name++;
+    }
+    out[w++] = 0;                                  /* 根 label */
+    return w;
+}
+
+/* 跳过一个（可能被压缩的）域名，返回新偏移；越界/非法返回 0 */
+static uint32_t dns_skip_name(const uint8_t *p, uint32_t i, uint32_t n) {
+    for (;;) {
+        if (i >= n) return 0;
+        uint8_t l = p[i];
+        if ((l & 0xC0) == 0xC0) return (i + 2 <= n) ? i + 2 : 0;  /* 指针：收尾 */
+        if (l == 0)            return (i + 1 <= n) ? i + 1 : 0;   /* 根 label */
+        if ((l & 0xC0) != 0)   return 0;                          /* 保留类型 */
+        i += 1u + l;
+    }
+}
+
+static int dns_send(uint32_t server, const uint8_t *q, uint32_t n) {
+    uint32_t my = my_ip_be();
+    uint32_t mask = g_lease.mask, gw = g_lease.router;
+    uint32_t hop = server;
+    /* 跨网段且网关与自己同网段：帧给网关，IP 目的仍是 DNS 服务器 */
+    if (mask != 0 && gw != 0 && (my & mask) != (server & mask) &&
+        (gw & mask) == (my & mask))
+        hop = gw;
+
+    uint8_t *p = g_build;
+    uint32_t need = UDP_HDR_LEN + n;
+    put16(p + 0, g_dns_w.port);
+    put16(p + 2, DNS_PORT);
+    put16(p + 4, (uint16_t)need);
+    put16(p + 6, 0);
+    for (uint32_t i = 0; i < n; i++) p[UDP_HDR_LEN + i] = q[i];
+    put16(p + 6, udp_checksum(my, server, p, need));
+    g_udp_tx++;
+    return ipv4_send_via(server, hop, 17, p, need);
+}
+
+/* net_input 路径（可能 IRQ 上下文）。命中本轮查询就收下并返回 1（消费掉），
+ * 否则返回 0 让包照常走 UDP 投递。 */
+static int dns_input(const uint8_t *ip, uint32_t ihl) {
+    if (!g_dns_w.active) return 0;
+    uint32_t totlen = be16(ip + 2);
+    if (totlen < ihl + UDP_HDR_LEN) return 0;
+    const uint8_t *u = ip + ihl;
+    uint32_t ulen = be16(u + 4);
+    if (ulen < UDP_HDR_LEN || ulen > totlen - ihl) return 0;
+    uint32_t dlen = ulen - UDP_HDR_LEN;
+    if (dlen < 12 || dlen > sizeof(g_dns_w.buf)) return 0;
+    if (be16(u + 0) != DNS_PORT || be16(u + 2) != g_dns_w.port) return 0;
+
+    const uint8_t *d = u + UDP_HDR_LEN;
+    if (be16(d + 0) != g_dns_w.id) return 0;       /* 不是这一轮的应答 */
+    if ((d[2] & 0x80) == 0) return 0;              /* QR=0：这是查询不是应答 */
+
+    for (uint32_t i = 0; i < dlen; i++) g_dns_w.buf[i] = d[i];
+    g_dns_w.len = dlen;
+    g_dns_w.rcode = d[3] & 0x0F;
+    g_dns_w.got = 1;
+    return 1;
+}
+
+static int dns_wait(uint32_t timeout_ms) {
+    uint32_t deadline = g_pit_ticks + timeout_ms;
+    for (;;) {
+        net_poll();
+        if (g_dns_w.got) return 1;
+        uint32_t now = g_pit_ticks;
+        if ((int32_t)(now - deadline) >= 0) return 0;
+        task_sleep(&g_netrx_wq, deadline - now);
+    }
+}
+
+/* 解析一个域名到 IPv4（网络序写入 *out_ip_be）。
+ * 返回：0 = 成功、1 = 超时（发了但没人回）、-1 = 参数/发送失败、
+ * -2 = 服务器回了但不是 A 记录（含 NXDOMAIN 等 rcode != 0）、
+ * -3 = 没有 DNS 服务器（既没 DHCP 租约也没手动配）。 */
+int net_dns_resolve(const char *name, uint32_t *out_ip_be, uint32_t timeout_ms) {
+    if (!name || !out_ip_be) return -1;
+    uint32_t server = g_dns_server ? g_dns_server : g_lease.dns;
+    if (server == 0) return -3;
+    if (!rtl8139_present()) return -1;
+    if (!build_ready()) return -1;
+    if (timeout_ms == 0) timeout_ms = 2500u;
+
+    uint8_t q[320];
+    uint32_t namelen = dns_encode_name(q + 12, name);
+    if (namelen == 0 || 12u + namelen + 4u > sizeof(q)) return -1;
+
+    static uint16_t id_counter = 0x1234;
+    uint16_t id = ++id_counter;
+    put16(q + 0, id);
+    put16(q + 2, 0x0100);                          /* 标准查询，RD=1 */
+    put16(q + 4, 1);                               /* QDCOUNT */
+    put16(q + 6, 0); put16(q + 8, 0); put16(q + 10, 0);
+    put16(q + 12 + namelen, 1);                    /* QTYPE  = A */
+    put16(q + 14 + namelen, 1);                    /* QCLASS = IN */
+    uint32_t qlen = 12u + namelen + 4u;
+
+    g_dns_w.id = id;
+    g_dns_w.port = (uint16_t)(40000u + (id & 0x07FFu));
+
+    int got = 0;
+    for (int attempt = 0; attempt < 2 && !got; attempt++) {
+        g_dns_w.got = 0;
+        g_dns_w.active = 1;        /* 先置位再发：应答可能在发送途中就到 */
+        if (dns_send(server, q, qlen) != 0) { g_dns_w.active = 0; return -1; }
+        got = dns_wait(timeout_ms);
+    }
+    g_dns_w.active = 0;
+    if (!got) return 1;
+    if (g_dns_w.rcode != 0) return -2;              /* NXDOMAIN / SERVFAIL ... */
+
+    const uint8_t *d = g_dns_w.buf;
+    uint32_t n = g_dns_w.len;
+    uint16_t qd = be16(d + 4), an = be16(d + 6);
+    uint32_t i = 12;
+    for (uint32_t k = 0; k < qd; k++) {             /* 跳过问题区 */
+        i = dns_skip_name(d, i, n);
+        if (i == 0 || i + 4 > n) return -2;
+        i += 4;
+    }
+    for (uint32_t k = 0; k < an; k++) {             /* 应答区找第一条 A */
+        i = dns_skip_name(d, i, n);
+        if (i == 0 || i + 10 > n) return -2;
+        uint16_t type = be16(d + i), cls = be16(d + i + 2);
+        uint32_t rdlen = be16(d + i + 8);
+        i += 10;
+        if (i + rdlen > n) return -2;
+        if (type == 1 && cls == 1 && rdlen == 4) {
+            *out_ip_be = be32(d + i);
+            return 0;
+        }
+        i += rdlen;                                 /* CNAME 等：跳过继续找 */
+    }
+    return -2;                                      /* 没有 A 记录 */
+}
+
+void net_dns_set_server(uint32_t be) { g_dns_server = be; }
+
+uint32_t net_dns_server(void) {
+    return g_dns_server ? g_dns_server : g_lease.dns;
 }
 
 /* ---------- TCP ---------- */
@@ -1118,7 +1331,11 @@ int net_input(const uint8_t *f, uint32_t len) {
     if (be32(ip + 16) != my_ip_be()) return -1;
 
     if (ip[9] == 1)      icmp_input(ip, ihl);
-    else if (ip[9] == 17) udp_input(ip, ihl);
+    else if (ip[9] == 17) {
+        /* DNS 等待者优先：解析是内核自己发的查询，不走 socket 层 */
+        if (dns_input(ip, ihl)) return 0;
+        udp_input(ip, ihl);
+    }
     else if (ip[9] == 6)  tcp_input(ip, ihl);
     return 0;
 }

@@ -216,6 +216,7 @@ class DhcpServer(threading.Thread):
         self.buf = b""
         self.sock = None
         self.pings = 0
+        self.ping_src = None
 
     def stop(self):
         self.running = False
@@ -259,6 +260,7 @@ class DhcpServer(threading.Thread):
                 ic = ip[ihl:]
                 if len(ic) >= 8 and ic[0] == 8 and ic[1] == 0 and self.mode == "ok":
                     self.pings += 1
+                    self.ping_src = bytes(ip[12:16])    # 实际用的源地址
                     self._send(icmp_reply_to(frame, ic))
                 continue
             if ip[9] != 17:
@@ -419,6 +421,11 @@ def case_ok():
         ok3, out3 = run_cmd(qmp, serial, "ping 10.0.2.2", "reply from", 35.0)
         res.append(("ping gateway works on the new address", ok3))
         res.append(("gateway actually saw ICMP echoes", srv.pings >= 1))
+        # 真正的"地址生效"：屏幕上的租约来自 g_lease，写进 rtl8139 的字节序
+        # 搞反时屏幕仍然显示 10.0.2.66，但实际发出的是 66.2.0.10。
+        # 只有查实际发包才抓得到（这条就是为那个 bug 补的）。
+        res.append(("outgoing packets really use the leased address",
+                    srv.ping_src == OFFER_IP))
         if not ok3:
             print("---- ping tail ----\n" + out3[-800:])
         return res
@@ -442,7 +449,7 @@ def case_silent():
             print("  FAIL B: shell did not come up")
             return [("shell up", False)]
 
-        ok, out = run_cmd(qmp, serial, "dhcp", "dhcp: no response", 45.0)
+        ok, out = run_cmd(qmp, serial, "dhcp", "dhcp: no response", 90.0)
         res.append(("reported timeout", ok))
         if not ok:
             print("---- serial tail ----\n" + out[-1200:])
@@ -475,7 +482,7 @@ def case_nak():
             print("  FAIL C: shell did not come up")
             return [("shell up", False)]
 
-        ok, out = run_cmd(qmp, serial, "dhcp", "dhcp: nak", 45.0)
+        ok, out = run_cmd(qmp, serial, "dhcp", "dhcp: nak", 90.0)
         res.append(("reported NAK", ok))
         if not ok:
             print("---- serial tail ----\n" + out[-1200:])

@@ -39,6 +39,8 @@
 
 /* 网络地址格式化（定义在 cmd_ping 之后；cmd_nic 也要用，故提前声明） */
 static const char *ips_of(uint32_t be);
+/* "a.b.c.d" -> 网络序 u32（定义在 ips_of 旁边）；成功返回 1 */
+static int parse_ipv4(const char *s, uint32_t *be);
 
 
 
@@ -2089,6 +2091,76 @@ static const char *ips_of(uint32_t be) {
     }
     buf[n] = '\0';
     return buf;
+}
+
+/* ---- lookup <host>：DNS A 记录查询；dns [a.b.c.d]：查看/设置服务器 ----
+ * 输出统一 "DNS: " 前缀（E2E 按前缀取行）。服务器默认来自 DHCP option 6，
+ * 没跑过 dhcp 时用 `dns a.b.c.d` 手动指定。 */
+void cmd_lookup(const char *args) {
+    while (*args == ' ') args++;
+    if (*args == '\0') {
+        ezos_console_write("Usage: lookup <hostname>\n");
+        return;
+    }
+    uint32_t ip = 0;
+    int rc = net_dns_resolve(args, &ip, 2500);
+    if (rc == 0) {
+        ezos_console_write("DNS: ");
+        ezos_console_write(args);
+        ezos_console_write(" = ");
+        ezos_console_write(ips_of(ip));
+        ezos_console_write("\n");
+        return;
+    }
+    if (rc == 1)       ezos_console_write("DNS: timeout (no answer)\n");
+    else if (rc == -2) ezos_console_write("DNS: no A record\n");
+    else if (rc == -3) ezos_console_write("DNS: no server (dhcp / dns a.b.c.d)\n");
+    else               ezos_console_write("DNS: failed (bad name / tx error)\n");
+}
+
+void cmd_dns(const char *args) {
+    while (*args == ' ') args++;
+    if (*args == '\0') {
+        uint32_t s = net_dns_server();
+        if (s == 0) ezos_console_write("DNS: no server\n");
+        else {
+            ezos_console_write("DNS: server ");
+            ezos_console_write(ips_of(s));
+            ezos_console_write("\n");
+        }
+        return;
+    }
+    uint32_t be = 0;
+    if (!parse_ipv4(args, &be)) {
+        ezos_console_write("Usage: dns [a.b.c.d]\n");
+        return;
+    }
+    net_dns_set_server(be);
+    ezos_console_write("DNS: server set\n");
+}
+
+static int parse_ipv4(const char *s, uint32_t *be) {
+    uint32_t v[4];
+    const char *p = s;
+    for (int f = 0; f < 4; f++) {
+        uint32_t x = 0;
+        int d = 0;
+        while (*p >= '0' && *p <= '9') {
+            x = x * 10 + (uint32_t)(*p - '0');
+            p++;
+            d++;
+            if (x > 255) return 0;
+        }
+        if (d == 0) return 0;
+        v[f] = x;
+        if (f < 3) {
+            if (*p != '.') return 0;
+            p++;
+        }
+    }
+    if (*p != '\0') return 0;
+    *be = (v[0] << 24) | (v[1] << 16) | (v[2] << 8) | v[3];
+    return 1;
 }
 
 /* ---- httpd：监听 80，服务一个 GET（固定 200 页面）后返回 ---- */

@@ -255,8 +255,12 @@ def phase_ping():
 
 def phase_httpd():
     print("== phase httpd: guest `httpd` + host GET ==")
+    # 8080 常被本机别的服务占着（占着时连上去拿到的是那个服务的页面，
+    # 看起来像"guest 页面内容不对"，其实是连错了地方）。
+    # 换端口：EZOS_HTTPD_PORT=18080 python tests/test_netapp.py
+    port = int(os.environ.get("EZOS_HTTPD_PORT", "8080"))
     g = Guest(mon_port=4480,
-              extra_net=["-netdev", "user,id=n0,hostfwd=tcp::8080-:80",
+              extra_net=["-netdev", "user,id=n0,hostfwd=tcp::%d-:80" % port,
                          "-device", "rtl8139,netdev=n0"])
     g.start()
     try:
@@ -266,7 +270,7 @@ def phase_httpd():
         last = None
         for _ in range(12):                 # guest 进 accept 需要几秒
             try:
-                s = socket.create_connection(("127.0.0.1", 8080), timeout=3)
+                s = socket.create_connection(("127.0.0.1", port), timeout=3)
                 break
             except OSError as e:
                 last = e
