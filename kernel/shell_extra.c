@@ -2029,30 +2029,33 @@ void cmd_nic(const char *args) {
 static wait_queue_t g_ping_gap_wq = {-1};   /* 两次 ping 之间的间歇睡这 */
 
 void cmd_ping(const char *args) {
-    uint32_t ip[4];
+    uint32_t be = 0;
     const char *p = args;
     while (*p == ' ') p++;
-    for (int f = 0; f < 4; f++) {
-        uint32_t v = 0;
-        int d = 0;
-        while (*p >= '0' && *p <= '9') {
-            v = v * 10 + (uint32_t)(*p - '0');
-            p++;
-            d++;
-            if (v > 255) break;
-        }
-        if (d == 0 || v > 255) { p = ""; break; }
-        ip[f] = v;
-        if (f < 3) {
-            if (*p == '.') p++;
-            else { p = ""; break; }
-        }
-    }
-    if (*p != '\0') {
-        ezos_console_write("Usage: ping <a.b.c.d>\n");
+    if (*p == '\0') {
+        ezos_console_write("Usage: ping <a.b.c.d | hostname>\n");
         return;
     }
-    uint32_t be = (ip[0] << 24) | (ip[1] << 16) | (ip[2] << 8) | ip[3];
+    /* 先当点分十进制；不是就当域名——网络工具接域名是刚需（ping 一个
+     * 名字比查完再 ping 一次省事），解析失败就报解析失败，不再退回 usage。 */
+    if (!parse_ipv4(p, &be)) {
+        ezos_console_write("PING: resolving ");
+        ezos_console_write(p);
+        ezos_console_write("\n");
+        int rc = net_dns_resolve(p, &be, 2500);
+        if (rc != 0) {
+            if (rc == 1)       ezos_console_write("PING: dns timeout (no answer)\n");
+            else if (rc == -2) ezos_console_write("PING: dns: no A record\n");
+            else if (rc == -3) ezos_console_write("PING: no dns server (dhcp / dns a.b.c.d)\n");
+            else               ezos_console_write("PING: cannot resolve (bad name)\n");
+            return;
+        }
+        ezos_console_write("PING: ");
+        ezos_console_write(p);
+        ezos_console_write(" = ");
+        ezos_console_write(ips_of(be));
+        ezos_console_write("\n");
+    }
 
     for (int i = 1; i <= 4; i++) {
         uint32_t rtt = 0;
@@ -2103,6 +2106,14 @@ void cmd_lookup(const char *args) {
         return;
     }
     uint32_t ip = 0;
+    if (net_dns_cache_lookup(args, &ip)) {      /* 命中：一个包都没发 */
+        ezos_console_write("DNS: ");
+        ezos_console_write(args);
+        ezos_console_write(" = ");
+        ezos_console_write(ips_of(ip));
+        ezos_console_write(" (cached)\n");
+        return;
+    }
     int rc = net_dns_resolve(args, &ip, 2500);
     if (rc == 0) {
         ezos_console_write("DNS: ");
@@ -2121,18 +2132,31 @@ void cmd_lookup(const char *args) {
 void cmd_dns(const char *args) {
     while (*args == ' ') args++;
     if (*args == '\0') {
-        uint32_t s = net_dns_server();
-        if (s == 0) ezos_console_write("DNS: no server\n");
+        uint32_t n = net_dns_server_count();
+        if (n == 0) ezos_console_write("DNS: no server\n");
         else {
-            ezos_console_write("DNS: server ");
-            ezos_console_write(ips_of(s));
-            ezos_console_write("\n");
+            for (uint32_t i = 0; i < n; i++) {   /* option 6 可能给多个 */
+                ezos_console_write("DNS: server ");
+                ezos_console_write(ips_of(net_dns_server_at(i)));
+                ezos_console_write("\n");
+            }
         }
+        ezos_console_write("DNS: cache ");
+        ezos_console_print_dec(net_dns_cache_entries());
+        ezos_console_write(" entries, ");
+        ezos_console_print_dec(net_dns_cache_hits());
+        ezos_console_write(" hits\n");
+        return;
+    }
+    if (args[0] == 'f' && args[1] == 'l' && args[2] == 'u' &&
+        args[3] == 's' && args[4] == 'h') {
+        net_dns_cache_clear();
+        ezos_console_write("DNS: cache flushed\n");
         return;
     }
     uint32_t be = 0;
     if (!parse_ipv4(args, &be)) {
-        ezos_console_write("Usage: dns [a.b.c.d]\n");
+        ezos_console_write("Usage: dns [a.b.c.d | flush]\n");
         return;
     }
     net_dns_set_server(be);

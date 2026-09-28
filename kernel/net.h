@@ -78,14 +78,24 @@ int net_dhcp(uint32_t timeout_ms);
 
 /* ---- DNS 解析器（RFC 1035，只查 A 记录） ----
  * 服务器来源：net_dns_set_server() 手动配的优先，否则用 DHCP 下发的
- * option 6。跨网段时自动走网关（帧给网关，IP 目的仍是服务器）。
- * 只能在任务上下文调用（内部睡等响应）。
- * 返回：0 = 成功（*out_ip_be 网络序）、1 = 超时无人应答、
+ * option 6（**全部**收下，最多 4 个）；第一个超时就换下一个。
+ * 跨网段时自动走网关（帧给网关，IP 目的仍是服务器）。
+ * 只在任务上下文调用（内部睡等响应）。
+ * 结果按应答里的 TTL 缓存（8 条）：命中直接返回，一个包都不发。
+ * 返回：0 = 成功（*out_ip_be 网络序，可能是缓存里的）、1 = 超时无人应答、
  * -1 = 参数/发送失败、-2 = 应答里没有 A 记录（含 NXDOMAIN）、
  * -3 = 没有 DNS 服务器可问。 */
 int net_dns_resolve(const char *name, uint32_t *out_ip_be, uint32_t timeout_ms);
 void net_dns_set_server(uint32_t be);
-uint32_t net_dns_server(void);   /* 实际会用的那个（0 = 没有） */
+uint32_t net_dns_server(void);   /* 实际会用的第一个（0 = 没有） */
+uint32_t net_dns_server_count(void);          /* 服务器表项数 */
+uint32_t net_dns_server_at(uint32_t i);       /* 第 i 个（越界返回 0） */
+
+/* 只查缓存、不发包：命中返回 1 并写 *out_ip_be（shell 用它标注 cached）。 */
+int net_dns_cache_lookup(const char *name, uint32_t *out_ip_be);
+void    net_dns_cache_clear(void);            /* `dns flush` */
+uint32_t net_dns_cache_hits(void);            /* 累计命中次数 */
+uint32_t net_dns_cache_entries(void);         /* 当前有效表项数 */
 
 /* 租约是否生效（0 = 从未成功或尚未运行 dhcp） */
 int net_dhcp_valid(void);

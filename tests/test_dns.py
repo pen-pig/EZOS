@@ -23,6 +23,14 @@
      -> "no A record"；服务器装死 -> "timeout"；**全程绝不出现 " = "**
      —— 没有这一组，"解析成功"可能只是打印逻辑恒真
 
+  D（缓存）：第二次 lookup 必须走缓存、**服务器上只有一个查询**；
+     `dns flush` 之后再问会重新发；TTL=1s 的名字睡过 1s 必须失效重查
+     —— 没有 D，"解析成功"看不出答案是不是从缓存来的
+  E（多服务器）：option 6 下发两台，第一台装死 -> 必须回退到第二台，
+     且**先问过第一台**（没问过就谈不上回退）
+  F（ping 接域名）：`ping www.example.com` 先解析再 ping 通；解析失败
+     的名字（NXDOMAIN）必须报解析失败且**一个 ICMP 都不发**
+
 用法：python tests/test_dns.py   （退出码 0 = 全通过）
 """
 import os
@@ -50,12 +58,18 @@ DISK = os.path.join(ROOT, "disk.img")
 PORT_A = (4531, 4532, 4537)     # (QMP, serial, netdev)
 PORT_B = (4533, 4534, 4538)
 PORT_C = (4535, 4536, 4539)
+PORT_D = (4541, 4542, 4547)     # 缓存（命中/flush/TTL 过期）
+PORT_E = (4543, 4544, 4548)     # 多服务器回退
+PORT_F = (4545, 4546, 4549)     # ping 接域名
 BOOT_WAIT = 150
 
 WORK = {
     "A": os.path.join(HERE, "dns_a.img").replace("\\", "/"),
     "B": os.path.join(HERE, "dns_b.img").replace("\\", "/"),
     "C": os.path.join(HERE, "dns_c.img").replace("\\", "/"),
+    "D": os.path.join(HERE, "dns_d.img").replace("\\", "/"),
+    "E": os.path.join(HERE, "dns_e.img").replace("\\", "/"),
+    "F": os.path.join(HERE, "dns_f.img").replace("\\", "/"),
 }
 
 GW_IP = bytes([10, 0, 2, 2])            # 网关（也是 Python 侧的 MAC 主人）
@@ -65,6 +79,7 @@ GW_IP = bytes([10, 0, 2, 2])            # 网关（也是 Python 侧的 MAC 主�
 DHCP_SRV_IP = bytes([10, 0, 2, 9])
 DNS_LOCAL = bytes([10, 0, 2, 3])        # A 组：同网段 DNS
 DNS_REMOTE = bytes([8, 8, 8, 8])        # B 组：跨网段 DNS
+DNS_BACKUP = bytes([10, 0, 2, 4])      # E 组：option 6 里的第二个服务器
 LEASE = 3600
 
 A_RECORD = bytes([93, 184, 216, 34])    # www.example.com 的"答案"
@@ -95,7 +110,7 @@ def dec_qname(p, i):
     return ".".join(labels), i
 
 
-def build_dns_reply(q, answers, rcode=0):
+def build_dns_reply(q, answers, rcode=0, ttl=300):
     """q = 查询报文；answers = [(type, rdata_bytes), ...]。
     问题区原样回显；应答的域名一律用指向问题区的压缩指针 0xC00C ——
     真实服务器都这么干，解析器必须能处理。"""
@@ -103,7 +118,7 @@ def build_dns_reply(q, answers, rcode=0):
     flags = 0x8180 | (rcode & 0x0F)      # QR=1 RD=1 RA=1
     out = q[0:2] + struct.pack(">HHHHH", flags, 1, len(answers), 0, 0) + q[12:qend]
     for typ, rdata in answers:
-        out += b"\xc0\x0c" + struct.pack(">HHIH", typ, 1, 300, len(rdata)) + rdata
+        out += b"\xc0\x0c" + struct.pack(">HHIH", typ, 1, ttl, len(rdata)) + rdata
     return out
 
 
@@ -122,7 +137,10 @@ def build_dhcp_reply(msg_type, xid, chaddr, yiaddr, dns_ip, router, src_ip):
     b[o:o + 3] = bytes([53, 1, msg_type]); o += 3
     b[o:o + 6] = bytes([1, 4]) + MASK; o += 6
     b[o:o + 6] = bytes([3, 4]) + router; o += 6
-    b[o:o + 6] = bytes([6, 4]) + dns_ip; o += 6
+    # option 6 可以带**多个** DNS 服务器（4 字节一个）；给列表就全部下发
+    servers = dns_ip if isinstance(dns_ip, (list, tuple)) else [dns_ip]
+    blob = b"".join(bytes(s) for s in servers)
+    b[o:o + 2 + len(blob)] = bytes([6, len(blob)]) + blob; o += 2 + len(blob)
     b[o:o + 6] = bytes([51, 4]) + struct.pack(">I", LEASE); o += 6
     b[o:o + 6] = bytes([54, 4]) + src_ip; o += 6
     b[o] = 255
@@ -141,7 +159,12 @@ def build_dhcp_reply(msg_type, xid, chaddr, yiaddr, dns_ip, router, src_ip):
 class LanServer(threading.Thread):
     """dns_ip 为 None 时只做 DHCP（不参与 DNS）；silent/nx 名字集合控制失败分支"""
 
-    def __init__(self, port, dns_ip=None, silent=(), nx=(), serve_dhcp=True):
+    def __init__(self, port, dns_ip=None, silent=(), nx=(), serve_dhcp=True,
+                 silent_srv=(), ttl_map=None):
+        """dns_ip：单个 IP 或列表（列表 -> DHCP option 6 下发多个）。
+        silent：不回答的名字；nx：回 NXDOMAIN 的名字；
+        silent_srv：装死的**服务器 IP**（多服务器回退用）；
+        ttl_map：{名字: TTL 秒}，默认 300。"""
         threading.Thread.__init__(self)
         self.daemon = True
         self.port = port
@@ -149,6 +172,8 @@ class LanServer(threading.Thread):
         self.silent = set(silent)
         self.nx = set(nx)
         self.serve_dhcp = serve_dhcp
+        self.silent_srv = set(bytes(s) for s in silent_srv)
+        self.ttl_map = ttl_map or {}
         self.running = True
         self.lock = threading.Lock()
         self.queries = []        # dict: name/qtype/qclass/dport/sum_ok/id/ip_dst/mac_dst
@@ -168,6 +193,14 @@ class LanServer(threading.Thread):
     def names(self):
         with self.lock:
             return [q["name"] for q in self.queries]
+
+    def count(self, name):
+        with self.lock:
+            return sum(1 for q in self.queries if q["name"] == name)
+
+    def count_to(self, ip):
+        with self.lock:
+            return sum(1 for q in self.queries if q["ip_dst"] == bytes(ip))
 
     def first(self, name):
         with self.lock:
@@ -259,6 +292,8 @@ class LanServer(threading.Thread):
                 })
             if name in self.silent:
                 continue
+            if bytes(ip[16:20]) in self.silent_srv:
+                continue                       # 这台服务器装死（回退测试）
             if name in self.nx:
                 ans, rcode = [], 3
             elif name == "cname.test":
@@ -266,12 +301,14 @@ class LanServer(threading.Thread):
             else:
                 ans, rcode = [(1, A_RECORD)], 0
             self.dns_replied += 1
-            self._reply(frame, udp, q, ans, rcode)
+            self._reply(frame, udp, q, ans, rcode, bytes(ip[16:20]),
+                        self.ttl_map.get(name, 300))
 
-    def _reply(self, req_frame, req_udp, q, ans, rcode):
-        """回一个 DNS 应答：源 IP 是 DNS 服务器（可能跨网段），目的取请求的源。"""
-        body = build_dns_reply(q, ans, rcode)
-        src = self.dns_ip if self.dns_ip else DNS_LOCAL
+    def _reply(self, req_frame, req_udp, q, ans, rcode, srv_ip, ttl=300):
+        """回一个 DNS 应答：源 IP 是查询**发往**的那台服务器（可能跨网段），
+        目的取请求的源。TTL 可按名字定制（测缓存过期）。"""
+        body = build_dns_reply(q, ans, rcode, ttl)
+        src = srv_ip
         client_ip = req_frame[26:30]
         client_port = struct.unpack(">H", req_udp[0:2])[0]
         udp = struct.pack(">HHHH", 53, client_port, 8 + len(body), 0) + body
@@ -502,13 +539,154 @@ def case_failures():
         teardown(proc, qmp, serial, srv, PORT_C[0])
 
 
+def case_cache():
+    """D：缓存三态 —— 命中不发包 / flush 后重新问 / TTL 过期后重新问
+
+    反向组是第 3、4 条：如果缓存恒真（比如永远命中），flush 之后就不该
+    再发查询；如果缓存恒假，第二次 lookup 就会在服务器上留第二个查询。
+    """
+    res = []
+    proc = boot(WORK["D"], PORT_D)
+    serial = qmp = srv = None
+    try:
+        time.sleep(1.0)
+        serial = SerialReader(PORT_D[1])
+        qmp = Qmp(PORT_D[0])
+        srv = LanServer(PORT_D[2], dns_ip=DNS_LOCAL, ttl_map={"short.test": 1})
+        srv.start()
+        time.sleep(0.5)
+        if not shell_up(serial, qmp):
+            print("  FAIL D: shell did not come up")
+            return [("shell up", False)]
+
+        ok, out = run_cmd(qmp, serial, "dhcp", "dhcp: got", 40.0)
+        res.append(("got a lease first", ok))
+
+        ok, out = run_cmd(qmp, serial, "lookup cache.test",
+                          "dns: cache.test = 93.184.216.34", 30.0)
+        res.append(("first lookup resolves", ok))
+        res.append(("first lookup really went on the wire",
+                    srv.count("cache.test") == 1))
+
+        ok, out = run_cmd(qmp, serial, "lookup cache.test",
+                          "dns: cache.test = 93.184.216.34 (cached)", 25.0)
+        res.append(("second lookup says cached", ok))
+        res.append(("cache hit sent no packet at all",
+                    srv.count("cache.test") == 1))
+
+        ok, out = run_cmd(qmp, serial, "dns flush", "dns: cache flushed", 20.0)
+        res.append(("dns flush accepted", ok))
+        ok, out = run_cmd(qmp, serial, "lookup cache.test",
+                          "dns: cache.test = 93.184.216.34", 30.0)
+        res.append(("after flush it asks the server again",
+                    ok and "(cached)" not in out))
+        res.append(("flush really re-queried", srv.count("cache.test") == 2))
+
+        # TTL=1s 的名字：睡过 1s 之后必须失效（缓存若不看 TTL 这里会失败）
+        ok, out = run_cmd(qmp, serial, "lookup short.test",
+                          "dns: short.test = 93.184.216.34", 30.0)
+        res.append(("short-TTL name resolves", ok))
+        before = srv.count("short.test")
+        ok, out = run_cmd(qmp, serial, "sleep 1500", "done", 90.0)
+        res.append(("slept past the TTL", ok))
+        ok, out = run_cmd(qmp, serial, "lookup short.test",
+                          "dns: short.test = 93.184.216.34", 30.0)
+        res.append(("expired entry resolves again", ok))
+        res.append(("expired entry was re-queried (TTL honoured)",
+                    srv.count("short.test") > before))
+        return res
+    finally:
+        teardown(proc, qmp, serial, srv, PORT_D[0])
+
+
+def case_multiserver():
+    """E：option 6 给两台服务器，第一台装死 -> 必须回退到第二台"""
+    res = []
+    proc = boot(WORK["E"], PORT_E)
+    serial = qmp = srv = None
+    try:
+        time.sleep(1.0)
+        serial = SerialReader(PORT_E[1])
+        qmp = Qmp(PORT_E[0])
+        srv = LanServer(PORT_E[2], dns_ip=[DNS_LOCAL, DNS_BACKUP],
+                        silent_srv=(DNS_LOCAL,))
+        srv.start()
+        time.sleep(0.5)
+        if not shell_up(serial, qmp):
+            print("  FAIL E: shell did not come up")
+            return [("shell up", False)]
+
+        ok, out = run_cmd(qmp, serial, "dhcp", "dhcp: got", 40.0)
+        res.append(("got a lease first", ok))
+        ok, out = run_cmd(qmp, serial, "dns", "dns: server 10.0.2.3", 25.0)
+        res.append(("option 6 delivered the first server", ok))
+        ok, out = run_cmd(qmp, serial, "dns", "dns: server 10.0.2.4", 25.0)
+        res.append(("option 6 delivered the second server", ok))
+
+        ok, out = run_cmd(qmp, serial, "lookup www.example.com",
+                          "dns: www.example.com = 93.184.216.34", 120.0)
+        res.append(("resolved through the fallback server", ok))
+        if not ok:
+            print("---- serial tail ----\n" + out[-1200:])
+        res.append(("asked the first server first", srv.count_to(DNS_LOCAL) >= 1))
+        res.append(("gave up on it and asked the second",
+                    srv.count_to(DNS_BACKUP) >= 1))
+        return res
+    finally:
+        teardown(proc, qmp, serial, srv, PORT_E[0])
+
+
+def case_ping_host():
+    """F：ping 接受域名（先解析再 ping）；解析失败就不许发 ICMP"""
+    res = []
+    proc = boot(WORK["F"], PORT_F)
+    serial = qmp = srv = None
+    try:
+        time.sleep(1.0)
+        serial = SerialReader(PORT_F[1])
+        qmp = Qmp(PORT_F[0])
+        srv = LanServer(PORT_F[2], dns_ip=DNS_LOCAL, nx=("nx.test",))
+        srv.start()
+        time.sleep(0.5)
+        if not shell_up(serial, qmp):
+            print("  FAIL F: shell did not come up")
+            return [("shell up", False)]
+
+        ok, out = run_cmd(qmp, serial, "dhcp", "dhcp: got", 40.0)
+        res.append(("got a lease first", ok))
+
+        ok, out = run_cmd(qmp, serial, "ping www.example.com",
+                          "reply from 93.184.216.34", 60.0)
+        res.append(("ping by hostname reaches the resolved address", ok))
+        if not ok:
+            print("---- serial tail ----\n" + out[-1200:])
+        res.append(("printed the resolved address",
+                    "ping: www.example.com = 93.184.216.34" in out))
+
+        ok, out = run_cmd(qmp, serial, "ping 10.0.2.2",
+                          "reply from 10.0.2.2", 60.0)
+        res.append(("ping by literal IP still works", ok))
+
+        ok, out = run_cmd(qmp, serial, "ping nx.test",
+                          "ping: dns: no a record", 40.0)
+        res.append(("unresolvable name reported as such", ok))
+        res.append(("no ICMP went out for the bad name",
+                    "reply from" not in out))
+        return res
+    finally:
+        teardown(proc, qmp, serial, srv, PORT_F[0])
+
+
 def main():
     print("== test_dns: DNS resolver (A record) ==")
     kill_all_qemu()
     total = failed = 0
     for name, fn in (("A same-subnet DNS", case_local),
                      ("B off-subnet DNS via gateway", case_remote),
-                     ("C failure branches", case_failures)):
+                     ("C failure branches", case_failures),
+                     ("D cache (hit / flush / TTL)", case_cache),
+                     ("E multiple servers, fallback", case_multiserver),
+                     ("F ping by hostname", case_ping_host)):
         print("-- %s --" % name)
         res = fn()
         for label, ok in res:

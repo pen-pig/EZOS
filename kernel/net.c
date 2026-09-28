@@ -493,12 +493,53 @@ static int net_udp_send(uint32_t dst_ip, uint16_t dst_port, uint16_t src_port,
 static struct {
     uint8_t  active;      /* 正在等响应（net_input 据此放宽目的 IP 检查） */
     uint8_t  got;
+    uint8_t  renewing;    /* 这一轮是后台续租，不是 shell 的 dhcp 命令在等 */
     uint32_t xid;         /* 只认自己发起的事务 */
     uint8_t  msg_type;    /* option 53：2=OFFER 5=ACK 6=NAK */
     uint32_t yiaddr;      /* BOOTP 头里的"你的地址"（网络序） */
     uint8_t  buf[512];
     uint32_t len;
 } g_dhcp_w;
+
+/* 后台续租状态机（RFC 2131 4.4.5 的 T1/T2）：
+ *   未到 T1（0.5 × 租期）      什么也不做
+ *   RENEWING  过了 T1          单播 REQUEST 给原来那台服务器（ciaddr 已填）
+ *   REBINDING 过了 T2（0.875） 没人理就改广播，任何服务器都能接手
+ *   INIT      租期到            地址不再属于我，重新走 DISCOVER
+ * 三个特点必须记牢：
+ *   1. 全部由 net_tick（IRQ0）驱动，**不睡等**——睡等只能在任务上下文，而
+ *      内核没有专职网络线程。发 REQUEST 与收 ACK 是两件分开的事：应答由
+ *      dhcp_input（IRQ11）收下并置 got，下一次 net_tick 才应用。
+ *   2. 两个入口都在 IF=0 的上下文（IRQ0/IRQ11 都走中断门），故 g_lease /
+ *      g_renew 的读写不需要加锁。
+ *   3. 续租窗口里 g_dhcp_w.active 保持 1，net_input 才会放行回给 68 端口
+ *      的包；续租成功后 dhcp_apply() 把它清掉。 */
+static struct {
+    uint8_t  active;    /* 有租约在计时（租期 0 或超长 = 不开定时器） */
+    uint8_t  state;     /* 0=未到 T1  1=RENEWING  2=REBINDING  3=INIT */
+    uint32_t t1, t2, expire;   /* 绝对 tick（g_pit_ticks，单位 ms） */
+    uint32_t next;             /* 下一次重发的 tick */
+} g_renew;
+
+#define DHCP_RENEW_RETRY_MIN  1000u    /* 重发间隔下限（ms） */
+#define DHCP_LEASE_MAX_SEC    100000u  /* 租期超过它就当永久（ms 换算会溢出） */
+
+/* 新事务号：MAC 与 tick 混合，保证与上一轮不同（否则会把旧应答当新应答） */
+static uint32_t dhcp_new_xid(void) {
+    const uint8_t *my = rtl8139_mac();
+    uint32_t x = (uint32_t)g_pit_ticks ^ 0x9E3779B9u;
+    for (int i = 0; i < 6; i++) x = (x << 5) ^ (x >> 27) ^ my[i];
+    if (x == 0) x = 0x5A5A5A5Au;
+    return x;
+}
+
+/* DNS 服务器表（DHCP option 6 填写，DNS 查询时逐个尝试）。
+ * 放在 DHCP 段是因为只有 DHCP 会写它；DNS 段只负责读。
+ * g_dns_manual = 表来自 `dns a.b.c.d`（手动配的），DHCP 没下发时不覆盖。 */
+#define DNS_MAX_SRV 4u
+static uint32_t g_dns_srv[DNS_MAX_SRV];
+static uint32_t g_dns_srv_n;
+static uint8_t  g_dns_manual;
 
 /* 已生效的租约（nic 命令显示；后续 DNS 客户端直接用 g_lease.dns） */
 static struct {
@@ -508,12 +549,17 @@ static struct {
     uint32_t tick;                             /* 取得时刻（g_pit_ticks） */
 } g_lease;
 
-/* 发一份 DHCP 报文：以太网广播 + IP 源 0.0.0.0 目的 255.255.255.255。
- * msg_type: 1=DISCOVER 3=REQUEST；REQUEST 需要 req_ip（option 50）与
- * server_id（option 54，选中的那台服务器）。
+/* 发一份 DHCP 报文。两种形态：
+ *   bound = 0（INIT/SELECTING）：以太网广播 + IP 源 0.0.0.0 目的 255.255.255.255，
+ *           REQUEST 带 option 50（请求的 IP）与 54（选中的服务器）。
+ *   bound = 1（RENEWING/REBINDING，RFC 2131 表 5）：已有地址，ciaddr 填上
+ *           自己的 IP、源 IP 也是它，**且不发** 50/54（服务器靠 ciaddr +
+ *           chaddr 认人）；能查到服务器 MAC 就单播给它，否则退回广播。
+ * msg_type: 1=DISCOVER 3=REQUEST。
  * flags 置 broadcast(0x8000)：请求服务器用广播回，避免它单播到一个
  * 二层上还解析不到的地址。返回 0 = 已提交网卡。 */
-static int dhcp_send(uint8_t msg_type, uint32_t req_ip, uint32_t server_id) {
+static int dhcp_send(uint8_t msg_type, uint32_t req_ip, uint32_t server_id,
+                     int bound) {
     uint8_t *p = g_build;
     for (uint32_t i = 0; i < BOOTP_MIN; i++) p[i] = 0;   /* 含 sname/file 全零 */
 
@@ -525,11 +571,12 @@ static int dhcp_send(uint8_t msg_type, uint32_t req_ip, uint32_t server_id) {
     put16(p + 10, 0x8000);                    /* flags: broadcast */
     const uint8_t *my = rtl8139_mac();
     for (int i = 0; i < 6; i++) p[28 + i] = my[i];       /* chaddr[0..5] */
+    if (bound) put32(p + 12, g_lease.ip);     /* ciaddr：我已绑定这个地址 */
     put32(p + 236, DHCP_MAGIC);
 
     uint32_t o = 240;
     p[o++] = 53; p[o++] = 1; p[o++] = msg_type;
-    if (msg_type == 3) {
+    if (msg_type == 3 && !bound) {
         p[o++] = 50; p[o++] = 4; put32(p + o, req_ip);    o += 4;
         p[o++] = 54; p[o++] = 4; put32(p + o, server_id); o += 4;
     }
@@ -540,8 +587,19 @@ static int dhcp_send(uint8_t msg_type, uint32_t req_ip, uint32_t server_id) {
     p[o++] = 255;                             /* end */
     if (o > BOOTP_MIN) return -1;             /* options 写穿了固定长度区 */
 
+    /* 目的：单播给服务器（只有查得到 MAC 时），否则广播 */
+    uint32_t ip_dst = 0xFFFFFFFFu, udp_src_ip = 0u;
+    const uint8_t *dst_mac = 0;
+    if (bound) {
+        udp_src_ip = g_lease.ip;
+        if (server_id != 0) {
+            dst_mac = arp_lookup(server_id);   /* 非阻塞：只看缓存，不发 ARP */
+            if (dst_mac) ip_dst = server_id;
+        }
+    }
+
     uint8_t *r = g_frame;
-    for (int i = 0; i < 6; i++) r[i] = 0xFF;              /* 以太网广播 */
+    for (int i = 0; i < 6; i++) r[i] = dst_mac ? dst_mac[i] : 0xFF;
     for (int i = 0; i < 6; i++) r[6 + i] = my[i];
     r[12] = 0x08; r[13] = 0x00;
 
@@ -552,7 +610,7 @@ static int dhcp_send(uint8_t msg_type, uint32_t req_ip, uint32_t server_id) {
     put16(u + 4, (uint16_t)ulen);
     put16(u + 6, 0);
     for (uint32_t i = 0; i < BOOTP_MIN; i++) u[UDP_HDR_LEN + i] = p[i];
-    put16(u + 6, udp_checksum(0u, 0xFFFFFFFFu, u, ulen));
+    put16(u + 6, udp_checksum(udp_src_ip, ip_dst, u, ulen));
 
     uint8_t *ip = r + ETH_HDR_LEN;
     ip[0] = 0x45; ip[1] = 0;
@@ -561,8 +619,8 @@ static int dhcp_send(uint8_t msg_type, uint32_t req_ip, uint32_t server_id) {
     put16(ip + 6, 0);                         /* 无分片 */
     ip[8] = 64; ip[9] = 17;
     put16(ip + 10, 0);
-    put32(ip + 12, 0u);                       /* 源 0.0.0.0：还没有地址 */
-    put32(ip + 16, 0xFFFFFFFFu);              /* 目的 255.255.255.255 */
+    put32(ip + 12, udp_src_ip);               /* 未绑定 = 0.0.0.0 */
+    put32(ip + 16, ip_dst);                   /* 未绑定 = 255.255.255.255 */
     put16(ip + 10, cksum(ip, IP_HDR_MIN));
 
     g_udp_tx++;
@@ -635,6 +693,137 @@ static int dhcp_wait(uint32_t timeout_ms) {
     }
 }
 
+/* 把刚收到的 ACK 落到 g_lease 上，并重启 T1/T2 计时（net_dhcp 与后台
+ * 续租共用同一条路径，保证"首次取得"与"续上"的行为完全一致）。
+ * server_id 是 OFFER 里记下的服务器（ACK 不带 option 54 时沿用旧的）。
+ * 调用上下文：任务（net_dhcp）或 IRQ0（dhcp_renew_check），都是 IF=0。 */
+static void dhcp_apply(uint32_t ip, uint32_t server_id) {
+    uint8_t v[4];
+
+    g_lease.valid = 0;      /* 先摘掉，IRQ0 的续租检查在下面装好前不会误动 */
+    g_renew.active = 0;
+    g_renew.state  = 0;
+
+    if (dhcp_opt(54, v, 4) == 4) server_id = be32(v);
+    g_lease.ip      = ip;
+    g_lease.mask    = (dhcp_opt(1, v, 4) == 4)  ? be32(v) : 0u;
+    g_lease.router  = (dhcp_opt(3, v, 4) == 4)  ? be32(v) : 0u;
+    g_lease.server  = server_id;
+    g_lease.lease   = (dhcp_opt(51, v, 4) == 4) ? be32(v) : 0u;
+    g_lease.tick    = g_pit_ticks;
+
+    /* DNS 服务器表（option 6 可能给多个，全部收下；超时/失败时逐个问）。
+     * 手动配过（`dns a.b.c.d`）而服务器这次没下发时保留手动那张表。 */
+    uint8_t dv[16];
+    uint32_t dn = dhcp_opt(6, dv, sizeof(dv)) / 4u;
+    if (dn != 0) {
+        g_dns_srv_n = 0;
+        for (uint32_t k = 0; k < dn && g_dns_srv_n < DNS_MAX_SRV; k++) {
+            uint32_t a = be32(dv + k * 4);
+            if (a != 0) g_dns_srv[g_dns_srv_n++] = a;      /* 0.0.0.0 跳过 */
+        }
+        g_dns_manual = 0;
+    } else if (!g_dns_manual) {
+        g_dns_srv_n = 0;
+    }
+    g_lease.dns = (g_dns_srv_n != 0) ? g_dns_srv[0] : 0u;  /* 显示用：第一个 */
+
+    /* T1/T2 计时（RFC 2131 4.4.5）。租期为 0（服务器没下发）或长到换算会
+     * 溢出时不排定时器——那种租约当永久，不做续租。 */
+    uint32_t l = g_lease.lease;
+    if (l != 0 && l <= DHCP_LEASE_MAX_SEC) {
+        uint32_t ms = l * 1000u, now = g_pit_ticks;
+        g_renew.t1     = now + ms / 2u;          /* T1 = 0.5 × 租期 */
+        g_renew.t2     = now + (ms / 8u) * 7u;   /* T2 = 0.875 × 租期 */
+        g_renew.expire = now + ms;
+        g_renew.next   = 0;
+        g_renew.active = 1;
+    }
+
+    g_dhcp_w.active   = 0;
+    g_dhcp_w.got      = 0;
+    g_dhcp_w.renewing = 0;
+
+    /* IP 是网络序（大端打包）的 u32：字节 0（点分第一段）在**最高** 8 位。
+     * 写成 ip & 0xFF 取第一段会得到反过来的地址（10.0.2.66 -> 66.2.0.10），
+     * 屏幕上的租约看着对、实际发包全用错地址，且掩码算出的网络号与网关
+     * 对不上，跨网段判断会静默失效。 */
+    rtl8139_set_ip((uint8_t)((ip >> 24) & 0xFFu), (uint8_t)((ip >> 16) & 0xFFu),
+                   (uint8_t)((ip >> 8) & 0xFFu),  (uint8_t)(ip & 0xFFu));
+    g_lease.valid = 1;      /* 放在最后：IRQ0 见到 valid 时其余字段已就绪 */
+}
+
+/* 后台续租定时器（net_tick 调用，IRQ0 上下文）。只做两件不阻塞的事：
+ * 发出 REQUEST/DISCOVER、把 dhcp_input 收下的应答交给 dhcp_apply。
+ * 返回 1 表示这一轮发了包（调用方可据此决定是否要 net_poll）。 */
+static int dhcp_renew_check(uint32_t now) {
+    if (!g_renew.active || !g_lease.valid) return 0;
+
+    /* 1) 消化上一轮发出的请求的应答（dhcp_input 在 IRQ11 收下、置 got） */
+    if (g_dhcp_w.renewing && g_dhcp_w.got) {
+        uint8_t t = g_dhcp_w.msg_type;
+        g_dhcp_w.got = 0;
+        if (t == 5) {                                  /* ACK：续上了 */
+            if (g_dhcp_w.yiaddr != 0) {
+                dhcp_apply(g_dhcp_w.yiaddr, g_lease.server);
+                dmesg_write("DHCP: renewed");
+            }
+            return 0;
+        }
+        if (t == 6) {                                  /* NAK：地址没了 */
+            g_lease.valid = 0;                         /* 不再使用它 */
+            g_renew.state = 3;                         /* 回 INIT 重来 */
+        } else if (t == 2 && g_renew.state == 3) {     /* INIT 收到 OFFER */
+            uint32_t ip = g_dhcp_w.yiaddr;
+            uint8_t sid[4];
+            uint32_t server = (dhcp_opt(54, sid, 4) == 4) ? be32(sid) : 0u;
+            if (ip != 0 && dhcp_send(3, ip, server, 0) == 0) {
+                g_renew.next = now + DHCP_RENEW_RETRY_MIN;
+                return 1;
+            }
+        }
+    }
+
+    /* 2) 状态推进：T1 -> RENEWING -> T2 -> REBINDING -> 到期 -> INIT。
+     * 每次**跃迁**都立刻发一次（next 清 0）：否则上一轮的重发间隔会把
+     * 新状态的第一包推到租期之后——T2 的广播 rebind 就永远发不出去。 */
+    uint32_t state = g_renew.state;
+    int changed = 0;
+    if (state == 0) {
+        if ((int32_t)(now - g_renew.t1) < 0) return 0;
+        g_renew.state = state = 1;
+        changed = 1;
+    } else if (state == 1) {
+        if ((int32_t)(now - g_renew.t2) >= 0) { g_renew.state = state = 2; changed = 1; }
+    } else if (state == 2 && (int32_t)(now - g_renew.expire) >= 0) {
+        g_lease.valid = 0;                 /* 租期到：地址不再属于我 */
+        g_renew.state = state = 3;
+        changed = 1;
+        dmesg_write("DHCP: lease expired");
+    }
+    if (changed) g_renew.next = 0;
+    if ((int32_t)(now - g_renew.next) < 0) return 0;   /* 未到重发间隔 */
+
+    /* 3) 发一次。RENEWING 单播给原服务器，REBINDING 广播，INIT 重新 DISCOVER */
+    uint32_t retry = (g_renew.t2 > g_renew.t1)
+                     ? (g_renew.t2 - g_renew.t1) / 2u : 0u;
+    if (retry < DHCP_RENEW_RETRY_MIN) retry = DHCP_RENEW_RETRY_MIN;
+    if (retry > 60000u) retry = 60000u;
+
+    g_dhcp_w.xid      = dhcp_new_xid();
+    g_dhcp_w.got      = 0;
+    g_dhcp_w.msg_type = 0;
+    g_dhcp_w.active   = 1;
+    g_dhcp_w.renewing = 1;
+    int ok;
+    if (state == 3)      ok = (dhcp_send(1, 0, 0, 0) == 0);
+    else if (state == 1) ok = (dhcp_send(3, g_lease.ip, g_lease.server, 1) == 0);
+    else                 ok = (dhcp_send(3, g_lease.ip, 0u, 1) == 0);
+    if (!ok) { g_dhcp_w.active = 0; g_dhcp_w.renewing = 0; }
+    g_renew.next = now + retry;
+    return ok ? 1 : 0;
+}
+
 /* DHCP 主流程（任务上下文，会睡最多 ~3*timeout_ms 每阶段）。
  * 返回：0 = 已取得并应用租约、1 = 无服务器应答（超时）、2 = 被 NAK 或
  * 服务器给的 IP 非法、-1 = 无网卡/缓冲不足/发送失败。 */
@@ -644,18 +833,14 @@ int net_dhcp(uint32_t timeout_ms) {
     if (timeout_ms == 0) timeout_ms = 2500u;
 
     g_lease.valid = 0;
-    const uint8_t *my = rtl8139_mac();
-    uint32_t xid = (uint32_t)g_pit_ticks;
-    for (int i = 0; i < 6; i++) xid = (xid << 5) ^ (xid >> 27) ^ my[i];
-    if (xid == 0) xid = 0x5A5A5A5Au;
-    g_dhcp_w.xid = xid;
+    g_dhcp_w.xid = dhcp_new_xid();
 
     /* 阶段 1：DISCOVER -> OFFER */
     int offered = 0;
     for (int attempt = 0; attempt < 3 && !offered; attempt++) {
         g_dhcp_w.got = 0;
         g_dhcp_w.active = 1;              /* 先置位再发：响应可能在发送途中到 */
-        if (dhcp_send(1, 0, 0) != 0) { g_dhcp_w.active = 0; return -1; }
+        if (dhcp_send(1, 0, 0, 0) != 0) { g_dhcp_w.active = 0; return -1; }
         if (dhcp_wait(timeout_ms) && g_dhcp_w.msg_type == 2) offered = 1;
     }
     if (!offered) { g_dhcp_w.active = 0; return 1; }
@@ -670,7 +855,7 @@ int net_dhcp(uint32_t timeout_ms) {
     for (int attempt = 0; attempt < 3 && !acked; attempt++) {
         g_dhcp_w.got = 0;
         g_dhcp_w.active = 1;
-        if (dhcp_send(3, offer_ip, server_id) != 0) { g_dhcp_w.active = 0; return -1; }
+        if (dhcp_send(3, offer_ip, server_id, 0) != 0) { g_dhcp_w.active = 0; return -1; }
         if (dhcp_wait(timeout_ms)) {
             if (g_dhcp_w.msg_type == 5) acked = 1;
             else if (g_dhcp_w.msg_type == 6) { g_dhcp_w.active = 0; return 2; }
@@ -681,23 +866,7 @@ int net_dhcp(uint32_t timeout_ms) {
 
     uint32_t ip = g_dhcp_w.yiaddr;
     if (ip == 0) return 2;                 /* ACK 里没给地址：不应用 */
-
-    uint8_t v[4];
-    g_lease.ip      = ip;
-    g_lease.mask    = (dhcp_opt(1, v, 4) == 4)  ? be32(v) : 0u;
-    g_lease.router  = (dhcp_opt(3, v, 4) == 4)  ? be32(v) : 0u;
-    g_lease.dns     = (dhcp_opt(6, v, 4) == 4)  ? be32(v) : 0u;  /* 只取第一个 */
-    g_lease.server  = server_id;
-    g_lease.lease   = (dhcp_opt(51, v, 4) == 4) ? be32(v) : 0u;
-    g_lease.tick    = g_pit_ticks;
-    g_lease.valid   = 1;
-
-    /* IP 是网络序（大端打包）的 u32：字节 0（点分第一段）在**最高** 8 位。
-     * 写成 ip & 0xFF 取第一段会得到反过来的地址（10.0.2.66 -> 66.2.0.10），
-     * 屏幕上的租约看着对、实际发包全用错地址，且掩码算出的网络号与网关
-     * 对不上，跨网段判断会静默失效。 */
-    rtl8139_set_ip((uint8_t)((ip >> 24) & 0xFFu), (uint8_t)((ip >> 16) & 0xFFu),
-                   (uint8_t)((ip >> 8) & 0xFFu),  (uint8_t)(ip & 0xFFu));
+    dhcp_apply(ip, server_id);
     return 0;
 }
 
@@ -740,7 +909,101 @@ static struct {
     uint32_t len;
 } g_dns_w;
 
-static uint32_t g_dns_server = 0;   /* 手动配置；0 = 用 DHCP 下发的那个 */
+/* ---- 解析结果缓存 ----
+ * 表项很少（8 条）且只存 A 记录：shell 一次只跑一个查询，命中就省掉一次
+ * 往返（局域网里 1ms、公网几十 ms，但更重要的是不再给服务器添负载）。
+ * 失效只看 TTL：expire 是绝对 tick，判断用回绕安全的有符号比较。
+ * 不做负缓存（NXDOMAIN 不入表）——错误答案缓存起来的代价比重查一次大。 */
+#define DNS_CACHE_MAX  8u
+#define DNS_NAME_MAX   64u      /* 缓存键上限；更长的名字照常解析但不入表 */
+#define DNS_TTL_MAX    86400u   /* TTL 上限（秒）：挡住荒谬 TTL 与换算溢出 */
+
+static struct {
+    uint8_t  used;
+    char     name[DNS_NAME_MAX];
+    uint32_t ip;                /* 网络序 */
+    uint32_t expire;            /* 绝对 tick（ms） */
+} g_dns_cache[DNS_CACHE_MAX];
+
+static uint32_t g_dns_rr;       /* 轮换下标：表满时顶掉最老的一条 */
+static uint32_t g_dns_hits;     /* 缓存命中次数（nic 显示 / E2E 断言） */
+
+/* 小写化拷贝；名字过长则返回 0（不入缓存，但解析照常） */
+static uint32_t dns_name_copy(char *out, const char *in) {
+    uint32_t n = 0;
+    for (; in[n] != '\0'; n++) {
+        if (n + 1 >= DNS_NAME_MAX) return 0;
+        char c = in[n];
+        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+        out[n] = c;
+    }
+    out[n] = '\0';
+    return (n != 0) ? n : 0u;
+}
+
+static int dns_name_eq(const char *a, const char *b) {
+    for (;;) {
+        char x = *a++, y = *b++;
+        if (x >= 'A' && x <= 'Z') x = (char)(x + 32);
+        if (y >= 'A' && y <= 'Z') y = (char)(y + 32);
+        if (x != y) return 0;
+        if (x == '\0') return 1;
+    }
+}
+
+/* 只查缓存，不发任何包（shell 的 lookup 用它区分"(cached)"）。
+ * 命中返回 1 并写入 *ip；过期项顺手清掉。 */
+int net_dns_cache_lookup(const char *name, uint32_t *out_ip_be) {
+    if (!name || !out_ip_be) return 0;
+    uint32_t now = g_pit_ticks;
+    for (uint32_t i = 0; i < DNS_CACHE_MAX; i++) {
+        if (!g_dns_cache[i].used) continue;
+        if (!dns_name_eq(name, g_dns_cache[i].name)) continue;
+        if ((int32_t)(now - g_dns_cache[i].expire) >= 0) {
+            g_dns_cache[i].used = 0;               /* 过期：当作没这条 */
+            return 0;
+        }
+        *out_ip_be = g_dns_cache[i].ip;
+        g_dns_hits++;
+        return 1;
+    }
+    return 0;
+}
+
+static void dns_cache_put(const char *name, uint32_t ip_be, uint32_t ttl) {
+    if (ttl == 0) return;                          /* RFC：TTL 0 = 不许缓存 */
+    if (ttl > DNS_TTL_MAX) ttl = DNS_TTL_MAX;
+    char key[DNS_NAME_MAX];
+    if (dns_name_copy(key, name) == 0) return;     /* 太长/空：不缓存 */
+
+    uint32_t slot = DNS_CACHE_MAX;
+    for (uint32_t i = 0; i < DNS_CACHE_MAX; i++) {
+        if (!g_dns_cache[i].used) { slot = i; break; }
+        if (dns_name_eq(key, g_dns_cache[i].name)) { slot = i; break; }
+    }
+    if (slot == DNS_CACHE_MAX) {                   /* 满：轮换顶掉一条 */
+        slot = g_dns_rr % DNS_CACHE_MAX;
+        g_dns_rr++;
+    }
+    g_dns_cache[slot].used = 1;
+    for (uint32_t i = 0; key[i] != '\0'; i++) g_dns_cache[slot].name[i] = key[i];
+    g_dns_cache[slot].name[DNS_NAME_MAX - 1] = '\0';
+    g_dns_cache[slot].ip = ip_be;
+    g_dns_cache[slot].expire = g_pit_ticks + ttl * 1000u;
+}
+
+void net_dns_cache_clear(void) {
+    for (uint32_t i = 0; i < DNS_CACHE_MAX; i++) g_dns_cache[i].used = 0;
+    g_dns_rr = 0;
+}
+
+uint32_t net_dns_cache_hits(void)  { return g_dns_hits; }
+
+uint32_t net_dns_cache_entries(void) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < DNS_CACHE_MAX; i++) if (g_dns_cache[i].used) n++;
+    return n;
+}
 
 /* "www.example.com" -> 03 77 77 77 07 ... 00
  * 返回写入字节数；0 = 名字非法（空、空 label、label > 63、总长 > 255）。 */
@@ -844,8 +1107,8 @@ static int dns_wait(uint32_t timeout_ms) {
  * -3 = 没有 DNS 服务器（既没 DHCP 租约也没手动配）。 */
 int net_dns_resolve(const char *name, uint32_t *out_ip_be, uint32_t timeout_ms) {
     if (!name || !out_ip_be) return -1;
-    uint32_t server = g_dns_server ? g_dns_server : g_lease.dns;
-    if (server == 0) return -3;
+    if (g_dns_srv_n == 0) return -3;
+    if (net_dns_cache_lookup(name, out_ip_be)) return 0;   /* 命中：一个包都不发 */
     if (!rtl8139_present()) return -1;
     if (!build_ready()) return -1;
     if (timeout_ms == 0) timeout_ms = 2500u;
@@ -867,12 +1130,19 @@ int net_dns_resolve(const char *name, uint32_t *out_ip_be, uint32_t timeout_ms) 
     g_dns_w.id = id;
     g_dns_w.port = (uint16_t)(40000u + (id & 0x07FFu));
 
+    /* 逐个服务器问，每个最多两轮（超时/丢包才轮到下一个；NXDOMAIN 这种
+     * 权威否定答案直接返回，不去问第二台——它也会说"没有"）。 */
     int got = 0;
     for (int attempt = 0; attempt < 2 && !got; attempt++) {
-        g_dns_w.got = 0;
-        g_dns_w.active = 1;        /* 先置位再发：应答可能在发送途中就到 */
-        if (dns_send(server, q, qlen) != 0) { g_dns_w.active = 0; return -1; }
-        got = dns_wait(timeout_ms);
+        for (uint32_t s = 0; s < g_dns_srv_n && !got; s++) {
+            uint32_t server = g_dns_srv[s];
+            if (server == 0) continue;
+            g_dns_w.got = 0;
+            g_dns_w.rcode = 0;
+            g_dns_w.active = 1;    /* 先置位再发：应答可能在发送途中就到 */
+            if (dns_send(server, q, qlen) != 0) { g_dns_w.active = 0; return -1; }
+            got = dns_wait(timeout_ms);
+        }
     }
     g_dns_w.active = 0;
     if (!got) return 1;
@@ -896,6 +1166,7 @@ int net_dns_resolve(const char *name, uint32_t *out_ip_be, uint32_t timeout_ms) 
         if (i + rdlen > n) return -2;
         if (type == 1 && cls == 1 && rdlen == 4) {
             *out_ip_be = be32(d + i);
+            dns_cache_put(name, *out_ip_be, be32(d + i - 6));  /* TTL 在 TYPE 前 4 字节 */
             return 0;
         }
         i += rdlen;                                 /* CNAME 等：跳过继续找 */
@@ -903,10 +1174,21 @@ int net_dns_resolve(const char *name, uint32_t *out_ip_be, uint32_t timeout_ms) 
     return -2;                                      /* 没有 A 记录 */
 }
 
-void net_dns_set_server(uint32_t be) { g_dns_server = be; }
+/* 手动指定服务器：覆盖整张表（DHCP 下次拿到 option 6 会重新覆盖回来） */
+void net_dns_set_server(uint32_t be) {
+    g_dns_srv[0] = be;
+    g_dns_srv_n  = (be != 0) ? 1u : 0u;
+    g_dns_manual = 1;
+}
 
 uint32_t net_dns_server(void) {
-    return g_dns_server ? g_dns_server : g_lease.dns;
+    return (g_dns_srv_n != 0) ? g_dns_srv[0] : 0u;   /* 实际会用的第一个 */
+}
+
+uint32_t net_dns_server_count(void) { return g_dns_srv_n; }
+
+uint32_t net_dns_server_at(uint32_t i) {
+    return (i < g_dns_srv_n) ? g_dns_srv[i] : 0u;
 }
 
 /* ---------- TCP ---------- */
@@ -1009,6 +1291,9 @@ void net_tick(void) {
     uint32_t now = g_pit_ticks;
     if ((int32_t)(now - last_tick) < (int32_t)TCP_TICK_MS) return;
     last_tick = now;
+    /* DHCP 续租（T1/T2，见 g_renew 注释）：先跑，因为它可能刚续上租约、
+     * 也可能刚把地址作废——之后的重传都按最新的本机 IP 走。 */
+    dhcp_renew_check(now);
     for (uint32_t i = 0; i < NET_MAX_SOCKS; i++) {
         sock_t *s = &g_socks[i];
         if (!s->used || s->type != SOCK_TYPE_TCP) continue;

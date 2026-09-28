@@ -22,6 +22,12 @@ Python 侧的自建 DHCP 服务器（`-netdev socket` 直连，完全掌控报�
   C（REQUEST 被 NAK）：必须打 "DHCP: NAK"，**绝不**出现 "DHCP: got"，
      IP 仍是缺省 —— 证明 ACK/NAK 两条分支分别走得通，不是只看 got
 
+  D（T1 续租）：4s 租约，过了 T1(2s) 必须**自己**发 REQUEST 续上
+     （ciaddr 填好、单播给原服务器、不带 option 50/54），不用再敲 dhcp
+  E（续租被无视）：服务器不理续租 -> 推进到 T2 广播、租期到作废并重新
+     DISCOVER；**绝不**出现续租成功 —— 与 D 结果相反，证明状态机真的
+     在按 T1/T2/到期推进，而不是"续上了一次"就万事大吉
+
 用法：python tests/test_dhcp.py   （退出码 0 = 全通过）
 """
 import os
@@ -47,12 +53,16 @@ DISK = os.path.join(ROOT, "disk.img")
 PORT_A = (4521, 4522, 4527)     # (QMP, serial, netdev)
 PORT_B = (4523, 4524, 4528)
 PORT_C = (4525, 4526, 4529)
+PORT_D = (4551, 4552, 4557)     # D：T1 自动续租
+PORT_E = (4553, 4554, 4558)     # E：服务器不理续租 -> T2 广播 -> 过期重来
 BOOT_WAIT = 150
 
 WORK = {
     "A": os.path.join(HERE, "dhcp_a.img").replace("\\", "/"),
     "B": os.path.join(HERE, "dhcp_b.img").replace("\\", "/"),
     "C": os.path.join(HERE, "dhcp_c.img").replace("\\", "/"),
+    "D": os.path.join(HERE, "dhcp_d.img").replace("\\", "/"),
+    "E": os.path.join(HERE, "dhcp_e.img").replace("\\", "/"),
 }
 
 GUEST_MAC = bytes([0x52, 0x54, 0x00, 0x12, 0x34, 0x56])
@@ -67,6 +77,7 @@ MASK = bytes([255, 255, 255, 0])
 ROUTER = bytes([10, 0, 2, 2])
 DNS = bytes([10, 0, 2, 3])
 LEASE = 3600
+LEASE_SHORT = 4          # D/E 组：4 秒租约 -> T1=2s、T2=3.5s（不然要等几分钟）
 
 MAGIC = 0x63825363
 
@@ -133,6 +144,8 @@ def parse_dhcp(frame):
 
     return {
         "src_ip": bytes(src_ip), "dst_ip": bytes(dst_ip),
+        "mac_dst": bytes(frame[0:6]),
+        "ciaddr": bytes(bootp[12:16]),     # 非 0 = 已绑定（续租形态）
         "sport": sport, "dport": dport,
         "xid": struct.unpack(">I", bootp[4:8])[0],
         "flags": struct.unpack(">H", bootp[10:12])[0],
@@ -146,7 +159,7 @@ def parse_dhcp(frame):
     }
 
 
-def build_reply(msg_type, xid, chaddr, yiaddr):
+def build_reply(msg_type, xid, chaddr, yiaddr, lease=LEASE):
     """构造 OFFER/ACK/NAK：以太网广播 + IP 源 SERVER_IP 目的 255.255.255.255。"""
     b = bytearray(300)
     b[0] = 2                                   # BOOTREPLY
@@ -166,7 +179,7 @@ def build_reply(msg_type, xid, chaddr, yiaddr):
         b[o:o + 6] = bytes([1, 4]) + MASK; o += 6
         b[o:o + 6] = bytes([3, 4]) + ROUTER; o += 6
         b[o:o + 6] = bytes([6, 4]) + DNS; o += 6
-        b[o:o + 6] = bytes([51, 4]) + struct.pack(">I", LEASE); o += 6
+        b[o:o + 6] = bytes([51, 4]) + struct.pack(">I", lease); o += 6
     b[o:o + 6] = bytes([54, 4]) + SERVER_IP; o += 6
     b[o] = 255
 
@@ -203,13 +216,16 @@ def icmp_reply_to(frame, req_ic):
 # ---------------- 自建 DHCP 服务器（跑在 netdev socket 对端） ----------------
 
 class DhcpServer(threading.Thread):
-    """mode: 'ok' 正常应答 / 'silent' 收下不回 / 'nak' 对 REQUEST 回 NAK"""
+    """mode: 'ok' 正常应答 / 'silent' 收下不回 / 'nak' 对 REQUEST 回 NAK
+              / 'renew' 短租约，续租照常 ACK
+              / 'renew_silent' 短租约，但**不理**续租（ciaddr != 0 的 REQUEST）"""
 
-    def __init__(self, port, mode):
+    def __init__(self, port, mode, lease=LEASE):
         threading.Thread.__init__(self)
         self.daemon = True
         self.port = port
         self.mode = mode
+        self.lease = lease
         self.running = True
         self.lock = threading.Lock()
         self.events = []
@@ -244,7 +260,7 @@ class DhcpServer(threading.Thread):
                 continue
             et = struct.unpack(">H", frame[12:14])[0]
             if et == 0x0806:                            # ARP：让 ping 能解析网关
-                if self.mode == "ok":
+                if self.mode in ("ok", "renew", "renew_silent"):
                     a = frame[14:]
                     if len(a) >= 28 and struct.unpack(">H", a[6:8])[0] == 1 \
                             and a[24:28] == SERVER_IP:
@@ -258,7 +274,8 @@ class DhcpServer(threading.Thread):
             if ip[9] == 1:                              # ICMP echo request
                 ihl = (ip[0] & 0x0F) * 4
                 ic = ip[ihl:]
-                if len(ic) >= 8 and ic[0] == 8 and ic[1] == 0 and self.mode == "ok":
+                if len(ic) >= 8 and ic[0] == 8 and ic[1] == 0 \
+                        and self.mode != "silent":
                     self.pings += 1
                     self.ping_src = bytes(ip[12:16])    # 实际用的源地址
                     self._send(icmp_reply_to(frame, ic))
@@ -273,10 +290,17 @@ class DhcpServer(threading.Thread):
             if self.mode == "silent":
                 continue
             if d["msg_type"] == 1:                      # DISCOVER -> OFFER
-                self._send(build_reply(2, d["xid"], d["chaddr"], OFFER_IP))
+                self._send(build_reply(2, d["xid"], d["chaddr"], OFFER_IP,
+                                       self.lease))
             elif d["msg_type"] == 3:                    # REQUEST -> ACK / NAK
-                mt = 6 if self.mode == "nak" else 5
-                self._send(build_reply(mt, d["xid"], d["chaddr"], OFFER_IP))
+                if self.mode == "nak":
+                    self._send(build_reply(6, d["xid"], d["chaddr"], OFFER_IP))
+                    continue
+                # renew_silent：只答应"未绑定"的 REQUEST，续租一律装死
+                if self.mode == "renew_silent" and d["ciaddr"] != ZERO_IP:
+                    continue
+                self._send(build_reply(5, d["xid"], d["chaddr"], OFFER_IP,
+                                       self.lease))
 
     def _send(self, frame):
         if len(frame) < 60:
@@ -497,6 +521,95 @@ def case_nak():
         teardown(proc, qmp, serial, srv, PORT_C[0])
 
 
+def case_renew():
+    """D：4s 租约 -> 过了 T1(2s) 必须**自己**续租（不用再敲 dhcp）
+
+    反向组是 E。这里要证明的不只是"又发了一个包"，而是续租的形态对：
+    ciaddr 填着自己的地址、源 IP 也是它（不再是 0.0.0.0）、单播给原服务器、
+    且按 RFC 2131 表 5 **不带** option 50/54。
+    """
+    res = []
+    proc = boot(WORK["D"], PORT_D)
+    serial = qmp = srv = None
+    try:
+        time.sleep(1.0)
+        serial = SerialReader(PORT_D[1])
+        qmp = Qmp(PORT_D[0])
+        srv = DhcpServer(PORT_D[2], "renew", lease=LEASE_SHORT)
+        srv.start()
+        time.sleep(0.5)
+        if not shell_up(serial, qmp):
+            print("  FAIL D: shell did not come up")
+            return [("shell up", False)]
+
+        ok, out = run_cmd(qmp, serial, "dhcp", "dhcp: got", 40.0)
+        res.append(("got the first lease", ok))
+        res.append(("exactly one REQUEST so far", len(srv.seen(3)) == 1))
+
+        # 睡过 T1（2s）：期间没人敲命令
+        ok, out = run_cmd(qmp, serial, "sleep 5000", "done", 200.0)
+        res.append(("slept past T1", ok))
+        res.append(("reported the renewal", "dhcp: renewed" in out))
+        res.append(("never said the lease expired", "lease expired" not in out))
+
+        reqs = srv.seen(3)
+        res.append(("a second REQUEST went out unprompted", len(reqs) >= 2))
+        renew = [r for r in reqs if r["ciaddr"] == OFFER_IP]
+        res.append(("the renewal is a bound REQUEST (ciaddr filled)", bool(renew)))
+        if renew:
+            r = renew[0]
+            res.append(("sent from the leased address", r["src_ip"] == OFFER_IP))
+            res.append(("RENEWING goes unicast to the server",
+                        r["dst_ip"] == SERVER_IP))
+            res.append(("...and to the server's MAC", r["mac_dst"] == HOST_MAC))
+            res.append(("omits option 50 (requested IP)", r["opt50"] is None))
+            res.append(("omits option 54 (server id)", r["opt54"] is None))
+            res.append(("still carries option 61 (client id)",
+                        r["opt61"] == b"\x01" + GUEST_MAC))
+        return res
+    finally:
+        teardown(proc, qmp, serial, srv, PORT_D[0])
+
+
+def case_renew_silent():
+    """E：服务器不理续租 -> 必须推进到 T2 广播，租期到作废并重新 DISCOVER
+
+    与 D 结果相反：这里"续租"绝不能成功。若状态机停在 RENEWING 不动，
+    "lease expired" 就不会出现，第二条也就无从谈起。
+    """
+    res = []
+    proc = boot(WORK["E"], PORT_E)
+    serial = qmp = srv = None
+    try:
+        time.sleep(1.0)
+        serial = SerialReader(PORT_E[1])
+        qmp = Qmp(PORT_E[0])
+        srv = DhcpServer(PORT_E[2], "renew_silent", lease=LEASE_SHORT)
+        srv.start()
+        time.sleep(0.5)
+        if not shell_up(serial, qmp):
+            print("  FAIL E: shell did not come up")
+            return [("shell up", False)]
+
+        ok, out = run_cmd(qmp, serial, "dhcp", "dhcp: got", 40.0)
+        res.append(("got the first lease", ok))
+
+        ok, out = run_cmd(qmp, serial, "sleep 6000", "done", 240.0)
+        res.append(("slept past the whole lease", ok))
+        res.append(("gave the address up at expiry", "dhcp: lease expired" in out))
+
+        reqs = srv.seen(3)
+        bound = [r for r in reqs if r["ciaddr"] == OFFER_IP]
+        res.append(("tried to renew (bound REQUEST)", len(bound) >= 1))
+        res.append(("rebinding went out as broadcast",
+                    any(r["dst_ip"] == BCAST_IP for r in bound)))
+        res.append(("restarted from DISCOVER after expiry",
+                    len(srv.seen(1)) >= 2))
+        return res
+    finally:
+        teardown(proc, qmp, serial, srv, PORT_E[0])
+
+
 def main():
     print("== test_dhcp: DHCP client (D/O/R/A) ==")
     kill_all_qemu()
@@ -504,7 +617,9 @@ def main():
     failed = 0
     for name, fn in (("A normal lease", case_ok),
                      ("B silent server", case_silent),
-                     ("C NAK", case_nak)):
+                     ("C NAK", case_nak),
+                     ("D T1 renewal", case_renew),
+                     ("E renewal ignored -> expiry", case_renew_silent)):
         print("-- %s --" % name)
         res = fn()
         for label, ok in res:
