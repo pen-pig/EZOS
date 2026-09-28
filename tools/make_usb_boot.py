@@ -162,7 +162,9 @@ def _list_darwin():
 # 实测（QEMU SeaBIOS 1.16.3）：993 扇区（奇数）的镜像 U 盘引导失败
 # （BIOS 认出设备但读盘报错），pad 到 1024 立即成功；真机 BIOS 实现各有
 # 怪癖，对齐整 KB 是零成本保险。多写的 15KB 全是零，不影响引导。
-# kernel.bin / UEFI 契约（kernel.bin 固定 507904 字节）不受影响。
+# kernel.bin / UEFI 契约不受影响：UEFI 加载器（uefi/main.c）读的是文件真实
+# 大小，不是这个 pad；BIOS 路径的扇区数由 tools/make_image.py 写进引导扇区
+# 0x1FC，与这里的 1024 扇区无关。
 PAD_SECTORS = 1024
 
 

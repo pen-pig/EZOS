@@ -28,8 +28,9 @@ SECTIONS
         *(.data)
     }
 
-    /* 镜像（text+data）受 boot.asm KERNEL_SECTORS=992 限制，最大 496KB。
-     * 镜像末尾 0x8C000 到栈顶 0x90000 之间留 16KB 作为主栈向下增长空间。 */
+    /* 镜像（text+data）上限 496KB：0x10000(内核) ~ 0x90000(主栈) 只有 512KB，
+     * 末尾留 16KB 给主栈向下增长。同一上限在 tools/make_image.py 里也校验一次
+     * （MAX_SECTORS=992）——镜像大小本身是动态的，扇区数写进引导扇区 0x1FC。 */
     ASSERT(. - 0x10000 <= 0x7C000, "kernel image exceeds 496KB limit")
 
     /* .bss 与镜像解耦：放到 19MB（16MB GUI 背缓冲 ~18.6MB 结束之后、

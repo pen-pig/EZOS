@@ -3,7 +3,8 @@
 [bits 16]
 
 KERNEL_OFFSET equ 0x10000     ; �ں˼��ص�ַ
-KERNEL_SECTORS equ 992        ; �ں�����������384KB���� build �ű� --pad-to 507904 ��Ӧ��
+KERNEL_SECTORS_MAX equ 992    ; hard cap: image lives at 0x10000, main stack at 0x90000
+                              ; -> 512KB window, 16KB of it left for the stack
 
 start:
     xor ax, ax
@@ -48,7 +49,11 @@ disk_load:
     ; ��չ��ѭ����AH=42h�����ܶ� KERNEL_SECTORS ������ÿ�����?64 ������
     ; ���ⵥ�� DAP ���� BIOS ���ơ�
     ; ��ڣ�DL = ��������
-    mov bx, KERNEL_SECTORS      ; ʣ��������
+    mov bx, [kernel_sectors]  ; real count, patched in by tools/make_image.py
+    cmp bx, KERNEL_SECTORS_MAX
+    jb  .ks_ok                ; 0 (bare boot.bin) or >MAX -> fall back to MAX
+    mov bx, KERNEL_SECTORS_MAX
+.ks_ok:
     xor ecx, ecx                  ; �Ѷ�������
 .load_loop:
     test bx, bx
@@ -276,5 +281,6 @@ protected_mode_start:
     call KERNEL_OFFSET
     jmp $
 
-times 510-($-$$) db 0
+times 508-($-$$) db 0
+kernel_sectors: dw 0          ; LE16 sector count, written by tools/make_image.py
 dw 0xaa55

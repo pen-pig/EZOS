@@ -225,6 +225,10 @@ typedef EFI_STATUS (EFIAPI *EFI_FILE_OPEN)(
 typedef EFI_STATUS (EFIAPI *EFI_FILE_CLOSE)(EFI_FILE_PROTOCOL *This);
 typedef EFI_STATUS (EFIAPI *EFI_FILE_READ)(
   EFI_FILE_PROTOCOL *This, UINTN *BufferSize, void *Buffer);
+typedef EFI_STATUS (EFIAPI *EFI_FILE_GET_POSITION)(
+  EFI_FILE_PROTOCOL *This, UINT64 *Position);
+typedef EFI_STATUS (EFIAPI *EFI_FILE_SET_POSITION)(
+  EFI_FILE_PROTOCOL *This, UINT64 Position);
 struct _EFI_FILE_PROTOCOL {
   UINT64 Revision;
   EFI_FILE_OPEN  Open;
@@ -232,8 +236,8 @@ struct _EFI_FILE_PROTOCOL {
   void *Delete;
   EFI_FILE_READ  Read;
   void *Write;
-  void *GetPosition;
-  void *SetPosition;
+  EFI_FILE_GET_POSITION GetPosition;
+  EFI_FILE_SET_POSITION SetPosition;   /* Position = 0xFFFFFFFFFFFFFFFF -> EOF */
   void *GetInfo;
   void *SetInfo;
   void *Flush;

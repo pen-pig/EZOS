@@ -113,12 +113,12 @@ i686-elf-ld %LDFLAGS% -o kernel_raw.bin !OBJS!
 if errorlevel 1 goto error
 endlocal & set "OBJS="
 
-echo [5/6] padding kernel to 384KB...
-i686-elf-objcopy -I binary -O binary --pad-to 507904 kernel_raw.bin kernel.bin
-if errorlevel 1 goto error
-
-echo [6/6] generating system image...
-copy /b boot\boot.bin + kernel.bin os-image.bin >nul
+echo [5/6] building image (dynamic size)...
+rem tools/make_image.py is the single source of truth for the image layout:
+rem it pads kernel_raw.bin up to a whole (even) number of sectors, writes the
+rem sector count into the boot sector's reserved field at 0x1FC, and emits both
+rem kernel.bin (UEFI path) and os-image.bin (BIOS path).
+python "%~dp0tools\make_image.py" boot\boot.bin kernel_raw.bin kernel.bin os-image.bin
 if errorlevel 1 goto error
 
 echo.

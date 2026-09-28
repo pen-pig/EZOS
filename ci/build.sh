@@ -5,8 +5,9 @@
 # 与 worker/local 的 i686-elf-tools 方案等价：
 #   - 用系统 gcc -m32 -ffreestanding 编译（Ubuntu 的 gcc-multilib）
 #   - 64 位除法符号由 kernel/div64.c（__udivdi3/__umoddi3）提供
-#   - padding 尺寸从 boot/boot.asm 的 KERNEL_SECTORS 自动推导，
-#     避免 main(512扇区/256KB) 与 dev(768扇区/384KB) 写死不一致
+#   - 镜像大小由 tools/make_image.py 动态计算（kernel_raw.bin 真实大小取整到
+#     扇区），扇区数写进引导扇区 0x1FC，boot.asm 运行时读取；不再需要
+#     main/dev 各自写死 KERNEL_SECTORS
 #
 # 用法: bash ci/build.sh
 # 产物: os-image.bin
@@ -19,14 +20,7 @@ LD="${LD:-ld}"
 ASM="${ASM:-nasm}"
 OBJCOPY="${OBJCOPY:-objcopy}"
 
-# ---- 从 boot.asm 推导 padding（KERNEL_SECTORS * 512） ----
-KERNEL_SECTORS="$(grep -oiE 'KERNEL_SECTORS[[:space:]]+equ[[:space:]]+[0-9]+' boot/boot.asm | grep -oE '[0-9]+' | head -1)"
-if [ -z "${KERNEL_SECTORS}" ]; then
-    echo "[ci] ERROR: cannot find KERNEL_SECTORS in boot/boot.asm" >&2
-    exit 1
-fi
-PAD_BYTES=$((KERNEL_SECTORS * 512))
-echo "[ci] KERNEL_SECTORS=${KERNEL_SECTORS}  =>  pad-to ${PAD_BYTES} bytes"
+# ---- 镜像大小动态化（单一事实来源：tools/make_image.py） ----
 
 # ---- 编译内核 C 源（自动收集，主/dev 分支通用） ----
 CFLAGS="-m32 -ffreestanding -O2 -Wall -Wextra \
@@ -52,9 +46,8 @@ echo "[ci] ASM boot/kernel_entry.asm (elf32)"
 # ---- 链接 + padding + 组镜像 ----
 echo "[ci] LD kernel_raw.bin"
 "$LD" $LDFLAGS -o kernel_raw.bin boot/kernel_entry.o $OBJS
-echo "[ci] OBJCOPY pad to ${PAD_BYTES}"
-"$OBJCOPY" -I binary -O binary --pad-to "${PAD_BYTES}" kernel_raw.bin kernel.bin
-echo "[ci] ASSEMBLE os-image.bin"
-cat boot/boot.bin kernel.bin > os-image.bin
+PYTHON="${PYTHON:-python3}"
+echo "[ci] ASSEMBLE kernel.bin + os-image.bin (dynamic size)"
+"$PYTHON" tools/make_image.py boot/boot.bin kernel_raw.bin kernel.bin os-image.bin
 
 echo "[ci] BUILD OK: os-image.bin ($(stat -c%s os-image.bin) bytes)"

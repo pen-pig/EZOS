@@ -9,7 +9,7 @@
   5. 开始菜单打开（帧差断言）-> "返回终端" -> 回切 720x400 文本 shell
   6. 回切后 shell 仍可用（ver 命令 OCR）+ 全程无 "kernel panic"
 
-前置：uefi/esp/kernel.bin（507904 字节）+ uefi/esp/EFI/BOOT/BOOTIA32.EFI
+前置：uefi/esp/kernel.bin（与 ../kernel.bin 同大小、512 对齐、<= 507904）
      + disk.img（拷为本测试私有副本，避免污染基线盘）。
 端口 4464（端口每脚本唯一，见 tests/README.md）。
 用法：python tests/test_uefi3.py   （退出码 0 = 全通过）
@@ -183,9 +183,17 @@ def main():
         print("MISSING %s - build kernel/EFI first (see uefi/build.sh)"
               % ", ".join(missing))
         return 2
-    if os.path.getsize(KERNEL_BIN) != 507904:
-        print("BAD esp/kernel.bin size %d (expect 507904)"
-              % os.path.getsize(KERNEL_BIN))
+    # 镜像大小现在是动态的，只能校验"非空 + 512 对齐 + 不超 496KB 上限"，
+    # 再和仓库根的 kernel.bin 比对，防止 esp 里留着上一轮的陈旧内核。
+    ksz = os.path.getsize(KERNEL_BIN)
+    if ksz == 0 or ksz % 512 != 0 or ksz > 507904:
+        print("BAD esp/kernel.bin size %d (expect non-empty, 512-aligned, <= 507904)"
+              % ksz)
+        return 2
+    root_k = os.path.join(ROOT, "kernel.bin")
+    if os.path.isfile(root_k) and os.path.getsize(root_k) != ksz:
+        print("STALE esp/kernel.bin %d != ../kernel.bin %d (re-copy it)"
+              % (ksz, os.path.getsize(root_k)))
         return 2
     shutil.copyfile(DISK_SRC, DISK)      # 私有副本，不污染基线盘
     if os.path.exists(LOG):

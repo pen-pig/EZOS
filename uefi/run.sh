@@ -18,6 +18,10 @@ else
   echo "WARN: $KERNEL_BIN 不存在，内核将无法加载"
 fi
 
+# 镜像大小现在是动态的（tools/make_image.py 按 kernel_raw.bin 真实大小算），
+# 所以不能写死 507904 —— 直接用 ESP 里这份的实际字节数做断言。
+KSIZE="$(wc -c < "$ESP/kernel.bin" | tr -d ' ')"
+
 rm -f "$LOG"
 "$QEMU" -machine pc -m 256 -vga std \
   -drive if=pflash,format=raw,readonly=on,file="$WFD" \
@@ -31,7 +35,7 @@ echo "=== EZEFI 标记行校验 ==="
 grep -a "EZEFI: hello" "$LOG" && echo "[OK] 已抓到应用启动标记" || echo "[FAIL] 未抓到应用启动标记"
 grep -a "EZEFI:gop " "$LOG" && echo "[OK] 已抓到 GOP 行" || echo "[FAIL] 未抓到 GOP 行"
 grep -a "EZEFI:gop write@0x5000 ok" "$LOG" && echo "[OK] 已写入 0x5000" || echo "[FAIL] 未写入 0x5000"
-grep -a "EZEFI:kernel size=507904 dst=0x10000 ok" "$LOG" && echo "[OK] 内核已载入 0x10000" || echo "[FAIL] 内核未载入"
+grep -a "EZEFI:kernel size=${KSIZE} dst=0x10000 ok" "$LOG" && echo "[OK] 内核已载入 0x10000" || echo "[FAIL] 内核未载入（期望 size=${KSIZE}）"
 grep -a "EZEFI:uefi magic@0x5010 ok" "$LOG" && echo "[OK] UEFI 魔数已写" || echo "[FAIL] UEFI 魔数未写"
 grep -a "EZEFI:ebs ok" "$LOG" && echo "[OK] ExitBootServices 成功" || echo "[FAIL] EBS 未成功"
 echo "=== 跳转后串口内容（前 50 行，含 OVMF 固件 + 内核启动日志）==="

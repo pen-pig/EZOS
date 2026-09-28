@@ -46,12 +46,15 @@ rule link_user
     command = $LD -m elf_i386 -s -T user/user.ld -o $out $in
     description = LINK-USER $out
 
-rule objcopy_pad
-    command = $OBJCOPY -I binary -O binary --pad-to 507904 $in $out
-    description = PAD $out
-
-rule make_os_image
-    command = cmd /c copy /b boot\boot.bin + kernel.bin os-image.bin >nul
+rule make_image
+    # 内核镜像大小是动态的：tools/make_image.py 按 kernel_raw.bin 的真实大小
+    # 算扇区数（向上取整 + 凑偶数，上限 992 扇区 = 496KB），把扇区数写进引导
+    # 扇区偏移 0x1FC 的保留字段，boot.asm 运行时从内存读它。三条契约：
+    #   boot/boot.asm（读 0x1FC）、tools/make_image.py（写 0x1FC）、
+    #   uefi/main.c（UEFI 无引导扇区，直接用文件真实大小）
+    # 旧做法 objcopy --pad-to 507904 已废弃：镜像永远占满 496KB，且大小一变
+    # 就要手改 boot.asm 的 KERNEL_SECTORS。
+    command = cmd /c python tools/make_image.py boot/boot.bin kernel_raw.bin kernel.bin os-image.bin
     description = BUILD os-image.bin
 
 rule make_sysvol
@@ -158,9 +161,7 @@ build user/netcli.elf: link_user user/crt0.o user/netcli.o | user/user.ld
 
 build kernel_raw.bin: link boot/kernel_entry.o boot/task_switch.o kernel/kernel.o kernel/tty.o kernel/idt.o kernel/isr.o kernel/paging.o kernel/pmm.o kernel/task.o kernel/fd.o kernel/elf.o kernel/exec.o kernel/fpu.o kernel/calc.o kernel/gdt.o kernel/syscall.o kernel/panic.o kernel/kmalloc.o kernel/dmesg.o kernel/serial.o kernel/acpi.o kernel/ahci.o kernel/nvme.o kernel/keyboard.o kernel/ata.o kernel/pci.o kernel/usb.o kernel/uhci.o kernel/usbenum.o kernel/usbkbd.o kernel/usbmsc.o kernel/usbmouse.o kernel/ehci.o kernel/usbhc.o kernel/lockselftest.o kernel/rtl8139.o kernel/net.o kernel/shell.o kernel/shell_extra.o kernel/exfat.o kernel/fat.o kernel/fs.o kernel/sysvol.o kernel/sysvol_data.o kernel/ext4.o kernel/ntfs.o kernel/f2fs.o kernel/erofs.o kernel/refs.o kernel/div64.o kernel/gfx.o kernel/gui.o kernel/mouse.o kernel/gfxwin.o kernel/desktop.o kernel/games.o kernel/hiscore.o
 
-build kernel.bin: objcopy_pad kernel_raw.bin
-
-build os-image.bin: make_os_image boot/boot.bin kernel.bin
+build kernel.bin os-image.bin: make_image boot/boot.bin kernel_raw.bin tools/make_image.py
 
 build disk.img: make_disk user/hello.elf user/fdtest.elf user/forktest.elf user/spin.elf user/fdleak.elf user/netecho.elf user/nettcp.elf user/segprobe.elf user/netcli.elf
 

@@ -5,8 +5,9 @@ static const EFI_GUID gEfiGraphicsOutputProtocolGuid = {
   0x9042a9de, 0x23dc, 0x4a38, {0x96,0xfb,0x7a,0xde,0xd0,0x80,0x51,0x6a}
 };
 
-/* 内核镜像固定大小（build.ninja: kernel.bin = pad-to 507904 kernel_raw.bin�? */
-#define KERNEL_SIZE  507904u
+/* Kernel image size is dynamic (tools/make_image.py sizes it from kernel_raw.bin).
+ * KERNEL_SIZE_MAX only bounds it: 0x10000..0x90000 leaves 512KB, 16KB for stack. */
+#define KERNEL_SIZE_MAX  507904u   /* fail-closed cap; real size read from the file */
 #define KERNEL_LOAD  0x10000u   /* boot/boot.asm: KERNEL_OFFSET equ 0x10000 */
 
 /* ---- 串口（QEMU �? 0x3F8 即�??�?�? ISA UART，接�? -serial�? ---- */
@@ -169,23 +170,44 @@ EFI_STATUS EFIAPI EfiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *ST) {
   }
 
   /* 2) 读内核到临时缓冲（AllocatePages 不能指定地址），�? memcpy �? 0x10000 */
+  /* real size: seek to EOF, read the position back. UEFI has no boot sector,
+   * so the sector-count field boot.asm reads (0x1FC) does not exist here. */
+  UINT64 fsize = 0;
+  st = ((EFI_FILE_SET_POSITION)kf->SetPosition)(kf, 0xFFFFFFFFFFFFFFFFull);
+  if (st == EFI_SUCCESS)
+    st = ((EFI_FILE_GET_POSITION)kf->GetPosition)(kf, &fsize);
+  if (st != EFI_SUCCESS || fsize == 0 || fsize > (UINT64)KERNEL_SIZE_MAX) {
+    serial_puts("EZEFI:kernel size fail st=0x");
+    serial_hex((uint32_t)st);
+    serial_puts(" size=");
+    serial_dec((uint32_t)fsize);
+    serial_puts("\r\n");
+    return EFI_SUCCESS;
+  }
+  UINTN ksize = (UINTN)fsize;
+  st = ((EFI_FILE_SET_POSITION)kf->SetPosition)(kf, 0);
+  if (st != EFI_SUCCESS) {
+    serial_puts("EZEFI:kernel rewind fail\r\n");
+    return EFI_SUCCESS;
+  }
+
   EFI_PHYSICAL_ADDRESS tmp = 0;
   st = ((EFI_ALLOCATE_PAGES)BS->AllocatePages)(AllocateAnyPages, EfiLoaderData,
-      (KERNEL_SIZE + 4095) / 4096 + 1, &tmp);
+      (ksize + 4095) / 4096 + 1, &tmp);
   if (st != EFI_SUCCESS || tmp == 0) {
     serial_puts("EZEFI:kernel alloc fail\r\n");
     return EFI_SUCCESS;
   }
   void *buf = (void *)(UINTN)tmp;
-  UINTN read_size = KERNEL_SIZE;
+  UINTN read_size = ksize;
   st = kf->Read(kf, &read_size, buf);
-  if (st != EFI_SUCCESS || read_size != KERNEL_SIZE) {
+  if (st != EFI_SUCCESS || read_size != ksize) {
     serial_puts("EZEFI:kernel read fail size=");
     serial_dec((uint32_t)read_size);
     serial_puts("\r\n");
     return EFI_SUCCESS;
   }
-  my_memcpy((void *)KERNEL_LOAD, buf, KERNEL_SIZE);
+  my_memcpy((void *)KERNEL_LOAD, buf, ksize);
   serial_puts("EZEFI:kernel size=");
   serial_dec((uint32_t)read_size);
   serial_puts(" dst=0x10000 ok\r\n");

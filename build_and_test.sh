@@ -85,21 +85,13 @@ done
 echo "[4/6] 链接内核..."
 "$LD" $LDFLAGS -o kernel_raw.bin $OBJS
 
-# padding 必须从 boot.asm 的 KERNEL_SECTORS 推导，不能写死。
-# 此前这里硬编码 256KB，而 KERNEL_SECTORS=768（384KB）——镜像比引导程序
-# 要读的扇区数短 1/3，boot 读盘时越过镜像尾部，内核尾部数据丢失。
-# ci/build.sh 早已是动态推导，此处对齐同一做法（单一事实来源：boot.asm）。
-KERNEL_SECTORS="$(grep -oiE 'KERNEL_SECTORS[[:space:]]+equ[[:space:]]+[0-9]+' boot/boot.asm | grep -oE '[0-9]+' | head -1)"
-if [ -z "${KERNEL_SECTORS}" ]; then
-    echo "[错误] 无法从 boot/boot.asm 解析 KERNEL_SECTORS" >&2
-    exit 1
-fi
-PAD_BYTES=$((KERNEL_SECTORS * 512))
-echo "[5/6] 填充内核到 ${PAD_BYTES} 字节 (KERNEL_SECTORS=${KERNEL_SECTORS})..."
-"$OBJCOPY" -I binary -O binary --pad-to "${PAD_BYTES}" kernel_raw.bin kernel.bin
-
-echo "[6/6] 生成系统镜像..."
-cat boot/boot.bin kernel.bin > os-image.bin
+# 镜像大小是动态的：tools/make_image.py 按 kernel_raw.bin 真实大小算扇区数，
+# 写进引导扇区 0x1FC，boot.asm 运行时读它。不再从 boot.asm 解析 KERNEL_SECTORS
+# （旧做法：boot.asm 写死 992、objcopy 写死 --pad-to 507904，两边手工同步）。
+echo "[5/6] 生成镜像（动态大小）..."
+"$PYTHON" "$(dirname "$0")/tools/make_image.py" \
+    boot/boot.bin kernel_raw.bin kernel.bin os-image.bin
+if [ $? -ne 0 ]; then echo "[错误] make_image.py 失败" >&2; exit 1; fi
 
 echo ""
 echo "构建成功！已生成 os-image.bin"
