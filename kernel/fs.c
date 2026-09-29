@@ -470,65 +470,126 @@ static int fs_ro_abs(const char *name, char *out, uint32_t outsz) {
     return 0;
 }
 
+/* ============ 系统卷当前目录（相对路径解析） ============ */
+
+/* "" = 不在系统卷；"/bin" 或 "/system"（带斜杠，方便直接拼与直接显示） */
+static char g_sysvol_cwd[8];
+
+const char *fs_sysvol_cwd(void) {
+    return g_sysvol_cwd;
+}
+
+int fs_set_sysvol_cwd(const char *dir) {
+    if (dir == 0 || dir[0] == 0) { g_sysvol_cwd[0] = 0; return 0; }
+    const char *p = dir;
+    while (*p == '/') p++;
+    if (*p == 0) { g_sysvol_cwd[0] = 0; return 0; }
+    uint32_t n = 0;
+    g_sysvol_cwd[n++] = '/';
+    while (*p && *p != '/' && n + 1 < sizeof(g_sysvol_cwd)) {
+        char c = *p++;
+        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);   /* 统一小写 */
+        g_sysvol_cwd[n++] = c;
+    }
+    g_sysvol_cwd[n] = 0;
+    if (*p != 0 && *p != '/') { g_sysvol_cwd[0] = 0; return -1; }  /* 过长 */
+    return 0;
+}
+
+int fs_resolve_path(const char *name, char *out, uint32_t outsz) {
+    if (name == 0 || out == 0 || outsz < 2) return -1;
+    /* 不在系统卷、已是绝对路径、或 "." / ".."：原样交回（磁盘卷自己有 cwd
+     * 机制；".." 的离开系统卷语义由 fs_change_dir 处理）。 */
+    if (g_sysvol_cwd[0] == 0 || name[0] == 0 || name[0] == '/' ||
+        (name[0] == '.' && (name[1] == 0 || (name[1] == '.' && name[2] == 0)))) {
+        uint32_t n = 0;
+        while (name[n] && n + 1 < outsz) { out[n] = name[n]; n++; }
+        if (name[n] != 0) return -1;
+        out[n] = 0;
+        return 0;
+    }
+    uint32_t cwdlen = 0;
+    while (g_sysvol_cwd[cwdlen]) cwdlen++;
+    uint32_t namelen = 0;
+    while (name[namelen]) namelen++;
+    if (cwdlen + 1 + namelen + 1 > outsz) return -1;
+    uint32_t n = 0;
+    for (uint32_t k = 0; k < cwdlen; k++) out[n++] = g_sysvol_cwd[k];
+    out[n++] = '/';
+    for (uint32_t k = 0; k < namelen; k++) out[n++] = name[k];
+    out[n] = 0;
+    return 0;
+}
+
 /* ============ 分发 API ============ */
 
 int fs_read_file(const char *name, uint8_t *buffer, uint32_t max_size) {
     /* 系统卷（内核内置只读）：/bin 与 /system 不走任何磁盘后端。
      * 放在最前面——它是内存里的，与 fs_type_cur 是否挂载无关，
      * 这样数据盘被 format 之后这些文件依然可读。 */
-    if (sysvol_is_path(name)) return sysvol_read(name, buffer, max_size);
-    if (fs_type_cur == FS_EXFAT) return exfat_read_file(name, buffer, max_size);
-    if (fs_is_fat()) return fat_read_file(name, buffer, max_size);
+    char full[256];
+    if (fs_resolve_path(name, full, sizeof(full)) != 0) return -1;
+    if (sysvol_is_path(full)) return sysvol_read(full, buffer, max_size);
+    if (fs_type_cur == FS_EXFAT) return exfat_read_file(full, buffer, max_size);
+    if (fs_is_fat()) return fat_read_file(full, buffer, max_size);
     if (fs_is_ro()) {
-        char full[512];
-        if (fs_ro_abs(name, full, sizeof(full)) != 0) return -1;
-        return ro_read_file(full, buffer, max_size);
+        char abs[512];
+        if (fs_ro_abs(full, abs, sizeof(abs)) != 0) return -1;
+        return ro_read_file(abs, buffer, max_size);
     }
     return -1;
 }
 
 uint32_t fs_get_file_size(const char *name) {
-    if (sysvol_is_path(name)) return sysvol_size(name);
-    if (fs_type_cur == FS_EXFAT) return exfat_get_file_size(name);
-    if (fs_is_fat()) return fat_get_file_size(name);
+    char full[256];
+    if (fs_resolve_path(name, full, sizeof(full)) != 0) return 0;
+    if (sysvol_is_path(full)) return sysvol_size(full);
+    if (fs_type_cur == FS_EXFAT) return exfat_get_file_size(full);
+    if (fs_is_fat()) return fat_get_file_size(full);
     if (fs_is_ro()) {
-        char full[512];
-        if (fs_ro_abs(name, full, sizeof(full)) != 0) return 0;
-        return ro_get_file_size(full);
+        char abs[512];
+        if (fs_ro_abs(full, abs, sizeof(abs)) != 0) return 0;
+        return ro_get_file_size(abs);
     }
     return 0;
 }
 
 int fs_create_file(const char *name, const uint8_t *data, uint32_t size) {
     /* 系统卷只读：写 /bin、/system 一律拒绝（哪怕是磁盘卷已挂载）。
-     * 这是"格式化数据分区不影响系统"的另一半——系统目录不可写。 */
-    if (sysvol_is_path(name)) return -1;
+     * 这是"格式化数据分区不影响系统"的另一半——系统目录不可写。
+     * 注意 name 先经 fs_resolve_path：站在 /bin 里 `write x hi` 会被解析成
+     * /bin/x，然后在这里被拒，而不是悄悄写到数据盘根目录去。 */
+    char full[256];
+    if (fs_resolve_path(name, full, sizeof(full)) != 0) return -1;
+    if (sysvol_is_path(full)) return -1;
     if (fs_type_cur == FS_NONE) return -1;
     /* create-or-replace：先删旧文件（不存在则忽略），修复覆盖写 */
     if (fs_type_cur == FS_EXFAT) {
-        exfat_delete_file(name);
-        return exfat_create_file(name, data, size);
+        exfat_delete_file(full);
+        return exfat_create_file(full, data, size);
     }
     if (fs_is_fat()) {
-        fat_delete_file(name);
-        return fat_create_file(name, data, size);
+        fat_delete_file(full);
+        return fat_create_file(full, data, size);
     }
     if (fs_is_ro()) {
-        char full[512];
-        if (fs_ro_abs(name, full, sizeof(full)) != 0) return -1;
-        return ro_create_file(full, data, size);   /* 驱动内部含 replace 语义 */
+        char abs[512];
+        if (fs_ro_abs(full, abs, sizeof(abs)) != 0) return -1;
+        return ro_create_file(abs, data, size);   /* 驱动内部含 replace 语义 */
     }
     return -1;      /* EROFS：拒绝写入 */
 }
 
 int fs_delete_file(const char *name) {
-    if (sysvol_is_path(name)) return -1;        /* 系统卷只读 */
-    if (fs_type_cur == FS_EXFAT) return exfat_delete_file(name);
-    if (fs_is_fat()) return fat_delete_file(name);
+    char full[256];
+    if (fs_resolve_path(name, full, sizeof(full)) != 0) return -1;
+    if (sysvol_is_path(full)) return -1;        /* 系统卷只读 */
+    if (fs_type_cur == FS_EXFAT) return exfat_delete_file(full);
+    if (fs_is_fat()) return fat_delete_file(full);
     if (fs_is_ro()) {
-        char full[512];
-        if (fs_ro_abs(name, full, sizeof(full)) != 0) return -1;
-        return ro_delete_file(full);
+        char abs[512];
+        if (fs_ro_abs(full, abs, sizeof(abs)) != 0) return -1;
+        return ro_delete_file(abs);
     }
     return -1;      /* EROFS：拒绝删除 */
 }
@@ -558,23 +619,47 @@ int fs_read_dir(fs_dir_entry_t *entries, int max_entries) {
  * exFAT/FAT/只读三套后端和 shell、vi、desktop 等多处调用，改签名要动一条
  * 长链；这里是新增能力，老行为一点不动，回归风险为零。 */
 int fs_read_dir_path(const char *path, fs_dir_entry_t *entries, int max_entries) {
-    if (sysvol_is_path(path)) return sysvol_list(path, entries, max_entries);
+    char full[256];
+    if (fs_resolve_path(path, full, sizeof(full)) != 0) return -1;
+    if (sysvol_is_path(full)) return sysvol_list(full, entries, max_entries);
     return fs_read_dir(entries, max_entries);
 }
 
 int fs_change_dir(const char *name) {
-    /* 系统卷只读且当前目录机制是磁盘卷的（fs_read_dir 无路径参数），
-     * 进了 /bin 之后再 ls 仍会列磁盘卷，语义会打架 —— 直接拒绝。
-     * 要看系统卷内容用 `ls /bin`。 */
-    if (sysvol_is_path(name)) return -1;
+    if (name == 0 || name[0] == 0) return -1;
+
+    /* 站在系统卷里 `cd /` 或 `cd ..`：只是离开系统卷，磁盘 cwd 不动。
+     * `cd .` 原地不动。 */
+    if (g_sysvol_cwd[0] != 0) {
+        if (name[0] == '.' && name[1] == 0) return 0;
+        if ((name[0] == '/' && name[1] == 0) ||
+            (name[0] == '.' && name[1] == '.' && name[2] == 0)) {
+            g_sysvol_cwd[0] = 0;
+            return 0;
+        }
+    }
+
+    /* /bin 与 /system：系统卷只读、没有目录簇可切，把 cwd 记在 fs 层，
+     * 让后续的 ls / cat / 相对路径都跟着走（fs_resolve_path 负责拼接）。 */
+    if (sysvol_is_path(name)) {
+        if (fs_set_sysvol_cwd(name) != 0) return -1;
+        /* 子路径（/bin/foo）不接受：系统卷只有一层 */
+        const char *p = name;
+        while (*p == '/') p++;
+        while (*p && *p != '/') p++;
+        if (*p == '/') { g_sysvol_cwd[0] = 0; return -1; }
+        return 0;
+    }
+
+    g_sysvol_cwd[0] = 0;   /* 切到任何磁盘目录都意味着离开系统卷 */
     if (fs_type_cur == FS_EXFAT) return exfat_change_dir(name);
     if (fs_is_fat()) return fat_change_dir(name);
     if (fs_is_ro()) {
-        char full[512];
-        if (fs_ro_abs(name, full, sizeof(full)) != 0) return -1;
-        if (ro_is_dir(full) != 1) return -1;
+        char abs[512];
+        if (fs_ro_abs(name, abs, sizeof(abs)) != 0) return -1;
+        if (ro_is_dir(abs) != 1) return -1;
         uint32_t i = 0;
-        while (full[i] && i < sizeof(ro_cwd) - 1) { ro_cwd[i] = full[i]; i++; }
+        while (abs[i] && i < sizeof(ro_cwd) - 1) { ro_cwd[i] = abs[i]; i++; }
         ro_cwd[i] = 0;
         return 0;
     }
@@ -582,30 +667,35 @@ int fs_change_dir(const char *name) {
 }
 
 int fs_mkdir(const char *name) {
-    if (sysvol_is_path(name)) return -1;        /* 系统卷只读 */
-    if (fs_type_cur == FS_EXFAT) return exfat_mkdir(name);
-    if (fs_is_fat()) return fat_mkdir(name);
+    char full[256];
+    if (fs_resolve_path(name, full, sizeof(full)) != 0) return -1;
+    if (sysvol_is_path(full)) return -1;        /* 系统卷只读 */
+    if (fs_type_cur == FS_EXFAT) return exfat_mkdir(full);
+    if (fs_is_fat()) return fat_mkdir(full);
     if (fs_is_ro()) {
-        char full[512];
-        if (fs_ro_abs(name, full, sizeof(full)) != 0) return -1;
-        return ro_mkdir(full);
+        char abs[512];
+        if (fs_ro_abs(full, abs, sizeof(abs)) != 0) return -1;
+        return ro_mkdir(abs);
     }
     return -1;      /* EROFS：拒绝建目录 */
 }
 
 int fs_rmdir(const char *name) {
-    if (sysvol_is_path(name)) return -1;        /* 系统卷只读 */
-    if (fs_type_cur == FS_EXFAT) return exfat_rmdir(name);
-    if (fs_is_fat()) return fat_rmdir(name);
+    char full[256];
+    if (fs_resolve_path(name, full, sizeof(full)) != 0) return -1;
+    if (sysvol_is_path(full)) return -1;        /* 系统卷只读 */
+    if (fs_type_cur == FS_EXFAT) return exfat_rmdir(full);
+    if (fs_is_fat()) return fat_rmdir(full);
     if (fs_is_ro()) {
-        char full[512];
-        if (fs_ro_abs(name, full, sizeof(full)) != 0) return -1;
-        return ro_rmdir(full);
+        char abs[512];
+        if (fs_ro_abs(full, abs, sizeof(abs)) != 0) return -1;
+        return ro_rmdir(abs);
     }
     return -1;
 }
 
 const char *fs_cwd_path(void) {
+    if (g_sysvol_cwd[0] != 0) return g_sysvol_cwd;   /* "/bin"、"/system" */
     if (fs_type_cur == FS_EXFAT) return exfat_cwd_path();
     if (fs_is_fat()) return fat_cwd_path();
     if (fs_is_ro()) return ro_cwd;

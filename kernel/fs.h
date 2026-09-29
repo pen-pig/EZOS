@@ -80,6 +80,21 @@ int      fs_change_dir(const char *name);
 int      fs_mkdir(const char *name);
 int      fs_rmdir(const char *name);   /* 删空目录；非目录/非空/不存在均 -1 */
 const char *fs_cwd_path(void);
+
+/* ---- 系统卷当前目录（cd /bin、cd /system 之后的相对路径解析） ----
+ *
+ * 系统卷是内核内置的只读 blob，没有目录簇，磁盘卷那套 cwd 完全管不到它。
+ * 之前 shell 只在呈现层记着 cwd（`cd /system` 后 ls / pwd 看着对，但
+ * `cat version` 仍报 no such file，只有绝对路径 `/system/version` 能用）。
+ * cwd 下沉到本层后，所有 fs_* 入口统一先过 fs_resolve_path()，
+ * 相对路径才真的可用；写操作解析成 /bin/... 后仍会被系统卷的只读检查拒掉。
+ *
+ * fs_sysvol_cwd() 返回 ""（不在系统卷）或 "/bin"、"/system"（带斜杠）。 */
+const char *fs_sysvol_cwd(void);
+int fs_set_sysvol_cwd(const char *dir);   /* "" 清空；"/bin"、"/system" 或裸名 */
+/* 相对名 -> 绝对路径。不在系统卷 / 已是绝对路径 / "." / ".." 一律原样返回。
+ * 失败（缓冲不足或空指针）返回 -1。 */
+int fs_resolve_path(const char *name, char *out, uint32_t outsz);
 uint32_t fs_count_used_clusters(void);
 uint32_t fs_get_file_clusters(const char *name);
 

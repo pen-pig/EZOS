@@ -17,6 +17,8 @@ EZOS 这里把系统卷编进内核镜像（.rodata），挂成 /system 与 /bin
        相反结果，这是本测试存在的意义；只测一半就是弱断言。
      - 写 /bin 必须失败（Failed to write file. / Failed to delete file.）
      - cat /bin/nope.elf 必须 not found（证明查找不是"全都命中"）
+     - `cd /system` 之后裸名 `cat version` 必须等价于 `cat /system/version`
+       （cwd 只在呈现层记着时这条会红），且 `cd ..` 能离开
   B（数据卷对照组，独立 QEMU）：
      - 数据盘 write/ls/cat/rm 全通 —— 证明"拒绝"只针对 /bin，
        不是 fs_create_file 被改坏了；A 组若全拒这里是反向证据。
@@ -165,6 +167,34 @@ def case_sysvol():
         # 9) 不存在的文件必须 not found（防"查找恒真"型假成功）
         ok, out = run_cmd(qmp, serial, "cat /bin/nope.elf", "file not found")
         results.append(("cat /bin/nope.elf reports not found", ok))
+
+        # ---- 相对路径：cd 进系统卷后裸名必须解析到系统卷 ----
+        # 守的 bug：cwd 曾只记在 shell 呈现层（ls/pwd 看着对），但 fs_* 入口
+        # 拿裸名直接查数据盘 -> `cd /system` 后 `cat version` 报 no such file，
+        # 只有写绝对路径 `/system/version` 才行。
+        ok, out = run_cmd(qmp, serial, "cd /system", "")
+        ok, out = run_cmd(qmp, serial, "pwd", "/system")
+        results.append(("cd /system then pwd shows /system", ok))
+
+        ok, out = run_cmd(qmp, serial, "cat version", "mount=/system /bin")
+        results.append(("relative cat resolves inside /system", ok))
+        if not ok:
+            print("  relative cat out: " + out)
+
+        # 反例：解析不能是"全都命中"——不存在的文件照样 not found
+        ok, out = run_cmd(qmp, serial, "cat nope", "file not found")
+        results.append(("relative cat of missing file reports not found", ok))
+
+        # 反例：相对路径的写也要被系统卷只读拦住，不能漏写到数据盘根目录
+        ok, out = run_cmd(qmp, serial, "write v2 hi", "failed to write file")
+        results.append(("relative write inside /system rejected", ok))
+
+        ok, out = run_cmd(qmp, serial, "cd ..", "")
+        ok, out = run_cmd(qmp, serial, "pwd", "/")
+        left = ok and "system" not in out
+        results.append(("cd .. leaves the system volume", left))
+        if not left:
+            print("  pwd after cd .. out: " + out)
 
         # ---- 核心：format 之后数据卷空了，系统卷还在 ----
         ok, out = run_cmd(qmp, serial, "format exfat", "disk formatted as exfat",

@@ -758,10 +758,11 @@ int shell_complete_command(const char *prefix, char *out, int outsz,
 }
 
 // �ػ浱ǰ������
-/* cd /bin | cd /system 后 shell 的当前目录停在系统卷。
- * 空串 = 数据盘。只影响 ls / pwd / cd / 提示符的呈现层；文件操作请用绝对
- * 路径（/bin/xxx）——系统卷只读，exec 的裸名查找本来就落在 /bin。 */
-static char sh_sysvol_cwd[8];      /* "" | "bin" | "system" */
+/* cd /bin | cd /system 之后的当前目录**不在 shell 里**：它下沉到了 fs 层
+ * （fs.c 的 g_sysvol_cwd），这样 cat / write / rm / mkdir 等所有 fs_* 入口
+ * 都能把相对路径解析成 /bin/xxx、/system/xxx——只在呈现层记 cwd 的话，
+ * `cd /system` 后 `cat version` 会报 no such file（只有绝对路径能用）。
+ * shell 只读它：fs_sysvol_cwd() 返回 "" 或 "/bin"、"/system"。 */
 
 /* 提示符：把当前路径打进 "[path] > "，cd 到哪一眼可见。
  * 返回提示符的字符宽度——重绘输入行时要据此算光标列，写死 2 会错位。
@@ -770,12 +771,8 @@ static int shell_prompt(void) {
     int n = 1;                      /* '[' */
     shell_fg(CLR_HEADER);
     terminal_putchar('[');
-    if (sh_sysvol_cwd[0] != 0) {
-        terminal_putchar('/');
-        terminal_writestring(sh_sysvol_cwd);
-        n += 1 + (int)my_strlen(sh_sysvol_cwd);
-    } else {
-        const char *p = fs_cwd_path();
+    {
+        const char *p = fs_cwd_path();      /* 已含 "/bin"、"/system" */
         terminal_writestring(p);
         n += (int)my_strlen(p);
     }
@@ -1358,10 +1355,10 @@ static void cmd_ls(const char *args) {
     if (t > 0 && sysvol_is_path(target)) {
         n = fs_read_dir_path(target, entries, 64);
         title = target;
-    } else if (t == 0 && sh_sysvol_cwd[0] != 0) {
+    } else if (t == 0 && fs_sysvol_cwd()[0] != 0) {
         /* cd /bin 之后的 ls：列系统卷当前目录 */
-        n = fs_read_dir_path(sh_sysvol_cwd, entries, 64);
-        title = sh_sysvol_cwd;
+        n = fs_read_dir_path(fs_sysvol_cwd(), entries, 64);
+        title = fs_sysvol_cwd();
     } else {
         /* 根目录 = 系统卷挂载点（bin/ system/）在前 + 数据盘内容在后。
          * 系统卷不依赖任何盘：数据盘没格式化时挂载点也必须可见——
@@ -1467,8 +1464,9 @@ static void cmd_cat(const char *args) {
         terminal_writestring("Usage: cat <filename>\n");
         return;
     }
-    /* 系统卷（/bin、/system）不需要磁盘挂载；只有数据盘路径才要求 fs_init */
-    if (!sysvol_is_path(filename) && fs_init() != 0) {
+    /* 系统卷（/bin、/system）不需要磁盘挂载；只有数据盘路径才要求 fs_init。
+     * 站在系统卷里时裸名会被 fs 层解析成 /system/xxx，同样不需要盘。 */
+    if (fs_sysvol_cwd()[0] == 0 && !sysvol_is_path(filename) && fs_init() != 0) {
         terminal_writestring("FS init failed.\n");
         return;
     }
@@ -1832,39 +1830,17 @@ static void cmd_cd(const char *args) {
         terminal_writestring("Usage: cd <dir>\n");
         return;
     }
-    /* /bin 与 /system：系统卷挂载点，cd 只改 shell 呈现层（只读卷，
-     * 没有磁盘目录簇可切）。离开系统卷一律清标志。 */
-    if (sysvol_is_path(dir)) {
-        const char *q = dir;
-        while (*q == '/') q++;
-        char seg[8];
-        int s = 0;
-        while (*q && *q != '/' && s < 7) {
-            char c = *q;
-            if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
-            seg[s++] = c;
-            q++;
+    /* /bin | /system: the read-only system volume has no directory
+     * cluster to walk, so fs_change_dir() just records the cwd at the
+     * fs layer (fs.c g_sysvol_cwd) -- no disk needed. Standing inside
+     * the system volume, "cd /" and "cd .." leave it again.
+     * Everything else falls through to the disk volume cwd. */
+    if (sysvol_is_path(dir) || fs_sysvol_cwd()[0] != 0) {
+        if (fs_change_dir(dir) != 0) {
+            terminal_writestring("cd: no such directory\n");
         }
-        seg[s] = 0;
-        if (*q == 0 || *q == '/') {
-            if (seg[0] == 'b' && seg[1] == 'i' && seg[2] == 'n' && seg[3] == 0) {
-                sh_sysvol_cwd[0] = 'b'; sh_sysvol_cwd[1] = 'i';
-                sh_sysvol_cwd[2] = 'n'; sh_sysvol_cwd[3] = 0;
-                return;
-            }
-            if (seg[0] == 's' && seg[1] == 'y' && seg[2] == 's' && seg[3] == 't' &&
-                seg[4] == 'e' && seg[5] == 'm' && seg[6] == 0) {
-                sh_sysvol_cwd[0] = 's'; sh_sysvol_cwd[1] = 'y';
-                sh_sysvol_cwd[2] = 's'; sh_sysvol_cwd[3] = 't';
-                sh_sysvol_cwd[4] = 'e'; sh_sysvol_cwd[5] = 'm';
-                sh_sysvol_cwd[6] = 0;
-                return;
-            }
-        }
-        terminal_writestring("cd: no such directory\n");
         return;
     }
-    sh_sysvol_cwd[0] = 0;   /* 一切磁盘路径（含 cd /）都意味着离开系统卷 */
     if (fs_init() != 0) {
         terminal_writestring("FS init failed. Is disk formatted?\n");
         return;
@@ -1892,13 +1868,7 @@ static void cmd_mkdir(const char *args) {
 
 static void cmd_pwd(const char *args) {
     (void)args;
-    if (sh_sysvol_cwd[0] != 0) {
-        terminal_putchar('/');
-        terminal_writestring(sh_sysvol_cwd);
-        terminal_putchar('\n');
-        return;
-    }
-    terminal_writestring(fs_cwd_path());
+    terminal_writestring(fs_cwd_path());   /* 已含 "/bin"、"/system" */
     terminal_putchar('\n');
 }
 
