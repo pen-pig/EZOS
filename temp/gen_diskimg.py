@@ -164,60 +164,15 @@ def make_exfat_entry_set(name, first_cluster, size, is_dir=False):
 def exfat_files():
     """根目录下的文件清单：(name, data)。
 
-    HELLO.ELF 是步骤 5c 构建的用户态 ELF 程序（user/hello.elf），
-    shell 的 `exec` 命令会把它从盘上读进内核再加载执行。缺失时不算错误
-    ——只是没有可执行的用户程序，镜像其余部分照旧可用。"""
-    files = [
+    只有纯数据文件。用户程序（user/*.elf）自系统卷（kernel/sysvol_data.c，
+    挂载 /bin + /system）之后就**不再**放进数据盘根目录——否则 `ls` 里
+    ELF 又回到根目录，且 format 会抹掉它们（这正是引入系统卷要解决的问题）。
+    E2E 里的 `exec HELLO.ELF` / `SPIN.ELF &` 等裸名由 sysvol_lookup 大小写
+    不敏感地落到 /bin/*.elf，不依赖盘上副本。"""
+    return [
         ('README.TXT', b"Welcome to EZOS!\nThis is the exFAT data disk.\n"),
         (LFN_NAME, b"Long filename (LFN) test file on exFAT.\n"),
     ]
-    here = os.path.dirname(os.path.abspath(__file__))
-    elf = os.path.join(os.path.dirname(here), 'user', 'hello.elf')
-    if os.path.isfile(elf):
-        with open(elf, 'rb') as f:
-            files.append(('HELLO.ELF', f.read()))
-    else:
-        print("WARN %s not found - skip embedding HELLO.ELF (run ninja user first)" % elf)
-
-    # FDTEST.ELF：步骤 6b 的文件描述符测试程序（open/read/lseek/write/close）
-    fdtest = os.path.join(os.path.dirname(here), 'user', 'fdtest.elf')
-    if os.path.isfile(fdtest):
-        with open(fdtest, 'rb') as f:
-            files.append(('FDTEST.ELF', f.read()))
-    else:
-        print("WARN %s not found - skip embedding FDTEST.ELF (run ninja user first)" % fdtest)
-
-    # SPIN.ELF / FDLEAK.ELF：步骤 6c 的多进程验证程序
-    #   SPIN.ELF   —— ring3 忙等几秒，证明用户进程是可被抢占的任务
-    #   FDLEAK.ELF —— 写完文件故意不 close，证明进程退出时内核代关并落盘
-    # 根目录只有 1024B（簇 2-3），已被 10 个 entry set 顶满。
-    # FORKTST.ELF 是 fork/waitpid 的用户态验证（用户态生态 ②），E2E 要用；
-    # 让位的是 FDLEAK.ELF（步骤 6c 的手工演示程序，没有任何 E2E 依赖）。
-    for fname in ('SPIN.ELF',):
-        p = os.path.join(os.path.dirname(here), 'user', fname.lower())
-        if os.path.isfile(p):
-            with open(p, 'rb') as f:
-                files.append((fname, f.read()))
-        else:
-            print("WARN %s not found - skip embedding %s (run ninja user first)" % (p, fname))
-
-    # 步骤 7.3 的 socket 层验证程序（E2E：temp/test_step7_sock.py）：
-    #   NETECHO.ELF  —— UDP echo（7000 端口），宿主发数据报断言回显
-    #   NETTCP.ELF   —— TCP echo 服务器（7001 端口），三次握手/回显/四次挥手
-    #   SEGPROBE.ELF —— sockcall 返回路径段寄存器自检（7.3 调试复现，留作回归）
-    #   NETCLI.ELF   —— TCP 主动连接客户端（7.4：connect/乱序重组/重传）
-    # 根目录只有 2 簇（1KB，约 10 个目录项），SEGPROBE 是 7.3 调试期的
-    # 一次性探针，让位给 NETCLI（7.4 需要）；源码与构建规则仍保留。
-    # FORKTST.ELF：fork/waitpid 的用户态验证（用户态生态 ②）
-    for fname in ('FORKTST.ELF', 'NETECHO.ELF', 'NETTCP.ELF', 'NETCLI.ELF'):
-        p = os.path.join(os.path.dirname(here), 'user',
-                         'forktest.elf' if fname == 'FORKTST.ELF' else fname.lower())
-        if os.path.isfile(p):
-            with open(p, 'rb') as f:
-                files.append((fname, f.read()))
-        else:
-            print("WARN %s not found - skip embedding %s (run ninja user first)" % (p, fname))
-    return files
 
 
 def gen_exfat(path):

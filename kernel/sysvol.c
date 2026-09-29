@@ -136,7 +136,11 @@ int sysvol_list(const char *dir, fs_dir_entry_t *out, int max_entries) {
         }
         if (n < max_entries) {
             const char *s = "system";
-            for (uint32_t k = 0; s[k]; k++) out[n].name[k] = s[k];
+            uint32_t k = 0;
+            for (; s[k]; k++) out[n].name[k] = s[k];
+            out[n].name[k] = 0;      /* 必须收尾：调用方的 entries 不清零，
+                                      * 少了这一字节就会把栈上残留打进名字
+                                      * （实测 ls / 出现 "systemst.elf/"）*/
             out[n].size = 0; out[n].is_dir = 1;
             n++;
         }

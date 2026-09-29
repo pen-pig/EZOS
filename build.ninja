@@ -163,7 +163,7 @@ build kernel_raw.bin: link boot/kernel_entry.o boot/task_switch.o kernel/kernel.
 
 build kernel.bin os-image.bin: make_image boot/boot.bin kernel_raw.bin tools/make_image.py
 
-build disk.img: make_disk user/hello.elf user/fdtest.elf user/forktest.elf user/spin.elf user/fdleak.elf user/netecho.elf user/nettcp.elf user/segprobe.elf user/netcli.elf
+build disk.img: make_disk temp/gen_diskimg.py
 
 build run: run_qemu os-image.bin disk.img
 

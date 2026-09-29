@@ -335,8 +335,6 @@ static int shell_try_exec_file(const char *cmd, char *args, int bg) {
                  (my_strcasecmp(ext, ".COM") == 0) ||
                  (my_strcasecmp(ext, ".BIN") == 0);
     if (!is_exe) return 0;
-    if (!fs_ready()) return 0;
-
     /* exFAT 文件名查找大小写敏感（盘上为大写），这里统一转大写再查 */
     char fname[64];
     int i;
@@ -346,7 +344,17 @@ static int shell_try_exec_file(const char *cmd, char *args, int bg) {
         fname[i] = c;
     }
     fname[i] = '\0';
-    if (fs_get_file_size(fname) == 0) return 0;   /* 盘上无此文件 */
+
+    /* 系统卷优先：/bin 里的程序不依赖任何盘，format 之后也必须能跑
+     * （用户程序早就从数据盘根目录搬到系统卷了，盘上已无副本）。
+     * sysvol_resolve_bin 大小写不敏感，且会补 /bin/ 前缀。 */
+    char svpath[64];
+    int from_sysvol = (sysvol_resolve_bin(fname, svpath, sizeof(svpath)) == 0);
+    if (!from_sysvol) {
+        if (!fs_ready()) return 0;
+        if (fs_get_file_size(fname) == 0) return 0;   /* 盘上也无此文件 */
+    }
+    const char *target = from_sysvol ? svpath : fname;
 
     if (bg) {
         /* 上限保护：并发后台任务数受 MAX_TASKS=8 约束，超限报错不 panic */
@@ -355,20 +363,20 @@ static int shell_try_exec_file(const char *cmd, char *args, int bg) {
             return 1;
         }
         int pid = 0;
-        int rc = exec_file_bg(fname, args, &pid);
+        int rc = exec_file_bg(target, args, &pid);
         if (rc < 0) {
             terminal_writestring("background launch failed: ");
-            terminal_writestring(fname);
+            terminal_writestring(target);
             terminal_writestring("\n");
             return 1;
         }
         shell_bg_register(fname, pid);
     } else {
         const char *why = 0;
-        int rc = exec_file(fname, args, &why);
+        int rc = exec_file(target, args, &why);
         if (rc < 0) {
             terminal_writestring("exec: ");
-            terminal_writestring(fname);
+            terminal_writestring(target);
             terminal_writestring(": ");
             terminal_writestring(why ? why : "failed");
             terminal_writestring("\n");
@@ -1308,6 +1316,11 @@ static void cmd_setcolor(const char *args) {
     terminal_writestring("Color set.\n");
 }
 
+/* cd /bin | cd /system 后 shell 的当前目录停在系统卷。
+ * 空串 = 数据盘。只影响 ls / pwd / cd 的呈现层；文件操作请用绝对路径
+ * （/bin/xxx）——系统卷只读，exec 的裸名查找本来就落在 /bin。 */
+static char sh_sysvol_cwd[8];      /* "" | "bin" | "system" */
+
 static void cmd_ls(const char *args) {
     int verbose = 0;
     const char *p = args;
@@ -1327,13 +1340,34 @@ static void cmd_ls(const char *args) {
     if (t > 0 && sysvol_is_path(target)) {
         n = fs_read_dir_path(target, entries, 64);
         title = target;
+    } else if (t == 0 && sh_sysvol_cwd[0] != 0) {
+        /* cd /bin 之后的 ls：列系统卷当前目录 */
+        n = fs_read_dir_path(sh_sysvol_cwd, entries, 64);
+        title = sh_sysvol_cwd;
     } else {
-        if (fs_init() != 0) {
-            terminal_writestring("FS init failed. Is disk formatted?\n");
-            return;
+        /* 根目录 = 系统卷挂载点（bin/ system/）在前 + 数据盘内容在后。
+         * 系统卷不依赖任何盘：数据盘没格式化时挂载点也必须可见——
+         * 否则用户从 shell 根本看不出 /bin /system 存在。 */
+        const char *cwd = fs_cwd_path();
+        int at_root = (cwd[0] == '/' && cwd[1] == 0);
+        int want_root = (t == 0 && at_root) ||
+                        (t > 0 && target[0] == '/' && target[1] == 0);
+        if (want_root) {
+            n = sysvol_list("/", entries, 62);
+            if (n < 0) n = 0;
+            if (fs_init() == 0) {
+                int m = fs_read_dir(&entries[n], 62 - n);
+                if (m > 0) n += m;
+            }
+            title = (t > 0) ? target : cwd;
+        } else {
+            if (fs_init() != 0) {
+                terminal_writestring("FS init failed. Is disk formatted?\n");
+                return;
+            }
+            n = fs_read_dir(entries, 64);
+            title = fs_cwd_path();
         }
-        n = fs_read_dir(entries, 64);
-        title = fs_cwd_path();
     }
     if (n < 0) {
         terminal_writestring("read dir failed\n");
@@ -1780,6 +1814,39 @@ static void cmd_cd(const char *args) {
         terminal_writestring("Usage: cd <dir>\n");
         return;
     }
+    /* /bin 与 /system：系统卷挂载点，cd 只改 shell 呈现层（只读卷，
+     * 没有磁盘目录簇可切）。离开系统卷一律清标志。 */
+    if (sysvol_is_path(dir)) {
+        const char *q = dir;
+        while (*q == '/') q++;
+        char seg[8];
+        int s = 0;
+        while (*q && *q != '/' && s < 7) {
+            char c = *q;
+            if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+            seg[s++] = c;
+            q++;
+        }
+        seg[s] = 0;
+        if (*q == 0 || *q == '/') {
+            if (seg[0] == 'b' && seg[1] == 'i' && seg[2] == 'n' && seg[3] == 0) {
+                sh_sysvol_cwd[0] = 'b'; sh_sysvol_cwd[1] = 'i';
+                sh_sysvol_cwd[2] = 'n'; sh_sysvol_cwd[3] = 0;
+                return;
+            }
+            if (seg[0] == 's' && seg[1] == 'y' && seg[2] == 's' && seg[3] == 't' &&
+                seg[4] == 'e' && seg[5] == 'm' && seg[6] == 0) {
+                sh_sysvol_cwd[0] = 's'; sh_sysvol_cwd[1] = 'y';
+                sh_sysvol_cwd[2] = 's'; sh_sysvol_cwd[3] = 't';
+                sh_sysvol_cwd[4] = 'e'; sh_sysvol_cwd[5] = 'm';
+                sh_sysvol_cwd[6] = 0;
+                return;
+            }
+        }
+        terminal_writestring("cd: no such directory\n");
+        return;
+    }
+    sh_sysvol_cwd[0] = 0;   /* 一切磁盘路径（含 cd /）都意味着离开系统卷 */
     if (fs_init() != 0) {
         terminal_writestring("FS init failed. Is disk formatted?\n");
         return;
@@ -1807,6 +1874,12 @@ static void cmd_mkdir(const char *args) {
 
 static void cmd_pwd(const char *args) {
     (void)args;
+    if (sh_sysvol_cwd[0] != 0) {
+        terminal_putchar('/');
+        terminal_writestring(sh_sysvol_cwd);
+        terminal_putchar('\n');
+        return;
+    }
     terminal_writestring(fs_cwd_path());
     terminal_putchar('\n');
 }
