@@ -47,11 +47,26 @@ def uint16_ror1(v):
 
 
 def make_mbr(part_type, part_len):
+    """标准 MBR：单主分区，LBA 从 PART_START 起。
+    Windows 挂载要求不高，但两处别省：0x1B8 的磁盘签名（Windows 用来标识
+    磁盘，缺失时"磁盘管理"会提示初始化），以及真实的 ending CHS（>1023
+    柱面时按 ATA 上限钉在 1023/15/63，LBA 字段才是权威值）。"""
     mbr = bytearray(512)
-    mbr[446] = 0x00
-    mbr[447] = 0x00; mbr[448] = 0x02; mbr[449] = 0x00
+    struct.pack_into('<I', mbr, 0x1B8, 0x1BADB002)      # 磁盘签名
+    mbr[446] = 0x00                                     # 非活动分区
+    mbr[447] = 0x00; mbr[448] = 0x02; mbr[449] = 0x00   # CHS start = 0/0/2
     mbr[450] = part_type
-    mbr[451] = 0x00; mbr[452] = 0x3F; mbr[453] = 0xFF
+    end_lba = PART_START + part_len - 1
+    heads, spt = 16, 63
+    cyl = end_lba // (heads * spt)
+    if cyl > 1023:
+        cyl, head, sect = 1023, 15, 63
+    else:
+        head = (end_lba // spt) % heads
+        sect = end_lba % spt + 1
+    mbr[451] = head
+    mbr[452] = sect | ((cyl >> 8) << 6)
+    mbr[453] = cyl & 0xFF
     struct.pack_into('<I', mbr, 454, PART_START)
     struct.pack_into('<I', mbr, 458, part_len)
     mbr[510] = 0x55; mbr[511] = 0xAA
@@ -103,6 +118,25 @@ def make_exfat_upcase():
         chk = (chk + up[i]) & 0xFFFFFFFF
     struct.pack_into('<I', up, 0, chk)
     return bytes(up)
+
+
+def exfat_boot_checksum_sector(boot_region):
+    """Boot Checksum Sector（卷相对扇区 11，备份在 23）——严格按 exFAT 规范：
+
+    内容是 11 个 little-endian uint32，第 N 个是卷相对扇区 N（0..10）的
+    exFAT 校验和；扇区 0 计算时 VolumeFlags(106,107) 与 PercentInUse(112)
+    按 0 参与（这两个字段会被宿主改写，所以排除在外）。其余字节全 0。
+
+    早期版本只写了 VolumeChecksum@0 + 一个整体校验@508，Windows 视其为
+    卷损坏（双击挂载报"需要格式化"）——这就是 disk.img 挂不上的根因之一。"""
+    assert len(boot_region) == 11 * 512, "boot region must be 11 sectors"
+    sec = bytearray(512)
+    for s in range(11):
+        data = bytearray(boot_region[s * 512:(s + 1) * 512])
+        if s == 0:
+            data[106] = 0; data[107] = 0; data[112] = 0
+        struct.pack_into('<I', sec, s * 4, exfat_checksum(bytes(data)))
+    return bytes(sec)
 
 
 def exfat_name_hash(name):
@@ -181,17 +215,12 @@ def gen_exfat(path):
     img[0:512] = make_mbr(0x07, EXFAT_PART_SECTORS)
     img[512:1024] = vbr
 
-    boot_region = bytearray(img[0:11 * 512])
-    boot_region[0x170:0x174] = b'\x00\x00\x00\x00'
-    chk_sector = bytearray(512)
-    vchk_buf = bytearray(31)
-    vchk_buf[0:11] = vbr[0:11]
-    vchk_buf[11:31] = vbr[90:110]
-    struct.pack_into('<I', chk_sector, 0, exfat_checksum(bytes(vchk_buf)))
-    struct.pack_into('<I', chk_sector, 508, exfat_checksum(bytes(boot_region)))
-    img[12 * 512:13 * 512] = chk_sector
-    img[13 * 512:14 * 512] = vbr
-    img[24 * 512:25 * 512] = chk_sector
+    # boot region = 卷相对扇区 0..10（绝对 1..11），绝不能把 MBR 算进去
+    boot_region = bytes(img[512:512 + 11 * 512])
+    chk_sector = exfat_boot_checksum_sector(boot_region)
+    img[12 * 512:13 * 512] = chk_sector   # 卷相对 11（绝对 12）
+    img[13 * 512:14 * 512] = vbr          # 卷相对 12：VBR 备份
+    img[24 * 512:25 * 512] = chk_sector   # 卷相对 23：checksum 备份
 
     files = exfat_files()
 

@@ -799,10 +799,14 @@ int exfat_format(void) {
     // 0. 标准 MBR（分区表：1 个 exFAT 分区，从扇区 1 开始）
     uint8_t mbr[512];
     for (int i = 0; i < 512; i++) mbr[i] = 0;
+    *((uint32_t*)(mbr + 0x1B8)) = 0x1BADB002;           // 磁盘签名（Windows 用它标识磁盘）
     mbr[446] = 0x00;                    // boot flag
-    mbr[447] = 0x00; mbr[448] = 0x02; mbr[449] = 0x00;   // CHS start
+    mbr[447] = 0x00; mbr[448] = 0x02; mbr[449] = 0x00;   // CHS start = 0/0/2
     mbr[450] = 0x07;                    // 分区类型: exFAT
-    mbr[451] = 0x00; mbr[452] = 0x3F; mbr[453] = 0xFF;   // CHS end
+    // CHS end（按 16 磁头 / 63 扇区换算，末 LBA = 1 + 32767 - 1 = 32767）：
+    //   cyl 32 / head 8 / sector 8 —— 与 temp/gen_diskimg.py make_mbr 一致。
+    // LBA 字段（454/458）才是权威值，CHS 只是给不认 LBA 的老工具看。
+    mbr[451] = 8; mbr[452] = 8; mbr[453] = 32;
     *((uint32_t*)(mbr + 454)) = 1;      // LBA start = 1
     *((uint32_t*)(mbr + 458)) = 32767;  // 分区扇区数
     mbr[510] = 0x55;
@@ -835,29 +839,29 @@ int exfat_format(void) {
     vbr[511] = 0xAA;
     if (exfat_write_sector(exfat_partition_start, vbr) != 0) return -1;
 
-    // 1.5 Boot Region 校验（sector 11 = Boot Checksum 扇区）
-    // VolumeChecksum @0：对 VBR 偏移 0-10 + 90-109（31 字节）计算（exFAT 规范）
+    // 1.5 Boot Checksum Sector（卷相对扇区 11，备份在 23）
+    // 规范写法：11 个 uint32，第 N 个 = 卷相对扇区 N（0..10）的 exFAT 校验和；
+    // 扇区 0 参与计算时 VolumeFlags(106,107) 与 PercentInUse(112) 按 0 处理
+    //（这两个字段会被宿主/格式化工具改写，所以排除）。
+    // 早期只写 VolumeChecksum@0 + 一个整体校验@508，Windows 会判为卷损坏
+    //（双击挂载报"需要格式化"）—— 与 temp/gen_diskimg.py 保持同一算法。
     uint8_t boot_region[11 * 512];
     for (int s = 0; s < 11; s++) {
-        if (exfat_read_sector(exfat_partition_start + s, boot_region + s * 512) != 0) return -1;   // BootChecksum 覆盖卷相对 0-10（=绝对 exfat_partition_start..+10）
+        // BootChecksum 覆盖卷相对 0-10（=绝对 exfat_partition_start..+10）
+        if (exfat_read_sector(exfat_partition_start + s, boot_region + s * 512) != 0) return -1;
     }
-    boot_region[106] = 0; boot_region[107] = 0;
-    uint8_t vchk_buf[31];
-    for (int i = 0; i < 11; i++) vchk_buf[i] = vbr[i];
-    for (int i = 0; i < 20; i++) vchk_buf[11 + i] = vbr[90 + i];
-    uint32_t vchk = exfat_checksum(vchk_buf, 31);
     uint8_t boot_chk_sector[512];
     for (int i = 0; i < 512; i++) boot_chk_sector[i] = 0;
-    *((uint32_t*)(boot_chk_sector + 0)) = vchk;        // VolumeChecksum @0
-    // BootChecksum @508：仅对前 11 个扇区（sector 0-10 = 5632 字节）计算，
-    // 第一个扇区偏移 0x170-0x173 按 0 处理（exFAT 规范 7.2.2）
-    {
-        uint8_t bcs_buf[11 * 512];
-        for (int i = 0; i < 11 * 512; i++) bcs_buf[i] = boot_region[i];
-        bcs_buf[0x170] = 0; bcs_buf[0x171] = 0;
-        bcs_buf[0x172] = 0; bcs_buf[0x173] = 0;
-        uint32_t bchk = exfat_checksum(bcs_buf, 11 * 512);
-        *((uint32_t*)(boot_chk_sector + 508)) = bchk;      // BootChecksum @508（规范：508-511 全为校验和，无签名）
+    for (int s = 0; s < 11; s++) {
+        uint8_t *p = boot_region + s * 512;
+        uint8_t b106 = 0, b107 = 0, b112 = 0;
+        if (s == 0) {
+            b106 = p[106]; b107 = p[107]; b112 = p[112];
+            p[106] = 0; p[107] = 0; p[112] = 0;
+        }
+        uint32_t c = exfat_checksum(p, 512);
+        if (s == 0) { p[106] = b106; p[107] = b107; p[112] = b112; }
+        *((uint32_t*)(boot_chk_sector + s * 4)) = c;
     }
     if (exfat_write_sector(exfat_partition_start + 11, boot_chk_sector) != 0) return -1;
 
