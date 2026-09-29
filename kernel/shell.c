@@ -758,21 +758,46 @@ int shell_complete_command(const char *prefix, char *out, int outsz,
 }
 
 // �ػ浱ǰ������
+/* cd /bin | cd /system 后 shell 的当前目录停在系统卷。
+ * 空串 = 数据盘。只影响 ls / pwd / cd / 提示符的呈现层；文件操作请用绝对
+ * 路径（/bin/xxx）——系统卷只读，exec 的裸名查找本来就落在 /bin。 */
+static char sh_sysvol_cwd[8];      /* "" | "bin" | "system" */
+
+/* 提示符：把当前路径打进 "[path] > "，cd 到哪一眼可见。
+ * 返回提示符的字符宽度——重绘输入行时要据此算光标列，写死 2 会错位。
+ * 结尾仍是 "> "：E2E 靠 '>' 切分"最近一条命令的输出"，不能改掉。 */
+static int shell_prompt(void) {
+    int n = 1;                      /* '[' */
+    shell_fg(CLR_HEADER);
+    terminal_putchar('[');
+    if (sh_sysvol_cwd[0] != 0) {
+        terminal_putchar('/');
+        terminal_writestring(sh_sysvol_cwd);
+        n += 1 + (int)my_strlen(sh_sysvol_cwd);
+    } else {
+        const char *p = fs_cwd_path();
+        terminal_writestring(p);
+        n += (int)my_strlen(p);
+    }
+    terminal_writestring("] > ");
+    n += 4;
+    shell_color_default();
+    return n;
+}
+
 static void shell_redraw_line(void) {
     terminal_clear_line(current_row);
-    terminal_writestring("> ");
+    int plen = shell_prompt();
     for (int i = 0; i < cmd_pos; i++) {
         terminal_putchar(cmd_buffer[i]);
     }
-    size_t col = 2 + cursor;
+    size_t col = (size_t)plen + (size_t)cursor;
     terminal_set_cursor(current_row, col);
 }
 
 void shell_run(void) {
     terminal_writestring("EZOS Shell - Type 'help' for commands, 'exit' to launch desktop.\n");
-    shell_fg(CLR_HEADER);
-    terminal_writestring("> ");
-    shell_color_default();
+    shell_prompt();
 
     cmd_pos = 0;
     cursor = 0;
@@ -839,9 +864,7 @@ void shell_run(void) {
             cursor = 0;
             history_index = -1;
             shell_reap_bg();              /* 回提示符前非阻塞收割已退出的后台任务 */
-            shell_fg(CLR_HEADER);
-            terminal_writestring("> ");
-            shell_color_default();
+            shell_prompt();
             current_row = terminal_get_row();
         } else if (c == '\b') {
             if (cursor > 0) {
@@ -1315,11 +1338,6 @@ static void cmd_setcolor(const char *args) {
     terminal_setcolor((uint8_t)(fg | (bg << 4)));
     terminal_writestring("Color set.\n");
 }
-
-/* cd /bin | cd /system 后 shell 的当前目录停在系统卷。
- * 空串 = 数据盘。只影响 ls / pwd / cd 的呈现层；文件操作请用绝对路径
- * （/bin/xxx）——系统卷只读，exec 的裸名查找本来就落在 /bin。 */
-static char sh_sysvol_cwd[8];      /* "" | "bin" | "system" */
 
 static void cmd_ls(const char *args) {
     int verbose = 0;
