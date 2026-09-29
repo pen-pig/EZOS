@@ -50,5 +50,7 @@ typedef struct {
 } exfat_dir_entry_t;
 
 int exfat_read_dir(exfat_dir_entry_t *entries, int max_entries);
+/* 列指定路径的目录（支持 "SD"、"SD/sub"、"/SD"）；不存在或不是目录 -> -1 */
+int exfat_read_dir_path(const char *path, exfat_dir_entry_t *entries, int max_entries);
 
 #endif

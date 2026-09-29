@@ -1380,8 +1380,15 @@ static void cmd_ls(const char *args) {
                 terminal_writestring("FS init failed. Is disk formatted?\n");
                 return;
             }
-            n = fs_read_dir(entries, 64);
-            title = fs_cwd_path();
+            if (t > 0) {
+                /* 给了路径参数就列那个目录（`ls SD`、`ls SD/sub`）。
+                 * 以前这里一律列 cwd，参数被静默忽略。 */
+                n = fs_read_dir_path(target, entries, 64);
+                title = target;
+            } else {
+                n = fs_read_dir(entries, 64);
+                title = fs_cwd_path();
+            }
         }
     }
     if (n < 0) {

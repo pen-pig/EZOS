@@ -622,6 +622,10 @@ int fs_read_dir_path(const char *path, fs_dir_entry_t *entries, int max_entries)
     char full[256];
     if (fs_resolve_path(path, full, sizeof(full)) != 0) return -1;
     if (sysvol_is_path(full)) return sysvol_list(full, entries, max_entries);
+    /* exFAT 真的按路径列那个目录（以前是忽略参数列 cwd，`ls SD` 答非所问）；
+     * 其余后端暂时沿用 cwd 行为，保持不变以免动到已通过的 fs_matrix。 */
+    if (fs_type_cur == FS_EXFAT)
+        return exfat_read_dir_path(full, (exfat_dir_entry_t *)entries, max_entries);
     return fs_read_dir(entries, max_entries);
 }
 

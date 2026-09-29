@@ -381,21 +381,106 @@ static int exfat_find_entry(uint32_t dir_cluster, const char *name, uint8_t *out
     return -1;
 }
 
+/* ===== 路径解析（跨目录相对/绝对路径）=====
+ * exFAT 后端历史上只认单层名：`exfat_find_entry(cwd, name)` 把 "SD/f1"
+ * 整个当成一个文件名。后果有两层——读/删永远找不到（SD/f1 在根里不存在），
+ * 而**写却会成功**，在根目录里造出一个名字就叫 "SD/f2" 的目录项：ls 能
+ * 看见、任何合法路径都读不到、还占着簇。这是静默的数据损坏，必须堵死。
+ *
+ * 现在把路径拆成"父目录簇 + 末段文件名"逐级走目录：任一级不存在或不是
+ * 目录即失败（fail closed），绝不退回"把斜杠当名字的一部分"。
+ * 单层名（不含 '/'）行为与以前完全一致：父目录就是 cwd。 */
+static int exfat_resolve_dir(const char *path, uint32_t *dir_out) {
+    if (!exfat_ready || path == 0 || path[0] == 0 || dir_out == 0) return -1;
+
+    uint32_t stack[32];
+    int depth = 0;
+    uint32_t cur;
+    const char *p;
+    if (path[0] == '/') { cur = exfat_info.root_dir_cluster; p = path + 1; }
+    else                { cur = exfat_cwd_cluster();          p = path; }
+
+    if (*p == 0) { *dir_out = cur; return 0; }      /* "/" 或 "" */
+
+    char comp[128];
+    for (;;) {
+        int cl = 0;
+        while (*p && *p != '/' && cl < 127) comp[cl++] = *p++;
+        comp[cl] = '\0';
+        int more = (*p == '/');
+        while (*p == '/') p++;                      /* 连续分隔符 */
+        if (cl == 0) { if (!more) break; continue; }
+
+        if (my_strcmp(comp, ".") == 0) { if (!more) break; continue; }
+        if (my_strcmp(comp, "..") == 0) {
+            if (depth == 0) return -1;              /* 已到起点，不能再往上 */
+            cur = stack[--depth];
+            if (!more) break;
+            continue;
+        }
+        if (depth >= 31) return -1;                 /* 目录栈上限 */
+        uint8_t entry[1024];
+        if (exfat_find_entry(cur, comp, entry) < 0) return -1;
+        if ((entry[1] & EXFAT_ATTR_DIRECTORY) == 0) return -1;   /* 不是目录 */
+        stack[depth++] = cur;
+        cur = *((uint32_t *)(entry + EXFAT_MERGED_CLUSTER_OFF));
+        if (!more) break;
+    }
+    *dir_out = cur;
+    return 0;
+}
+
+/* path -> (父目录簇, 末段文件名)。末段为空（以 '/' 结尾）视为失败。 */
+static int exfat_resolve_leaf(const char *path, uint32_t *dir_out,
+                              char *leaf, uint32_t leafsz) {
+    if (!exfat_ready || path == 0 || path[0] == 0) return -1;
+    if (dir_out == 0 || leaf == 0 || leafsz < 2) return -1;
+
+    int last = -1;
+    for (int i = 0; path[i]; i++) if (path[i] == '/') last = i;
+
+    if (last < 0) {                                 /* 单层名：父目录 = cwd */
+        uint32_t n = 0;
+        while (path[n]) n++;
+        if (n == 0 || n + 1 > leafsz) return -1;
+        for (uint32_t i = 0; i <= n; i++) leaf[i] = path[i];
+        *dir_out = exfat_cwd_cluster();
+        return 0;
+    }
+    uint32_t n = 0;
+    while (path[last + 1 + n]) n++;
+    if (n == 0 || n + 1 > leafsz) return -1;        /* 没有末段 / 太长 */
+    for (uint32_t i = 0; i <= n; i++) leaf[i] = path[last + 1 + i];
+    if (last == 0) {                                /* "/xxx" -> 根目录 */
+        *dir_out = exfat_info.root_dir_cluster;
+        return 0;
+    }
+    char parent[128];
+    if ((uint32_t)last >= sizeof(parent)) return -1;
+    for (int i = 0; i < last; i++) parent[i] = path[i];
+    parent[last] = '\0';
+    return exfat_resolve_dir(parent, dir_out);
+}
+
 /* ===== rmdir ===== */
 /* 删除**空目录**，与 rm（exfat_delete_file）职责分离：
  *   目标不存在 / 是普通文件 / 目录非空 / 是 "." ".."  →  一律返回 -1，
  *   且在此之前不释放任何簇（避免半成品状态）。
- * 只接受相对当前目录的单段名字；要删别处的目录请先 cd。
+ * 接受带 '/' 的路径（父目录逐级解析，见 exfat_resolve_leaf）；
  * 真正的删除**复用** exfat_delete_file，不复制第二份释放逻辑，
  * 否则两边迟早漂移（历史教训：exfat 的 free 循环已经被抄过一份）。 */
 int exfat_rmdir(const char *name) {
     if (!exfat_ready || name == 0) return -1;
-    if (name[0] == '\0' || name[0] == '/') return -1;
+    if (name[0] == '\0') return -1;
     if (name[0] == '.' && (name[1] == '\0' ||
         (name[1] == '.' && name[2] == '\0'))) return -1;
 
+    uint32_t dir = 0;
+    char leaf[128];
+    if (exfat_resolve_leaf(name, &dir, leaf, sizeof(leaf)) != 0) return -1;
+
     uint8_t merged[1024];
-    if (exfat_find_entry(exfat_cwd_cluster(), name, merged) < 0) return -1;
+    if (exfat_find_entry(dir, leaf, merged) < 0) return -1;
     if ((merged[1] & EXFAT_ATTR_DIRECTORY) == 0) return -1;   /* 文件归 rm 管 */
 
     /* 非空与否交给 exfat_delete_file 判定（它拒绝非空目录并原样返回 -1）。
@@ -989,13 +1074,12 @@ int exfat_list_root(void) {
 }
 
 // 读取当前目录全部目录项到结构体数组（供 desktop 文件管理器使用）
-int exfat_read_dir(exfat_dir_entry_t *entries, int max_entries) {
+int exfat_read_dir_cluster(uint32_t cluster, exfat_dir_entry_t *entries, int max_entries) {
     if (!exfat_ready) return -1;
 
     static uint8_t dir_data[512 * 16] XF_HIBUF;
     uint8_t *buffer = dir_data;
 
-    uint32_t cluster = exfat_cwd_cluster();
     uint32_t cluster_size = exfat_info.bytes_per_sector * exfat_info.sectors_per_cluster;
     uint32_t cluster_count = exfat_read_dir_chain(cluster, buffer, 16);
     if (cluster_count == 0) return -1;
@@ -1037,11 +1121,30 @@ int exfat_read_dir(exfat_dir_entry_t *entries, int max_entries) {
     return count;
 }
 
+int exfat_read_dir(exfat_dir_entry_t *entries, int max_entries) {
+    return exfat_read_dir_cluster(exfat_cwd_cluster(), entries, max_entries);
+}
+
+/* 列指定路径的目录（"SD"、"SD/sub"、"/SD" 均可）。
+ * 以前 fs_read_dir_path 对磁盘路径是**忽略参数、直接列 cwd**——`ls SD`
+ * 看到的其实是当前目录，属于静默答非所问。现在真的去列那个目录；
+ * 路径不存在 / 中间分量不是目录 -> -1（fail closed）。 */
+int exfat_read_dir_path(const char *path, exfat_dir_entry_t *entries, int max_entries) {
+    if (!exfat_ready || path == 0 || path[0] == 0) return -1;
+    uint32_t cluster = 0;
+    if (exfat_resolve_dir(path, &cluster) != 0) return -1;
+    return exfat_read_dir_cluster(cluster, entries, max_entries);
+}
+
 uint32_t exfat_get_file_size(const char *name) {
     if (!exfat_ready) return 0;
 
+    uint32_t dir = 0;
+    char leaf[128];
+    if (exfat_resolve_leaf(name, &dir, leaf, sizeof(leaf)) != 0) return 0;
+
     uint8_t entry[1024];
-    if (exfat_find_entry(exfat_cwd_cluster(), name, entry) < 0) return 0;
+    if (exfat_find_entry(dir, leaf, entry) < 0) return 0;
     return *((uint32_t*)(entry + EXFAT_MERGED_SIZE_OFF));
 }
 
@@ -1058,8 +1161,11 @@ uint32_t exfat_count_used_clusters(void) {
 // 沿 FAT 链统计文件/目录占用的簇数（供 du 使用）
 uint32_t exfat_get_file_clusters(const char *name) {
     if (!exfat_ready) return 0;
+    uint32_t dir = 0;
+    char leaf[128];
+    if (exfat_resolve_leaf(name, &dir, leaf, sizeof(leaf)) != 0) return 0;
     uint8_t entry[1024];
-    if (exfat_find_entry(exfat_cwd_cluster(), name, entry) < 0) return 0;
+    if (exfat_find_entry(dir, leaf, entry) < 0) return 0;
     uint32_t first = *((uint32_t*)(entry + EXFAT_MERGED_CLUSTER_OFF));
     if (first < 2) return 0;   // 空文件（0 簇）
     uint32_t n = 0, cur = first;
@@ -1075,8 +1181,12 @@ uint32_t exfat_get_file_clusters(const char *name) {
 int exfat_read_file(const char *name, uint8_t *buffer, uint32_t max_size) {
     if (!exfat_ready) return -1;
 
+    uint32_t dir = 0;
+    char leaf[128];
+    if (exfat_resolve_leaf(name, &dir, leaf, sizeof(leaf)) != 0) return -1;
+
     uint8_t entry[1024];
-    if (exfat_find_entry(exfat_cwd_cluster(), name, entry) < 0) return -1;
+    if (exfat_find_entry(dir, leaf, entry) < 0) return -1;
     uint32_t file_start_cluster = *((uint32_t*)(entry + EXFAT_MERGED_CLUSTER_OFF));
     uint32_t file_size = *((uint32_t*)(entry + EXFAT_MERGED_SIZE_OFF));
     if (file_size == 0) return 0;
@@ -1129,17 +1239,23 @@ static void exfat_free_cluster_chain(uint32_t head) {
 int exfat_create_file(const char *name, const uint8_t *data, uint32_t size) {
     if (!exfat_ready) return -1;
 
+    /* 路径解析：父目录逐级走，末段才是文件名。父目录不存在 -> 直接失败，
+     * 绝不退化成"在当前目录里建一个名字含斜杠的项"（那会造出读不到的垃圾）。 */
+    uint32_t dir = 0;
+    char leaf[256];
+    if (exfat_resolve_leaf(name, &dir, leaf, sizeof(leaf)) != 0) return -1;
+
     int name_len = 0;
-    while (name[name_len]) name_len++;
+    while (leaf[name_len]) name_len++;
     if (name_len == 0) return -1;
     /* exFAT 规范文件名最长 255 字符，防止 name_utf16 缓冲区溢出 */
     if (name_len > 255) return -1;
 
     // 重名检查
     uint8_t exist_entry[1024];
-    if (exfat_find_entry(exfat_cwd_cluster(), name, exist_entry) >= 0) return -1;
+    if (exfat_find_entry(dir, leaf, exist_entry) >= 0) return -1;
 
-    uint32_t root_cluster = exfat_cwd_cluster();
+    uint32_t root_cluster = dir;
     static uint8_t root_cluster_data[512 * 16] XF_HIBUF;
     uint8_t *root_buffer = root_cluster_data;
     /* 数据写缓冲放到高内存静态区，避免 8KB 栈上分配压垮内核栈
@@ -1204,7 +1320,7 @@ int exfat_create_file(const char *name, const uint8_t *data, uint32_t size) {
     }
 
     // 写 entry set
-    exfat_write_entry_set(root_buffer, free_entry_offset, name, start_cluster, size, 0);
+    exfat_write_entry_set(root_buffer, free_entry_offset, leaf, start_cluster, size, 0);
     exfat_fix_dir_layout(root_buffer, dir_clusters * cluster_size);
     if (exfat_write_cluster(root_cluster, root_buffer) != 0) {
         exfat_free_cluster_chain(start_cluster);
@@ -1230,9 +1346,13 @@ int exfat_create_file(const char *name, const uint8_t *data, uint32_t size) {
 int exfat_delete_file(const char *name) {
     if (!exfat_ready) return -1;
 
+    uint32_t dir = 0;
+    char leaf[128];
+    if (exfat_resolve_leaf(name, &dir, leaf, sizeof(leaf)) != 0) return -1;
+
     static uint8_t root_cluster_data[512 * 16] XF_HIBUF;
     uint8_t *root_buffer = root_cluster_data;
-    uint32_t root_cluster = exfat_cwd_cluster();
+    uint32_t root_cluster = dir;
     uint32_t cluster_size = exfat_info.bytes_per_sector * exfat_info.sectors_per_cluster;
     uint32_t dir_clusters = exfat_read_dir_chain(root_cluster, root_buffer, 16);
     if (dir_clusters == 0) return -1;
@@ -1258,7 +1378,7 @@ int exfat_delete_file(const char *name) {
                     else entry_name[nlen++] = '.';
                 }
                 entry_name[nlen] = '\0';
-                if (my_strcmp(entry_name, name) == 0) {
+                if (my_strcmp(entry_name, leaf) == 0) {
                     // 目录不可直接删除（非空检查）
                     if ((merged[1] & EXFAT_ATTR_DIRECTORY) != 0) {
                         // 检查目录是否为空：读其第一簇，看是否有有效条目
