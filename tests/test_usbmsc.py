@@ -43,7 +43,7 @@ SHELL_WAIT = 12
 
 IMG = os.path.join(ROOT, "os-image.bin")
 IMG_PAD = os.path.join(ROOT, "temp", "os-image-1024.bin")
-DISK = os.path.join(ROOT, "disk.img")
+DISK = os.path.join(ROOT, "disk.vhd")
 SHOT = os.path.join(HERE, "msc_shot.ppm").replace("\\", "/")
 
 KEYMAP = {' ': 'spc', '.': 'dot', '-': 'minus', '_': 'shift-minus',

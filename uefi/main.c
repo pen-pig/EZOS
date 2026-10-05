@@ -219,16 +219,33 @@ EFI_STATUS EFIAPI EfiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *ST) {
   /* 4) 取内存映射（�?步只打印，不传�?�给内核�? */
   UINTN map_size = 0, map_key = 0, desc_size = 0;
   UINT32 desc_ver = 0;
-  ((EFI_GET_MEMORY_MAP)BS->GetMemoryMap)(&map_size, 0, &map_key, &desc_size, &desc_ver);
   void *mmap = 0;
-  UINTN mmap_cap = map_size + desc_size * 2;   /* buffer capacity (for EBS retries, U3) */
-  st = ((EFI_ALLOCATE_POOL)BS->AllocatePool)(EfiLoaderData, mmap_cap, &mmap);
-  if (st != EFI_SUCCESS || mmap == 0) {
-    serial_puts("EZEFI:map alloc fail\r\n");
-    return EFI_SUCCESS;
+  UINTN mmap_cap = 0;
+  /* Allocating the buffer can itself change the map (new pool pages show up
+   * as extra descriptors), so "ask for the size, allocate exactly that, then
+   * fetch" is not enough - the second call can still come back
+   * EFI_BUFFER_TOO_SMALL. Grow the slack and retry instead of giving up.
+   * Seen with a 486912-byte kernel on OVMF i386: one round trip failed here
+   * and the loader bailed out before ever jumping to the kernel. */
+  for (int attempt = 0; attempt < 8; ++attempt) {
+    UINTN need = 0;
+    ((EFI_GET_MEMORY_MAP)BS->GetMemoryMap)(&need, 0, &map_key, &desc_size, &desc_ver);
+    if (need == 0 || desc_size == 0) break;
+    UINTN cap = need + desc_size * (8 + 8 * (UINTN)attempt);
+    void *tmp = 0;
+    st = ((EFI_ALLOCATE_POOL)BS->AllocatePool)(EfiLoaderData, cap, &tmp);
+    if (st != EFI_SUCCESS || tmp == 0) break;
+    if (mmap) ((EFI_FREE_POOL)BS->FreePool)(mmap);
+    mmap = tmp;
+    mmap_cap = cap;
+    UINTN in = cap;
+    st = ((EFI_GET_MEMORY_MAP)BS->GetMemoryMap)(&in, mmap, &map_key, &desc_size, &desc_ver);
+    if (st == EFI_SUCCESS) {
+      map_size = in;
+      break;
+    }
   }
-  st = ((EFI_GET_MEMORY_MAP)BS->GetMemoryMap)(&map_size, mmap, &map_key, &desc_size, &desc_ver);
-  if (st != EFI_SUCCESS) {
+  if (st != EFI_SUCCESS || mmap == 0) {
     serial_puts("EZEFI:map get fail\r\n");
     return EFI_SUCCESS;
   }

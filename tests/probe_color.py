@@ -58,8 +58,8 @@ def pixels(ppm):
 
 def main():
     img = os.path.join(T.ROOT, "os-image.bin").replace("\\", "/")
-    disk = os.path.join(HERE, "disk_color.img").replace("\\", "/")
-    shutil.copyfile(os.path.join(T.ROOT, "disk.img"), disk)
+    disk = os.path.join(HERE, "disk_color.vhd").replace("\\", "/")
+    shutil.copyfile(os.path.join(T.ROOT, "disk.vhd"), disk)
     shot = os.path.join(HERE, "color_shot.ppm").replace("\\", "/")
 
     if T.port_in_use(T.PORT):

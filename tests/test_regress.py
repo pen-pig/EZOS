@@ -129,7 +129,7 @@ def wait_port_free(port, timeout=15):
 
 def main():
     img = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
-    disk = os.path.join(ROOT, "disk.img").replace("\\", "/")
+    disk = os.path.join(ROOT, "disk.vhd").replace("\\", "/")
     for p in (img, disk):
         if not os.path.isfile(p):
             print("MISSING %s - run ninja first" % p)

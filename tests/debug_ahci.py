@@ -2,15 +2,20 @@ import os, socket, subprocess, sys, time, threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+sys.path.insert(0, os.path.join(ROOT, "tools"))    # make_vhd：给空白盘补 VHD footer
+import make_vhd
 QEMU = "D:/MyOS/tools/qemu-portable-20241220/qemu-system-x86_64.exe"
 QMP_PORT = 4499
 SERIAL_PORT = 4500
-AHCI_IMG = os.path.join(HERE, "ahci.img").replace("\\", "/")
-DISK_COPY = os.path.join(HERE, "disk_ahci.img").replace("\\", "/")
+AHCI_IMG = os.path.join(HERE, "ahci.vhd").replace("\\", "/")
+DISK_COPY = os.path.join(HERE, "disk_ahci.vhd").replace("\\", "/")
 
 def make_blank(path, mb):
+    size = mb * 1024 * 1024
     with open(path, "wb") as f:
-        f.truncate(mb * 1024 * 1024)
+        f.truncate(size)
+        f.seek(0, os.SEEK_END)
+        f.write(make_vhd.make_footer(size, 946684800, os.path.basename(path)))
 
 class SR:
     def __init__(self, port):
@@ -37,9 +42,9 @@ class SR:
 
 if __name__ == "__main__":
     make_blank(AHCI_IMG, 64)
-    if os.path.isfile(os.path.join(ROOT, "disk.img")):
+    if os.path.isfile(os.path.join(ROOT, "disk.vhd")):
         import shutil
-        shutil.copyfile(os.path.join(ROOT, "disk.img"), DISK_COPY)
+        shutil.copyfile(os.path.join(ROOT, "disk.vhd"), DISK_COPY)
     img = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
     proc = subprocess.Popen([
         QEMU, "-icount", "shift=auto", "-vga", "std",

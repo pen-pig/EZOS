@@ -130,11 +130,11 @@ echo build-only mode: QEMU not launched.
 exit /b 0
 
 :run
-echo rebuilding disk.img (exFAT layout)...
-python "%~dp0temp\gen_diskimg.py" disk.img
+echo rebuilding disk.vhd (exFAT layout)...
+python "%~dp0temp\gen_diskimg.py" disk.vhd
 if errorlevel 1 goto error
 echo launching QEMU...
-qemu-system-x86_64 -icount shift=auto -vga std -drive format=raw,file=os-image.bin -drive format=raw,file=disk.img
+qemu-system-x86_64 -icount shift=auto -vga std -drive format=raw,file=os-image.bin -drive format=raw,file=disk.vhd
 pause
 goto end
 

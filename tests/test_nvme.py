@@ -20,7 +20,7 @@
         写路径走 OPC_NVM_WRITE，读不通只会卡在 write/ls，不会假成功
 
 铁律「两组结果必须相反」+「警惕弱断言」：
-  A（挂 -device nvme，后端是 disk.img 的副本）：
+  A（挂 -device nvme，后端是 disk.vhd 的副本）：
      - 上面 1-5 全部成立，且**绝不出现** "NVME-IO: read/write fail"
   B（不挂 nvme）：
      - 必须打印 "NVME: no NVMe controller found"
@@ -54,9 +54,9 @@ SERIAL_PORT = 4510
 BOOT_WAIT = 150
 
 IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
-DISK = os.path.join(ROOT, "disk.img")
-# 写测试会改盘内容，绝不拿 disk.img 本体开刀——每次跑复制一份。
-NVME_IMG = os.path.join(HERE, "nvme_disk.img").replace("\\", "/")
+DISK = os.path.join(ROOT, "disk.vhd")
+# 写测试会改盘内容，绝不拿 disk.vhd 本体开刀——每次跑复制一份。
+NVME_IMG = os.path.join(HERE, "nvme_disk.vhd").replace("\\", "/")
 
 KEYMAP = {' ': 'spc', '.': 'dot', '-': 'minus', '_': 'shift-minus',
           '/': 'slash', '*': 'kp_multiply', '+': 'kp_add', ':': 'shift-semicolon'}

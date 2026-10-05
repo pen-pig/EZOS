@@ -23,8 +23,8 @@ slirp 不会改写 guest→host 方向的帧内容）：
     python tests/test_step7_sock.py udp       # 只跑 UDP
     python tests/test_step7_sock.py tcp       # 只跑 TCP
 
-前置：ninja -f build.ninja 已产出 os-image.bin / disk.img / user/*.elf
-      （disk.img 由 gen_diskimg.py 生成，自动嵌入 NETECHO/NETTCP.ELF）
+前置：ninja -f build.ninja 已产出 os-image.bin / disk.vhd / user/*.elf
+      （disk.vhd 由 gen_diskimg.py 生成，自动嵌入 NETECHO/NETTCP.ELF）
 退出码 0 = 全部断言通过。
 注：开机等待 BOOT_WAIT_S 是保守值；机器慢导致键入落空时把它调大。
 """
@@ -88,7 +88,7 @@ class QemuGuest(object):
             "-icount", "shift=auto",       # 与 build.ninja run_qemu 一致（时钟近似实时）
             "-display", "none",
             "-drive", "format=raw,file=os-image.bin",
-            "-drive", "format=raw,file=disk.img",
+            "-drive", "format=raw,file=disk.vhd",
             "-netdev", "user,id=n0,hostfwd=tcp::%d-:%d,hostfwd=udp::%d-:%d"
                        % (TCP_PORT, TCP_PORT, UDP_PORT, UDP_PORT),
             "-device", "rtl8139,netdev=n0",
@@ -425,11 +425,11 @@ def phase_tcp():
 def main():
     only = (sys.argv[1] if len(sys.argv) > 1 else "all").lower()
     assert os.path.isfile(QEMU), "QEMU not found: %s" % QEMU
-    for pre in ("os-image.bin", "disk.img"):
+    for pre in ("os-image.bin", "disk.vhd"):
         assert os.path.isfile(os.path.join(ROOT, pre)), pre + " missing - run ninja first"
     for elf in ("netecho.elf", "nettcp.elf"):
         if not os.path.isfile(os.path.join(ROOT, "user", elf)):
-            print("WARN user/%s missing - disk.img may lack it (run ninja)" % elf)
+            print("WARN user/%s missing - disk.vhd may lack it (run ninja)" % elf)
     if only in ("all", "udp"):
         phase_udp()
     if only in ("all", "tcp"):

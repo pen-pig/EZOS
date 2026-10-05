@@ -46,8 +46,8 @@ def type_text(qmp, s):
 
 
 def main():
-    disk = os.path.join(HERE, "disk_vi.img").replace("\\", "/")
-    shutil.copyfile(os.path.join(ROOT, "disk.img"), disk)
+    disk = os.path.join(HERE, "disk_vi.vhd").replace("\\", "/")
+    shutil.copyfile(os.path.join(ROOT, "disk.vhd"), disk)
     img = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
 
     if T.port_in_use(PORT):

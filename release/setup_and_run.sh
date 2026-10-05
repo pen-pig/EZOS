@@ -26,11 +26,11 @@ if ! command -v "$QEMU" >/dev/null 2>&1; then
     fi
 fi
 
-if [ ! -f "disk.img" ]; then
-    echo "[INFO] disk.img missing, regenerating with gen_diskimg.py..."
-    (command -v python3 >/dev/null 2>&1 && python3 gen_diskimg.py disk.img) \
-        || python gen_diskimg.py disk.img
+if [ ! -f "disk.vhd" ]; then
+    echo "[INFO] disk.vhd missing, regenerating with gen_diskimg.py..."
+    (command -v python3 >/dev/null 2>&1 && python3 gen_diskimg.py disk.vhd) \
+        || python gen_diskimg.py disk.vhd
 fi
 
 echo "[INFO] Booting EZOS in QEMU..."
-"$QEMU" -icount shift=auto -vga std -m 128 -drive format=raw,file=os-image.bin -drive format=raw,file=disk.img
+"$QEMU" -icount shift=auto -vga std -m 128 -drive format=raw,file=os-image.bin -drive format=raw,file=disk.vhd

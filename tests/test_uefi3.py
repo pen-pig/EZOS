@@ -10,7 +10,7 @@
   6. 回切后 shell 仍可用（ver 命令 OCR）+ 全程无 "kernel panic"
 
 前置：uefi/esp/kernel.bin（与 ../kernel.bin 同大小、512 对齐、<= 507904）
-     + disk.img（拷为本测试私有副本，避免污染基线盘）。
+     + disk.vhd（拷为本测试私有副本，避免污染基线盘）。
 端口 4464（端口每脚本唯一，见 tests/README.md）。
 用法：python tests/test_uefi3.py   （退出码 0 = 全通过）
 """
@@ -33,8 +33,8 @@ FD = "D:/MyOS/tools/qemu-portable-20241220/share/edk2-i386-code.fd"
 ESP = os.path.join(ROOT, "uefi/esp").replace("\\", "/")
 KERNEL_BIN = os.path.join(ESP, "kernel.bin")
 BOOT_EFI = os.path.join(ESP, "EFI/BOOT/BOOTIA32.EFI").replace("\\", "/")
-DISK_SRC = os.path.join(ROOT, "disk.img").replace("\\", "/")
-DISK = os.path.join(HERE, "uefi3_disk.img").replace("\\", "/")
+DISK_SRC = os.path.join(ROOT, "disk.vhd").replace("\\", "/")
+DISK = os.path.join(HERE, "uefi3_disk.vhd").replace("\\", "/")
 LOG = os.path.join(ROOT, "uefi/serial.log").replace("\\", "/")
 PORT = 4464
 BOOT_WAIT = 120

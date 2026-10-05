@@ -13,7 +13,7 @@
     用例连锁失败，看起来像"到处都是 bug"，实际只有第一个是真问题
   - 用例前先确认上一轮的 QEMU 已释放端口，否则会连到残留 VM（脏状态）
   - 单用例异常记 FAIL 并继续，不整组中止；QMP 读写都有超时，不会挂死
-  - 数据盘用 disk.img 副本（超长文件名会真的写进卷里）
+  - 数据盘用 disk.vhd 副本（超长文件名会真的写进卷里）
 端口 4496。用法：python tests/test_edge.py
 """
 import json
@@ -151,8 +151,8 @@ CASES = [
 
 def main():
     img = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
-    src_disk = os.path.join(ROOT, "disk.img")
-    disk = os.path.join(HERE, "disk_edge.img").replace("\\", "/")
+    src_disk = os.path.join(ROOT, "disk.vhd")
+    disk = os.path.join(HERE, "disk_edge.vhd").replace("\\", "/")
     for p in (img, src_disk):
         if not os.path.isfile(p):
             print("MISSING %s - run ninja first" % p)

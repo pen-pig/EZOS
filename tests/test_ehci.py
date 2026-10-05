@@ -56,7 +56,7 @@ SERIAL_PORT = 4508
 BOOT_WAIT = 150
 
 IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
-DISK = os.path.join(ROOT, "disk.img")
+DISK = os.path.join(ROOT, "disk.vhd")
 SHOT = os.path.join(HERE, "ehci_shot.ppm").replace("\\", "/")
 
 KEYMAP = {' ': 'spc', '.': 'dot', '-': 'minus', '_': 'shift-minus',

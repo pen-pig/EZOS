@@ -41,7 +41,7 @@ def main():
         os.remove(SERIAL_LOG)
 
     img = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
-    disk = os.path.join(ROOT, "disk.img").replace("\\", "/")
+    disk = os.path.join(ROOT, "disk.vhd").replace("\\", "/")
 
     proc = subprocess.Popen([
         QEMU, "-icount", "shift=auto", "-vga", "std",

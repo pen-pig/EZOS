@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-make_usb_boot.py —— 把 os-image.bin 安全写进 U 盘的小工具
+make_usb_boot.py —— 把 usb-image.bin 安全写进 U 盘的小工具
+
+为什么默认镜像从 os-image.bin 换成了 usb-image.bin：os-image.bin 的 LBA0 是
+裸引导扇区，**既没有 BPB 也没有分区表**，不少真机 BIOS 直接拒绝它，UEFI 固件
+更是根本看不见（它只扫分区里的 \\EFI\\BOOT\\BOOT*.EFI）。usb-image.bin 由
+tools/make_usb_image.py 产出，是 legacy + UEFI 双通道的混合镜像，同一份镜像
+两种固件都能起。要用旧的裸镜像就显式 --image ../os-image.bin。
 
 设计原则（看 docs/USB_BOOT.md 了解为什么这样写）：
   * 默认 dry-run：只列出本机磁盘 + 校验镜像，绝不写任何东西。
@@ -13,7 +19,7 @@ make_usb_boot.py —— 把 os-image.bin 安全写进 U 盘的小工具
 
 用法：
   python3 tools/make_usb_boot.py                 # 只读：列出磁盘 + 校验镜像
-  python3 tools/make_usb_boot.py --image X.bin   # 指定镜像（默认 ../os-image.bin）
+  python3 tools/make_usb_boot.py --image X.bin   # 指定镜像（默认 ../usb-image.bin）
   python3 tools/make_usb_boot.py --write --disk 2 # 真的写盘（Windows 需管理员 / Linux macOS 需 sudo）
   python3 tools/make_usb_boot.py --write --disk 2 --verify  # 写后逐块回读比对（很慢，但最稳）
 
@@ -285,7 +291,7 @@ def main():
     args = ap.parse_args()
 
     here = os.path.dirname(os.path.abspath(__file__))
-    image_path = args.image or os.path.normpath(os.path.join(here, "..", "os-image.bin"))
+    image_path = args.image or os.path.normpath(os.path.join(here, "..", "usb-image.bin"))
 
     print("=" * 64)
     print("EZOS U 盘制作工具（只读优先，绝不自动选盘）")

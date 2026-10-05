@@ -13,7 +13,7 @@
 判定方法同 test_rmdir.py：QMP sendkey 打字 -> screendump -> 真字库 OCR，
 取倒数第二个 ">" 之间的文本作为"最近一条命令的输出"；屏幕稳定靠连拍两张一致。
 
-数据盘直接用构建产物 disk.img（本测试只读，不污染）。
+数据盘直接用构建产物 disk.vhd（本测试只读，不污染）。
 """
 import json
 import os
@@ -146,7 +146,7 @@ def wait_port_free(port, timeout=15):
 
 def main():
     img = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
-    disk = os.path.join(ROOT, "disk.img").replace("\\", "/")
+    disk = os.path.join(ROOT, "disk.vhd").replace("\\", "/")
     for p in (img, disk):
         if not os.path.isfile(p):
             print("MISSING %s - run ninja first" % p)

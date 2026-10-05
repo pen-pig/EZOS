@@ -41,15 +41,15 @@ from test_nvme import (SerialReader, Qmp, flat, wait_for, wait_port_free,  # noq
 
 QEMU = "D:/MyOS/tools/qemu-portable-20241220/qemu-system-x86_64.exe"
 IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
-DISK = os.path.join(ROOT, "disk.img")
+DISK = os.path.join(ROOT, "disk.vhd")
 
 PORT_A = (4511, 4512)      # (QMP, serial)
 PORT_B = (4513, 4514)
 BOOT_WAIT = 150
 
-# 写测试会改盘内容，绝不拿 disk.img 本体开刀——每次跑复制一份。
-WORK_A = os.path.join(HERE, "sysvol_a.img").replace("\\", "/")
-WORK_B = os.path.join(HERE, "sysvol_b.img").replace("\\", "/")
+# 写测试会改盘内容，绝不拿 disk.vhd 本体开刀——每次跑复制一份。
+WORK_A = os.path.join(HERE, "sysvol_a.vhd").replace("\\", "/")
+WORK_B = os.path.join(HERE, "sysvol_b.vhd").replace("\\", "/")
 
 BIN_PROGRAMS = ["hello.elf", "forktest.elf", "fdtest.elf", "fdleak.elf",
                 "spin.elf", "segprobe.elf", "netecho.elf", "nettcp.elf",

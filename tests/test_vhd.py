@@ -1,20 +1,23 @@
 # -*- coding: utf-8 -*-
 """test_vhd.py - disk.vhd 与 exFAT Boot Checksum 守护（纯宿主侧，不启 QEMU）
 
-为什么需要它：disk.img 在 Windows 上双击挂不上，原因有两层，都是静默的——
+背景：disk.img 以前在 Windows 上双击挂不上，两层原因都是静默的——
   1) 资源管理器只给 .iso / .vhd 提供"装载"，.img 只会问你用什么打开；
   2) 就算换后缀，没有尾部 512 字节 Hard Disk Footer（"conectix"）Windows
      也不认；而我们的 exFAT Boot Checksum 扇区一直是"VolumeChecksum@0 +
      整体校验@508"的非规范写法，Windows 会判卷损坏、提示格式化。
 
-所以这里守住两件事：
-  A. tools/make_vhd.py 产出的 disk.vhd：数据是 disk.img 原样搬运（偏移 0），
-     footer 字段合法、校验和对、几何容量与 Current Size 一致；
-  B. disk.img 的 Boot Checksum 扇区符合 exFAT 规范：11 个 uint32 分别对应
-     卷相对扇区 0..10，扇区 0 计算时排除 VolumeFlags(106,107) 与
-     PercentInUse(112)，44 字节之后必须全零，备份扇区与正本一致。
+现在镜像**本身就是固定 VHD**：temp/gen_diskimg.py 把镜像字节写在文件头
+（偏移 0）再追加 512 字节 footer，所以 QEMU 用 format=raw 直接加载 disk.vhd，
+不再有第二份 .img。本脚本守住：
+  A. footer 字段合法、校验和对、CHS 容量与 Current Size 一致；
+  B. 产物可重现（gen_diskimg 重跑一次字节必须完全一致，UUID 由文件名派生）；
+  C. tools/make_vhd.py 的 raw -> VHD 往返仍然正确（剥 footer 再包回来）；
+  D. Boot Checksum 扇区符合 exFAT 规范：11 个 uint32 分别对应卷相对扇区
+     0..10，扇区 0 计算时排除 VolumeFlags(106,107) 与 PercentInUse(112)，
+     44 字节之后必须全零，备份扇区与正本一致。
 
-B 的校验在测试里**独立重写一遍算法**（不 import 生成器），两边对不上就说明
+D 的校验在测试里**独立重写一遍算法**（不 import 生成器），两边对不上就说明
 生成器写错了或者被人改回旧写法。最后照例跑反例：故意改坏的 VHD / 改坏的
 checksum 都必须被判 FAIL。
 
@@ -28,11 +31,12 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-IMG = os.path.join(ROOT, "disk.img")
 VHD = os.path.join(ROOT, "disk.vhd")
+GEN = os.path.join(ROOT, "temp", "gen_diskimg.py")
 MAKE_VHD = os.path.join(ROOT, "tools", "make_vhd.py")
-TMP_VHD = os.path.join(HERE, "_vhd_bad.vhd")
-TMP_REGEN = os.path.join(HERE, "_vhd_regen.vhd")
+TMP_BAD = os.path.join(HERE, "_vhd_bad.vhd")
+TMP_REGEN_DIR = os.path.join(HERE, "_vhd_regen")
+TMP_RAW = os.path.join(HERE, "_vhd_roundtrip.img")
 
 SECTOR = 512
 FOOTER = 512
@@ -57,7 +61,7 @@ def check_boot_checksum(img):
     """独立重算 exFAT Boot Checksum 扇区并比对（返回 (ok, 说明)）"""
     mbr = img[0:SECTOR]
     if mbr[510] != 0x55 or mbr[511] != 0xAA:
-        return False, "disk.img has no MBR signature"
+        return False, "disk image has no MBR signature"
     part_start = struct.unpack_from('<I', mbr, 446 + 8)[0]
     if part_start < 1:
         return False, "partition start LBA = %d" % part_start
@@ -84,46 +88,43 @@ def check_boot_checksum(img):
     return True, "11 x uint32 verified, backup matches"
 
 
-def bad_case(name, mutate, target=VHD):
-    """把 VHD/checksum 改坏，检查器必须判 FAIL"""
-    with open(target, "rb") as f:
+def bad_case(name, mutate):
+    """把 VHD 改坏，检查器必须判 FAIL"""
+    with open(VHD, "rb") as f:
         data = bytearray(f.read())
     mutate(data)
-    with open(TMP_VHD, "wb") as f:
+    with open(TMP_BAD, "wb") as f:
         f.write(data)
-    ok, _ = vhd_check(TMP_VHD)
-    if os.path.isfile(TMP_VHD):
-        os.remove(TMP_VHD)
+    ok, _ = vhd_check(TMP_BAD)
+    if os.path.isfile(TMP_BAD):
+        os.remove(TMP_BAD)
     return ("%s -> correctly rejected" % name if not ok
             else "%s: checker said OK on a broken image" % name), not ok
 
 
 def main():
     results = []
-    if not os.path.isfile(IMG) or not os.path.isfile(VHD):
-        print("MISSING disk.img / disk.vhd - run ninja first")
+    if not os.path.isfile(VHD):
+        print("MISSING disk.vhd - run ninja first")
         return 2
-    if not os.path.isfile(MAKE_VHD):
-        print("MISSING tools/make_vhd.py")
+    if not os.path.isfile(MAKE_VHD) or not os.path.isfile(GEN):
+        print("MISSING tools/make_vhd.py / temp/gen_diskimg.py")
         return 2
 
-    img_size = os.path.getsize(IMG)
     vhd_size = os.path.getsize(VHD)
+    data_size = vhd_size - FOOTER
+    with open(VHD, "rb") as f:
+        blob = f.read()
+    data, footer = blob[:data_size], blob[data_size:]
 
     # --- A. VHD 容器 ---
     ok, why = vhd_check(VHD)
     results.append(("disk.vhd footer: %s" % why.splitlines()[-1] if ok
                     else "disk.vhd footer: %s" % why, ok))
-    results.append(("disk.vhd size == disk.img + 512 footer (%d)" % vhd_size,
-                    vhd_size == img_size + FOOTER))
-    with open(IMG, "rb") as f:
-        raw = f.read()
-    with open(VHD, "rb") as f:
-        head = f.read(img_size)
-    results.append(("disk.vhd data area is byte-identical to disk.img", raw == head))
-    with open(VHD, "rb") as f:
-        f.seek(vhd_size - FOOTER)
-        footer = f.read(FOOTER)
+    results.append(("disk.vhd size is 512-aligned and > footer (%d)" % vhd_size,
+                    vhd_size % SECTOR == 0 and data_size > 0))
+    results.append(("data area starts with a valid MBR (0x55AA)",
+                    data[510] == 0x55 and data[511] == 0xAA))
     results.append(("footer cookie 'conectix'", footer[0:8] == b'conectix'))
     results.append(("footer data offset = all-ones (fixed VHD)",
                     footer[16:24] == b'\xff' * 8))
@@ -132,22 +133,47 @@ def main():
     heads, spt = footer[58], footer[59]
     results.append(("CHS %d/%d/%d capacity == Current Size %d"
                     % (cyl, heads, spt, cur), cyl * heads * spt * SECTOR == cur))
+    results.append(("Current Size == data area size", cur == data_size))
 
-    # 重新生成一次：UUID 由文件名派生，字节必须完全一致（ninja 幂等）
-    subprocess.run([sys.executable, MAKE_VHD, IMG, TMP_REGEN],
+    # --- B. 产物可重现（UUID 由文件名派生，所以要放到同名临时目录里重生成）---
+    os.makedirs(TMP_REGEN_DIR, exist_ok=True)
+    regen = os.path.join(TMP_REGEN_DIR, os.path.basename(VHD))
+    subprocess.run([sys.executable, GEN, regen],
                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     same = False
-    if os.path.isfile(TMP_REGEN):
-        with open(TMP_REGEN, "rb") as f:
-            regen = f.read(img_size + FOOTER)
-        with open(VHD, "rb") as f:
-            cur_bytes = f.read()
-        same = (regen == cur_bytes)
-        os.remove(TMP_REGEN)
+    if os.path.isfile(regen):
+        with open(regen, "rb") as f:
+            same = (f.read() == blob)
+    shutil.rmtree(TMP_REGEN_DIR, ignore_errors=True)
     results.append(("regenerating disk.vhd is byte-reproducible", same))
 
-    # --- B. exFAT Boot Checksum ---
-    ok, why = check_boot_checksum(raw)
+    # --- C. make_vhd.py 的 raw -> VHD 往返仍然正确 ---
+    roundtrip = False
+    out = os.path.join(HERE, "_vhd_roundtrip.vhd")
+    try:
+        with open(TMP_RAW, "wb") as f:
+            f.write(data)
+        subprocess.run([sys.executable, MAKE_VHD, TMP_RAW, out],
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if os.path.isfile(out):
+            with open(out, "rb") as f:
+                rb = f.read()
+            # TimeStamp(24..28) 取源 mtime、UniqueId(68..84) 由源文件名派生、
+            # Checksum(64..68) 覆盖全 footer —— 这三处随"源"而变，不参与比较；
+            # 其余字段 + 整个数据区必须逐字节一致。
+            def strip_volatile(fb):
+                return fb[:24] + fb[28:64] + fb[84:]
+            roundtrip = (rb[:data_size] == data and
+                         strip_volatile(rb[data_size:]) == strip_volatile(footer))
+    finally:
+        for p in (out, TMP_RAW):
+            if os.path.isfile(p):
+                os.remove(p)
+    results.append(("make_vhd.py round-trip (strip footer, rewrap) is lossless",
+                    roundtrip))
+
+    # --- D. exFAT Boot Checksum ---
+    ok, why = check_boot_checksum(data)
     results.append(("exFAT boot checksum sector: %s" % why, ok))
 
     # --- 反例：断言必须咬得住 ---
@@ -155,13 +181,12 @@ def main():
         d[len(d) - FOOTER:len(d) - FOOTER + 8] = b'\x00' * 8
 
     def break_sum(d):
-        off = len(d) - FOOTER + 64
-        d[off] ^= 0xFF
+        d[len(d) - FOOTER + 64] ^= 0xFF
 
     def shrink_size(d):
         off = len(d) - FOOTER + 48
-        v = struct.unpack_from('>Q', d, off)[0] - SECTOR
-        struct.pack_into('>Q', d, off, v)
+        struct.pack_into('>Q', d, off,
+                         struct.unpack_from('>Q', d, off)[0] - SECTOR)
 
     def not_fixed(d):
         struct.pack_into('>I', d, len(d) - FOOTER + 60, 3)   # 3 = dynamic
@@ -171,14 +196,10 @@ def main():
     results.append(bad_case("Current Size shrunk", shrink_size))
     results.append(bad_case("disk type switched to dynamic", not_fixed))
 
-    # boot checksum 反例：改 VBR 的 PercentInUse 之外的字节，checksum 就不该再匹配
-    def break_bcs(d):
-        d[(1 + 5) * SECTOR] ^= 0x5A       # 卷相对扇区 5 首字节（正本区之前）
-
-    with open(IMG, "rb") as f:
-        img2 = bytearray(f.read())
-    break_bcs(img2)
-    ok2, _ = check_boot_checksum(bytes(img2))
+    # boot checksum 反例：改一个被校验扇区的字节，checksum 就不该再匹配
+    broken = bytearray(data)
+    broken[(1 + 5) * SECTOR] ^= 0x5A       # 卷相对扇区 5（正本区之前）
+    ok2, _ = check_boot_checksum(bytes(broken))
     results.append(("boot checksum rejects a mutated boot region", not ok2))
 
     for name, good in results:

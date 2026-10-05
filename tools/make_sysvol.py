@@ -4,7 +4,7 @@
 
 为什么要有这个东西
 ------------------
-之前所有用户程序（user/*.elf）都放在 disk.img 的数据分区根目录里，
+之前所有用户程序（user/*.elf）都放在 disk.vhd 的数据分区根目录里，
 而 `format` 只要格式化数据盘就会把它们全部抹掉（实测：format 之后
 `ls` 变空、`exec HELLO.ELF` 报 file not found）。Linux 的做法是
 /bin 与 /home 分属不同挂载点，格式化数据分区不影响系统。

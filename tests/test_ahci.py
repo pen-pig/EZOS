@@ -10,9 +10,10 @@
     format / write / ls / cat / rm 全部走通（exFAT）。
   - 普通不挂 AHCI 的 VM（test_regress.py）走 ATA 兜底，不受影响（另行验证）。
   - 端口 4487 给 QMP；串口另走 4488，每脚本端口唯一。
-  - ahci.img 64MB 空文件在 tests/ 下临时生成（已被 .gitignore 的 *.img 忽略）。
+  - ahci.vhd 64MB 空文件在 tests/ 下临时生成（已被 .gitignore 的 *.vhd 忽略）。
 用法：python tests/test_ahci.py   （退出码 0 = 全通过）
 """
+import make_vhd
 import os
 import socket
 import subprocess
@@ -24,13 +25,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 KERNEL_DIR = os.path.join(ROOT, "kernel")
 sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(ROOT, "tools"))    # make_vhd：给空白盘补 VHD footer
 
 QEMU = "D:/MyOS/tools/qemu-portable-20241220/qemu-system-x86_64.exe"
 QMP_PORT = 4487
 SERIAL_PORT = 4488
 BOOT_WAIT = 40
-AHCI_IMG = os.path.join(HERE, "ahci.img").replace("\\", "/")
-DISK_COPY = os.path.join(HERE, "disk_ahci.img").replace("\\", "/")
+AHCI_IMG = os.path.join(HERE, "ahci.vhd").replace("\\", "/")
+DISK_COPY = os.path.join(HERE, "disk_ahci.vhd").replace("\\", "/")
 
 KEYMAP = {' ': 'spc', '.': 'dot', '-': 'minus', '_': 'shift-minus',
           '/': 'slash', '*': 'kp_multiply', '+': 'kp_add'}
@@ -155,8 +157,14 @@ def wait_port_free(port, timeout=15):
 
 
 def make_blank_image(path, mb):
+    """空白盘也是一份**固定 VHD**（后缀是 .vhd 就得名副其实）：
+    末尾追加 512 字节 footer，Windows 侧同样能挂。QEMU 用 format=raw 打开
+    不受影响，多出来的那 512 字节内核永远读不到。"""
+    size = mb * 1024 * 1024
     with open(path, "wb") as f:
-        f.truncate(mb * 1024 * 1024)
+        f.truncate(size)
+        f.seek(0, os.SEEK_END)
+        f.write(make_vhd.make_footer(size, 946684800, os.path.basename(path)))
 
 
 def wait_for(serial, marker, timeout):
@@ -183,7 +191,7 @@ def run_cmd(qmp, serial, cmd, expect, timeout=20.0):
 
 def main():
     img = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
-    disk = os.path.join(ROOT, "disk.img")
+    disk = os.path.join(ROOT, "disk.vhd")
     for p in (img, disk):
         if not os.path.isfile(p):
             print("MISSING %s - run ninja first" % p)

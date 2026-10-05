@@ -21,7 +21,7 @@
 同一套方法（含"取倒数第二个 >"、"等屏幕文本稳定"两条硬规矩）。
 
 EROFS 是只读卷不提供 format，不在矩阵里。
-数据盘用 disk.img 的副本（tests/disk_rmdir.img），绝不污染构建产物。
+数据盘用 disk.vhd 的副本（tests/disk_rmdir.vhd），绝不污染构建产物。
 端口 4478（4477 被 test_netapp.py 的 netdev 占用，端口必须每脚本唯一）。用法：python tests/test_rmdir.py   （退出码 0 = 全通过）
 """
 import json
@@ -196,8 +196,8 @@ def fs_cases(qmp, name):
 
 def main():
     img = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
-    src = os.path.join(ROOT, "disk.img")
-    disk = os.path.join(HERE, "disk_rmdir.img").replace("\\", "/")
+    src = os.path.join(ROOT, "disk.vhd")
+    disk = os.path.join(HERE, "disk_rmdir.vhd").replace("\\", "/")
     for p in (img, src):
         if not os.path.isfile(p):
             print("MISSING %s - run ninja first" % p)

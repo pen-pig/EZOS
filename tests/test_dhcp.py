@@ -48,7 +48,7 @@ from test_nvme import (SerialReader, Qmp, flat, wait_for, wait_port_free,  # noq
 
 QEMU = "D:/MyOS/tools/qemu-portable-20241220/qemu-system-x86_64.exe"
 IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
-DISK = os.path.join(ROOT, "disk.img")
+DISK = os.path.join(ROOT, "disk.vhd")
 
 PORT_A = (4521, 4522, 4527)     # (QMP, serial, netdev)
 PORT_B = (4523, 4524, 4528)
@@ -58,11 +58,11 @@ PORT_E = (4553, 4554, 4558)     # E：服务器不理续租 -> T2 广播 -> 过�
 BOOT_WAIT = 150
 
 WORK = {
-    "A": os.path.join(HERE, "dhcp_a.img").replace("\\", "/"),
-    "B": os.path.join(HERE, "dhcp_b.img").replace("\\", "/"),
-    "C": os.path.join(HERE, "dhcp_c.img").replace("\\", "/"),
-    "D": os.path.join(HERE, "dhcp_d.img").replace("\\", "/"),
-    "E": os.path.join(HERE, "dhcp_e.img").replace("\\", "/"),
+    "A": os.path.join(HERE, "dhcp_a.vhd").replace("\\", "/"),
+    "B": os.path.join(HERE, "dhcp_b.vhd").replace("\\", "/"),
+    "C": os.path.join(HERE, "dhcp_c.vhd").replace("\\", "/"),
+    "D": os.path.join(HERE, "dhcp_d.vhd").replace("\\", "/"),
+    "E": os.path.join(HERE, "dhcp_e.vhd").replace("\\", "/"),
 }
 
 GUEST_MAC = bytes([0x52, 0x54, 0x00, 0x12, 0x34, 0x56])

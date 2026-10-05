@@ -13,7 +13,7 @@
 （EROFS 只读，不提供 format，不在矩阵里）
 每个 FS 跑：format → df → write → ls → cat → rm → ls（确认删掉）
 
-数据盘用 disk.img 的副本（tests/disk_fs.img），绝不污染构建产物。
+数据盘用 disk.vhd 的副本（tests/disk_fs.vhd），绝不污染构建产物。
 端口 4493（与其它 E2E 端口约定一致）。
 用法：python tests/test_fs_matrix.py        （退出码 0 = 全部通过）
 """
@@ -162,8 +162,8 @@ FS_LIST = [
 
 def main():
     img = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
-    src_disk = os.path.join(ROOT, "disk.img")
-    disk = os.path.join(HERE, "disk_fs.img").replace("\\", "/")
+    src_disk = os.path.join(ROOT, "disk.vhd")
+    disk = os.path.join(HERE, "disk_fs.vhd").replace("\\", "/")
     for p in (img, src_disk):
         if not os.path.isfile(p):
             print("MISSING %s - run ninja first" % p)

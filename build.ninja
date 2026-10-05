@@ -63,17 +63,21 @@ rule make_sysvol
     description = SYSVOL kernel/sysvol_data.c
 
 rule make_disk
-    command = cmd /c python temp/gen_diskimg.py disk.img
-    description = CHECK DISK IMAGE
+    # 数据盘镜像**直接就是固定 VHD**：gen_diskimg.py 把镜像字节写在文件头
+    # （偏移 0），尾部追加 512 字节 Hard Disk Footer（conectix）。所以同一个
+    # disk.vhd 既能被 Windows 双击挂载（需 UAC 提权），也能给 QEMU 当 raw 盘
+    # ——尾巴那 512 字节内核永远读不到。想单独转换一个 raw 镜像时用
+    # tools/make_vhd.py。
+    command = cmd /c python temp/gen_diskimg.py disk.vhd
+    description = BUILD disk.vhd
 
-rule make_vhd
-    # Windows 资源管理器的"装载"只认 .iso 和 .vhd/.vhdx，.img 双击只会问你
-    # 用什么打开。这里把 raw 镜像包成固定 VHD：文件头即原始数据，尾部追加
-    # 512 字节 Hard Disk Footer（conectix）。偏移 0 就是数据，所以 disk.vhd
-    # 照样能给 QEMU 当 raw 盘用（尾巴那 512 字节内核永远读不到）。
-    # 双击挂载会走 UAC 提权——挂载 VHD 需要管理员。
-    command = cmd /c python tools/make_vhd.py disk.img disk.vhd
-    description = VHD disk.vhd
+rule make_usb
+    # 真机 U 盘镜像：LBA0 是带 BPB + 活动 EFI 分区表项的 MBR（真机 BIOS 要 BPB
+    # 才认介质，UEFI 只认分区里的 \EFI\BOOT\BOOTIA32.EFI），LBA1024 是真正的
+    # 引导扇区，LBA2048 起是 FAT32 的 EFI 系统分区。QEMU 自检跑
+    # tests/test_usbboot.py（legacy + OVMF 两条路）。
+    command = cmd /c python tools/make_usb_image.py
+    description = BUILD usb-image.bin
 
 rule run_qemu
     # -icount shift=auto: 虚拟时钟跟踪真实时间（否则 portable QEMU 非 icount 模式
@@ -82,7 +86,7 @@ rule run_qemu
     # 无网卡环境下 rtl8139_init 静默跳过，不影响启动。宿主转发（hostfwd
     # tcp/udp 7000-7001）由 temp/test_step7_sock.py 自带——不放这里，
     # 常驻 hostfwd 在端口被占时会直接拒绝 QEMU 启动。
-    command = $QEMU -icount shift=auto -vga std -drive format=raw,file=os-image.bin -drive format=raw,file=disk.img -netdev user,id=n0 -device rtl8139,netdev=n0
+    command = $QEMU -icount shift=auto -vga std -drive format=raw,file=os-image.bin -drive format=raw,file=disk.vhd -netdev user,id=n0 -device rtl8139,netdev=n0
     description = RUN EZOS
 
 # ===================== ???? =====================
@@ -172,13 +176,14 @@ build kernel_raw.bin: link boot/kernel_entry.o boot/task_switch.o kernel/kernel.
 
 build kernel.bin os-image.bin: make_image boot/boot.bin kernel_raw.bin tools/make_image.py
 
-build disk.img: make_disk temp/gen_diskimg.py
+build disk.vhd: make_disk temp/gen_diskimg.py
 
-build disk.vhd: make_vhd disk.img tools/make_vhd.py
+build boot/mbr_usb.bin: asm_bin boot/mbr_usb.asm
+build usb-image.bin: make_usb os-image.bin kernel.bin boot/mbr_usb.bin tools/make_usb_image.py
 
-build run: run_qemu os-image.bin disk.img
+build run: run_qemu os-image.bin disk.vhd
 
-default os-image.bin user/hello.elf user/fdtest.elf user/forktest.elf user/spin.elf user/fdleak.elf user/netecho.elf user/nettcp.elf user/segprobe.elf user/netcli.elf disk.img disk.vhd
+default os-image.bin user/hello.elf user/fdtest.elf user/forktest.elf user/spin.elf user/fdleak.elf user/netecho.elf user/nettcp.elf user/segprobe.elf user/netcli.elf disk.vhd usb-image.bin
 
 build clean: phony
     command = cmd /c del /q boot\boot.bin boot\kernel_entry.o kernel\*.o kernel\*.d kernel_raw.bin kernel.bin os-image.bin 2>nul

@@ -39,7 +39,7 @@ BOOT_WAIT = 120
 SHELL_WAIT = 30
 
 IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
-DISK = os.path.join(ROOT, "disk.img")
+DISK = os.path.join(ROOT, "disk.vhd")
 
 
 class SerialReader(object):

@@ -64,7 +64,7 @@ class Guest(object):
     def start(self):
         argv = [QEMU, "-icount", "shift=auto", "-display", "none",
                 "-drive", "format=raw,file=os-image.bin",
-                "-drive", "format=raw,file=disk.img"] + self.extra_net
+                "-drive", "format=raw,file=disk.vhd"] + self.extra_net
         if self.net_port is not None:
             argv += ["-netdev", "socket,id=n0,listen=127.0.0.1:%d" % self.net_port,
                      "-device", "rtl8139,netdev=n0"]
@@ -301,7 +301,7 @@ def phase_httpd():
 
 
 def main():
-    for pre in ("os-image.bin", "disk.img"):
+    for pre in ("os-image.bin", "disk.vhd"):
         assert os.path.isfile(os.path.join(ROOT, pre)), pre + " missing - run ninja"
     assert os.path.isfile(QEMU), "QEMU not found"
     phase_ping()

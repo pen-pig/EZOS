@@ -12,6 +12,18 @@ FAT 镜像为标准 MBR + 单主分区 FAT 卷（分区类型 0x01/0x06/0x0B）�
 """
 import struct, sys, os
 
+# 产出的镜像一律是**固定 VHD**：镜像原样放在文件头（偏移 0），尾部追加
+# 512 字节 Hard Disk Footer（见 tools/make_vhd.py）。同一份文件因此既能被
+# Windows 双击挂载，也能给 QEMU 当 raw 盘（尾巴 512 字节内核永远读不到）。
+_TOOLS = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools')
+if _TOOLS not in sys.path:
+    sys.path.insert(0, _TOOLS)
+import make_vhd                                    # noqa: E402
+
+# 固定的 VHD 时间戳（2000-01-01 UTC，VHD 纪元起点）：用当前时间会让每次
+# 生成的字节都不同，ninja 就永远认为产物过期。
+VHD_MTIME = 946684800
+
 # ---------- exFAT 参数（与 kernel/exfat.c exfat_format 对齐） ----------
 EXFAT_DISK_SIZE = 16 * 1024 * 1024
 EXFAT_PART_SECTORS = 32767
@@ -71,6 +83,14 @@ def make_mbr(part_type, part_len):
     struct.pack_into('<I', mbr, 458, part_len)
     mbr[510] = 0x55; mbr[511] = 0xAA
     return bytes(mbr)
+
+
+def write_disk_image(path, img):
+    """落盘：镜像字节 + 512 字节 VHD footer。见文件头注释。"""
+    with open(path, 'wb') as f:
+        f.write(img)
+        f.write(make_vhd.make_footer(len(img), VHD_MTIME,
+                                     os.path.basename(path)))
 
 
 # ==================== exFAT ====================
@@ -285,12 +305,11 @@ def gen_exfat(path):
     img[29 * 512:30 * 512] = bytes(bm)
     img[30 * 512:31 * 512] = make_exfat_upcase()
 
-    with open(path, 'wb') as f:
-        f.write(img)
+    write_disk_image(path, img)
     names = ", ".join("%s(%dB,%d簇)" % (n, len(d), max(1, (len(d) + 511) // 512))
                       for n, _fc, d in layout)
-    print("OK %s: %d bytes exFAT (spec-aligned entry sets, files: %s)"
-          % (path, len(img), names))
+    print("OK %s: %d bytes exFAT + 512B VHD footer (spec-aligned entry sets, "
+          "files: %s)" % (path, len(img), names))
 
 
 # ==================== FAT12/16/32 ====================
@@ -532,10 +551,9 @@ def gen_fat(path, fat_type):
     else:
         wsec(PART_START + p['reserved'] + p['nfats'] * p['fat_size'], bytes(root))
 
-    with open(path, 'wb') as f:
-        f.write(img)
-    print("OK %s: %d bytes FAT%d (%d clusters, %d B/cluster, FAT x%d sectors, "
-          "files: README.TXT + '%s')"
+    write_disk_image(path, img)
+    print("OK %s: %d bytes FAT%d + 512B VHD footer (%d clusters, %d B/cluster, "
+          "FAT x%d sectors, files: README.TXT + '%s')"
           % (path, len(img), fat_type, p['clusters'], p['spc'] * 512,
              p['fat_size'], LFN_NAME))
 
@@ -701,10 +719,10 @@ def gen_ext4(path):
     ibmp[0] = 0x0F                           # inode 1..4
     wblk(IBMP_BLK, bytes(ibmp))
 
-    with open(path, 'wb') as f:
-        f.write(img)
-    print("OK %s: %d bytes ext4 (1KB blocks, %d blocks, extent+legacy files: "
-          "README.TXT + '%s')" % (path, len(img), vol_blocks, LFN_NAME))
+    write_disk_image(path, img)
+    print("OK %s: %d bytes ext4 + 512B VHD footer (1KB blocks, %d blocks, "
+          "extent+legacy files: README.TXT + '%s')"
+          % (path, len(img), vol_blocks, LFN_NAME))
 
 
 def main():

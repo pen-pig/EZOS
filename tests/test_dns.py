@@ -53,7 +53,7 @@ from test_dhcp import (HOST_MAC, SERVER_IP, OFFER_IP, MASK, BCAST_MAC,  # noqa: 
 
 QEMU = "D:/MyOS/tools/qemu-portable-20241220/qemu-system-x86_64.exe"
 IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
-DISK = os.path.join(ROOT, "disk.img")
+DISK = os.path.join(ROOT, "disk.vhd")
 
 PORT_A = (4531, 4532, 4537)     # (QMP, serial, netdev)
 PORT_B = (4533, 4534, 4538)
@@ -64,12 +64,12 @@ PORT_F = (4545, 4546, 4549)     # ping 接域名
 BOOT_WAIT = 150
 
 WORK = {
-    "A": os.path.join(HERE, "dns_a.img").replace("\\", "/"),
-    "B": os.path.join(HERE, "dns_b.img").replace("\\", "/"),
-    "C": os.path.join(HERE, "dns_c.img").replace("\\", "/"),
-    "D": os.path.join(HERE, "dns_d.img").replace("\\", "/"),
-    "E": os.path.join(HERE, "dns_e.img").replace("\\", "/"),
-    "F": os.path.join(HERE, "dns_f.img").replace("\\", "/"),
+    "A": os.path.join(HERE, "dns_a.vhd").replace("\\", "/"),
+    "B": os.path.join(HERE, "dns_b.vhd").replace("\\", "/"),
+    "C": os.path.join(HERE, "dns_c.vhd").replace("\\", "/"),
+    "D": os.path.join(HERE, "dns_d.vhd").replace("\\", "/"),
+    "E": os.path.join(HERE, "dns_e.vhd").replace("\\", "/"),
+    "F": os.path.join(HERE, "dns_f.vhd").replace("\\", "/"),
 }
 
 GW_IP = bytes([10, 0, 2, 2])            # 网关（也是 Python 侧的 MAC 主人）

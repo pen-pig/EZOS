@@ -15,7 +15,7 @@
              （重传定时器真的在工作），随后再 ACK 让它停下
 
 用法：python tests/test_step7_tcp.py        （退出码 0 = 全部断言通过）
-前置：ninja 已产出 os-image.bin / disk.img（disk.img 需含 NETCLI.ELF）
+前置：ninja 已产出 os-image.bin / disk.vhd（disk.vhd 需含 NETCLI.ELF）
 端口：netdev 4476（QEMU listen，脚本连），monitor 55666（sendkey 键入）
 """
 import os
@@ -128,7 +128,7 @@ class Guest(object):
         self.proc = subprocess.Popen([
             QEMU, "-icount", "shift=auto", "-display", "none",
             "-drive", "format=raw,file=os-image.bin",
-            "-drive", "format=raw,file=disk.img",
+            "-drive", "format=raw,file=disk.vhd",
             # QEMU 要求 listen=host:port（只给端口号会报 "doesn't contain ':'"）
             "-netdev", "socket,id=n0,listen=127.0.0.1:%d" % NET_PORT,
             "-device", "rtl8139,netdev=n0",
@@ -234,7 +234,7 @@ class Guest(object):
 # ==================== 主流程 ====================
 
 def main():
-    for pre in ("os-image.bin", "disk.img"):
+    for pre in ("os-image.bin", "disk.vhd"):
         assert os.path.isfile(os.path.join(ROOT, pre)), pre + " missing - run ninja"
     assert os.path.isfile(QEMU), "QEMU not found"
 

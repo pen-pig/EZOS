@@ -36,7 +36,7 @@ SERIAL_PORT = 4498
 BOOT_WAIT = 45
 
 IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
-DISK = os.path.join(ROOT, "disk.img")
+DISK = os.path.join(ROOT, "disk.vhd")
 
 
 class SerialReader(object):

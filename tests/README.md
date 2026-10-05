@@ -5,8 +5,8 @@
 > 配套安全写盘工具：`python3 tools/make_usb_boot.py`（默认只读检查，必须显式
 > `--write --disk N` 并二次确认才真写，绝不自动选盘）。
 
-在 **src 根目录**下运行（脚本自己按 `ROOT = 上级目录` 定位 os-image.bin / disk.img）。
-前置：`ninja -f build.ninja` 已产出 `os-image.bin`、`disk.img`。
+在 **src 根目录**下运行（脚本自己按 `ROOT = 上级目录` 定位 os-image.bin / disk.vhd）。
+前置：`ninja -f build.ninja` 已产出 `os-image.bin`、`disk.vhd`。
 退出码 0 = 全部断言通过。
 
 | 脚本 | 覆盖 | 端口 | 参考耗时 |

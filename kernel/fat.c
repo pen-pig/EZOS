@@ -723,6 +723,88 @@ static int fat_find_entry(uint32_t dir_cluster, const char *name, fat_dirent_t *
     return 0;
 }
 
+/* ===== 路径解析（跨目录相对/绝对路径）=====
+ * 与 exfat.c 同款问题：FAT 后端以前只认单层名，`fat_find_entry(cwd, name)`
+ * 把 "SD/f1" 整个当文件名。读/删永远找不到，而**写却会成功**——造出一个
+ * 短名里带斜杠的垃圾目录项（ls 看得见、任何合法路径都读不到、还占簇），
+ * 属静默数据损坏。现在拆成"父目录簇 + 末段名"逐级走目录，任一级缺失或
+ * 不是目录即失败（fail closed），绝不退化成把斜杠当名字的一部分。
+ *
+ * FAT 的特殊点：FAT12/16 的**根目录是根目录区**，用簇号 0 表示（见
+ * fat_dir_block 的特判），不是簇 2——所以绝对路径的起点必须是
+ * root_dir_cluster_value()，不能抄 exFAT 的 root_dir_cluster。 */
+static int fat_resolve_dir(const char *path, uint32_t *dir_out) {
+    if (!fat_type || path == 0 || path[0] == 0 || dir_out == 0) return -1;
+
+    uint32_t stack[32];
+    int depth = 0;
+    uint32_t cur;
+    const char *p;
+    if (path[0] == '/') { cur = root_dir_cluster_value(); p = path + 1; }
+    else                { cur = current_dir_cluster;      p = path; }
+
+    if (*p == 0) { *dir_out = cur; return 0; }      /* "/" 或 "" */
+
+    char comp[128];
+    for (;;) {
+        int cl = 0;
+        while (*p && *p != '/' && cl < 127) comp[cl++] = *p++;
+        comp[cl] = '\0';
+        int more = (*p == '/');
+        while (*p == '/') p++;                      /* 连续分隔符 */
+        if (cl == 0) { if (!more) break; continue; }
+
+        if (name_eq(comp, ".")) { if (!more) break; continue; }
+        if (name_eq(comp, "..")) {
+            if (depth == 0) return -1;              /* 已到起点，不能再往上 */
+            cur = stack[--depth];
+            if (!more) break;
+            continue;
+        }
+        if (depth >= 31) return -1;                 /* 目录栈上限 */
+        fat_dirent_t de;
+        if (fat_find_entry(cur, comp, &de) != 0) return -1;
+        if (!de.is_dir) return -1;                  /* 不是目录 */
+        stack[depth++] = cur;
+        cur = de.first_cluster;
+        if (!more) break;
+    }
+    *dir_out = cur;
+    return 0;
+}
+
+/* path -> (父目录簇, 末段文件名)。末段为空（以 '/' 结尾）视为失败。 */
+static int fat_resolve_leaf(const char *path, uint32_t *dir_out,
+                            char *leaf, uint32_t leafsz) {
+    if (!fat_type || path == 0 || path[0] == 0) return -1;
+    if (dir_out == 0 || leaf == 0 || leafsz < 2) return -1;
+
+    int last = -1;
+    for (int i = 0; path[i]; i++) if (path[i] == '/') last = i;
+
+    if (last < 0) {                                 /* 单层名：父目录 = cwd */
+        uint32_t n = 0;
+        while (path[n]) n++;
+        if (n == 0 || n + 1 > leafsz) return -1;
+        for (uint32_t i = 0; i <= n; i++) leaf[i] = path[i];
+        *dir_out = current_dir_cluster;
+        return 0;
+    }
+    uint32_t n = 0;
+    while (path[last + 1 + n]) n++;
+    if (n == 0 || n + 1 > leafsz) return -1;        /* 没有末段 / 太长 */
+    for (uint32_t i = 0; i <= n; i++) leaf[i] = path[last + 1 + i];
+    if (last == 0) {                                /* "/xxx" -> 根目录 */
+        *dir_out = root_dir_cluster_value();
+        return 0;
+    }
+    char parent[128];
+    if ((uint32_t)last >= sizeof(parent)) return -1;
+    for (int i = 0; i < last; i++) parent[i] = path[i];
+    parent[last] = '\0';
+    return fat_resolve_dir(parent, dir_out);
+}
+
 typedef struct {
     fat_dir_entry_t *entries;   /* 与 fs_dir_entry_t 布局一致 */
     int max;
@@ -924,8 +1006,11 @@ static int fat_free_chain(uint32_t first) {
 
 int fat_read_file(const char *name, uint8_t *buffer, uint32_t max_size) {
     if (!fat_type) return -1;
+    uint32_t dir = 0;
+    char leaf[128];
+    if (fat_resolve_leaf(name, &dir, leaf, sizeof(leaf)) != 0) return -1;
     fat_dirent_t de;
-    if (fat_find_entry(current_dir_cluster, name, &de) != 0) return -1;
+    if (fat_find_entry(dir, leaf, &de) != 0) return -1;
     if (de.is_dir) return -1;
     if (de.size == 0 || de.first_cluster == 0) return 0;
 
@@ -952,15 +1037,21 @@ int fat_read_file(const char *name, uint8_t *buffer, uint32_t max_size) {
 
 uint32_t fat_get_file_size(const char *name) {
     if (!fat_type) return 0;
+    uint32_t dir = 0;
+    char leaf[128];
+    if (fat_resolve_leaf(name, &dir, leaf, sizeof(leaf)) != 0) return 0;
     fat_dirent_t de;
-    if (fat_find_entry(current_dir_cluster, name, &de) != 0) return 0;
+    if (fat_find_entry(dir, leaf, &de) != 0) return 0;
     return de.size;
 }
 
 uint32_t fat_get_file_clusters(const char *name) {
     if (!fat_type) return 0;
+    uint32_t dir = 0;
+    char leaf[128];
+    if (fat_resolve_leaf(name, &dir, leaf, sizeof(leaf)) != 0) return 0;
     fat_dirent_t de;
-    if (fat_find_entry(current_dir_cluster, name, &de) != 0) return 0;
+    if (fat_find_entry(dir, leaf, &de) != 0) return 0;
     if (de.first_cluster < 2) return 0;
     uint32_t n = 0, cur = de.first_cluster;
     while (cur >= 2 && cur < fi.cluster_count + 2 && n < fi.cluster_count + 2) {
@@ -993,6 +1084,21 @@ int fat_read_dir(fat_dir_entry_t *entries, int max_entries) {
     lc.max = max_entries;
     lc.n = 0;
     fat_dir_foreach(current_dir_cluster, list_cb, &lc);
+    return lc.n;
+}
+
+/* 列**指定目录**（`ls SD`）——以前 fs_read_dir_path 只对 exFAT 接了，
+ * FAT 后端走的是"忽略参数直接列 cwd"。解析失败（不存在 / 不是目录）返回 -1，
+ * 让 shell 报 no such directory，而不是拿 cwd 的内容糊弄过去。 */
+int fat_read_dir_path(const char *path, fat_dir_entry_t *entries, int max_entries) {
+    if (!fat_type || !entries || path == 0 || max_entries <= 0) return -1;
+    uint32_t cluster = 0;
+    if (fat_resolve_dir(path, &cluster) != 0) return -1;
+    list_ctx_t lc;
+    lc.entries = entries;
+    lc.max = max_entries;
+    lc.n = 0;
+    fat_dir_foreach(cluster, list_cb, &lc);
     return lc.n;
 }
 
@@ -1240,12 +1346,19 @@ int fat_create_file(const char *name, const uint8_t *data, uint32_t size) {
     if (name_len == 0 || name_len > 255) return -1;
     if (name[name_len - 1] == '/') return -1;
 
+    /* 父目录 + 末段名：父目录不存在时**直接失败**，绝不把整条路径当文件名 */
+    uint32_t dir = 0;
+    char leaf[128];
+    if (fat_resolve_leaf(name, &dir, leaf, sizeof(leaf)) != 0) return -1;
+    name_len = my_strlen(leaf);
+    if (name_len == 0 || name_len > 255) return -1;
+
     /* 重名检查 */
     fat_dirent_t de;
-    if (fat_find_entry(current_dir_cluster, name, &de) == 0) return -1;
+    if (fat_find_entry(dir, leaf, &de) == 0) return -1;
 
     uint8_t sn11[11];
-    int lfn_entries = prepare_names(name, current_dir_cluster, sn11);
+    int lfn_entries = prepare_names(leaf, dir, sn11);
     if (lfn_entries < 0) return -1;
     int need = 1 + lfn_entries;
 
@@ -1295,11 +1408,11 @@ int fat_create_file(const char *name, const uint8_t *data, uint32_t size) {
 
     /* 找空闲目录项并写入 */
     fat_dirent_t ref;
-    if (fat_find_free_slots(current_dir_cluster, need, &ref) != 0) {
+    if (fat_find_free_slots(dir, need, &ref) != 0) {
         if (first_cluster) fat_free_chain(first_cluster);
         return -1;
     }
-    if (write_dir_entries(&ref, name, sn11, lfn_entries,
+    if (write_dir_entries(&ref, leaf, sn11, lfn_entries,
                           ATTR_ARCHIVE, first_cluster, size) != 0) {
         fat_free_chain(first_cluster);   /* 目录项写失败：数据簇链要还 */
         return -1;
@@ -1321,8 +1434,11 @@ static int empty_check_cb(const fat_dirent_t *e, void *ctx) {
 
 int fat_delete_file(const char *name) {
     if (!fat_type) return -1;
+    uint32_t dir = 0;
+    char leaf[128];
+    if (fat_resolve_leaf(name, &dir, leaf, sizeof(leaf)) != 0) return -1;
     fat_dirent_t de;
-    if (fat_find_entry(current_dir_cluster, name, &de) != 0) return -1;
+    if (fat_find_entry(dir, leaf, &de) != 0) return -1;
 
     if (de.is_dir) {
         empty_ctx_t ec;
@@ -1358,10 +1474,15 @@ int fat_mkdir(const char *name) {
     int name_len = my_strlen(name);
     if (name_len == 0 || name_len > 255) return -1;
 
-    fat_dirent_t de;
-    if (fat_find_entry(current_dir_cluster, name, &de) == 0) return -1;
+    /* 父目录 + 末段名（与 create_file 同款：父目录缺失即失败） */
+    uint32_t parent_cluster = 0;
+    char leaf[128];
+    if (fat_resolve_leaf(name, &parent_cluster, leaf, sizeof(leaf)) != 0) return -1;
+    name_len = my_strlen(leaf);
+    if (name_len == 0 || name_len > 255) return -1;
 
-    uint32_t parent_cluster = current_dir_cluster;
+    fat_dirent_t de;
+    if (fat_find_entry(parent_cluster, leaf, &de) == 0) return -1;
 
     /* 分配目录簇并初始化 . 与 .. */
     uint32_t nc = fat_alloc_cluster();
@@ -1405,7 +1526,7 @@ int fat_mkdir(const char *name) {
 
     /* 父目录写目录项 */
     uint8_t sn11[11];
-    int lfn_entries = prepare_names(name, parent_cluster, sn11);
+    int lfn_entries = prepare_names(leaf, parent_cluster, sn11);
     if (lfn_entries < 0) return -1;
     int need = 1 + lfn_entries;
 
@@ -1414,7 +1535,7 @@ int fat_mkdir(const char *name) {
         fat_free_chain(nc);   /* 父目录放不下新目录项：目录簇要还 */
         return -1;
     }
-    if (write_dir_entries(&ref, name, sn11, lfn_entries,
+    if (write_dir_entries(&ref, leaf, sn11, lfn_entries,
                           ATTR_DIRECTORY, nc, 0) != 0) {
         fat_free_chain(nc);   /* 目录项写失败：目录簇要还 */
         return -1;
@@ -1425,18 +1546,26 @@ int fat_mkdir(const char *name) {
 /* ===== rmdir ===== */
 /* 删除**空目录**，与 rm（fat_delete_file）职责分离：
  *   目标不存在 / 是普通文件 / 目录非空 / 是 "." ".." → 返回 -1 且不释放任何簇。
- *   只接受相对当前目录的单段名字（要删别处的目录请先 cd）。
+ *   只接受相对当前目录的单段名字（要删别处的目录请先 cd）——**这条限制已取消**，
+ *   现在与 exfat_rmdir 一致：先拆"父目录簇 + 末段名"，支持 "SD/sub"，
+ *   父目录不存在或末段不是目录即失败。
  * 非空判定复用 empty_check_cb：遍历的是 fat_dir_foreach，它已经跳过
  *   已删除项、LFN 从项，且 . / .. 不计为内容。
  * 真正的删除复用 fat_delete_file，避免释放逻辑出现第二份副本。 */
 int fat_rmdir(const char *name) {
     if (!fat_type || name == 0) return -1;
-    if (name[0] == '\0' || name[0] == '/') return -1;
+    if (name[0] == '\0') return -1;
     if (name[0] == '.' && (name[1] == '\0' ||
         (name[1] == '.' && name[2] == '\0'))) return -1;
 
+    uint32_t dir = 0;
+    char leaf[128];
+    if (fat_resolve_leaf(name, &dir, leaf, sizeof(leaf)) != 0) return -1;
+    if (leaf[0] == '.' && (leaf[1] == '\0' ||
+        (leaf[1] == '.' && leaf[2] == '\0'))) return -1;
+
     fat_dirent_t de;
-    if (fat_find_entry(current_dir_cluster, name, &de) != 0) return -1;
+    if (fat_find_entry(dir, leaf, &de) != 0) return -1;
     if (!de.is_dir) return -1;              /* 普通文件归 rm 管 */
     if (de.first_cluster == 0) return -1;   /* 根目录区，不允许删 */
 

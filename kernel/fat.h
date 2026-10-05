@@ -47,6 +47,8 @@ int      fat_create_file(const char *name, const uint8_t *data, uint32_t size);
 int      fat_delete_file(const char *name);
 int      fat_list_root(void);
 int      fat_read_dir(fat_dir_entry_t *entries, int max_entries);
+/* 按路径列目录（`ls SD`）：FAT 后端与 exfat_read_dir_path 对等 */
+int      fat_read_dir_path(const char *path, fat_dir_entry_t *entries, int max_entries);
 int      fat_change_dir(const char *name);
 int      fat_mkdir(const char *name);
 int      fat_rmdir(const char *name);   /* 仅删目录；目标是文件或非空则失败 */

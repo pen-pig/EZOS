@@ -4,7 +4,7 @@ rem ============================================================
 rem  EZOS - Windows 一键启动脚本（QEMU）
 rem  要求: os-image.bin 与本脚本同目录
 rem  若未安装 QEMU 会自动尝试 winget 安装（包 ID: SoftwareFreedomConservancy.QEMU）
-rem  数据盘 disk.img 缺失时用同目录 gen_diskimg.py 重新生成
+rem  数据盘 disk.vhd 缺失时用同目录 gen_diskimg.py 重新生成
 rem ============================================================
 setlocal
 cd /d "%~dp0"
@@ -44,16 +44,16 @@ if errorlevel 1 (
 )
 
 rem ---- ensure data disk ----
-if not exist "disk.img" (
-    echo [INFO] disk.img missing, regenerating with gen_diskimg.py...
-    python "%~dp0gen_diskimg.py" "disk.img"
+if not exist "disk.vhd" (
+    echo [INFO] disk.vhd missing, regenerating with gen_diskimg.py...
+    python "%~dp0gen_diskimg.py" "disk.vhd"
     if errorlevel 1 (
-        echo [ERROR] failed to generate disk.img. Check Python installation.
+        echo [ERROR] failed to generate disk.vhd. Check Python installation.
         pause
         exit /b 1
     )
 )
 
 echo [INFO] Booting EZOS in QEMU...
-qemu-system-x86_64 -icount shift=auto -vga std -m 128 -drive format=raw,file=os-image.bin -drive format=raw,file=disk.img
+qemu-system-x86_64 -icount shift=auto -vga std -m 128 -drive format=raw,file=os-image.bin -drive format=raw,file=disk.vhd
 endlocal

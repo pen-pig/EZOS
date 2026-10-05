@@ -41,7 +41,7 @@ BOOT_WAIT = 45
 N_CASES = 8
 
 IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
-DISK = os.path.join(ROOT, "disk.img")
+DISK = os.path.join(ROOT, "disk.vhd")
 
 
 class SerialReader(object):
@@ -84,7 +84,7 @@ def kill_all_qemu():
 
 def main():
     if not os.path.isfile(IMG) or not os.path.isfile(DISK):
-        print("MISSING os-image.bin / disk.img - run ninja first")
+        print("MISSING os-image.bin / disk.vhd - run ninja first")
         return 1
 
     proc = subprocess.Popen(
