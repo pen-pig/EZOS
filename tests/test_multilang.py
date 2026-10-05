@@ -19,6 +19,7 @@ Zig: rust/ezos_zig）和两份文件名 hash（Rust / Zig），`rstest` 命令�
 用法：python tests/test_multilang.py   （退出码 0 = 通过）
 """
 import os
+import shutil
 import subprocess
 import sys
 
@@ -31,6 +32,11 @@ QMP_PORT = 4564
 SERIAL_PORT = 4563
 IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
 DISK = os.path.join(ROOT, "disk.vhd")
+# 用**副本**而不是 disk.vhd 本体：宿主机上随时可能有别的进程（索引服务、
+# 杀软扫描、Explorer 缩略图）拿着它的句柄，QEMU 会直接
+# "Could not open ... 另一个程序正在使用此文件" 退出，测试看起来像
+# "串口连不上" —— 实际是盘没挂上。每条用例独立盘副本是 E2E 的通用规矩。
+WORK = os.path.join(HERE, "multilang_disk.vhd").replace("\\", "/")
 
 from test_nvme import SerialReader, Qmp, wait_for, kill_all_qemu  # noqa
 
@@ -44,10 +50,11 @@ def main():
         print("MISSING os-image.bin / disk.vhd - run ninja first")
         return 1
 
+    shutil.copyfile(DISK, WORK)
     proc = subprocess.Popen(
         [QEMU, "-icount", "shift=auto", "-vga", "std",
          "-drive", "format=raw,file=" + IMG,
-         "-drive", "format=raw,file=" + DISK,
+         "-drive", "format=raw,file=" + WORK,
          "-serial", "tcp:127.0.0.1:%d,server,nowait" % SERIAL_PORT,
          "-qmp", "tcp:127.0.0.1:%d,server,nowait" % QMP_PORT],
         cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -78,7 +85,21 @@ def main():
         check("checksum: C == Rust == Zig",
               "checksum c=0x" in f and "rust=0x" in f and "zig=0x" in f,
               f[:160])
-        check("namehash: Rust == Zig", "namehash rust=0x" in f, f[:120])
+        # 16 位目录项集校验和是**另一支算法**（32 位版截断不得出这个数），
+        # 必须单独对拍：历史上就是这里写错，盘上 SetChecksum 全错而内核毫无
+        # 察觉，靠 tests/test_fsref.py 的宿主机独立实现才抓出来。
+        check("setcksum(16-bit): C == Rust == Zig",
+              "setcksum c=0x" in f and f.count("rust=0x") >= 2, f[:200])
+        # 输出顺序是 C / rust / zig，"namehash rust=0x" 这种连写匹配不到
+        # （flat 压过空白后是 "namehash c=0x... rust=0x... zig=0x..."）。
+        check("namehash: C == Rust == Zig", "namehash c=0x" in f, f[:200])
+        # 固定向量：'R','e','A','d','M','e','.','T','x','T' 大写化后 = 0x78A3，
+        # 与宿主机独立实现一致（python -c "from ref_exfat import name_hash;
+        # print(hex(name_hash('README.TXT')))" -> 0x78a3）。
+        # 三份一致但集体算错的可能性极低，钉死绝对值也就几行成本。
+        check("namehash == published vector 0x78A3",
+              "namehash c=0x000078a3 rust=0x000078a3 zig=0x000078a3" in f,
+              f[:220])
         check("overall PASS", "result: pass" in f)
         # 全 0 陷阱：三份都返回 0 说明函数压根没被调用
         check("hash is non-zero (not a no-op stub)",

@@ -19,8 +19,11 @@ typedef struct {
 } exfat_info_t;
 
 int exfat_init(void);
-/* 校验和的 C 参考实现（对拍用，见 exfat.c 里的说明与 `rstest`） */
-uint32_t exfat_checksum(const uint8_t *data, int len);
+/* 校验和/文件名哈希的 **C 参考实现**：`rstest` 的对拍基线，也是
+ * EZ_EXFAT_IMPL=0 时的回退目标。生产路径走 rust_bridge.h 选中的实现
+ * （默认 Rust），不要把这两套混着调。 */
+uint32_t exfat_checksum_c(const uint8_t *data, int len);
+uint16_t exfat_name_hash_c(const uint16_t *name, int name_len);
 
 int exfat_format(void);
 const exfat_info_t *exfat_get_info(void);

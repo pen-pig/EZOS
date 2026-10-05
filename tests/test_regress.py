@@ -19,6 +19,7 @@ QMP sendkey 打字 → screendump → 真字库 OCR → 断言。
 """
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -129,11 +130,16 @@ def wait_port_free(port, timeout=15):
 
 def main():
     img = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
-    disk = os.path.join(ROOT, "disk.vhd").replace("\\", "/")
-    for p in (img, disk):
+    disk_src = os.path.join(ROOT, "disk.vhd")
+    # 用**副本**而不是 disk.vhd 本体：宿主机上随时可能有别的进程拿着它的
+    # 句柄（索引/杀软/Explorer），QEMU 会直接 "Could not open ... 另一个程序
+    # 正在使用此文件" 退出，症状却是"QMP 连不上"——排查时极易误判成端口问题。
+    disk = os.path.join(HERE, "regress_disk.vhd").replace("\\", "/")
+    for p in (img, disk_src):
         if not os.path.isfile(p):
             print("MISSING %s - run ninja first" % p)
             return 2
+    shutil.copyfile(disk_src, disk)
 
     if port_in_use(PORT):       # 上轮残留：不清掉会连到脏旧 VM
         subprocess.call(["taskkill", "//F", "//IM", "qemu-system-x86_64.exe"],

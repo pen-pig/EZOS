@@ -1,4 +1,5 @@
 #include "exfat.h"
+#include "rust_bridge.h"   /* 生产实现选择：exfat_checksum_active / name_hash_active */
 #include "ata.h"
 #include "tty.h"
 #include "port.h"
@@ -119,8 +120,21 @@ static int exfat_bitmap_set(uint32_t cluster, int used) {
 
 /* ============ 标准 exFAT 目录项（entry set）支持 ============ */
 
-// 计算 entry set 校验和（跳过 0x85 条目的 SetChecksum 字段 offset 2-3）
+// 计算 entry set 校验和（16 位，跳过 0x85 条目的 SetChecksum 字段 offset 2-3）。
+//
+// 生产路径走 `exfat_set_checksum_active`（见 rust_bridge.h，默认 Rust），
+// C 版 `exfat_set_checksum_c` 只当对拍基线与回退目标。
+//
+// **不能拿 32 位卷校验和截断代替**：32 位循环右移 1 位时 bit0 落到 bit31，
+// 而 16 位版的 bit15 来自 bit15 原位——低半字的演化根本不一样。踩过一次：
+// 盘上每个 entry set 的 SetChecksum 全错，内核自己读自己的盘毫无察觉（它
+// 不校验），是宿主机独立实现（tests/ref_exfat.py）重算时红的。
 static uint16_t exfat_set_checksum(const uint8_t *entries, int total_bytes) {
+    return exfat_set_checksum_active(entries, (uint32_t)total_bytes);
+}
+
+// C 参考实现（`rstest` 基线 + EZ_EXFAT_IMPL=0 时的回退）
+uint16_t exfat_set_checksum_c(const uint8_t *entries, int total_bytes) {
     uint16_t sum = 0;
     for (int i = 0; i < total_bytes; i++) {
         if (i == 2 || i == 3) continue;
@@ -129,8 +143,9 @@ static uint16_t exfat_set_checksum(const uint8_t *entries, int total_bytes) {
     return sum;
 }
 
-// 计算文件名哈希（UTF-16 字符）
-static uint16_t exfat_name_hash(const uint16_t *name, int name_len) {
+// 计算文件名哈希（UTF-16 字符）——**C 参考实现**，生产调用点走
+// `exfat_name_hash_active`，这里只给 `rstest` 当基线（见 rust_bridge.h）。
+uint16_t exfat_name_hash_c(const uint16_t *name, int name_len) {
     uint16_t hash = 0;
     for (int i = 0; i < name_len; i++) {
         uint16_t ch = name[i];
@@ -251,6 +266,9 @@ static void exfat_write_entry_set(uint8_t *dir_buf, int free_off,
                                   uint32_t size, uint8_t is_dir) {
     int name_len = 0;
     while (name[name_len]) name_len++;
+    /* exFAT 文件名上限 255 个 UTF-16 字符。超限就截断（fail closed）：名字
+     * 来自调用方，缓冲只有 256 项，越界写会踩到栈上别的字段。 */
+    if (name_len > 255) name_len = 255;
     int name_entries = (name_len + 14) / 15;
     int secondary_count = 1 + name_entries;
 
@@ -270,9 +288,13 @@ static void exfat_write_entry_set(uint8_t *dir_buf, int free_off,
     ec0[0] = 0xC0;
     ec0[1] = (size <= exfat_info.bytes_per_sector * exfat_info.sectors_per_cluster) ? 0x02 : 0x00;   // 单簇文件 NoFatChain，多簇用 FAT 链
     ec0[3] = (uint8_t)name_len;   // NameLength
+    /* 整块清零：hash 现在由另一个编译单元算（rust_bridge.h 选中的实现），
+     * 编译器看不到 name_len 的上界，会认为读到了未初始化元素
+     * （-Werror=maybe-uninitialized）。清零本身也不贵（256 项）。 */
     uint16_t name_utf16[256];
+    for (int i = 0; i < 256; i++) name_utf16[i] = 0;
     for (int i = 0; i < name_len; i++) name_utf16[i] = (uint16_t)(uint8_t)name[i];
-    *((uint16_t*)(ec0 + 4)) = exfat_name_hash(name_utf16, name_len);  // NameHash
+    *((uint16_t*)(ec0 + 4)) = exfat_name_hash_active(name_utf16, (uint32_t)name_len);  // NameHash
     *((uint64_t*)(ec0 + 8)) = size;    // ValidDataLength
     *((uint32_t*)(ec0 + 0x14)) = first_cluster;  // FirstCluster
     *((uint64_t*)(ec0 + 0x18)) = size;  // DataLength
@@ -778,12 +800,10 @@ restore:
 
 // exFAT 校验和算法：chk = ((chk << 31) | (chk >> 1)) + byte（uint32 自然溢出）
 //
-// 不再 static：这是三方对拍（`rstest`）里的 **C 参考实现**。Rust 版在
-// rust/ezos_rs（`exfat_checksum_rs`）、Zig 版在 rust/ezos_zig
-// （`exfat_checksum_zig`），三者对同一缓冲区必须算出同一个数——规范算法就
-// 这么一处，谁算错一目了然。将来真要把调用点换成 Rust/Zig 实现，也是
-// 先跑 rstest 确认一致再换。
-uint32_t exfat_checksum(const uint8_t *data, int len) {
+// 已经改成 `_c` 后缀：现在它是 `rstest` 的**对拍基线**与 EZ_EXFAT_IMPL=0 的
+// 回退实现，生产路径（`exfat_set_checksum` / exfat_format 的 boot checksum）
+// 走 rust_bridge.h 里选中的实现。算法本身一行没动。
+uint32_t exfat_checksum_c(const uint8_t *data, int len) {
     uint32_t chk = 0;
     for (int i = 0; i < len; i++) {
         chk = ((chk << 31) | (chk >> 1)) + data[i];
@@ -865,7 +885,7 @@ int exfat_format(void) {
             b106 = p[106]; b107 = p[107]; b112 = p[112];
             p[106] = 0; p[107] = 0; p[112] = 0;
         }
-        uint32_t c = exfat_checksum(p, 512);
+        uint32_t c = exfat_checksum_active(p, 512);
         if (s == 0) { p[106] = b106; p[107] = b107; p[112] = b112; }
         *((uint32_t*)(boot_chk_sector + s * 4)) = c;
     }

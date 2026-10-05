@@ -20,6 +20,24 @@ export fn exfat_checksum_zig(data: [*]const u8, len: u32) u32 {
     return sum;
 }
 
+// exFAT **目录项集**校验和（规范 §7.4）：16 位宽度，跳过偏移 2-3（那两字节
+// 就是校验和自身）。
+//
+// 与上面的 32 位卷校验和**不是同一件事**：32 位右移循环时 bit0 落到 bit31，
+// 而 16 位版的 bit15 来自 bit15 之后的位——截断 32 位结果当 16 位用是错的
+// （宿主机独立实现对拍抓到过：盘上 SetChecksum 全错，内核自己读不出来）。
+export fn exfat_set_checksum_zig(data: [*]const u8, len: u32) u16 {
+    var sum: u16 = 0;
+    var i: u32 = 0;
+    while (i < len) : (i += 1) {
+        if (i != 2 and i != 3) {
+            const b: u16 = data[i];
+            sum = std.math.rotl(u16, sum, 15) +% b;
+        }
+    }
+    return sum;
+}
+
 /// exFAT 文件名 hash（规范 §7.6）：UTF-16LE 码元逐个混入。
 ///
 /// 混入前要转成**大写**（严格来说走 Up-case Table，内核简化为 ASCII a-z 减 32）。

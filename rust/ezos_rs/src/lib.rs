@@ -49,6 +49,27 @@ pub unsafe extern "C" fn exfat_name_hash_rs(utf16: *const u16, chars: u32) -> u1
     hash
 }
 
+/// exFAT **目录项集**校验和（规范 §7.4）：16 位宽度，且跳过偏移 2-3
+/// （那两个字节放的就是校验和本身，参与计算等于把自己算进去）。
+///
+/// 别拿 32 位卷校验和截断代替：32 位循环右移 1 位时 bit0 落到 bit31，而低
+/// 半字的 bit15 来自 **bit16** —— 两者不是一个算法。曾经这么干过，结果是
+/// 盘上每个 entry set 的 SetChecksum 全是错的，而内核自己读自己的盘毫无
+/// 察觉（它压根不校验），只有宿主机独立实现一比就红。
+#[no_mangle]
+pub unsafe extern "C" fn exfat_set_checksum_rs(data: *const u8, len: u32) -> u16 {
+    let mut sum: u16 = 0;
+    let mut i: u32 = 0;
+    while i < len {
+        if i != 2 && i != 3 {
+            let b = *data.add(i as usize) as u16;
+            sum = sum.rotate_left(15).wrapping_add(b);
+        }
+        i += 1;
+    }
+    sum
+}
+
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}

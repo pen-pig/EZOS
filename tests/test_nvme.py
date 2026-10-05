@@ -64,7 +64,22 @@ KEYMAP = {' ': 'spc', '.': 'dot', '-': 'minus', '_': 'shift-minus',
 
 class SerialReader(object):
     def __init__(self, port):
-        self.sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+        # QEMU 的 `-serial tcp:...,server` 监听建立得比脚本连接晚一点（机器
+        # 忙的时候能差好几秒），一次性 connect 会拿 ConnectionRefused。这里
+        # 轮询到就绪为止——所有 E2E 都从这里取串口，修一处全部受益。
+        self.sock = None
+        last = None
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                self.sock = socket.create_connection(("127.0.0.1", port),
+                                                     timeout=10)
+                break
+            except Exception as exc:      # 铁律：连接未就绪不是测试失败
+                last = exc
+                time.sleep(0.3)
+        if self.sock is None:
+            raise last
         self.buf = b""
         self.lock = threading.Lock()
         self.running = True

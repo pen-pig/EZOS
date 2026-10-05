@@ -36,7 +36,7 @@
 #include "serial.h"
 #include "acpi.h"
 #include "ata.h"
-#include "exfat.h"          /* exfat_checksum（C 参考实现，rstest 对拍用） */
+#include "exfat.h"          /* exfat_checksum_c / exfat_name_hash_c（C 基线） */
 #include "rust_bridge.h"    /* Rust / Zig 侧实现 */
 
 /* 网络地址格式化（定义在 cmd_ping 之后；cmd_nic 也要用，故提前声明） */
@@ -1518,7 +1518,7 @@ void cmd_rstest(const char *args) {
         0xDD, 0xEE, 0x0D, 0x0A, 0x20, 0x2E, 0x2F, 0x5C, 0x3A, 0x39, 0x41,
         0x61, 0x7A, 0x4E
     };
-    uint32_t cc = exfat_checksum(probe, (int)sizeof(probe));
+    uint32_t cc = exfat_checksum_c(probe, (int)sizeof(probe));
     uint32_t rc = exfat_checksum_rs(probe, (uint32_t)sizeof(probe));
     uint32_t zc = exfat_checksum_zig(probe, (uint32_t)sizeof(probe));
 
@@ -1531,20 +1531,39 @@ void cmd_rstest(const char *args) {
     int ok_sum = (cc == rc) && (cc == zc);
     ezos_console_write(ok_sum ? " [OK]\n" : " [FAIL]\n");
 
-    /* 文件名 hash 对拍：大小写混排，专抓"转大写写成转小写"那类漂移 */
+    /* 16 位目录项集校验和：单独对拍。32 位版截断不得出这个数（宽度不同就是
+     * 不同算法），历史上恰恰是这里出过事——盘上 SetChecksum 全错而内核毫无
+     * 察觉，宿主机独立实现一比就红。输入用上面同一段 probe，跳过 2-3 生效。 */
+    uint16_t sc = exfat_set_checksum_c(probe, (int)sizeof(probe));
+    uint16_t sr = exfat_set_checksum_rs(probe, (uint32_t)sizeof(probe));
+    uint16_t sz = exfat_set_checksum_zig(probe, (uint32_t)sizeof(probe));
+    ezos_console_write("  setcksum  C=0x");
+    ezos_console_print_hex32(sc);
+    ezos_console_write(" rust=0x");
+    ezos_console_print_hex32(sr);
+    ezos_console_write(" zig=0x");
+    ezos_console_print_hex32(sz);
+    int ok_set = (sc == sr) && (sc == sz) && (sc != 0);
+    ezos_console_write(ok_set ? " [OK]\n" : " [FAIL]\n");
+
+    /* 文件名 hash 对拍：大小写混排，专抓"转大写写成转小写"那类漂移。
+     * C 版以前是 exfat.c 里的 static，进不了对拍——现在三份都在场。 */
     static const uint16_t nm[10] = { 'R', 'e', 'A', 'd', 'M', 'e', '.',
                                      'T', 'x', 'T' };
+    uint16_t ch = exfat_name_hash_c(nm, 10);
     uint16_t rh = exfat_name_hash_rs(nm, 10);
     uint16_t zh = exfat_name_hash_zig(nm, 10);
-    ezos_console_write("  namehash rust=0x");
+    ezos_console_write("  namehash  C=0x");
+    ezos_console_print_hex32(ch);
+    ezos_console_write(" rust=0x");
     ezos_console_print_hex32(rh);
     ezos_console_write(" zig=0x");
     ezos_console_print_hex32(zh);
-    int ok_hash = (rh == zh) && (rh != 0);      /* 全 0 说明根本没算 */
+    int ok_hash = (ch == rh) && (ch == zh) && (ch != 0);   /* 全 0 说明根本没算 */
     ezos_console_write(ok_hash ? " [OK]\n" : " [FAIL]\n");
 
     ezos_console_write("  result: ");
-    ezos_console_write((ok_sum && ok_hash) ? "PASS" : "FAIL");
+    ezos_console_write((ok_sum && ok_set && ok_hash) ? "PASS" : "FAIL");
     ezos_console_write("\n");
 }
 

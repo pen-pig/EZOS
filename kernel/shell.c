@@ -23,7 +23,7 @@
 /* shell.c 用到 shell_extra.c 中定义的终端数字打印器（无头文件声明） */
 extern void ezos_console_print_dec(uint32_t num);
 
-#define CMD_BUFFER_SIZE 128
+#define CMD_BUFFER_SIZE 1024
 #define HISTORY_SIZE 8
 
 static char cmd_buffer[CMD_BUFFER_SIZE];
@@ -1512,7 +1512,9 @@ static void cmd_write(const char *args) {
     const char *content = args;
     uint32_t len = 0;
     while (content[len]) len++;
-    if (len > 512) len = 512;
+    /* 4096 = 与 PIPE_BUF_SIZE 一致。原上限 512 恰好等于一簇，任何跨簇写入
+     * 都被静默截断成单簇文件——多簇 FAT 链这条路径根本没被测到过。 */
+    if (len > 4096) len = 4096;
 
     if (fs_create_file(filename, (const uint8_t*)content, len) != 0) {
         terminal_writestring("Failed to write file.\n");
