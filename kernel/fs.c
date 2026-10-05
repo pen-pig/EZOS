@@ -26,9 +26,25 @@
 #include "ahci.h"
 #include "sysvol.h"
 
-/* 布局一致性编译期检查：三种目录项结构必须逐字节一致 */
-typedef char fs_layout_exfat[sizeof(fs_dir_entry_t) == sizeof(exfat_dir_entry_t) ? 1 : -1];
-typedef char fs_layout_fat[sizeof(fs_dir_entry_t) == sizeof(fat_dir_entry_t) ? 1 : -1];
+/* 布局一致性编译期检查：三种目录项结构被互相强转（cmd_ls 直接拿
+ * fat_dir_entry_t* / exfat_dir_entry_t* 当 fs_dir_entry_t* 用，省一份拷贝），
+ * 所以必须逐字节一致。**只比 sizeof 是不够的**：把 size 和 is_dir 换个顺序，
+ * 结构体总长不变、旧断言照样通过，而读出来的 size 会变成 is_dir 拼上填充
+ * 字节的垃圾——所以每个字段的偏移也要卡住。 */
+_Static_assert(sizeof(fs_dir_entry_t) == sizeof(exfat_dir_entry_t),
+               "fs_dir_entry_t / exfat_dir_entry_t size mismatch");
+_Static_assert(sizeof(fs_dir_entry_t) == sizeof(fat_dir_entry_t),
+               "fs_dir_entry_t / fat_dir_entry_t size mismatch");
+#define FS_DE_SAME_FIELD(other, field)                                      \
+    _Static_assert(__builtin_offsetof(fs_dir_entry_t, field) ==             \
+                   __builtin_offsetof(other, field),                        \
+                   "dir entry layout mismatch on field " #field)
+FS_DE_SAME_FIELD(exfat_dir_entry_t, name);
+FS_DE_SAME_FIELD(exfat_dir_entry_t, size);
+FS_DE_SAME_FIELD(exfat_dir_entry_t, is_dir);
+FS_DE_SAME_FIELD(fat_dir_entry_t, name);
+FS_DE_SAME_FIELD(fat_dir_entry_t, size);
+FS_DE_SAME_FIELD(fat_dir_entry_t, is_dir);
 
 static int      fs_type_cur = FS_NONE;
 static uint8_t  fs_drive_cur = 0;

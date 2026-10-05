@@ -1541,6 +1541,29 @@ void cmd_kmtest(const char *args) {
     ezos_console_write(u2 == u0 ? "OK" : "FAIL");
     ezos_console_write(")\n");
 
+    /* 越界写检测：尾部 canary 紧贴用户区，写穿 1 字节就该被 audit 抓到。
+     * 只靠头魔数的话，越界会一路踩进下一个块，要等受害者被 kfree 才暴露。 */
+    int guard_ok = 0;
+    void *p4 = kmalloc(64);
+    if (p4) {
+        uint32_t bad_before = kmalloc_audit();
+        ((uint8_t *)p4)[64] = 0x00;             /* 越界 1 字节 */
+        uint32_t bad_after = kmalloc_audit();
+        int caught = (bad_before == 0 && bad_after >= 1);
+        ezos_console_write("  tail canary detects 1-byte overflow: ");
+        ezos_console_write(caught ? "yes [OK]\n" : "NO [FAIL]\n");
+        /* 现场复原后再释放：真实代码里 canary 坏了应该是去修 bug，
+         * 这里只是不想让自检自己把自己停机。 */
+        kmalloc_repair_tail(p4);
+        int healed = (kmalloc_audit() == 0);
+        ezos_console_write("  audit clean after repair: ");
+        ezos_console_write(healed ? "yes [OK]\n" : "NO [FAIL]\n");
+        kfree(p4);
+        guard_ok = caught && healed;
+    } else {
+        ezos_console_write("  FAIL: guard alloc returned NULL\n");
+    }
+
     uint32_t f1 = kmalloc_largest_free();
     ezos_console_write("  largest free after: ");
     ezos_console_print_dec(f1 / 1024);
@@ -1548,7 +1571,7 @@ void cmd_kmtest(const char *args) {
     ezos_console_print_dec(f0 / 1024);
     ezos_console_write("KB)\n");
     ezos_console_write("  result: ");
-    ezos_console_write(u2 == u0 ? "PASS" : "FAIL");
+    ezos_console_write((u2 == u0) && guard_ok ? "PASS" : "FAIL");
     ezos_console_write("\n");
 }
 

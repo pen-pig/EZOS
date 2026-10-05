@@ -28,4 +28,11 @@ uint32_t kmalloc_total(void);
 uint32_t kmalloc_used(void);
 uint32_t kmalloc_largest_free(void);
 
+/* 全池体检：遍历每一个块，校验已分配块的头魔数与尾部 canary。
+ * 返回损坏块数（0 = 堆健康）；不修改堆，可随时调用。 */
+uint32_t kmalloc_audit(void);
+
+/* 仅供自检：把被踩坏的尾部 canary 重新装上（越界演练后好正常 kfree） */
+void kmalloc_repair_tail(void *ptr);
+
 #endif

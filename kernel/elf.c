@@ -38,6 +38,22 @@ typedef struct {
     uint32_t p_align;
 } __attribute__((packed)) elf32_phdr_t;
 
+/* gABI 硬约束：ELF32 Ehdr 52 字节、Phdr 32 字节。这两个结构靠 __attribute__
+ * ((packed)) 才不会被编译器插填充——谁把这个属性删了（或改成非 packed），
+ * sizeof 会变成 56，e_phoff 之后的每个字段都整体错位，而 ELF 校验只看
+ * magic/class/type，全部通过，症状是"内核跳进用户程序后立刻 #PF"。
+ * 这里把规范尺寸和关键字段偏移钉死，改坏即编译失败。 */
+_Static_assert(sizeof(elf32_ehdr_t) == 52, "elf32_ehdr_t must be 52 bytes");
+_Static_assert(sizeof(elf32_phdr_t) == 32, "elf32_phdr_t must be 32 bytes");
+_Static_assert(__builtin_offsetof(elf32_ehdr_t, e_entry) == 24, "e_entry @24");
+_Static_assert(__builtin_offsetof(elf32_ehdr_t, e_phoff) == 28, "e_phoff @28");
+_Static_assert(__builtin_offsetof(elf32_ehdr_t, e_phentsize) == 42, "e_phentsize @42");
+_Static_assert(__builtin_offsetof(elf32_ehdr_t, e_phnum) == 44, "e_phnum @44");
+_Static_assert(__builtin_offsetof(elf32_phdr_t, p_vaddr) == 8, "p_vaddr @8");
+_Static_assert(__builtin_offsetof(elf32_phdr_t, p_filesz) == 16, "p_filesz @16");
+_Static_assert(__builtin_offsetof(elf32_phdr_t, p_memsz) == 20, "p_memsz @20");
+_Static_assert(__builtin_offsetof(elf32_phdr_t, p_flags) == 24, "p_flags @24");
+
 /* ---------- 小工具（不依赖 libc） ---------- */
 
 static void e_memset(void *dst, uint8_t v, uint32_t n) {

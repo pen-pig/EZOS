@@ -101,3 +101,7 @@ tests/disk_fs.vhd
 tests/disk_edge.vhd
 tests/_vhd_regen/
 usb-image.bin
+
+# VMware 侧验证产物（vmx 入库，磁盘镜像与串口日志不入库）
+vmware/*.vmdk
+vmware/*.log

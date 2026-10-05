@@ -12,7 +12,7 @@ LD      = $BIN_DIR/i686-elf-ld.exe
 OBJCOPY = $BIN_DIR/i686-elf-objcopy.exe
 
 # ===================== ?????? =====================
-CFLAGS  = -ffreestanding -O2 -Wall -Wextra -Ikernel -MMD
+CFLAGS  = -ffreestanding -O2 -Wall -Wextra -Werror -Ikernel -MMD
 LDFLAGS = -m elf_i386 -T linker.ld --oformat binary -e _start
 
 # ===================== ???? =====================
@@ -182,6 +182,23 @@ build boot/mbr_usb.bin: asm_bin boot/mbr_usb.asm
 build usb-image.bin: make_usb os-image.bin kernel.bin boot/mbr_usb.bin tools/make_usb_image.py
 
 build run: run_qemu os-image.bin disk.vhd
+
+# 静态扫描：专挑 -Wall -Wextra 管不了的那类（禁函数、分配不检查、
+# memcpy 长度写成 sizeof(指针)）。故意不进 default——它是"人看一眼"的工具，
+# 不该让一次手滑的 WARN 挡住真机写盘。用法：ninja lint
+rule lint
+    command = cmd /c python tools/lint.py
+    description = LINT kernel+user
+
+build lint: lint tools/lint.py
+
+# VMware 侧验证：QEMU 的 SeaBIOS 太干净，VMware 的 PhoenixBIOS + 更接近真机的
+# 芯片组是介于 QEMU 与真机之间的第二道关。同样不进 default。用法：ninja vmware
+rule make_vmware
+    command = cmd /c python tools/make_vmware.py
+    description = VMWARE vmware/ezos.vmx
+
+build vmware: make_vmware usb-image.bin tools/make_vmware.py
 
 default os-image.bin user/hello.elf user/fdtest.elf user/forktest.elf user/spin.elf user/fdleak.elf user/netecho.elf user/nettcp.elf user/segprobe.elf user/netcli.elf disk.vhd usb-image.bin
 

@@ -1,0 +1,28 @@
+.encoding = "UTF-8"
+displayName = "EZOS"
+guestOS = "other-32"
+memsize = "256"
+numvcpus = "1"
+
+# legacy BIOS。别改成 efi：VMware 的 EFI 是 64 位，BOOTIA32.EFI 加载不了。
+firmware = "bios"
+
+# IDE 而不是 SCSI/SATA：内核目前只有 ATA(IDE) 与 AHCI 驱动，IDE 最稳。
+ide0:0.present = "TRUE"
+ide0:0.fileName = "ezos-usb.vmdk"
+ide0:0.deviceType = "disk"
+scsi0.present = "FALSE"
+sata0.present = "FALSE"
+floppy0.present = "FALSE"
+
+# 串口 -> 文件：内核的 COM1 诊断全落到这里，E2E 也是按行抓的。
+serial0.present = "TRUE"
+serial0.fileType = "file"
+serial0.fileName = "ezos-serial.log"
+serial0.yieldOnMsrWrite = "TRUE"
+
+# 想试 U 盘（USB MSC）时把下面的 usb.present 打开，并在虚拟机里接上设备
+usb.present = "FALSE"
+
+bios.bootDelay = "3000"
+logging = "FALSE"
