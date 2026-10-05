@@ -19,6 +19,9 @@ typedef struct {
 } exfat_info_t;
 
 int exfat_init(void);
+/* 校验和的 C 参考实现（对拍用，见 exfat.c 里的说明与 `rstest`） */
+uint32_t exfat_checksum(const uint8_t *data, int len);
+
 int exfat_format(void);
 const exfat_info_t *exfat_get_info(void);
 int exfat_list_root(void);

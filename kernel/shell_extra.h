@@ -28,6 +28,7 @@ void cmd_sleep(const char *args);
 void cmd_mem(const char *args);
 void cmd_dmesg(const char *args);
 void cmd_kmtest(const char *args);
+void cmd_rstest(const char *args);
 void cmd_pagetest(const char *args);
 void cmd_utest(const char *args);
 void cmd_pmmtest(const char *args);

@@ -449,6 +449,7 @@ static const command_t commands[] = {
     {"mem",      cmd_mem},
     {"dmesg",    cmd_dmesg},
     {"kmtest",   cmd_kmtest},
+    {"rstest",   cmd_rstest},
     {"pagetest", cmd_pagetest},
     {"utest",    cmd_utest},
     {"pmmtest",  cmd_pmmtest},
@@ -1000,6 +1001,7 @@ static void cmd_help(const char *args) {
     help_line("  mem <hexaddr> [len] - dump physical memory\n");
     help_line("  dmesg [n] - show last n buffered kernel log lines\n");
     help_line("  kmtest - kernel heap self-test\n");
+    help_line("  rstest - cross-check C/Rust/Zig checksum+namehash\n");
     help_line("  pagetest - paging self-test (identity/map/unmap)\n");
     help_line("  utest - ring3 user-mode + int 0x80 syscall self-test\n");
     help_line("  pmmtest - physical page frame allocator self-test\n");

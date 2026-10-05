@@ -105,3 +105,7 @@ usb-image.bin
 # VMware 侧验证产物（vmx 入库，磁盘镜像与串口日志不入库）
 vmware/*.vmdk
 vmware/*.log
+
+# Rust 构建产物（target/ 与 cargo registry 缓存；源码与 Cargo.lock 入库）
+rust/ezos_rs/target/
+rust/ezos_zig/*.o

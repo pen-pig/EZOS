@@ -10,6 +10,8 @@ QEMU    = D:/MyOS/tools/qemu-portable-20241220/qemu-system-x86_64.exe
 CC      = $BIN_DIR/i686-elf-gcc.exe
 LD      = $BIN_DIR/i686-elf-ld.exe
 OBJCOPY = $BIN_DIR/i686-elf-objcopy.exe
+ZIG     = D:/MyOS/tools/zig/zig-x86_64-windows-0.15.1/zig.exe
+CARGO   = C:/Users/admin/.cargo/bin/cargo.exe
 
 # ===================== ?????? =====================
 CFLAGS  = -ffreestanding -O2 -Wall -Wextra -Werror -Ikernel -MMD
@@ -33,6 +35,27 @@ rule cc
 rule link
     command = $LD $LDFLAGS -o $out $in
     description = LINK $out
+
+# ---- 非 C 语言模块（增量试验，见 kernel/rust_bridge.h）----
+# Rust: #![no_std] staticlib，自定义 target i686-ezos.json + -Z build-std
+#   （stable 上要靠 RUSTC_BOOTSTRAP=1 打开 -Z）。RUSTFLAGS 里没有别的依赖。
+# Zig:  x86-freestanding build-obj，产出的 .o 没有任何外部符号引用。
+# 两者都只提供纯计算函数，**不持有内核资源**，链接顺序放在最后即可。
+rule cargo_rs
+    command = cmd /c cd rust\ezos_rs&& set RUSTC_BOOTSTRAP=1&& $CARGO build --release -Z build-std=core,compiler_builtins -Zjson-target-spec --target ../i686-ezos.json
+    description = CARGO libezos_rs.a
+
+rule zig_obj
+    # zig 把 .o 输出到**当前目录**（不接受 -o），所以先 cd 进源目录，
+    # 产物路径才能和下面的 build 行对上。
+    command = cmd /c cd rust\ezos_zig&& $ZIG build-obj -target x86-freestanding -O ReleaseSafe ezos_zig.zig
+    description = ZIG rust/ezos_zig/ezos_zig.zig
+
+build rust/ezos_rs/target/i686-ezos/release/libezos_rs.a: cargo_rs rust/ezos_rs/src/lib.rs rust/i686-ezos.json
+    pool = console
+
+build rust/ezos_zig/ezos_zig.o: zig_obj rust/ezos_zig/ezos_zig.zig
+    pool = console
 
 # ---- 用户态程序（步骤 5c）：静态 ELF32，链接到 USER_IMAGE_BASE，
 #      保留 ELF 结构（不能 --oformat binary），-s 去掉符号表以缩小体积 ----
@@ -172,7 +195,7 @@ build user/segprobe.elf: link_user user/crt0.o user/segprobe.o | user/user.ld
 build user/netcli.o: cc_user user/netcli.c
 build user/netcli.elf: link_user user/crt0.o user/netcli.o | user/user.ld
 
-build kernel_raw.bin: link boot/kernel_entry.o boot/task_switch.o kernel/kernel.o kernel/tty.o kernel/idt.o kernel/isr.o kernel/paging.o kernel/pmm.o kernel/task.o kernel/fd.o kernel/elf.o kernel/exec.o kernel/fpu.o kernel/calc.o kernel/gdt.o kernel/syscall.o kernel/panic.o kernel/kmalloc.o kernel/dmesg.o kernel/serial.o kernel/acpi.o kernel/ahci.o kernel/nvme.o kernel/keyboard.o kernel/ata.o kernel/pci.o kernel/usb.o kernel/uhci.o kernel/usbenum.o kernel/usbkbd.o kernel/usbmsc.o kernel/usbmouse.o kernel/ehci.o kernel/usbhc.o kernel/lockselftest.o kernel/rtl8139.o kernel/net.o kernel/shell.o kernel/shell_extra.o kernel/exfat.o kernel/fat.o kernel/fs.o kernel/sysvol.o kernel/sysvol_data.o kernel/ext4.o kernel/ntfs.o kernel/f2fs.o kernel/erofs.o kernel/refs.o kernel/div64.o kernel/gfx.o kernel/gui.o kernel/mouse.o kernel/gfxwin.o kernel/desktop.o kernel/games.o kernel/hiscore.o
+build kernel_raw.bin: link boot/kernel_entry.o boot/task_switch.o kernel/kernel.o kernel/tty.o kernel/idt.o kernel/isr.o kernel/paging.o kernel/pmm.o kernel/task.o kernel/fd.o kernel/elf.o kernel/exec.o kernel/fpu.o kernel/calc.o kernel/gdt.o kernel/syscall.o kernel/panic.o kernel/kmalloc.o kernel/dmesg.o kernel/serial.o kernel/acpi.o kernel/ahci.o kernel/nvme.o kernel/keyboard.o kernel/ata.o kernel/pci.o kernel/usb.o kernel/uhci.o kernel/usbenum.o kernel/usbkbd.o kernel/usbmsc.o kernel/usbmouse.o kernel/ehci.o kernel/usbhc.o kernel/lockselftest.o kernel/rtl8139.o kernel/net.o kernel/shell.o kernel/shell_extra.o kernel/exfat.o kernel/fat.o kernel/fs.o kernel/sysvol.o kernel/sysvol_data.o kernel/ext4.o kernel/ntfs.o kernel/f2fs.o kernel/erofs.o kernel/refs.o kernel/div64.o kernel/gfx.o kernel/gui.o kernel/mouse.o kernel/gfxwin.o kernel/desktop.o kernel/games.o kernel/hiscore.o rust/ezos_zig/ezos_zig.o rust/ezos_rs/target/i686-ezos/release/libezos_rs.a
 
 build kernel.bin os-image.bin: make_image boot/boot.bin kernel_raw.bin tools/make_image.py
 

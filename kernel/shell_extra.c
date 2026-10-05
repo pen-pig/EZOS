@@ -36,6 +36,8 @@
 #include "serial.h"
 #include "acpi.h"
 #include "ata.h"
+#include "exfat.h"          /* exfat_checksum（C 参考实现，rstest 对拍用） */
+#include "rust_bridge.h"    /* Rust / Zig 侧实现 */
 
 /* 网络地址格式化（定义在 cmd_ping 之后；cmd_nic 也要用，故提前声明） */
 static const char *ips_of(uint32_t be);
@@ -1496,6 +1498,54 @@ void cmd_pagetest(const char *args) {
         ezos_console_print_dec((uint32_t)fail);
         ezos_console_write(" assertion(s) failed)\n");
     }
+}
+
+/* rstest - 多语言对拍：exFAT 卷校验和与文件名 hash 各有 C / Rust / Zig 三份
+ * 实现，对同一份输入必须算出同一个数。
+ *
+ * 这是"增量引入非 C 语言"的安全网：算法写歪、链接到错误版本、符号没接上，
+ * 都会在这里变红，而不是等到 Windows 判卷损坏才发现。第一版就真抓到一次——
+ * Rust/Zig 侧把 hash 的字符转小写（`c | 0x20`）而不是规范要求的大写。 */
+void cmd_rstest(const char *args) {
+    (void)args;
+    ezos_console_write("rust/zig cross-check:\n");
+
+    /* 校验和对拍：混入 0/0xFF/中间值，别只用规整数据（全 0 时任何错误算法
+     * 都给出 0，对拍就成了摆设）。 */
+    static const uint8_t probe[37] = {
+        0x00, 0xFF, 0x5A, 0xA5, 0x01, 0x80, 'E', 'X', 'F', 'A', 'T', ' ',
+        0x7F, 0x33, 0xC3, 0x11, 0x22, 0x44, 0x88, 0x99, 0xAA, 0xBB, 0xCC,
+        0xDD, 0xEE, 0x0D, 0x0A, 0x20, 0x2E, 0x2F, 0x5C, 0x3A, 0x39, 0x41,
+        0x61, 0x7A, 0x4E
+    };
+    uint32_t cc = exfat_checksum(probe, (int)sizeof(probe));
+    uint32_t rc = exfat_checksum_rs(probe, (uint32_t)sizeof(probe));
+    uint32_t zc = exfat_checksum_zig(probe, (uint32_t)sizeof(probe));
+
+    ezos_console_write("  checksum  C=0x");
+    ezos_console_print_hex32(cc);
+    ezos_console_write(" rust=0x");
+    ezos_console_print_hex32(rc);
+    ezos_console_write(" zig=0x");
+    ezos_console_print_hex32(zc);
+    int ok_sum = (cc == rc) && (cc == zc);
+    ezos_console_write(ok_sum ? " [OK]\n" : " [FAIL]\n");
+
+    /* 文件名 hash 对拍：大小写混排，专抓"转大写写成转小写"那类漂移 */
+    static const uint16_t nm[10] = { 'R', 'e', 'A', 'd', 'M', 'e', '.',
+                                     'T', 'x', 'T' };
+    uint16_t rh = exfat_name_hash_rs(nm, 10);
+    uint16_t zh = exfat_name_hash_zig(nm, 10);
+    ezos_console_write("  namehash rust=0x");
+    ezos_console_print_hex32(rh);
+    ezos_console_write(" zig=0x");
+    ezos_console_print_hex32(zh);
+    int ok_hash = (rh == zh) && (rh != 0);      /* 全 0 说明根本没算 */
+    ezos_console_write(ok_hash ? " [OK]\n" : " [FAIL]\n");
+
+    ezos_console_write("  result: ");
+    ezos_console_write((ok_sum && ok_hash) ? "PASS" : "FAIL");
+    ezos_console_write("\n");
 }
 
 void cmd_kmtest(const char *args) {

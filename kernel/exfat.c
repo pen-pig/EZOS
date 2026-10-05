@@ -777,7 +777,13 @@ restore:
 }
 
 // exFAT 校验和算法：chk = ((chk << 31) | (chk >> 1)) + byte（uint32 自然溢出）
-static uint32_t exfat_checksum(const uint8_t *data, int len) {
+//
+// 不再 static：这是三方对拍（`rstest`）里的 **C 参考实现**。Rust 版在
+// rust/ezos_rs（`exfat_checksum_rs`）、Zig 版在 rust/ezos_zig
+// （`exfat_checksum_zig`），三者对同一缓冲区必须算出同一个数——规范算法就
+// 这么一处，谁算错一目了然。将来真要把调用点换成 Rust/Zig 实现，也是
+// 先跑 rstest 确认一致再换。
+uint32_t exfat_checksum(const uint8_t *data, int len) {
     uint32_t chk = 0;
     for (int i = 0; i < len; i++) {
         chk = ((chk << 31) | (chk >> 1)) + data[i];

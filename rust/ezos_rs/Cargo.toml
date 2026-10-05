@@ -1,0 +1,16 @@
+[package]
+name = "ezos_rs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+debug = false
+overflow-checks = false
+
+# 裸机静态库：依赖树必须为空，任何 [dependencies] 都会把 std 拉进来。
+[dependencies]
