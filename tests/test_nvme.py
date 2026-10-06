@@ -62,7 +62,20 @@ DISK = os.path.join(ROOT, "disk.vhd")
 NVME_IMG = os.path.join(HERE, "nvme_disk.vhd").replace("\\", "/")
 
 KEYMAP = {' ': 'spc', '.': 'dot', '-': 'minus', '_': 'shift-minus',
-          '/': 'slash', '*': 'kp_multiply', '+': 'kp_add', ':': 'shift-semicolon'}
+          '/': 'slash', '*': 'kp_multiply', '+': 'kp_add', ':': 'shift-semicolon',
+          # sendkey 的键名不是字符本身。没映射的符号会被 sendkey 静默丢弃，
+          # 发出去的命令**看起来仍然合法**，于是"测试在工作、实际路径/参数
+          # 已经变了"。UEFI Shell 尤其危险：`fs0:EFI` 会被当成外部命令报错，
+          # `echo A > f` 会变成 `echo A  f`（只打印，不写文件）。
+          '\\': 'backslash', ';': 'semicolon', "'": 'apostrophe',
+          '[': 'bracket_left', ']': 'bracket_right', '=': 'equal',
+          ',': 'comma', '>': 'shift-dot', '<': 'shift-comma',
+          '?': 'shift-slash', '"': 'shift-apostrophe', '!': 'shift-1',
+          '@': 'shift-2', '#': 'shift-3', '$': 'shift-4', '%': 'shift-5',
+          '^': 'shift-6', '&': 'shift-7', '*': 'shift-8', '(': 'shift-9',
+          ')': 'shift-0', '~': 'shift-grave', '`': 'grave',
+          '{': 'shift-bracket_left', '}': 'shift-bracket_right',
+          '|': 'shift-backslash', '?': 'shift-slash'}
 
 
 class SerialReader(object):
