@@ -907,30 +907,35 @@ int exfat_format(void) {
     *((uint32_t*)(fat_sector + 16)) = 0xFFFFFFFF;  // 簇4 upcase 链尾
     if (exfat_write_sector(exfat_partition_start + exfat_info.fat_offset, fat_sector) != 0) return -1;
 
-    // 3. 根目录簇（簇2）：0x83 label + 0x81 bitmap + 0x82 upcase（对齐 Windows 原生顺序）
+    // 3. 根目录簇（簇2）：0x83 卷标 + 0xC0 卷标流 + 0x81 位图 + 0x82 大写表
+    //
+    // 次级条目布局按规范逐项对齐（Windows 挂载时报"需要格式化"就是这里错的）：
+    //   0x83 的 SecondaryCount 必须是 1 且紧跟 0xC0——早先写成 2、后面直接放
+    //   0x81，Windows 按卷标去读流扩展项读到 0x81 当场判卷损坏；内核读不出来
+    //   是因为内核只认 0x85 文件条目，绕过了这段。
+    //   0x81 的 GeneralSecondaryFlags bit0（AllocationPossible）必须为 1，
+    //   否则 Windows 认为没有可用位图，拒绝挂载。
     uint8_t root_cluster[512];
     for (int i = 0; i < 512; i++) root_cluster[i] = 0;
-    // 0x83 Volume Label（无卷标，SecondaryCount=2）
+    // 0x83 Volume Label（无卷标，SecondaryCount=1）
     root_cluster[0] = 0x83;
-    root_cluster[1] = 0x02;   // SecondaryCount = 2（0x81 + 0x82）
+    root_cluster[1] = 0x01;   // SecondaryCount = 1（一个 0xC0）
     root_cluster[4] = 0x00; root_cluster[5] = 0x00;   // CharacterCount = 0
-    // 0x81 Allocation Bitmap（条目内 FirstCluster@20, DataLength@24）
-    root_cluster[32] = 0x81;
-    root_cluster[33] = 0x00;   // BitmapFlags
-    *((uint32_t*)(root_cluster + 32 + 0x14)) = 3;   // FirstCluster
-    *((uint64_t*)(root_cluster + 32 + 0x18)) = 13;  // DataLength (100簇/8=12.5→13)
-    // 0x82 Up-case Table（条目内 FirstCluster@20, DataLength@24）
-    root_cluster[64] = 0x82;
-    *((uint32_t*)(root_cluster + 64 + 0x14)) = 4;   // FirstCluster
-    *((uint64_t*)(root_cluster + 64 + 0x18)) = 124; // DataLength（压缩 upcase 表：4 校验和 + 12 保留 + 26*4 映射 + 4 终止符）
-    // EntrySetChecksum（覆盖 0x83+0x81+0x82 共 96 字节，每个条目的字节 2-3 按 0 处理，16 位算法）
-    uint16_t esc = 0;
-    for (int i = 0; i < 96; i++) {
-        uint8_t eb = (i % 32 == 2 || i % 32 == 3) ? 0 : root_cluster[i]; // 条目字节2-3按0
-        // 16位循环右移1位 + 字节（必须避免 int 提升导致高位干扰）
-        esc = (uint16_t)((esc >> 1) | (uint16_t)(esc << 15)) + eb;
-    }
-    root_cluster[2] = (uint8_t)(esc & 0xFF);   // SetChecksum → 0x83 条目字节 2-3
+    // 0xC0 Stream Extension（卷标流：NoFatChain，0 簇 0 长度）
+    root_cluster[32] = 0xC0;
+    root_cluster[33] = 0x02;  // NoFatChain = 1
+    // 0x81 Allocation Bitmap（FirstCluster@+0x14, DataLength@+0x18）
+    root_cluster[64] = 0x81;
+    root_cluster[65] = 0x01;  // AllocationPossible = 1
+    *((uint32_t*)(root_cluster + 64 + 0x14)) = 3;   // FirstCluster
+    *((uint64_t*)(root_cluster + 64 + 0x18)) = 13;  // DataLength (100簇/8=12.5→13)
+    // 0x82 Up-case Table（FirstCluster@+0x14, DataLength@+0x18）
+    root_cluster[96] = 0x82;
+    *((uint32_t*)(root_cluster + 96 + 0x14)) = 4;   // FirstCluster
+    *((uint64_t*)(root_cluster + 96 + 0x18)) = 124; // DataLength（压缩 upcase 表：4 校验和 + 12 保留 + 26*4 映射 + 4 终止符）
+    // 卷标 entry set 的 SetChecksum（覆盖 0x83 + 0xC0 共 64 字节，跳过 0x83 的字节 2-3）
+    uint16_t esc = exfat_set_checksum(root_cluster, 64);
+    root_cluster[2] = (uint8_t)(esc & 0xFF);
     root_cluster[3] = (uint8_t)((esc >> 8) & 0xFF);
     if (exfat_write_cluster(exfat_info.root_dir_cluster, root_cluster) != 0) return -1;
 

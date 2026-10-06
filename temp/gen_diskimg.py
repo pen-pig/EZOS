@@ -279,16 +279,34 @@ def gen_exfat(path):
         off = (EXFAT_CLUSTER_HEAP_OFFSET - 1 + fc) * 512
         img[off:off + len(data)] = data
 
-    # 根目录（簇 2-3）: 0x83 卷标 + 0x81 位图 + 0x82 大写表 + 各文件 entry set
+    # 根目录（簇 2-3）。三个特殊次级条目的**布局必须严格按规范**，否则 Windows
+    # 读到就直接判卷损坏、弹"需要格式化"（历史事故：0x83 的 SecondaryCount
+    # 写成了 2、它后面跟的却是 0x81 而不是 0xC0；0x81 的 AllocationPossible
+    # 也没置 1。内核读得进去是因为内核只认 0x85，Windows 不是）：
+    #   slot0  0x83 Volume Label      SecondaryCount = 1
+    #   slot1  0xC0 Stream Extension  NoFatChain（无卷标 → 0 簇 0 长度）
+    #   slot2  0x81 Allocation Bitmap  GenSecFlags = 0x01（AllocationPossible）
+    #   slot3  0x82 Up-case Table      GenSecFlags = 0x00（不可分配）
     root = bytearray(1024)
-    root[0] = 0x83; root[1] = 0x02
-    root[32] = 0x81; root[33] = 0x00
-    struct.pack_into('<I', root, 52, 4)      # 0x81 FirstCluster@+0x14（簇 4 位图）
-    struct.pack_into('<Q', root, 56, 13)     # 0x81 DataLength@+0x18
-    root[64] = 0x82
-    struct.pack_into('<I', root, 84, 5)      # 0x82 FirstCluster@+0x14（簇 5 大写表）
-    struct.pack_into('<Q', root, 88, 124)    # 0x82 DataLength@+0x18
-    off = 96
+    root[0] = 0x83; root[1] = 0x01          # Volume Label，1 个次级项
+    root[4] = 0x00; root[5] = 0x00          # CharacterCount = 0（无卷标）
+    root[32] = 0xC0; root[33] = 0x02        # NoFatChain=1
+    struct.pack_into('<I', root, 32 + 0x14, 0)    # FirstCluster = 0
+    struct.pack_into('<Q', root, 32 + 0x18, 0)    # DataLength = 0
+    root[64] = 0x81; root[65] = 0x01        # AllocationPossible = 1
+    struct.pack_into('<I', root, 64 + 0x14, 4)    # 0x81 FirstCluster@+0x14（簇 4 位图）
+    struct.pack_into('<Q', root, 64 + 0x18, 13)   # 0x81 DataLength@+0x18
+    root[96] = 0x82; root[97] = 0x00        # Up-case：AllocationPossible = 0
+    struct.pack_into('<I', root, 96 + 0x14, 5)    # 0x82 FirstCluster@+0x14（簇 5 大写表）
+    struct.pack_into('<Q', root, 96 + 0x18, 124)  # 0x82 DataLength@+0x18
+    # 卷标 entry set 的 SetChecksum（覆盖 0x83 + 0xC0 共 64 字节，跳过首条目 2-3）
+    vchk = 0
+    for i in range(64):
+        if i == 2 or i == 3:
+            continue
+        vchk = (uint16_ror1(vchk) + root[i]) & 0xFFFF
+    struct.pack_into('<H', root, 2, vchk)
+    off = 128
     for name, fc, data in layout:
         es = make_exfat_entry_set(name, fc, len(data))
         if off + len(es) > len(root):

@@ -257,6 +257,44 @@ class Exfat(object):
         return self.read(e)
 
     # ---------- 体检 ----------
+    def audit_root_meta(self):
+        """根目录三个特殊次级条目——**Windows 挂载必查**，错一项就弹"需要格式化"：
+
+          * ``0x83`` Volume Label：``SecondaryCount`` 必须是 1，且紧跟一个 ``0xC0``
+            流扩展项（写成 2、后面直接放 0x81，Windows 按卷标读流扩展项读到
+            0x81 当场判卷损坏）；
+          * ``0x81`` Allocation Bitmap：``GeneralSecondaryFlags`` bit0
+            （AllocationPossible）必须为 1，否则 Windows 认为没有可用位图；
+          * ``0x82`` Up-case Table：AllocationPossible 必须为 0。
+
+        内核只把 ``0x85`` 当文件条目解析，绕过了这一段——所以这类错误内核
+        自己永远发现不了，只能靠这里或者真的挂一次盘。"""
+        problems = []
+        slots = self.dir_slots(self.root)
+        idx = {}
+        for i, s in enumerate(slots):
+            if s[0] in (0x81, 0x82, 0x83) and s[0] not in idx:
+                idx[s[0]] = (i, s)
+        if 0x83 not in idx:
+            return ["root: no 0x83 volume label entry"]
+        i83, s83 = idx[0x83]
+        if s83[1] != 1:
+            problems.append("0x83 volume label SecondaryCount=%d, spec requires 1"
+                            % s83[1])
+        nxt = slots[i83 + 1][0] if i83 + 1 < len(slots) else -1
+        if nxt != 0xC0:
+            problems.append("0x83 not followed by 0xC0 stream entry (found 0x%02X)"
+                            % nxt)
+        if 0x81 not in idx:
+            problems.append("root: no 0x81 allocation bitmap entry")
+        elif not (idx[0x81][1][1] & 0x01):
+            problems.append("0x81 bitmap AllocationPossible=0 (spec requires 1)")
+        if 0x82 not in idx:
+            problems.append("root: no 0x82 up-case table entry")
+        elif idx[0x82][1][1] & 0x01:
+            problems.append("0x82 up-case claims AllocationPossible=1")
+        return problems
+
     def audit(self, dir_cluster=None):
         """递归检查：SetChecksum / NameHash 是否自洽，簇链是否可读。
 
@@ -264,6 +302,8 @@ class Exfat(object):
         if dir_cluster is None:
             dir_cluster = self.root
         problems = []
+        if dir_cluster == self.root:
+            problems.extend(self.audit_root_meta())
         for e in self.parse_dir(dir_cluster):
             if e['chk_stored'] != e['chk_calc']:
                 problems.append('%s: set checksum %04X != recomputed %04X'
