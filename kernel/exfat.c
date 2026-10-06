@@ -353,28 +353,37 @@ static int exfat_parse_entry_set(const uint8_t *entry, uint8_t *out) {
 }
 
 // 在指定目录链中查找名字匹配的目录项，输出合并结构，返回偏移；未找到返回 -1
+//
+// **必须按拼接后的整条目录链解析，不能逐簇解析**：一个 entry set（0x85 +
+// N 个 0xC0/0xC1）在 exFAT 里就是目录字节流里连续的一段，**没有"必须落在
+// 同一簇内"这条规矩**——Windows 和任何第三方实现都会自然地跨簇边界写。
+// 逐簇读进 buffer 再解析时，次级项会越过簇尾落到上一轮留下的陈旧数据上，
+// 名字解析成乱码 → 匹配失败。症状极其阴险：
+//     ls 看得到这个目录（read_dir_cluster 走拼接链，正常）
+//     ls <dir> / cd <dir> / cat <dir>/f 全部失败（find_entry 逐簇，跳过）
+// 也就是"看得见、进不去"。宿主写入器造一个刚好跨簇的目录项就能复现。
 static int exfat_find_entry(uint32_t dir_cluster, const char *name, uint8_t *out_entry) {
     static uint8_t dir_data[512 * 16] XF_HIBUF;
     uint8_t *buffer = dir_data;
     uint32_t cluster_size = exfat_info.bytes_per_sector * exfat_info.sectors_per_cluster;
 
-    uint32_t cur = dir_cluster;
-    uint32_t steps = 0;
+    uint32_t clusters = exfat_read_dir_chain(dir_cluster, buffer, 16);
+    if (clusters == 0) return -1;
+    uint32_t total_size = clusters * cluster_size;
     uint32_t tlen = 0; { const char *tp = name; while (*tp) { tlen++; tp++; } }
-    while (cur >= 2 && cur < exfat_info.cluster_count + 2 &&
-           steps < exfat_info.cluster_count + 2) {
-        if (exfat_read_cluster(cur, buffer) != 0) return -1;
-        for (uint32_t off = 0; off < cluster_size; ) {
-            uint8_t *entry = buffer + off;
-            if (entry[0] == 0x00) break;
-            if (entry[0] == 0x85) {
-                int sec_count = entry[1];
-                if (sec_count < 2 || sec_count > 20) {
-                    off += 32;
-                    continue;
-                }
-                uint8_t merged[1024];
-                if (exfat_parse_entry_set(entry, merged) == 0) {
+    for (uint32_t off = 0; off + 32 <= total_size; ) {
+        uint8_t *entry = buffer + off;
+        if (entry[0] == 0x00) break;
+        if (entry[0] == 0x85) {
+            int sec_count = entry[1];
+            if (sec_count < 2 || sec_count > 20) {
+                off += 32;
+                continue;
+            }
+            /* 越界的 entry set（链被截断）直接判定找不到，绝不拿陈旧数据凑 */
+            if (off + (uint32_t)(1 + sec_count) * 32 > total_size) return -1;
+            uint8_t merged[1024];
+            if (exfat_parse_entry_set(entry, merged) == 0) {
                     char entry_name[256];
                     int name_len = merged[2];
                     int nlen = 0;
@@ -390,15 +399,11 @@ static int exfat_find_entry(uint32_t dir_cluster, const char *name, uint8_t *out
                         }
                         return (int)off;
                     }
-                }
-                off += (1 + sec_count) * 32;
-            } else {
-                off += 32;
             }
+            off += (uint32_t)(1 + sec_count) * 32;
+        } else {
+            off += 32;
         }
-        cur = exfat_read_fat_entry(cur);
-        if (cur >= 0xFFFFFFF8) break;
-        steps++;
     }
     return -1;
 }

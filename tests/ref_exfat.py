@@ -14,7 +14,9 @@
 这两项只要内核算错一个字节，盘上的目录项就处于"自相矛盾"状态——内核自己
 读得出来，宿主（Windows）可能直接判卷损坏。
 
-只读：本模块不写盘。格式化/建文件请走 temp/gen_diskimg.py。
+只读解析在 Exfat 里；ExfatRW 另外提供最小**写入**路径（建文件/建目录/删文件，
+含位图与 FAT 的真实维护），用来跑"宿主机先建 -> 内核读/改/删 -> 宿主机复检"
+的双向互操作对拍（tests/test_hostfs.py）。两处代码都不看 exfat.c。
 """
 import struct
 
@@ -319,3 +321,210 @@ class Exfat(object):
             if e['is_dir']:
                 problems.extend(self.audit(e['first_cluster']))
         return problems
+
+
+class ExfatRW(Exfat):
+    """宿主机侧 exFAT 写入器：**第二个实现**，与 kernel/exfat.c 零共享。
+
+    存在的理由和只读部分一样——内核自己写自己读永远绿。有了它才能问出那两个
+    只有"另一方的实现"才答得上来、且真实互操作（Windows 拖文件进 VHD）必然
+    遇到的问题：
+
+      * 别人建的卷，内核往里**追加**时会不会踩坏原有条目 / 位图 / FAT？
+      * 内核删掉别人建的文件后，簇和位图有没有真的还回去？
+    """
+
+    def __init__(self, path):
+        super(ExfatRW, self).__init__(path)
+        with open(path, 'rb') as f:
+            orig = f.read()
+        self.path = path
+        self.footer = orig[-512:] if orig[-512:-504] == b'conectix' else b''
+        self.raw = bytearray(self.raw)
+        self.bmp_cluster = None
+        for s in self.dir_slots(self.root):
+            if s[0] == 0x81:
+                self.bmp_cluster = _u32(s, 20)
+                self.bmp_len = _u64(s, 24)
+                break
+        if self.bmp_cluster is None:
+            raise ExfatError('no 0x81 allocation bitmap - refusing to write')
+
+    # ---------- 原始写 ----------
+    def _cl_off(self, c):
+        return self.part_off + (self.heap_off + (c - 2) * self.spc) * self.bps
+
+    def write_cluster(self, c, data):
+        if c < 2 or c >= self.cluster_count + 2:
+            raise ExfatError('cluster %d out of range' % c)
+        if len(data) > self.cluster_size:
+            raise ExfatError('cluster payload %d > %d' % (len(data), self.cluster_size))
+        data = bytes(data) + b'\x00' * (self.cluster_size - len(data))
+        off = self._cl_off(c)
+        self.raw[off:off + self.cluster_size] = data
+
+    def set_fat(self, c, v):
+        off = self.part_off + self.fat_off * self.bps + c * 4
+        struct.pack_into('<I', self.raw, off, v & 0xFFFFFFFF)
+
+    def bmp_get(self, c):
+        idx = c - 2
+        off = self._cl_off(self.bmp_cluster) + idx // 8
+        return (self.raw[off] >> (idx % 8)) & 1
+
+    def bmp_set(self, c, v):
+        idx = c - 2
+        off = self._cl_off(self.bmp_cluster) + idx // 8
+        if v:
+            self.raw[off] |= (1 << (idx % 8))
+        else:
+            self.raw[off] &= ((1 << (idx % 8)) ^ 0xFF) & 0xFF
+
+    def alloc(self, n=1):
+        """按位图找 n 个空闲簇，置位并串成 FAT 链（尾簇 EOC）。"""
+        out = []
+        for c in range(2, self.cluster_count + 2):
+            if len(out) == n:
+                break
+            if self.fat(c) == 0 and not self.bmp_get(c):
+                out.append(c)
+        if len(out) < n:
+            raise ExfatError('out of free clusters: need %d got %d' % (n, len(out)))
+        for i, c in enumerate(out):
+            self.bmp_set(c, 1)
+            self.set_fat(c, out[i + 1] if i + 1 < len(out) else 0xFFFFFFFF)
+        return out
+
+    def free_chain(self, first):
+        """回放 FAT 链，清 FAT 并把位图 bit 还回空闲。"""
+        freed = []
+        for c in self.chain(first):
+            self.set_fat(c, 0)
+            self.bmp_set(c, 0)
+            freed.append(c)
+        return freed
+
+    # ---------- 目录槽 ----------
+    def slot_offsets(self, dir_cluster):
+        return [(c, off) for c in self.chain(dir_cluster)
+                for off in range(0, self.cluster_size, 32)]
+
+    def _slot_byte(self, c, off):
+        return self.raw[self._cl_off(c) + off]
+
+    def _extend_dir(self, dir_cluster):
+        """目录槽不够时接一簇（内核读目录走 FAT 链，所以只需接链 + 清零）。"""
+        chain = self.chain(dir_cluster)
+        new = self.alloc(1)[0]
+        self.set_fat(chain[-1], new)
+        self.set_fat(new, 0xFFFFFFFF)
+        self.write_cluster(new, b'')
+        return new
+
+    def free_run(self, dir_cluster, need):
+        """找 need 个连续空闲槽；不够就扩目录再来。"""
+        for _ in range(4):
+            slots = self.slot_offsets(dir_cluster)
+            run = 0
+            for i, (c, off) in enumerate(slots):
+                if (self._slot_byte(c, off) & 0x80) == 0:
+                    run += 1
+                    if run == need:
+                        start = i - need + 1
+                        # 末尾必须留一个 0x00 终结符，否则读者会读到未初始化区
+                        if start + need < len(slots):
+                            return slots[start:start + need]
+                else:
+                    run = 0
+            self._extend_dir(dir_cluster)
+        raise ExfatError('cannot find %d free directory slots' % need)
+
+    def _write_run(self, dir_cluster, blob):
+        slots = self.free_run(dir_cluster, len(blob) // 32)
+        for i, (c, off) in enumerate(slots):
+            base = self._cl_off(c) + off
+            self.raw[base:base + 32] = blob[i * 32:(i + 1) * 32]
+
+    # ---------- 建 / 删 ----------
+    def _build_set(self, name, is_dir, first_cluster, size, no_fat_chain):
+        nlen = len(name)
+        n_name_entries = max(1, (nlen + 14) // 15)
+        secondary = 1 + n_name_entries
+        primary = bytearray(32)
+        primary[0] = 0x85
+        primary[1] = secondary
+        struct.pack_into('<H', primary, 4, 0x10 if is_dir else 0x20)
+        stream = bytearray(32)
+        stream[0] = 0xC0
+        stream[1] = 0x01 | (0x02 if (no_fat_chain and not is_dir and size > 0) else 0)
+        stream[3] = nlen
+        struct.pack_into('<H', stream, 4, name_hash(name))
+        if not is_dir:
+            struct.pack_into('<Q', stream, 8, size)      # ValidDataLength
+        struct.pack_into('<I', stream, 20, first_cluster)
+        struct.pack_into('<Q', stream, 24,
+                         size if not is_dir else self.cluster_size)
+        entries = [primary, stream]
+        name_u = name.encode('utf-16-le')
+        for i in range(n_name_entries):
+            e = bytearray(32)
+            e[0] = 0xC1
+            chunk = name_u[i * 30:(i + 1) * 30]
+            e[2:2 + len(chunk)] = chunk
+            entries.append(e)
+        blob = b''.join(bytes(x) for x in entries)
+        struct.pack_into('<H', entries[0], 2, set_checksum(blob))
+        return b''.join(bytes(x) for x in entries)
+
+    def create(self, dir_cluster, name, data=b'', is_dir=False,
+               force_fat_chain=False):
+        """建文件或目录。返回 (first_cluster, [占用的簇])。"""
+        data = bytes(data)
+        size = len(data)
+        if is_dir:
+            cl = self.alloc(1)[0]
+            self.write_cluster(cl, b'')
+            blob = self._build_set(name, True, cl, 0, False)
+            used = [cl]
+        elif size == 0:
+            blob = self._build_set(name, False, 0, 0, True)
+            used = []
+        else:
+            need = (size + self.cluster_size - 1) // self.cluster_size
+            clusters = self.alloc(need)
+            for i, c in enumerate(clusters):
+                self.write_cluster(c, data[i * self.cluster_size:
+                                            (i + 1) * self.cluster_size])
+            # 单簇且没有强制要求时按 NoFatChain 记；多簇一律走 FAT 链
+            no_fat = (need == 1 and not force_fat_chain)
+            if no_fat:
+                self.set_fat(clusters[0], 0xFFFFFFFF)
+            blob = self._build_set(name, False, clusters[0], size, no_fat)
+            used = clusters
+        self._write_run(dir_cluster, blob)
+        return (used[0] if used else 0), used
+
+    def delete(self, dir_cluster, name):
+        """标记 entry set 为已删除（清 0x80）并归还簇链。返回释放的簇列表。"""
+        slots = self.slot_offsets(dir_cluster)
+        blob = bytes(b''.join(bytes(self.raw[self._cl_off(c) + o:
+                                             self._cl_off(c) + o + 32])
+                              for c, o in slots))
+        slots_bytes = [blob[i * 32:(i + 1) * 32] for i in range(len(slots))]
+        for i, s in enumerate(slots_bytes):
+            if s[0] != 0x85:
+                continue
+            ent = self._parse_set(slots_bytes, i)
+            if ent is None or ent['name'].upper() != name.upper():
+                continue
+            for k in range(ent['secondary_count'] + 1):
+                c, off = slots[i + k]
+                self.raw[self._cl_off(c) + off] &= 0x7F
+            if ent['first_cluster'] >= 2:
+                return self.free_chain(ent['first_cluster'])
+            return []
+        return None
+
+    def flush(self, path=None):
+        with open(path or self.path, 'r+b') as f:
+            f.write(bytes(self.raw) + self.footer)
