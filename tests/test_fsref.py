@@ -20,6 +20,12 @@ B 方向的期望值不写死在断言里，而是在内核跑之前先用参考
 再拿去和内核 cat 的输出比——避免"两边都错但错得一样"以外的另一种假绿：
 期望值过时。
 """
+import os as _os_ezos
+import sys as _sys_ezos
+_sys_ezos.path.append(_os_ezos.path.dirname(
+    _os_ezos.path.dirname(_os_ezos.path.abspath(__file__))))
+from ezos_env import qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe  # noqa: E402
+
 import os
 import shutil
 import subprocess
@@ -31,7 +37,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 
-QEMU = "D:/MyOS/tools/qemu-portable-20241220/qemu-system-x86_64.exe"
+QEMU = qemu_exe()
 IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
 DISK = os.path.join(ROOT, "disk.vhd")
 WORK_A = os.path.join(HERE, "fsref_a.vhd").replace("\\", "/")

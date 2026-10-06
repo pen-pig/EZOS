@@ -16,6 +16,12 @@
   - 数据盘用 disk.vhd 副本（超长文件名会真的写进卷里）
 端口 4496。用法：python tests/test_edge.py
 """
+import os as _os_ezos
+import sys as _sys_ezos
+_sys_ezos.path.append(_os_ezos.path.dirname(
+    _os_ezos.path.dirname(_os_ezos.path.abspath(__file__))))
+from ezos_env import qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe  # noqa: E402
+
 import json
 import os
 import shutil
@@ -30,7 +36,7 @@ KERNEL_DIR = os.path.join(ROOT, "kernel")
 sys.path.insert(0, HERE)
 import ezocr  # noqa: E402
 
-QEMU = "D:/MyOS/tools/qemu-portable-20241220/qemu-system-x86_64.exe"
+QEMU = qemu_exe()
 PORT = 4496
 BOOT_WAIT = 30
 

@@ -6,32 +6,24 @@ rem ===== build-only mode: build only, no QEMU, no pause =====
 set "BUILD_ONLY=0"
 if /i "%~1"=="build-only" set "BUILD_ONLY=1"
 
-rem ===== auto-detect MyOS root (scan C-H drives for toolchain) =====
-set "MYOS_ROOT="
-for %%D in (C D E F G H) do (
-    if not defined MYOS_ROOT (
-        if exist "%%D:\MyOS\tools\i686-elf-tools-windows\bin\i686-elf-gcc.exe" set "MYOS_ROOT=%%D:\MyOS"
-    )
-)
-if not defined MYOS_ROOT (
-    echo [ERROR] MyOS toolchain not found. Check that MyOS\tools exists on C-H drives.
-    pause
-    exit /b 1
-)
-
-rem ===== generate temp ninja file with correct root path =====
-rem dynamically replace any drive-letter path (D:/MyOS or E:/MyOS), never hardcoded
-rem MUST be a byte-level copy. PowerShell's Get-Content decodes UTF-8 as GBK, and an
-rem orphan GBK lead byte (e.g. 0x82 left over from U+3002) swallows the following
-rem 0x0A, silently merging ninja lines -> "unexpected indent" on the next build.
-set "MYOS_ROOT_SLASH=%MYOS_ROOT:\=/%"
+rem ===== locate python =====
 set "PYEXE="
 for /f "delims=" %%P in ('where python 2^>nul') do if not defined PYEXE set "PYEXE=%%P"
+if not defined PYEXE if exist "%LOCALAPPDATA%\Programs\Python\Python313\python.exe" set "PYEXE=%LOCALAPPDATA%\Programs\Python\Python313\python.exe"
 if not defined PYEXE if exist "D:\Python315\python.exe" set "PYEXE=D:\Python315\python.exe"
 if not defined PYEXE set "PYEXE=python"
-"%PYEXE%" -c "import re; src=r'%~dp0build.ninja'; dst=r'%~dp0build_auto.ninja'; root=r'%MYOS_ROOT_SLASH%'; d=open(src,'rb').read(); open(dst,'wb').write(re.sub(rb'[A-Za-z]:/MyOS', root.encode(), d))"
+
+rem ===== generate build_auto.ninja =====
+rem All toolchain paths are resolved by tools\gen_ninja.py via ezos_env.py, which
+rem derives them from the project location. Nothing here is hardcoded to a drive
+rem letter, so a copy of the repo on another disk builds without editing files.
+rem The rewrite MUST stay byte-level: PowerShell Get-Content decodes UTF-8 as GBK
+rem and an orphan lead byte (e.g. 0x82 left from U+3002) swallows the following
+rem 0x0A, merging two ninja lines into "unexpected indent".
+"%PYEXE%" "%~dp0tools\gen_ninja.py" --src "%~dp0build.ninja" --out "%~dp0build_auto.ninja"
 if errorlevel 1 (
-    echo [ERROR] failed to generate build_auto.ninja - python is required
+    echo [ERROR] failed to generate build_auto.ninja
+    echo         see the message above for the missing tool or path
     pause
     exit /b 1
 )
@@ -48,7 +40,7 @@ if not exist "%NINJA%" (
     set "NINJA=ninja"
 )
 
-rem ===== parallel build (-j = CPU logical cores) =====
+rem ===== parallel build -j = CPU logical cores =====
 set "NINJA_JOBS=%NUMBER_OF_PROCESSORS%"
 if "%BUILD_ONLY%"=="1" (
     echo [build-only] ninja -j%NINJA_JOBS% building os-image.bin, no QEMU...

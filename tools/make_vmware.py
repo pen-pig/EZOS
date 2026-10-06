@@ -16,12 +16,16 @@ PhoenixBIOS + 更接近真机的芯片组，是介于 QEMU 和真机之间的第
 """
 import argparse
 import os
+
+import sys as _sys
+_sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import ezos_env as _ezos  # noqa: E402
 import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-QEMU_IMG = "D:/MyOS/tools/qemu-portable-20241220/qemu-img.exe"
+QEMU_IMG = _ezos.qemu_img_exe()
 
 VMX = """.encoding = "UTF-8"
 displayName = "EZOS"

@@ -17,6 +17,12 @@ QMP sendkey 打字 → screendump → 真字库 OCR → 断言。
 端口 4463（与项目其它 E2E 端口约定一致，脚本间不撞车）。
 用法：python tests/test_regress.py      （退出码 0 = 全通过）
 """
+import os as _os_ezos
+import sys as _sys_ezos
+_sys_ezos.path.append(_os_ezos.path.dirname(
+    _os_ezos.path.dirname(_os_ezos.path.abspath(__file__))))
+from ezos_env import qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe  # noqa: E402
+
 import json
 import os
 import shutil
@@ -31,7 +37,7 @@ KERNEL_DIR = os.path.join(ROOT, "kernel")
 sys.path.insert(0, HERE)
 import ezocr  # noqa: E402
 
-QEMU = "D:/MyOS/tools/qemu-portable-20241220/qemu-system-x86_64.exe"
+QEMU = qemu_exe()
 PORT = 4463
 BOOT_WAIT = 30          # icount 下到 shell 提示符的保守等待
 SHOT = os.path.join(HERE, "rg_shot.ppm").replace("\\", "/")

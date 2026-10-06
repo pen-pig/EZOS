@@ -28,6 +28,12 @@ QEMU 侧两个必知的坑（都实测过，别改回去）：
 
 用法：python tests/test_usbmouse.py   （退出码 0 = 全通过）
 """
+import os as _os_ezos
+import sys as _sys_ezos
+_sys_ezos.path.append(_os_ezos.path.dirname(
+    _os_ezos.path.dirname(_os_ezos.path.abspath(__file__))))
+from ezos_env import qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe  # noqa: E402
+
 import os
 import re
 import socket
@@ -38,7 +44,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-QEMU = "D:/MyOS/tools/qemu-portable-20241220/qemu-system-x86_64.exe"
+QEMU = qemu_exe()
 QMP_PORT = 4505
 SERIAL_PORT = 4506
 # icount shift=auto 下这台 QEMU 开机很慢（实测 45s 才走到 shell 提示符），

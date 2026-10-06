@@ -18,6 +18,12 @@ Zig: rust/ezos_zig）和两份文件名 hash（Rust / Zig），`rstest` 命令�
 端口 4563(serial) / 4564(QMP)。
 用法：python tests/test_multilang.py   （退出码 0 = 通过）
 """
+import os as _os_ezos
+import sys as _sys_ezos
+_sys_ezos.path.append(_os_ezos.path.dirname(
+    _os_ezos.path.dirname(_os_ezos.path.abspath(__file__))))
+from ezos_env import qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe  # noqa: E402
+
 import os
 import shutil
 import subprocess
@@ -27,7 +33,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
-QEMU = "D:/MyOS/tools/qemu-portable-20241220/qemu-system-x86_64.exe"
+QEMU = qemu_exe()
 QMP_PORT = 4564
 SERIAL_PORT = 4563
 IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")

@@ -17,6 +17,12 @@
 端口 4493（与其它 E2E 端口约定一致）。
 用法：python tests/test_fs_matrix.py        （退出码 0 = 全部通过）
 """
+import os as _os_ezos
+import sys as _sys_ezos
+_sys_ezos.path.append(_os_ezos.path.dirname(
+    _os_ezos.path.dirname(_os_ezos.path.abspath(__file__))))
+from ezos_env import qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe  # noqa: E402
+
 import json
 import os
 import shutil
@@ -31,7 +37,7 @@ KERNEL_DIR = os.path.join(ROOT, "kernel")
 sys.path.insert(0, HERE)
 import ezocr  # noqa: E402
 
-QEMU = "D:/MyOS/tools/qemu-portable-20241220/qemu-system-x86_64.exe"
+QEMU = qemu_exe()
 PORT = 4493
 BOOT_WAIT = 30
 SHOT = os.path.join(HERE, "fs_shot.ppm").replace("\\", "/")

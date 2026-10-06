@@ -13,6 +13,12 @@
 （本机实测 55669-55768 被预留，绑定直接 WinError 10013），换机器症状还会变。
 用法：python tests/test_netapp.py    （退出码 0 = 全部通过）
 """
+import os as _os_ezos
+import sys as _sys_ezos
+_sys_ezos.path.append(_os_ezos.path.dirname(
+    _os_ezos.path.dirname(_os_ezos.path.abspath(__file__))))
+from ezos_env import qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe  # noqa: E402
+
 import os
 import socket
 import struct
@@ -24,7 +30,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ezocr  # noqa: E402
 
-QEMU = "D:/MyOS/tools/qemu-portable-20241220/qemu-system-x86_64.exe"
+QEMU = qemu_exe()
 BOOT_WAIT_S = 10.0
 
 GUEST_MAC = bytes([0x52, 0x54, 0x00, 0x12, 0x34, 0x56])

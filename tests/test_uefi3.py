@@ -14,6 +14,12 @@
 端口 4464（端口每脚本唯一，见 tests/README.md）。
 用法：python tests/test_uefi3.py   （退出码 0 = 全通过）
 """
+import os as _os_ezos
+import sys as _sys_ezos
+_sys_ezos.path.append(_os_ezos.path.dirname(
+    _os_ezos.path.dirname(_os_ezos.path.abspath(__file__))))
+from ezos_env import qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe  # noqa: E402
+
 import json
 import os
 import shutil
@@ -28,8 +34,8 @@ KERNEL_DIR = os.path.join(ROOT, "kernel")
 sys.path.insert(0, HERE)
 import ezocr  # noqa: E402
 
-QEMU = "D:/MyOS/tools/qemu-portable-20241220/qemu-system-i386.exe"
-FD = "D:/MyOS/tools/qemu-portable-20241220/share/edk2-i386-code.fd"
+QEMU = qemu32_exe()
+FD = ovmf_fd()
 ESP = os.path.join(ROOT, "uefi/esp").replace("\\", "/")
 KERNEL_BIN = os.path.join(ESP, "kernel.bin")
 BOOT_EFI = os.path.join(ESP, "EFI/BOOT/BOOTIA32.EFI").replace("\\", "/")

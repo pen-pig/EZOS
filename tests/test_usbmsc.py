@@ -21,6 +21,12 @@
 
 端口 4503(QMP) / 4504(serial)。
 """
+import os as _os_ezos
+import sys as _sys_ezos
+_sys_ezos.path.append(_os_ezos.path.dirname(
+    _os_ezos.path.dirname(_os_ezos.path.abspath(__file__))))
+from ezos_env import qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe  # noqa: E402
+
 import json
 import os
 import socket
@@ -35,7 +41,7 @@ KERNEL_DIR = os.path.join(ROOT, "kernel")
 sys.path.insert(0, HERE)
 import ezocr  # noqa: E402
 
-QEMU = "D:/MyOS/tools/qemu-portable-20241220/qemu-system-x86_64.exe"
+QEMU = qemu_exe()
 QMP_PORT = 4503
 SERIAL_PORT = 4504
 BOOT_WAIT = 150        # USB 引导 + USB 枚举 + FS，比 IDE 慢

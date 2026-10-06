@@ -28,6 +28,12 @@ slirp 不会改写 guest→host 方向的帧内容）：
 退出码 0 = 全部断言通过。
 注：开机等待 BOOT_WAIT_S 是保守值；机器慢导致键入落空时把它调大。
 """
+import os as _os_ezos
+import sys as _sys_ezos
+_sys_ezos.path.append(_os_ezos.path.dirname(
+    _os_ezos.path.dirname(_os_ezos.path.abspath(__file__))))
+from ezos_env import qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe  # noqa: E402
+
 import os
 import socket
 import struct
@@ -36,7 +42,7 @@ import sys
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-QEMU = "D:/MyOS/tools/qemu-portable-20241220/qemu-system-x86_64.exe"
+QEMU = qemu_exe()
 GUEST_IP = "10.0.2.15"
 UDP_PORT = 7000
 TCP_PORT = 7001

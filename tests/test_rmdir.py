@@ -24,6 +24,12 @@ EROFS 是只读卷不提供 format，不在矩阵里。
 数据盘用 disk.vhd 的副本（tests/disk_rmdir.vhd），绝不污染构建产物。
 端口 4478（4477 被 test_netapp.py 的 netdev 占用，端口必须每脚本唯一）。用法：python tests/test_rmdir.py   （退出码 0 = 全通过）
 """
+import os as _os_ezos
+import sys as _sys_ezos
+_sys_ezos.path.append(_os_ezos.path.dirname(
+    _os_ezos.path.dirname(_os_ezos.path.abspath(__file__))))
+from ezos_env import qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe  # noqa: E402
+
 import json
 import os
 import shutil
@@ -38,7 +44,7 @@ KERNEL_DIR = os.path.join(ROOT, "kernel")
 sys.path.insert(0, HERE)
 import ezocr  # noqa: E402
 
-QEMU = "D:/MyOS/tools/qemu-portable-20241220/qemu-system-x86_64.exe"
+QEMU = qemu_exe()
 PORT = 4478
 BOOT_WAIT = 30
 SHOT = os.path.join(HERE, "rmdir_shot.ppm").replace("\\", "/")

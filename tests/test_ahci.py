@@ -13,6 +13,12 @@
   - ahci.vhd 64MB 空文件在 tests/ 下临时生成（已被 .gitignore 的 *.vhd 忽略）。
 用法：python tests/test_ahci.py   （退出码 0 = 全通过）
 """
+import os as _os_ezos
+import sys as _sys_ezos
+_sys_ezos.path.append(_os_ezos.path.dirname(
+    _os_ezos.path.dirname(_os_ezos.path.abspath(__file__))))
+from ezos_env import qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe  # noqa: E402
+
 import make_vhd
 import os
 import socket
@@ -27,7 +33,7 @@ KERNEL_DIR = os.path.join(ROOT, "kernel")
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "tools"))    # make_vhd：给空白盘补 VHD footer
 
-QEMU = "D:/MyOS/tools/qemu-portable-20241220/qemu-system-x86_64.exe"
+QEMU = qemu_exe()
 QMP_PORT = 4487
 SERIAL_PORT = 4488
 BOOT_WAIT = 40

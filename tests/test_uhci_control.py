@@ -24,6 +24,12 @@ SET_ADDRESS(1) -> GET_DESCRIPTOR(Device)@addr1，仅取设备描述符前几个�
 
 用法：python tests/test_uhci_control.py   （退出码 0 = 全通过）
 """
+import os as _os_ezos
+import sys as _sys_ezos
+_sys_ezos.path.append(_os_ezos.path.dirname(
+    _os_ezos.path.dirname(_os_ezos.path.abspath(__file__))))
+from ezos_env import qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe  # noqa: E402
+
 import os
 import socket
 import subprocess
@@ -33,7 +39,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-QEMU = "D:/MyOS/tools/qemu-portable-20241220/qemu-system-x86_64.exe"
+QEMU = qemu_exe()
 QMP_PORT = 4475
 SERIAL_PORT = 4476
 BOOT_WAIT = 45

@@ -15,6 +15,12 @@
 
 端口 4585(QMP) / 4586(serial)。
 """
+import os as _os_ezos
+import sys as _sys_ezos
+_sys_ezos.path.append(_os_ezos.path.dirname(
+    _os_ezos.path.dirname(_os_ezos.path.abspath(__file__))))
+from ezos_env import qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe  # noqa: E402
+
 import os
 import re
 import shutil
@@ -27,7 +33,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 
-QEMU = "D:/MyOS/tools/qemu-portable-20241220/qemu-system-x86_64.exe"
+QEMU = qemu_exe()
 IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
 DISK = os.path.join(ROOT, "disk.vhd")
 WORK = os.path.join(HERE, "mouse_work.vhd").replace("\\", "/")

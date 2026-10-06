@@ -16,6 +16,12 @@ tools/make_usb_image.py 产出的 usb-image.bin 是为真机准备的：LBA0 是
 端口 4519(QMP/legacy) / 4520(serial/legacy)、4521(QMP/UEFI) / 4522(serial/UEFI)。
 UEFI 用例用 -nographic + 串口文件，串口走 TCP 更实时，所以两边都用 TCP。
 """
+import os as _os_ezos
+import sys as _sys_ezos
+_sys_ezos.path.append(_os_ezos.path.dirname(
+    _os_ezos.path.dirname(_os_ezos.path.abspath(__file__))))
+from ezos_env import qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe  # noqa: E402
+
 import os
 import subprocess
 import sys
@@ -26,9 +32,9 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
-QEMU64 = "D:/MyOS/tools/qemu-portable-20241220/qemu-system-x86_64.exe"
-QEMU32 = "D:/MyOS/tools/qemu-portable-20241220/qemu-system-i386.exe"
-OVMF = "D:/MyOS/tools/qemu-portable-20241220/share/edk2-i386-code.fd"
+QEMU64 = qemu_exe()
+QEMU32 = qemu32_exe()
+OVMF = ovmf_fd()
 USB_IMG = os.path.join(ROOT, "usb-image.bin")
 
 from test_nvme import SerialReader, Qmp, wait_for, wait_port_free, kill_all_qemu  # noqa

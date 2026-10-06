@@ -35,6 +35,12 @@ QEMU 侧已实测的关键事实（别凭记忆改）：
 
 用法：python tests/test_ehci.py   （退出码 0 = 全通过）
 """
+import os as _os_ezos
+import sys as _sys_ezos
+_sys_ezos.path.append(_os_ezos.path.dirname(
+    _os_ezos.path.dirname(_os_ezos.path.abspath(__file__))))
+from ezos_env import qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe  # noqa: E402
+
 import os
 import re
 import socket
@@ -49,7 +55,7 @@ KERNEL_DIR = os.path.join(ROOT, "kernel")
 sys.path.insert(0, HERE)
 import ezocr  # noqa: E402
 
-QEMU = "D:/MyOS/tools/qemu-portable-20241220/qemu-system-x86_64.exe"
+QEMU = qemu_exe()
 QMP_PORT = 4507
 SERIAL_PORT = 4508
 # icount shift=auto 下这台 QEMU 开机很慢，按"看得见证据"为准，不按乐观估计。
