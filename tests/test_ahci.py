@@ -19,7 +19,6 @@ _sys_ezos.path.append(_os_ezos.path.dirname(
     _os_ezos.path.dirname(_os_ezos.path.abspath(__file__))))
 from ezos_env import qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe  # noqa: E402
 
-import make_vhd
 import os
 import socket
 import subprocess
@@ -32,6 +31,9 @@ ROOT = os.path.dirname(HERE)
 KERNEL_DIR = os.path.join(ROOT, "kernel")
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "tools"))    # make_vhd：给空白盘补 VHD footer
+
+# tools 路径进 sys.path **之后**才能 import（它不在脚本目录里）。
+import make_vhd  # noqa: E402
 
 QEMU = qemu_exe()
 QMP_PORT = 4487

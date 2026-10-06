@@ -259,12 +259,32 @@ def phase_ping():
 
 # ==================== phase httpd ====================
 
+def _free_port(start):
+    """从 start 起找一个真正没人监听的本地端口。
+
+    8080 常被本机别的服务占着（占着时连上去拿到的是那个服务的页面，看起来
+    像"guest 页面内容不对"，其实是连错了地方——曾因此误判内核 httpd 有 bug）。
+    与其让人手工传环境变量，不如自己避开。
+    """
+    import socket as _s
+    for p in range(start, start + 200):
+        with _s.socket(_s.AF_INET, _s.SOCK_STREAM) as sk:
+            sk.setsockopt(_s.SOL_SOCKET, _s.SO_REUSEADDR, 1)
+            try:
+                sk.bind(("127.0.0.1", p))
+            except OSError:
+                continue
+        return p
+    raise RuntimeError("no free port found from %d" % start)
+
+
 def phase_httpd():
     print("== phase httpd: guest `httpd` + host GET ==")
-    # 8080 常被本机别的服务占着（占着时连上去拿到的是那个服务的页面，
-    # 看起来像"guest 页面内容不对"，其实是连错了地方）。
-    # 换端口：EZOS_HTTPD_PORT=18080 python tests/test_netapp.py
-    port = int(os.environ.get("EZOS_HTTPD_PORT", "8080"))
+    # 端口必须选**没人监听的**：被别的服务占着时，hostfwd 转发不出去，
+    # 请求会落到那个服务上（拿到它的 HTML），症状极像 guest 页面不对。
+    # 仍可用 EZOS_HTTPD_PORT 指定起点。
+    port = _free_port(int(os.environ.get("EZOS_HTTPD_PORT", "18080")))
+    print("   hostfwd 127.0.0.1:%d -> guest:80" % port)
     g = Guest(mon_port=4480,
               extra_net=["-netdev", "user,id=n0,hostfwd=tcp::%d-:80" % port,
                          "-device", "rtl8139,netdev=n0"])
