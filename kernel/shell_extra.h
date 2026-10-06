@@ -36,6 +36,7 @@ void cmd_elftest(const char *args);
 void cmd_exec(const char *args);
 void cmd_calc(const char *args);
 void cmd_selftest(const char *args);
+void cmd_mouseproto(const char *args);
 void cmd_ktask(const char *args);
 void cmd_ps(const char *args);
 void cmd_pci(const char *args);

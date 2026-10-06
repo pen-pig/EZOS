@@ -155,10 +155,19 @@ static void poll_once(const usb_dev_t *d) {
         m_emit(line, n, lim);
     }
 
-    int btn = rep[0] & 0x07;
-    int dx  = (int)(int8_t)rep[1];
-    int dy  = (int)(int8_t)rep[2];
-    int dz  = (act >= 4) ? (int)(int8_t)rep[3] : 0;
+    /*
+     * 解析走 mouse_decode_usb() 这个纯函数：与 PS/2 共用同一份屏幕坐标语义
+     * （dx>0 右、dy>0 下、dz>0 上滚），并被 mouse_selftest 逐条守护——
+     * QEMU 没有触摸板也不发滚轮事件，真机上字节解析差一位只能靠它兜住。
+     */
+    mouse_ev_t ev;
+    ev.dx = ev.dy = ev.buttons = ev.dz = 0;
+    if (mouse_decode_usb(rep, (uint32_t)act, &ev) != 0) return;
+
+    int btn = ev.buttons;
+    int dx  = ev.dx;
+    int dy  = ev.dy;
+    int dz  = ev.dz;
 
     /* 静止且按键没变：不是事件，直接返回（避免把 0 位移当事件刷屏） */
     if (dx == 0 && dy == 0 && dz == 0 && btn == g_last_btn) return;

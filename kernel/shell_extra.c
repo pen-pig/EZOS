@@ -38,6 +38,7 @@
 #include "ata.h"
 #include "exfat.h"          /* exfat_checksum_c / exfat_name_hash_c（C 基线） */
 #include "rust_bridge.h"    /* Rust / Zig 侧实现 */
+#include "mouse.h"          /* mouse_selftest / mouse_protocol / 指针状态 */
 
 /* 网络地址格式化（定义在 cmd_ping 之后；cmd_nic 也要用，故提前声明） */
 static const char *ips_of(uint32_t be);
@@ -1040,6 +1041,21 @@ static int st2_string(char *detail, uint32_t ds) {
     return bad;
 }
 
+/* mouse：PS/2 与 USB HID 包解析（纯函数，喂合成包）+ 注入路径方向校验。
+ * 真机上的触摸板/滚轮在这里守：QEMU 没有触摸板、QMP 也不发滚轮事件，
+ * 不合成输入的话这两条分支在提交前永远没人跑过。 */
+static int st2_mouse(char *detail, uint32_t ds) {
+    int bad = mouse_selftest(0);
+    if (detail && ds) {
+        uint32_t p = 0;
+        st_puts(detail, &p, ds, "ps2+usb decode, proto=");
+        st_putd(detail, &p, ds, (uint32_t)mouse_protocol());
+        st_puts(detail, &p, ds, "B");
+        detail[p] = '\0';
+    }
+    return bad;
+}
+
 typedef int (*st2_probe_t)(char *detail, uint32_t dsize);
 static const struct {
     const char *name;      /* 与既有条目同宽：8 字符名 + 描述 */
@@ -1058,8 +1074,40 @@ static const struct {
     { "div64    64-bit division",   st2_div64 },
     { "pipe     kernel pipe pair",  st2_pipe },
     { "string   str/fmt helpers",   st2_string },
+    { "mouse    ps2/usb packet",    st2_mouse },
 };
 #define ST2_COUNT (sizeof(ST2_PROBES) / sizeof(ST2_PROBES[0]))
+
+/* mouseproto：查看 / 切换 PS/2 包长协议。
+ * 默认 3 字节（标准 PS/2）。真机上确认指点设备支持 IntelliMouse 滚轮后
+ * 用 `mouseproto 4` 切到 4 字节——QEMU 与部分固件对魔法序列应答不一致，
+ * 默认切成 4 会让包流永久错位，所以绝不在 init 里自动切。 */
+void cmd_mouseproto(const char *args) {
+    if (args && args[0]) {
+        if (args[0] == '4') mouse_set_protocol(1);
+        else if (args[0] == '3') mouse_set_protocol(0);
+        else { ezos_console_write("usage: mouseproto 3|4\n"); return; }
+    }
+    char line[128];
+    uint32_t p = 0;
+    st_puts(line, &p, sizeof(line), "mouse: proto=");
+    st_putd(line, &p, sizeof(line), (uint32_t)mouse_protocol());
+    st_puts(line, &p, sizeof(line), "B present=");
+    st_putd(line, &p, sizeof(line), (uint32_t)mouse_present());
+    st_puts(line, &p, sizeof(line), " usb=");
+    st_putd(line, &p, sizeof(line), (uint32_t)mouse_usb_present());
+    st_puts(line, &p, sizeof(line), " pkts=");
+    st_putd(line, &p, sizeof(line), (uint32_t)mouse_packet_count());
+    st_puts(line, &p, sizeof(line), " x=");
+    st_putd(line, &p, sizeof(line), (uint32_t)mouse_get_x());
+    st_puts(line, &p, sizeof(line), " y=");
+    st_putd(line, &p, sizeof(line), (uint32_t)mouse_get_y());
+    st_puts(line, &p, sizeof(line), " btn=");
+    st_putd(line, &p, sizeof(line), (uint32_t)mouse_get_buttons());
+    st_puts(line, &p, sizeof(line), "\n");
+    line[p] = '\0';
+    ezos_console_write(line);
+}
 
 void cmd_selftest(const char *args) {
     (void)args;
@@ -1392,6 +1440,7 @@ int boot_selftest(void) {
         "div64    64-bit division",
         "pipe     kernel pipe pair",
         "string   str/fmt helpers",
+        "mouse    ps2/usb packet",
     };
     int failed = 0;
     for (int i = 0; i < n; i++) {

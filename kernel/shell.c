@@ -458,6 +458,7 @@ static const command_t commands[] = {
     {"jobs",     cmd_jobs},
     {"calc",     cmd_calc},
     {"selftest", cmd_selftest},
+    {"mouseproto", cmd_mouseproto},
     {"ktask",     cmd_ktask},
     {"ps",        cmd_ps},
     {"pci",       cmd_pci},

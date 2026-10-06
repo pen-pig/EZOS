@@ -1,6 +1,36 @@
 #ifndef MOUSE_H
 #define MOUSE_H
 
+#include "types.h"
+
+/* ---- 统一事件（屏幕坐标）----
+ * dx > 0 向右，dy > 0 向下，dz > 0 上滚，buttons: bit0 左 / bit1 右 / bit2 中。
+ * 两条总线（PS/2 与 USB HID）各自的字节序与 Y 轴方向差异，全部在下面两个
+ * 纯函数里吃掉，上层永远只看到这一种语义。 */
+typedef struct {
+    int dx;
+    int dy;
+    int buttons;
+    int dz;
+} mouse_ev_t;
+
+/* 纯函数：无全局状态、无端口 I/O，同输入必得同输出，所以能被 selftest 直接
+ * 喂合成包守护——生产路径（IRQ12 与 USB 轮询）走的就是这两个函数。
+ * 返回 0 = 包合法并已解析；非 0 = 该包必须丢弃（不同步 / 溢出 / 太短 / 应答）。 */
+int mouse_decode_ps2(const uint8_t *pkt, uint32_t len, int wheel,
+                     mouse_ev_t *ev);
+int mouse_decode_usb(const uint8_t *rep, uint32_t len, mouse_ev_t *ev);
+
+/* 自检：喂合成包 + 注入合成事件，返回失败断言数（0 = 全过）。
+ * out 可为 NULL（开机自检静默跑）。 */
+int mouse_selftest(void (*out)(const char *line));
+
+/* PS/2 包长协议：3 = 标准三字节，4 = IntelliMouse（带滚轮第四字节）。
+ * 默认 3（QEMU 与部分固件对 IntelliMouse 魔法序列应答不一致，切成 4 字节会
+ * 让包流永久错位），真机上确认鼠标支持滚轮后可用 `mouseproto 4` 手工切换。 */
+void mouse_set_protocol(int four_byte);
+int  mouse_protocol(void);
+
 void mouse_init(void);
 void mouse_handler(void);
 void irq12_handler(void);

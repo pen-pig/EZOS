@@ -84,6 +84,18 @@ void mouse_set_sensitivity(int mul256) {
     mouse_speed = mul256;
 }
 
+int mouse_get_sensitivity(void) {
+    return mouse_speed;
+}
+
+/* 滚轮环形缓冲：满了就丢弃最旧的事件（绝不覆盖未读数据，也绝不阻塞） */
+static void wheel_push(int z) {
+    int next = (wheel_end + 1) % MOUSE_WHEEL_BUF_SIZE;
+    if (next == wheel_start) return;      /* 满：丢 */
+    wheel_buf[wheel_end] = z;
+    wheel_end = next;
+}
+
 static void mouse_accumulate(int dx, int dy) {
     dx = (int)((dx * mouse_speed) / 256);
     dy = (int)((dy * mouse_speed) / 256);
@@ -95,6 +107,201 @@ static void mouse_accumulate(int dx, int dy) {
     else if (mouse_x > max_x) mouse_x = max_x;
     if (mouse_y < 0) mouse_y = 0;
     else if (mouse_y > max_y) mouse_y = max_y;
+}
+
+/* ==========================================================================
+ * 纯函数：包解析
+ *
+ * 这两条分支以前各自散在 IRQ12 处理与 USB 轮询里，既不共享也没被任何测试
+ * 覆盖——QEMU 没有触摸板、也不发滚轮事件，真机上一旦字节解析差一位就只能
+ * 靠肉眼看指针飘。抽成纯函数（不碰全局、不碰端口）之后 selftest 可以直接
+ * 喂合成包，把"只能在真机上试"的东西搬到开机自检里。
+ *
+ * Y 轴：PS/2 原生"正=向上"，USB boot 报告"正=向下"。统一取屏幕坐标
+ * （dy>0 向下）后交给 mouse_accumulate，GUI 侧不必知道指针来自哪条总线。
+ * ========================================================================== */
+
+int mouse_decode_ps2(const uint8_t *pkt, uint32_t len, int wheel,
+                     mouse_ev_t *ev) {
+    if (!pkt || !ev || len < 3) return 1;          /* 太短：直接丢 */
+    uint8_t b0 = pkt[0];
+    if (!(b0 & 0x08)) return 1;                    /* bit3 同步位必须为 1 */
+    /* 命令应答字节虽然 bit3=1，但不是包首字节；混进来会让整条包流错位 */
+    if (b0 == 0xFA || b0 == 0xAA || b0 == 0xEE) return 1;
+    /* bit7/bit6 = X/Y 溢出：位移数据无效，必须整包丢弃（否则指针乱跳） */
+    if (b0 & 0xC0) return 1;
+
+    ev->buttons = b0 & 0x07;
+    ev->dx = (int)(int8_t)pkt[1];
+    ev->dy = -(int)(int8_t)pkt[2];                 /* PS/2 正=向上 → 取反 */
+    ev->dz = (wheel && len >= 4) ? (int)(int8_t)pkt[3] : 0;
+    return 0;
+}
+
+int mouse_decode_usb(const uint8_t *rep, uint32_t len, mouse_ev_t *ev) {
+    if (!rep || !ev || len < 3) return 1;          /* boot 报告至少 3 字节 */
+    ev->buttons = rep[0] & 0x07;
+    ev->dx = (int)(int8_t)rep[1];
+    ev->dy = (int)(int8_t)rep[2];                  /* USB 正=向下，与屏幕同向 */
+    ev->dz = (len >= 4) ? (int)(int8_t)rep[3] : 0; /* 第 4 字节是可选滚轮 */
+    return 0;
+}
+
+void mouse_set_protocol(int four_byte) {
+    uint32_t flags = irq_save_disable();
+    has_wheel = four_byte ? 1 : 0;
+    packet_len = has_wheel ? 4 : 3;
+    packet_index = 0;      /* 切协议必须重置，否则半包与新长度错位 */
+    irq_restore(flags);
+}
+
+int mouse_protocol(void) {
+    return packet_len;
+}
+
+/* ---------- 自检：合成包向量 + 注入路径的端到端方向校验 ---------- */
+int mouse_selftest(void (*out)(const char *line)) {
+    int bad = 0;
+    int asserts = 0;
+
+    struct {
+        uint8_t p[4];
+        uint32_t len;
+        int wheel;
+        int valid;             /* 0 = 该包必须被丢弃 */
+        int dx, dy, btn, dz;   /* valid=1 时的期望值 */
+    } t[] = {
+        /* --- PS/2 三字节 --- */
+        { {0x08, 0x00, 0x00, 0}, 3, 0, 1,   0,   0, 0, 0 },  /* 静止 */
+        { {0x09, 0x0A, 0x00, 0}, 3, 0, 1,  10,   0, 1, 0 },  /* 右键?左键 bit0 */
+        { {0x08, 0xF6, 0x00, 0}, 3, 0, 1, -10,   0, 0, 0 },  /* 负位移符号扩展 */
+        { {0x08, 0x00, 0x05, 0}, 3, 0, 1,   0,  -5, 0, 0 },  /* PS/2 上移 → dy<0 */
+        { {0x08, 0x00, 0xFB, 0}, 3, 0, 1,   0,   5, 0, 0 },  /* PS/2 下移 → dy>0 */
+        { {0x0C, 0x7F, 0x7F, 0}, 3, 0, 1, 127,-127, 4, 0 },  /* 中键 + 满量程 */
+        /* --- 必须丢弃的包 --- */
+        { {0x00, 0x00, 0x00, 0}, 3, 0, 0,   0,   0, 0, 0 },  /* 无同步位 */
+        { {0xC8, 0x00, 0x00, 0}, 3, 0, 0,   0,   0, 0, 0 },  /* X 溢出 */
+        { {0x48, 0x00, 0x00, 0}, 3, 0, 0,   0,   0, 0, 0 },  /* Y 溢出 */
+        { {0xFA, 0x00, 0x00, 0}, 3, 0, 0,   0,   0, 0, 0 },  /* ACK */
+        { {0xAA, 0x00, 0x00, 0}, 3, 0, 0,   0,   0, 0, 0 },  /* BAT */
+        { {0x08, 0x00, 0x00, 0}, 2, 0, 0,   0,   0, 0, 0 },  /* 长度不足 */
+        /* --- IntelliMouse 四字节 --- */
+        { {0x08, 0x00, 0x00, 0x01}, 4, 1, 1,   0,   0, 0,  1 },
+        { {0x08, 0x00, 0x00, 0xFF}, 4, 1, 1,   0,   0, 0, -1 },
+        { {0x08, 0x00, 0x00, 0x01}, 4, 0, 1,   0,   0, 0,  0 }, /* 未开滚轮：dz 恒 0 */
+        { {0x08, 0x00, 0x00, 0x01}, 3, 1, 1,   0,   0, 0,  0 }, /* 三字节包无 dz */
+    };
+
+    for (uint32_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
+        mouse_ev_t ev;
+        ev.dx = ev.dy = ev.buttons = ev.dz = 0;
+        asserts++;
+        int r = mouse_decode_ps2(t[i].p, t[i].len, t[i].wheel, &ev);
+        if (!t[i].valid) {
+            if (r == 0) bad++;                       /* 该丢却收了 */
+            continue;
+        }
+        if (r != 0) { bad++; continue; }
+        if (ev.dx != t[i].dx || ev.dy != t[i].dy ||
+            ev.buttons != t[i].btn || ev.dz != t[i].dz) bad++;
+    }
+
+    /* --- USB boot 报告：Y 轴方向与 PS/2 相反，必须逐条钉死 --- */
+    struct {
+        uint8_t r[4];
+        uint32_t len;
+        int valid;
+        int dx, dy, btn, dz;
+    } u[] = {
+        { {0x01, 0x10, 0x20, 0}, 3, 1,  16,  32, 1, 0 },  /* USB 正 Y = 向下 */
+        { {0x00, 0xF0, 0xF0, 0}, 3, 1, -16, -16, 0, 0 },
+        { {0x02, 0x00, 0x00, 0}, 3, 1,   0,   0, 2, 0 },  /* 右键 */
+        { {0x04, 0x00, 0x00, 0xFE}, 4, 1, 0, 0, 4, -2 },  /* 滚轮下滚 */
+        { {0x01, 0x10, 0x20, 0}, 2, 0,   0,   0, 0, 0 },  /* 报告不完整 */
+    };
+    for (uint32_t i = 0; i < sizeof(u) / sizeof(u[0]); i++) {
+        mouse_ev_t ev;
+        ev.dx = ev.dy = ev.buttons = ev.dz = 0;
+        asserts++;
+        int r = mouse_decode_usb(u[i].r, u[i].len, &ev);
+        if (!u[i].valid) {
+            if (r == 0) bad++;
+            continue;
+        }
+        if (r != 0) { bad++; continue; }
+        if (ev.dx != u[i].dx || ev.dy != u[i].dy ||
+            ev.buttons != u[i].btn || ev.dz != u[i].dz) bad++;
+    }
+
+    /* --- 端到端：注入 USB 事件，验证"屏幕坐标方向"与滚轮环形缓冲 ---
+     * 这一段会真的动指针状态，所以先存后恢复，灵敏度也临时钉成 1.0x。 */
+    {
+        int sp = mouse_get_sensitivity();
+        int sx = mouse_x, sy = mouse_y;
+        mouse_set_sensitivity(256);
+        mouse_warp(100, 100);
+
+        mouse_inject_report(0, 10, 0, 0);            /* 向下 10 */
+        asserts++;
+        if (mouse_get_y() != 110) bad++;
+        mouse_inject_report(10, 0, 0, 0);            /* 向右 10 */
+        asserts++;
+        if (mouse_get_x() != 110) bad++;
+
+        /* 钳位：负方向越过 0 不能变负，也不能绕回屏幕另一侧 */
+        mouse_inject_report(-500, -500, 0, 0);
+        asserts++;
+        if (mouse_get_x() != 0 || mouse_get_y() != 0) bad++;
+
+        /* 滚轮环形缓冲：单事件能取回原值；灌爆后留下来的不超过容量 */
+        while (mouse_get_wheel() != 0) { }           /* 排空（原本应为空） */
+        mouse_inject_report(0, 0, 0, 5);
+        asserts++;
+        if (mouse_get_wheel() != 5) bad++;
+        for (int i = 0; i < 200; i++) mouse_inject_report(0, 0, 0, 1);
+        int got = 0;
+        while (mouse_get_wheel() != 0 && got < 400) got++;
+        asserts++;
+        if (got > MOUSE_WHEEL_BUF_SIZE) bad++;       /* 溢出即状态破坏 */
+        while (mouse_get_wheel() != 0) { }
+
+        mouse_set_sensitivity(sp);
+        mouse_warp(sx, sy);
+    }
+
+    /* 手写十进制（内核无 sprintf） */
+    if (out) {
+        char line[96];
+        int p = 0;
+        int lim = (int)sizeof(line) - 1;
+        char tmp[12];
+        int m;
+        uint32_t v;
+
+        const char *s = "  mouse: ";
+        while (*s && p < lim) line[p++] = *s++;
+        v = (uint32_t)asserts; m = 0;
+        if (v == 0) tmp[m++] = '0';
+        while (v) { tmp[m++] = (char)('0' + v % 10); v /= 10; }
+        while (m && p < lim) line[p++] = tmp[--m];
+        s = " asserts, proto=";
+        while (*s && p < lim) line[p++] = *s++;
+        v = (uint32_t)packet_len; m = 0;
+        if (v == 0) tmp[m++] = '0';
+        while (v) { tmp[m++] = (char)('0' + v % 10); v /= 10; }
+        while (m && p < lim) line[p++] = tmp[--m];
+        s = "B -> ";
+        while (*s && p < lim) line[p++] = *s++;
+        v = (uint32_t)bad; m = 0;
+        if (v == 0) tmp[m++] = '0';
+        while (v) { tmp[m++] = (char)('0' + v % 10); v /= 10; }
+        while (m && p < lim) line[p++] = tmp[--m];
+        s = bad ? " FAILED\n" : " ok\n";
+        while (*s && p < lim) line[p++] = *s++;
+        line[p] = '\0';
+        out(line);
+    }
+    return bad;
 }
 
 void mouse_init(void) {
@@ -211,32 +418,20 @@ void mouse_handler(void) {
         packet_index++;
         if (packet_index >= packet_len) {
             packet_index = 0;
-            pkt_cnt++;
 
-            // PS/2 位移累积（带符号），并按当前分辨率裁剪。
-            // PS/2 约定 Y 正=向上，屏幕坐标 Y 正=向下，故传入 -dy。
-            int dx = (int)(int8_t)packet[1];
-            int dy = (int)(int8_t)packet[2];
-            mouse_buttons = packet[0] & 0x07;
-            /* PS/2 规范：byte0 的 bit7/bit6 为 X/Y 溢出标志，溢出包的
-             * 增量数据无效，必须整包丢弃（否则指针会乱跳/卡死）。 */
-            if (packet[0] & 0xC0) {
+            mouse_ev_t ev;
+            ev.dx = ev.dy = ev.buttons = ev.dz = 0;
+            /* 解析与判废全在纯函数里（不同步 / 溢出 / 应答字节一律丢弃） */
+            if (mouse_decode_ps2(packet, (uint32_t)packet_len, has_wheel, &ev) != 0) {
                 outb(0xA0, 0x20);
                 outb(0x20, 0x20);
                 return;
             }
-            mouse_accumulate(dx, -dy);
+            pkt_cnt++;                    /* 只计真正生效的包 */
 
-            if (has_wheel) {
-                int8_t z = (int8_t)packet[3];
-                if (z != 0) {
-                    int next = (wheel_end + 1) % MOUSE_WHEEL_BUF_SIZE;
-                    if (next != wheel_start) {
-                        wheel_buf[wheel_end] = (int)z;
-                        wheel_end = next;
-                    }
-                }
-            }
+            mouse_buttons = ev.buttons;
+            mouse_accumulate(ev.dx, ev.dy);
+            if (ev.dz != 0) wheel_push(ev.dz);
         }
     }
     outb(0xA0, 0x20);
@@ -273,13 +468,7 @@ void mouse_inject_report(int dx, int dy, int buttons, int dz) {
     mouse_buttons = buttons & 0x07;
     mouse_accumulate(dx, dy);
     pkt_cnt++;
-    if (dz != 0) {
-        int next = (wheel_end + 1) % MOUSE_WHEEL_BUF_SIZE;
-        if (next != wheel_start) {
-            wheel_buf[wheel_end] = dz;
-            wheel_end = next;
-        }
-    }
+    if (dz != 0) wheel_push(dz);
     irq_restore(flags);
 }
 
