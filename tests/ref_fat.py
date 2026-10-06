@@ -216,25 +216,26 @@ class Fat(object):
     def next_cluster(self, c):
         if c < 2 or c >= self.cluster_count + 2:
             return None
-        n = c - 2
+        # 表项下标 = 簇号（FAT 前两项保留，簇 2 在第 2 项）。
+        # 写成 (c - 2) 会整表错位两格：根目录因为"前一格恰好也是 EOC"看不出
+        # 问题，子目录会跟着别人的链跑进数据区——内核 fat.c 用的是 n * 4。
         if self.fat_type == 12:
-            off = self.fat_off + n + n // 2
+            off = self.fat_off + c + c // 2
             b = self.read_at(off, 2)
             v = b[0] | (b[1] << 8)
-            v = (v >> 4) if (n % 2 == 0) else (v & 0xFFF)
+            v = (v >> 4) if (c & 1) else (v & 0xFFF)
         elif self.fat_type == 16:
-            v = _u16(self.read_at(self.fat_off + n * 2, 2), 0)
+            v = _u16(self.read_at(self.fat_off + c * 2, 2), 0)
         else:
-            v = _u32(self.read_at(self.fat_off + n * 4, 4), 0) & 0x0FFFFFFF
+            v = _u32(self.read_at(self.fat_off + c * 4, 4), 0) & 0x0FFFFFFF
         return v
 
     def set_fat(self, c, v):
-        n = c - 2
         if self.fat_type == 12:
-            off = self.fat_off + n + n // 2
+            off = self.fat_off + c + c // 2
             b = bytearray(self.read_at(off, 2))
             cur = b[0] | (b[1] << 8)
-            if n % 2 == 0:
+            if c & 1:
                 cur = (cur & 0xF000) | (v & 0xFFF)
             else:
                 cur = (cur & 0x000F) | ((v & 0xFFF) << 4)
@@ -242,9 +243,9 @@ class Fat(object):
             b[1] = (cur >> 8) & 0xFF
             self.write_at(off, bytes(b))
         elif self.fat_type == 16:
-            self.write_at(self.fat_off + n * 2, struct.pack("<H", v))
+            self.write_at(self.fat_off + c * 2, struct.pack("<H", v))
         else:
-            self.write_at(self.fat_off + n * 4, struct.pack("<I", v & 0x0FFFFFFF))
+            self.write_at(self.fat_off + c * 4, struct.pack("<I", v & 0x0FFFFFFF))
 
     def chain(self, first):
         """返回簇链（不含 EOC）。有环或越界就抛 FatError——审计要的就是这个。"""

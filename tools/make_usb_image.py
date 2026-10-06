@@ -162,15 +162,17 @@ def build_esp(esp_sectors, kernel_data, efi_data):
     next_free = c_efi + n_efi
 
     fat = bytearray(p['fat_size'] * SECTOR)
-    put32(fat, 0, 0x0FFFFFF8)      # 簇 0 保留
-    put32(fat, 4, 0x0FFFFFFF)      # 簇 1 保留
+    # FAT32 的前两项是**保留的**（规范原文：The first two entries in the FAT
+    # are reserved and are not used），簇 N 的链值就在第 N 项 —— 不是 N-2。
+    # 错位两个表项的后果极具迷惑性：根目录因为"前一格恰好也是 EOC"而看起来
+    # 正常，子目录却会顺着别人的链跑到数据区里读出垃圾，文件读一半报 IO Error。
+    # kernel/fat.c 的 fat_entry_get() 就是 off = n * 4，两边必须一致。
+    put32(fat, 0, 0x0FFFFFF8)      # FAT[0] 保留：固定磁盘 / media 描述符
+    put32(fat, 4, 0x0FFFFFFF)      # FAT[1] 保留：坏簇标记
 
     def set_fat(c, val):
-        # c 是**簇号**，FAT 数组下标是 c-2。两者混用会让整张表错位 2 个簇：
-        # 症状是链在首簇就断（固件只读到 512 字节就 EOF），而所有字段断言
-        # 仍然全绿——因为它们根本不查链。
-        assert c >= 2, "FAT slot for cluster 0/1 is reserved, got %d" % c
-        put32(fat, (c - 2) * 4, val)
+        assert c >= 2, "FAT[0]/FAT[1] are reserved, got cluster %d" % c
+        put32(fat, c * 4, val)
 
     for c in (2, 3, 4):            # 三个目录簇各自 EOC
         set_fat(c, 0x0FFFFFFF)

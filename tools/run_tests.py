@@ -133,6 +133,18 @@ def pick_changed():
     return sorted({n for lay in layers for n in LAYERS[lay]}), out
 
 
+def kill_stale_qemu():
+    """每项测试前清掉上一次遗留的 QEMU。
+
+    残留进程会占住串口/QMP 端口，症状是测试直接 abort 或 ConnectionRefused
+    ——看起来像测试坏了，其实是上一轮没收拾干净。串行跑时上一项正常退出会
+    回收，但被 kill/超时打断的那一项不会。
+    """
+    for exe in ("qemu-system-x86_64.exe", "qemu-system-i386.exe"):
+        subprocess.run(["taskkill", "/F", "/IM", exe],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
     if not args:
@@ -178,6 +190,7 @@ def main():
             print("[%2d/%2d] %-14s MISSING" % (i, len(names), name))
             continue
         limit = TIMEOUT.get(name, 360)
+        kill_stale_qemu()
         print("[%2d/%2d] %-14s ... " % (i, len(names), name), end="",
               flush=True)
         t0 = time.time()
