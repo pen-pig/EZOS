@@ -43,6 +43,7 @@ LAYERS = {
     "gui":  ["vi", "vi_color", "uefi3"],
     "deep": ["step7_sock", "step7_tcp"],
     "hw":   ["ahci", "nvme", "power", "edge", "heap", "jobs", "lock"],
+    "util": ["digest"],
 }
 
 # 改动文件 -> 必跑层级。键是路径子串。

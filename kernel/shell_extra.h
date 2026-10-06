@@ -26,6 +26,14 @@ void cmd_unalias(const char *args);
 void cmd_uptime(const char *args);
 void cmd_sleep(const char *args);
 void cmd_mem(const char *args);
+/* 日用校验工具：纯 API 在 kernel/sysinfo.c，shell 包装在 shell_extra.c */
+int sysinfo_md5(const char *path, char *hex33, uint32_t *size_out);
+int sysinfo_crc(const char *path, int which, char *hex_out);
+int sysinfo_selftest(void);
+void cmd_md5(const char *args);
+void cmd_crc(const char *args);
+void cmd_crc16(const char *args);
+void cmd_crc32c(const char *args);
 void cmd_dmesg(const char *args);
 void cmd_kmtest(const char *args);
 void cmd_rstest(const char *args);

@@ -1056,6 +1056,21 @@ static int st2_mouse(char *detail, uint32_t ds) {
     return bad;
 }
 
+/* digest：MD5 / CRC 的**标准测试向量**（RFC 1321、zlib、Castagnoli、Modbus）。
+ * 校验和算错时，症状是"对拍时才发现某个盘读不出来"，很难往回找；
+ * 有向量守着，编译后第一次跑就知道对不对。 */
+static int st2_digest(char *detail, uint32_t ds) {
+    int bad = sysinfo_selftest();
+    if (detail && ds) {
+        uint32_t p = 0;
+        st_puts(detail, &p, ds, "md5/crc vectors, ");
+        st_putd(detail, &p, ds, (uint32_t)bad);
+        st_puts(detail, &p, ds, bad ? " bad" : " ok");
+        detail[p] = '\0';
+    }
+    return bad;
+}
+
 typedef int (*st2_probe_t)(char *detail, uint32_t dsize);
 static const struct {
     const char *name;      /* 与既有条目同宽：8 字符名 + 描述 */
@@ -1075,6 +1090,7 @@ static const struct {
     { "pipe     kernel pipe pair",  st2_pipe },
     { "string   str/fmt helpers",   st2_string },
     { "mouse    ps2/usb packet",    st2_mouse },
+    { "digest   md5/crc vectors",   st2_digest },
 };
 #define ST2_COUNT (sizeof(ST2_PROBES) / sizeof(ST2_PROBES[0]))
 
@@ -1082,6 +1098,62 @@ static const struct {
  * 默认 3 字节（标准 PS/2）。真机上确认指点设备支持 IntelliMouse 滚轮后
  * 用 `mouseproto 4` 切到 4 字节——QEMU 与部分固件对魔法序列应答不一致，
  * 默认切成 4 会让包流永久错位，所以绝不在 init 里自动切。 */
+/* ---- 日用校验命令（纯 API 在 kernel/sysinfo.c） ---- */
+void cmd_md5(const char *args) {
+    ezos_args_t a;
+    ezos_parse_args(args, &a);
+    if (a.argc < 1) {
+        ezos_console_write("Usage: md5 <file>\n");
+        return;
+    }
+    char hex[40];
+    uint32_t sz = 0;
+    if (sysinfo_md5(a.argv[0], hex, &sz) != 0) {
+        ezos_console_write("md5: cannot read file\n");
+        return;
+    }
+    ezos_console_write(hex);
+    ezos_console_write("  ");
+    char num[16], out[16];
+    uint32_t v = sz;
+    int m = 0;
+    if (v == 0) num[m++] = '0';
+    while (v) { num[m++] = (char)('0' + v % 10); v /= 10; }
+    int k = 0;
+    while (m) out[k++] = num[--m];
+    out[k] = 0;
+    ezos_console_write(out);
+    ezos_console_write("  ");
+    ezos_console_write(a.argv[0]);
+    ezos_console_write("\n");
+}
+
+/* 算法选择：命令表里 crc16/crc32/crc32c 指向同一个实现，靠薄包装把
+ * "我到底是谁"传进去——cmd_crc 收不到自己被注册成哪个名字。 */
+static void crc_common(const char *args, int which) {
+    ezos_args_t a;
+    ezos_parse_args(args, &a);
+    if (a.argc < 1) {
+        ezos_console_write(which == 1 ? "Usage: crc16 <file>\n"
+                           : (which == 2 ? "Usage: crc32c <file>\n"
+                                         : "Usage: crc32 <file>\n"));
+        return;
+    }
+    char hex[20];
+    if (sysinfo_crc(a.argv[0], which, hex) != 0) {
+        ezos_console_write("crc: cannot read file\n");
+        return;
+    }
+    ezos_console_write(hex);
+    ezos_console_write("  ");
+    ezos_console_write(a.argv[0]);
+    ezos_console_write("\n");
+}
+
+void cmd_crc(const char *args)   { crc_common(args, 0); }
+void cmd_crc16(const char *args) { crc_common(args, 1); }
+void cmd_crc32c(const char *args) { crc_common(args, 2); }
+
 void cmd_mouseproto(const char *args) {
     if (args && args[0]) {
         if (args[0] == '4') mouse_set_protocol(1);
@@ -1441,6 +1513,7 @@ int boot_selftest(void) {
         "pipe     kernel pipe pair",
         "string   str/fmt helpers",
         "mouse    ps2/usb packet",
+        "digest   md5/crc vectors",
     };
     int failed = 0;
     for (int i = 0; i < n; i++) {
