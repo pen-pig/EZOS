@@ -10,8 +10,11 @@
   2. 控制器真的 enable 了（CSTS.RDY=1，Admin 队列起来）
      -> "NVME: controller ready, admin queue up"
   3. Identify 真的取回了数据（不只是"命令返回成功"）
-     -> "NVME: ns0 nsid=1 sectors=32768 lbads=9 ready"
-        容量 32768 扇区是 QEMU 那个 16MB 盘的真实值，写成 0 或编的都过不了
+     -> "NVME: ns0 nsid=1 sectors=<后端文件真实扇区数> lbads=9 ready"
+        容量断言的期望值由**宿主机按后端文件大小现算**（os.path.getsize/512），
+        不写死：写死数字会在任何一次镜像格式迁移后永久假红（disk.vhd 自带
+        512 字节 VHD footer，16MB 的盘就是 32769 而不是 32768 扇区）；
+        现算既不过时，也照样抓得住 identify 返回 0 或编造值的假成功。
   4. 注册进块层
      -> "NVME: 1 namespace(s) registered as drive 16..16"
   5. **真读真写**（PRP1 单页 + NVM READ/WRITE opcode）
@@ -265,8 +268,15 @@ def case_nvme():
                         has("NVME: ") and has("bar=0x")))
         results.append(("controller ready / admin queue up",
                         has("controller ready, admin queue up")))
+        # 期望容量**由宿主机现算**（后端文件真实大小 / 512），不写死数字：
+        # 后端以前是裸 16MB（32768 扇区），全仓库 img->vhd 之后 disk.vhd 自带
+        # 512 字节 VHD footer，同一个盘子就是 32769 扇区。写死 32768 会在
+        # 迁移后永久假红，而"从文件算"既不会过时，也照样能抓住 identify
+        # 返回 0 / 编造值的那种假成功。
+        want_sectors = os.path.getsize(NVME_IMG) // 512
         results.append(("identify namespace with real capacity",
-                        has("ns0 nsid=1 sectors=32768") and has("lbads=9 ready")))
+                        has("ns0 nsid=1 sectors=%d" % want_sectors)
+                        and has("lbads=9 ready")))
         results.append(("registered as drive 16",
                         has("1 namespace(s) registered as drive 16..16")))
         # 失败行一条都不许有：读写出过错就是没点亮
