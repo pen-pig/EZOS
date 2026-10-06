@@ -1,16 +1,30 @@
-# 真机点亮 H1c：把 os-image.bin 做成可启动 U 盘
+# 真机点亮：把 EZOS 做成可启动 U 盘（Legacy + UEFI 双通道）
 
 > 适用对象：一个要在**真实 PC** 上点亮 EZOS 内核的人。
 > 场景：**没有屏幕、只有一根 USB-TTL/串口线**也能判断卡在哪一步。
-> 内核当前是**纯 Legacy BIOS** 引导（H2 才做 UEFI），所以这份文档只讲 Legacy 路线。
+>
+> **2026-10-06 更新**：UEFI 路径已经打通。现在的产物是
+> `usb-image.bin`（`tools/make_usb_image.py` 产出），一个镜像同时支持
+> legacy BIOS（MBR 链式引导）与 UEFI（ESP 分区里的
+> `\EFI\BOOT\BOOTIA32.EFI`），两条路径都在 QEMU/OVMF 上实测通过
+> （`tests/test_usbboot.py`）。下面仍保留大量 legacy 排障经验，因为
+> 真机上 legacy 仍然是兼容性最好的一条路。
 
 ---
 
 ## 0. 一句话结论
 
-把 `os-image.bin` **整盘原样写进 U 盘**（像写软盘镜像那样从 LBA0 开始），
-**不要**把它当文件拷进一个 FAT32/U 盘分区。写完的 U 盘在 Windows 里看起来像
-"未格式化"，这是正常的，千万别去"格式化拯救它"。
+用 `tools/make_usb_boot.py` 把 **`usb-image.bin`** 整盘写进 U 盘（从 LBA0
+开始），**不要**把它当文件拷进某个分区。Windows 里显示成"未格式化"是正常的
+——**千万别点"格式化"**，那会覆盖引导记录。
+
+```bat
+python tools\make_usb_boot.py                      :: 只读：列出磁盘 + 校验镜像
+python tools\make_usb_boot.py --write --disk 2     :: 真的写盘（要手打盘号二次确认）
+```
+
+> 早年的文档让你写 `os-image.bin`（裸镜像，只支持 legacy）。那份镜像还在，
+> 但请优先用 `usb-image.bin`：它多一个 FAT32 ESP，UEFI 机器才认得。
 
 ---
 
@@ -58,12 +72,23 @@ os-image.bin = boot/boot.bin (512 字节，引导扇区)
 "没有分区表的超级软盘"。Windows 弹出"需要格式化"是预期行为——**点取消**，
 格式化会覆盖引导扇区，U 盘就再也起不来了。
 
-### 为什么"必须 Legacy / CSM，不支持 UEFI"
+### UEFI 现在也能启动了
 
-这是纯 Legacy BIOS 内核：引导靠 `INT 13h`、实模式切换、VBE，没有 UEFI
-应用（没有 PE 头、没有 `efi/main.c`）。在纯 UEFI（关闭 CSM）模式下，
-固件不会去执行 0x7C00 那段 16 位代码，机器会直接报"无可引导设备"。
-**UEFI 支持是 H2 的事，本项目当前版本不要指望它能从 UEFI 启动。**
+`usb-image.bin` 的 LBA2048 起是一个合规的 FAT32 ESP（卷标 `EZOS ESP`），
+里面有 `EFI/BOOT/BOOTIA32.EFI`（PE32 UEFI 应用，源码 `uefi/main.c`）与
+`EFI/KERNEL.BIN`。固件按标准流程走：分区表 -> 认到 EFI 系统分区 ->
+`\EFI\BOOT\BOOTIA32.EFI` -> 读 `KERNEL.BIN` 进内存 -> 跳转。
+
+所以：
+
+- **UEFI 模式（关 CSM）**：可以启动，前提是固件认 32 位 PE（多数近年主板都认）。
+- **Secure Boot 必须关**：我们的引导器没有签名，Secure Boot 会拦下未签名的 PE。
+- **legacy 模式（开 CSM）**：走 LBA0 的 MBR 链式引导，同样通。
+
+> 踩过的坑：ESP 是 FAT32，FAT 表的表项下标是**簇号**而不是"簇号-2"
+> （前两项保留）。写错会导致根目录看着正常、子目录却是空的、文件读一半
+> IO Error——而所有 BPB 字段断言都是绿的。`tests/test_usbboot.py` 现在
+> 会真的走 OVMF 启动来守这条线。
 
 ### U 盘以什么方式被枚举
 
@@ -252,7 +277,7 @@ diskutil eject /dev/disk4
 |---|---|---|
 | **CSM / Legacy Boot / 兼容性支持模块** | **Enabled（开启）** | 纯 Legacy BIOS 内核，必须开 CSM 才能跑 16 位引导代码。 |
 | **Secure Boot（安全启动）** | **Disabled（关闭）** | Secure Boot 只认签名 EFI，会直接拦掉我们的裸镜像。 |
-| **Boot Mode / 启动模式** | **Legacy / UEFI+Legacy（CSM）**，不要纯 UEFI | 纯 UEFI 起不来（见第 1 节）。 |
+| **Boot Mode / 启动模式** | 两种都行 | UEFI 模式需要 **关 Secure Boot**；legacy 模式（CSM 开）兼容性最好。 |
 | **USB 启动项优先级** | 把 **USB-HDD / USB 设备** 挪到硬盘前面 | 否则主板会先去启动系统盘，跳过 U 盘。 |
 | **USB 仿真类型（如有）** | 先试 **USB-HDD**；起不来再换 **USB-ZIP / FDD** | 见第 1 节最后的枚举说明。 |
 | **SATA 模式（AHCI / IDE / RAID）** | 见下 | 决定你用 `setdrive` 选几号盘（见第 5 节排查表）。 |
@@ -317,7 +342,7 @@ EZOS>                                            ; 进 shell，可以敲命令�
 | # | 现象 | 最可能原因 | 怎么验证 / 怎么办 |
 |---|---|---|---|
 | 1 | **完全无显示、串口也一条都没有**（机器像没通电） | ① U 盘没插好 / 没被选为启动项；② 主板根本没从 U 盘启动；③ 电源/接线问题 | 进 BIOS 启动菜单（F12/Boot Menu）手动选 USB 设备；换 USB 口（优先后置主板直连口，别用前置面板或 hub）；确认 U 盘灯有活动。 |
-| 2 | **有 BIOS 画面，但报 "No bootable device / 无可引导设备"** | ① 用了 ISO 模式（Rufus）或把镜像当文件拷进分区，LBA0 不是引导扇区；② 选了纯 UEFI 模式 | 重做 U 盘，确认是 **整盘 DD 写入**（Rufus 选 DD Image）；BIOS 开 CSM、关 Secure Boot、启动模式改 Legacy。 |
+| 2 | **有 BIOS 画面，但报 "No bootable device / 无可引导设备"** | ① 用了 ISO 模式（Rufus）或把镜像当文件拷进分区，LBA0 不是引导扇区；② 选了纯 UEFI 模式但没关 Secure Boot | 重做 U 盘，确认是 **整盘 DD 写入**（Rufus 选 DD Image）。UEFI 模式请**关 Secure Boot**；不行就改回 Legacy（CSM 开），两条路都通。 |
 | 3 | **卡在读盘**（屏幕停在 `Loading kernel...` 或 `Disk read error!`） | ① 镜像没写完整（U 盘被提前拔出 / `conv=fsync` 没等）；② U 盘主控对 `INT 13h` 扩展读支持差；③ 写错盘导致镜像残缺 | 重新整盘写入并等 `sync`；换一个品牌/U 盘的盘（某些杂牌盘 INT13 扩展读有问题）；用 `tools/make_usb_boot.py` dry-run 确认首扇区 `0x55AA` 和大小。注：`Disk read error!` 是引导代码自身打印的，说明 BIOS 已加载引导扇区、但读内核扇区失败。 |
 | 4 | **卡在 A20**（进不了保护模式，无任何后续输出） | 老机器 A20 门没开，三重回退仍失败（极少见，多见于很老的 486/早期 Pentium） | 串口若连着，看是否停在 VBE/SELFTEST 之前；换更老或更新的机器；这基本是硬件兼容问题，软件侧已做三重回退。 |
 | 5 | **卡在 VBE**（屏幕花屏/黑屏，但串口可能还在走） | VBE 探测卡死或 LFB 地址异常（个别集成显卡 BIOS 有 bug） | 串口若打出 `VBE: no LFB mode probed, will fallback to VGA 0x13 320x200x256` 是正常的，会自动回退；若完全卡死无串口，是显卡 VBE BIOS 问题，换显示器接口/换机器。 |
