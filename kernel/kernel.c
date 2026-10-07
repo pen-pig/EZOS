@@ -10,6 +10,7 @@
 #include "dmesg.h"
 #include "kmalloc.h"
 #include "types.h"
+#include "stack.h"
 #include "ata.h"
 #include "pci.h"
 #include "shell.h"
@@ -305,7 +306,51 @@ static void klog_cpuinfo(void) {
     }
 }
 
+/* ===== main stack high-water mark =====
+ * The kernel stack has NO MMU protection and is tiny:
+ *   main stack  = [__data_end, 0x90000)  ~19KB (symbols from linker.ld)
+ *   task stack  = TASK_KSIZE = 16KB (kernel/task.h)
+ *   ring0 IRQs do not switch stacks, so they add on top of whatever is
+ *   already there.
+ * Overflowing it does NOT crash here -- it silently writes over the
+ * adjacent .data. Historical bug: shell.c cmd_ls kept a 16.9KB
+ * fs_dir_entry_t entries[64] on the stack, which scribbled over fs.c's
+ * ro_cwd[256]. Symptoms looked exactly like filesystem corruption
+ * (prompt became [A.TXT], cat/write all failed) while the on-disk data
+ * was in fact perfectly fine.
+ *
+ * So: paint the free stack with 0xA5 at boot; the first byte that is no
+ * longer 0xA5 is the lowest esp ever reached. `stack` in the shell reads
+ * it. Painting only touches [__data_end, esp) -- everything at or above
+ * esp (return address, saved regs, caller arguments) is left alone.
+ */
+extern uint8_t __data_end[];
+extern uint8_t __stack_top[];
+
+void stack_paint(void) {
+    uint32_t sp;
+    asm volatile("movl %%esp, %0" : "=r"(sp));
+    uint32_t lo = (uint32_t)__data_end;
+    uint32_t hi = (uint32_t)__stack_top;
+    if (sp < hi) hi = sp;              /* only below esp is free */
+    if (hi <= lo) return;
+    for (uint32_t a = lo; a < hi; a++) *(volatile uint8_t *)a = 0xA5u;
+}
+
+uint32_t stack_high_water(void) {
+    uint32_t lo = (uint32_t)__data_end;
+    uint32_t top = (uint32_t)__stack_top;
+    uint32_t a = lo;
+    while (a < top && *(volatile uint8_t *)a == 0xA5u) a++;
+    return top - a;                    /* peak stack usage in bytes */
+}
+
+uint32_t stack_total(void) {
+    return (uint32_t)__stack_top - (uint32_t)__data_end;
+}
+
 void kernel_main(void) {
+    stack_paint();          /* 必须最先：之后的所有栈使用才可能有水印 */
     /* ���ñ��� APIC��EZOS ʹ�ô�ͳ 8259 PIC �ж�·�ɡ�
      * QEMU Ĭ�� LAPIC enabled �� LVT0(ExtINT) masked�����̵� PIC ��
      * ����/����ж����󣻹ر�?LAPIC �� LINT0 �ָ�Ϊ INTR ����ֱͨ PIC�� */

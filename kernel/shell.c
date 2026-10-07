@@ -3,6 +3,7 @@
 #include "tty.h"
 #include "keyboard.h"
 #include "types.h"
+#include "stack.h"
 #include "port.h"
 #include "acpi.h"
 #include "ata.h"
@@ -163,6 +164,7 @@ static void cmd_crash(const char *args);
 static const char *parse_token(const char *args, char *out, int max);
 static void cmd_shutdown(const char *args);
 static void cmd_meminfo(const char *args);
+static void cmd_stack(const char *args);
 static void cmd_cpuid(const char *args);
 static void cmd_readdisk(const char *args);
 static void cmd_hexdump(const char *args);
@@ -447,6 +449,7 @@ static const command_t commands[] = {
     {"sleep",    cmd_sleep},
     {"uptime",   cmd_uptime},
     {"mem",      cmd_mem},
+    {"stack",    cmd_stack},
     {"md5",      cmd_md5},
     {"crc32",    cmd_crc},
     {"crc16",    cmd_crc16},
@@ -1006,6 +1009,7 @@ static void cmd_help(const char *args) {
     help_line("  mem <hexaddr> [len] - dump physical memory\n");
     help_line("  dmesg [n] - show last n buffered kernel log lines\n");
     help_line("  kmtest - kernel heap self-test\n");
+    help_line("  stack      - main stack high-water mark\n");
     help_line("  rstest - cross-check C/Rust/Zig checksum+namehash\n");
     help_line("  pagetest - paging self-test (identity/map/unmap)\n");
     help_line("  utest - ring3 user-mode + int 0x80 syscall self-test\n");
@@ -1182,6 +1186,26 @@ static void cmd_meminfo(const char *args) {
     terminal_writestring("Total memory: ");
     print_dec(mem_kb + ext_kb);
     terminal_writestring(" KB\n");
+}
+
+/* 主栈水位：启动时 kernel.c 把空闲栈涂成 0xA5，这里读"第一个不是 0xA5 的
+ * 字节"反推历史最低 esp。看的是**调用链叠加起来**的真实峰值——
+ * tools/check_stack.py 只能看单帧，看不见链的深度，两者互补。 */
+static void cmd_stack(const char *args) {
+    (void)args;
+    uint32_t used = stack_high_water();
+    uint32_t total = stack_total();
+    if (total == 0) { terminal_writestring("stack: not instrumented\n"); return; }
+    uint32_t pct = (uint32_t)(((uint64_t)used * 100u) / total);
+    terminal_writestring("main stack: ");
+    print_dec(used);
+    terminal_writestring(" / ");
+    print_dec(total);
+    terminal_writestring(" B used (");
+    print_dec(pct);
+    terminal_writestring("%)");
+    if (pct >= 75u) terminal_writestring("  <-- DANGER: 快踩到 .data 了");
+    terminal_writestring("\n");
 }
 
 static void cmd_cpuid(const char *args) {

@@ -52,7 +52,7 @@ LAYERS = {
     "hw":   ["ahci", "nvme", "power", "edge", "heap", "jobs", "lock"],
     "util": ["digest"],
     # 静态检查（不是 tests/test_*.py，而是 tools/*.py）
-    "static": ["stack"],
+    "static": ["check_stack", "stack"],
 }
 
 # 改动文件 -> 必跑层级。键是路径子串。

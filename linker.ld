@@ -28,6 +28,16 @@ SECTIONS
         *(.data)
     }
 
+    /* 主栈水位扫描的两端（见 kernel.c stack_paint / stack_high_water）。
+     * 栈区 = [__data_end, 0x90000)，栈从 0x90000 向下生长。启动时把这段
+     * 涂成 0xA5，之后"第一个不是 0xA5 的字节"就是历史最低 esp —— 用它
+     * 量真实栈峰值。为什么需要：内核栈总共只有 ~21KB（任务栈 16KB），
+     * 而栈越界在这里**不崩**，只是静默写穿紧邻的 .data（历史 bug：
+     * shell.c cmd_ls 的 16.9KB 栈数组覆盖了 fs.c 的 ro_cwd，症状是提示符
+     * 变 [A.TXT]、cat/write 全挂，伪装成文件系统损坏）。 */
+    __data_end = .;
+    __stack_top = 0x90000;
+
     /* 镜像（text+data）上限 496KB：0x10000(内核) ~ 0x90000(主栈) 只有 512KB，
      * 末尾留 16KB 给主栈向下增长。同一上限在 tools/make_image.py 里也校验一次
      * （MAX_SECTORS=992）——镜像大小本身是动态的，扇区数写进引导扇区 0x1FC。 */

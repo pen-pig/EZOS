@@ -52,6 +52,7 @@ def main():
             return " ".join(t.split())
 
         run("format ext4", 10.0)
+        run("stack", 3.0)
         run("df", 3.0)
         run("ls", 3.0)
         run("write A.TXT HELLO", 4.0)
@@ -64,6 +65,7 @@ def main():
         run("write B.TXT WORLD", 4.0)
         run("ls", 3.0)
         run("cat B.TXT", 4.0)
+        run("stack", 3.0)
         run("df", 3.0)
     finally:
         try:
