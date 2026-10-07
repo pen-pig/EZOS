@@ -176,6 +176,16 @@ def main():
             return 2
     shutil.copyfile(src_disk, disk)        # 格式化会改盘：必须用副本
 
+    # FAT32 需要 >= 65525 个簇（fat_probe 按簇数判类型，少于这个数写出来的卷
+    # 会被 Windows/Linux/我们自己读成 FAT16），512B 扇区 x 1 扇区/簇 => 至少要
+    # ~33MB。disk.vhd 只有 16MB，所以把副本扩到 64MB：既够 FAT32，也给
+    # ext4/ntfs/f2fs/refs 留出真实的多组/多区空间。（原来 fat_format 是写死
+    # 131071 扇区硬撑过去的 —— 那才是 bug，不是特性。）
+    DISK_BYTES = 64 * 1024 * 1024
+    if os.path.getsize(disk) < DISK_BYTES:
+        with open(disk, "r+b") as f:
+            f.truncate(DISK_BYTES)
+
     if port_in_use(PORT):
         subprocess.call(["taskkill", "//F", "//IM", "qemu-system-x86_64.exe"],
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

@@ -340,35 +340,64 @@ static void put32le(uint8_t *p, uint32_t v) {
  * fixed root area (FAT12/16) or root cluster 2 (FAT32, + FSInfo/backup BS). */
 int fat_format(uint8_t drive, int want_type) {
     if (want_type != 12 && want_type != 16 && want_type != 32) return -1;
-    if (drive > 3) return -1;
 
-    uint32_t total = (want_type == 32) ? 131071u : 32767u;
+    /* 卷大小**必须由磁盘实际容量决定**（ata_capacity）。以前写死 32767 /
+     * 131071 扇区，于是往 16MB 盘上 `format fat32` 会写出一个声称 64MB 的
+     * MBR/BPB —— 内核自己读得挺好（它不校验分区是否超出设备），但真机上
+     * 写越过盘尾的簇就是静默损坏。拿不到容量就拒绝格式化，不猜。 */
+    uint32_t cap = ata_capacity(drive);
+    if (cap == 0) return -1;
+    uint32_t part_start = 1;
+    if (cap <= part_start + 64) return -1;
+    uint32_t avail = cap - part_start;
+
     uint32_t spc = (want_type == 12) ? 16u : ((want_type == 16) ? 4u : 1u);
     uint32_t reserved = (want_type == 32) ? 32u : 1u;
     uint32_t root_entries = (want_type == 32) ? 0u : 512u;
     uint32_t nfats = 2;
-    uint32_t part_start = 1;
     uint8_t part_type = (want_type == 32) ? 0x0B : ((want_type == 16) ? 0x06 : 0x01);
 
-    /* FAT size fixed-point iteration: fat size shifts first_data, which
-     * shifts cluster count (same loop as gen_diskimg.py build_fat_params) */
+    /* 该 FAT 类型**能寻址**的簇数区间（由 FAT 项宽度决定上限）。
+     * 上限：FAT12 4084 / FAT16 65524，FAT32 只受 28 位簇号限制。
+     * 下限同样硬：类型**是由簇数决定的**（fat_probe 按簇数判，Windows 也是），
+     * 所以一个"BPB 写着 FAT32、却只有 3 万簇"的卷会被全世界当成 FAT16 读——
+     * 自己写得进、别人读不出。mkfs.vfat -F 32 在小盘上直接报
+     * "Not enough clusters for a 32 bit FAT!"，就是这条。够不着就拒绝，不猜。
+     * （FAT32 至少要 ~33MB：65525 簇 x 512B + 元数据。） */
+    uint32_t max_clusters = (want_type == 12) ? 4084u
+                          : ((want_type == 16) ? 65524u : 0x0FFFFFF0u);
+    uint32_t min_clusters = (want_type == 12) ? 16u
+                          : ((want_type == 16) ? 4085u : 65525u);
+
+    uint32_t total = avail;
     uint32_t fat_size = 1, root_sectors, first_data, clusters;
-    for (int i = 0; i < 10; i++) {
-        root_sectors = (root_entries * 32 + 511) / 512;
-        first_data = reserved + nfats * fat_size + root_sectors;
-        clusters = (total - first_data) / spc;
-        int t = (clusters < 4085) ? 12 : ((clusters < 65525) ? 16 : 32);
-        if (t != want_type) return -1;
-        uint32_t need = (want_type == 12)
-            ? (((clusters + 2) * 3 + 1) / 2)
-            : ((clusters + 2) * ((want_type == 16) ? 2u : 4u));
-        need = (need + 511) / 512;
-        if (need <= fat_size) break;
-        fat_size = need;
+    for (int round = 0; round < 8; round++) {
+        /* FAT 大小不动点迭代：fat_size 挪动 first_data，first_data 又挪动
+         * 簇数（与 gen_diskimg.py 的 build_fat_params 同一个循环） */
+        for (int i = 0; i < 10; i++) {
+            root_sectors = (root_entries * 32 + 511) / 512;
+            first_data = reserved + nfats * fat_size + root_sectors;
+            clusters = (total > first_data) ? (total - first_data) / spc : 0;
+            uint32_t need = (want_type == 12)
+                ? (((clusters + 2) * 3 + 1) / 2)
+                : ((clusters + 2) * ((want_type == 16) ? 2u : 4u));
+            need = (need + 511) / 512;
+            if (need <= fat_size) break;
+            fat_size = need;
+        }
+        if (clusters <= max_clusters) break;
+        /* 盘比这个 FAT 类型能寻址的范围还大：把卷缩到刚好装得下，
+         * 剩下的扇区留白——总比写出一个自己都覆盖不了的 BPB 强。 */
+        uint64_t want = (uint64_t)first_data + (uint64_t)max_clusters * spc;
+        if (want >= total) break;               /* 收敛不了就保持现状 */
+        total = (uint32_t)want;
+        fat_size = 1;                           /* 重新迭代（first_data 变小了） */
     }
     root_sectors = (root_entries * 32 + 511) / 512;
     first_data = reserved + nfats * fat_size + root_sectors;
-    clusters = (total - first_data) / spc;
+    clusters = (total > first_data) ? (total - first_data) / spc : 0;
+    if (clusters < min_clusters) return -1; /* 盘太小：拒绝，不写一个会被
+                                             * 别人误判成别种 FAT 的卷 */
 
     /* 1. MBR: single primary partition starting at LBA 1 */
     uint8_t mbr[512];

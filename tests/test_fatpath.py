@@ -41,6 +41,16 @@ from test_nvme import SerialReader, Qmp, wait_for, wait_port_free, kill_all_qemu
 
 def boot():
     shutil.copyfile(DISK, WORK)
+    # disk.vhd = è£¨éå + æ«å°¾ 512B VHD footerï¼ç» Windows æè½½ç¨ï¼ã
+    # ççå®ï¼QEMU raw ä¼æ footer å½æç¬¬ 32769 ä¸ªæåºï¼
+    # ata_capacity å°±æ¥ 32769ï¼äºæ¯ `format fat16` ååºçå·
+    # æåä¸ä¸ªæåºæ­£å¥½åå¨ footer ä¸ââå®¿ä¸»æº Windows
+    # æè½½æ¶å°±å·®è¿ä¸æåºãæµè¯çåªå½è£¨çç¨ï¼
+    # ç´æ¥æªæï¼å®¹éè¯­ä¹ææ¯ç¡®å®çã
+    with open(WORK, "rb") as f:
+        f.seek(-512, os.SEEK_END)
+        if f.read(8) == b"conectix":
+            os.truncate(WORK, os.path.getsize(WORK) - 512)
     return subprocess.Popen(
         [QEMU, "-icount", "shift=auto", "-vga", "std",
          "-drive", "format=raw,file=" + IMG,
@@ -118,6 +128,35 @@ def main():
         except Exception:
             kill_all_qemu()
         wait_port_free(QMP_PORT, 15)
+
+    # ---- host-side: the volume must never claim more than the device ----
+    # fat_format used to hardcode 32767/131071 sectors, so `format fat32` on
+    # a 16MB disk wrote an MBR/BPB claiming 64MB. The kernel happily reads it
+    # (it never checks the partition against the device), but on real hardware
+    # writing a cluster past the end of the disk is silent corruption.
+    try:
+        import ref_fat
+        dev_sectors = os.path.getsize(WORK) // 512
+        fs = ref_fat.Fat(WORK)
+        try:
+            # fs.total = BPB volume sector count; fs.part_off =
+            # byte offset of the partition inside the image.
+            vol = fs.total
+            part_sectors = fs.part_off // 512
+            ok = (part_sectors + vol <= dev_sectors)
+            results.append(("volume fits inside the device", ok))
+            print("%s volume fits inside the device | %s + %s <= %s sectors"
+                  % ("PASS" if ok else "FAIL", part_sectors, vol, dev_sectors))
+            probs = fs.audit()
+            results.append(("ref_fat.audit() clean", not probs))
+            print("%s ref_fat.audit() clean | %s"
+                  % ("PASS" if not probs else "FAIL",
+                     "; ".join(probs[:3]) if probs else "0 problems"))
+        finally:
+            fs.close()
+    except Exception as e:
+        results.append(("host ref_fat parses the image", False))
+        print("FAIL host ref_fat parses the image | %s" % e)
 
     bad = [n for n, ok in results if not ok]
     print("\n%d/%d passed" % (len(results) - len(bad), len(results)))

@@ -79,8 +79,9 @@ WATCH = [
 TIMEOUT = {
     "step7_sock": 900, "step7_tcp": 900, "uefi3": 600,
     "vi_color": 420, "vi": 420, "dhcp": 420, "dns": 420,
-    "fs_matrix": 600, "hostfs": 900, "netapp": 600, "edge": 420,
+    "fs_matrix": 600, "hostfs": 900, "netapp": 600, "edge": 700,
     "power": 420, "ahci": 420, "nvme": 600, "regress": 600,
+    # edge 每用例独立起一个 QEMU，实测 416s；420 会刚好卡线超时
     # rmdir 用 screendump+OCR 逐个断言，6 个 FS x ~20 条命令，实测 ~7 分钟
     "rmdir": 900,
     # 卷容量测试：QEMU -icount 下格式化慢，单项实测 ~3 分钟
