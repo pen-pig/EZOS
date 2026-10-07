@@ -361,6 +361,19 @@ def main():
         print("WARN: kernel.bin (%d) != os-image kernel (%d); using os-image copy"
               % (len(kernel), len(kernel_img)))
         kernel = kernel_img
+
+    # uefi/esp/kernel.bin 是 tests/test_uefi3.py（OVMF 用例）要用的**第二份**
+    # 内核，它自己按目录拼 ESP。这份和 kernel.bin 不同步时 uefi3 一上来就判
+    # STALE 直接红——而 ninja 里只有 make_usb 这条规则会自动跑到这里，所以
+    # 顺手同步，别让"改了内核但没手拷"变成一次假故障。
+    esp_kern = os.path.join(ROOT, "uefi", "esp", "kernel.bin")
+    if os.path.isdir(os.path.dirname(esp_kern)):
+        cur = open(esp_kern, 'rb').read() if os.path.isfile(esp_kern) else b''
+        if cur != kernel:
+            with open(esp_kern, 'wb') as f:
+                f.write(kernel)
+            print("   synced uefi/esp/kernel.bin (%d bytes)" % len(kernel))
+
     ksectors = struct.unpack_from('<H', vbr, 0x1FC)[0]
     if ksectors == 0 or ksectors > 992:
         print("kernel sector field at 0x1FC is %d - refusing to build" % ksectors)

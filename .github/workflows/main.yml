@@ -72,6 +72,13 @@ jobs:
       - name: Build kernel image
         run: bash ci/build.sh
 
+      # 纯宿主侧、秒级返回，不启 QEMU。守的正是这次 CI 连红撞上的那条契约：
+      # os-image = 引导扇区(512) + kernel.bin，扇区数写进 0x1FC、必须 <= 992
+      # 且总数为偶数（奇数会让 SeaBIOS 报 could not read the boot disk）。
+      # 它还会用三个故意做坏的镜像反向验证断言本身"咬得住"。
+      - name: Image layout guard
+        run: python3 tests/test_image.py
+
       - name: Generate data disk
         run: python3 temp/gen_diskimg.py disk.img
 
