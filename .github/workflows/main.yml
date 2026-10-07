@@ -51,11 +51,15 @@ jobs:
 
       - name: Install Zig 0.15.1
         run: |
-          curl -fsSL -o zig.tar.xz \
+          curl -fsSL --retry 3 -o zig.tar.xz \
             https://ziglang.org/download/0.15.1/zig-x86_64-linux-0.15.1.tar.xz
           tar -xJf zig.tar.xz
+          # $GITHUB_PATH 的改动**在同一步里不生效**（要下一步才生效），所以
+          # 这里必须用绝对路径自检；同时写 GITHUB_ENV 让 build.sh 明确拿到
+          # 它（PATH 那行是给后续步骤和人肉调试用的）。
           echo "$PWD/zig-x86_64-linux-0.15.1" >> "$GITHUB_PATH"
-          zig version
+          echo "ZIG=$PWD/zig-x86_64-linux-0.15.1/zig" >> "$GITHUB_ENV"
+          "$PWD/zig-x86_64-linux-0.15.1/zig" version
 
       - name: Build kernel image
         run: bash ci/build.sh
