@@ -39,6 +39,24 @@ jobs:
           nasm -v
           qemu-system-x86_64 --version | head -1
 
+      # rust_bridge.h 里 EZ_EXFAT_IMPL 默认 1 = Rust，exFAT 校验和的**生产
+      # 路径**就走 *_rs；`rstest` 还要 *_zig 做三路对拍。这两个产物缺了就是
+      # 链接期 undefined reference（CI 因此连红了十几次），所以必须真装真编。
+      - name: Install Rust nightly (+ rust-src for build-std)
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src
+          rustup default nightly
+          rustc --version
+          cargo --version
+
+      - name: Install Zig 0.15.1
+        run: |
+          curl -fsSL -o zig.tar.xz \
+            https://ziglang.org/download/0.15.1/zig-x86_64-linux-0.15.1.tar.xz
+          tar -xJf zig.tar.xz
+          echo "$PWD/zig-x86_64-linux-0.15.1" >> "$GITHUB_PATH"
+          zig version
+
       - name: Build kernel image
         run: bash ci/build.sh
 
