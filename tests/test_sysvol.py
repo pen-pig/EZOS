@@ -33,6 +33,7 @@ _sys_ezos.path.append(_os_ezos.path.dirname(
 from ezos_env import qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe  # noqa: E402
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -101,6 +102,29 @@ def teardown(proc, qmp, serial, qmp_port):
     wait_port_free(qmp_port, 15)
 
 
+def sysvol_expected():
+    """从 kernel/sysvol_data.c 读生成器声明的真实文件数 / 字节数。
+
+    别在测试里写死这两个数：/system 的内容一变（加一个程序、改一行元信息、
+    甚至把版本串改长一个字节），写死的常数就过期，测试红得莫名其妙——
+    实际已经发生过一次（写死 16922，真实 14070，硬红了很久）。
+
+    但也不能退化成"随便给个数都算过"：数字仍然要比对，只是从唯一事实来源
+    （make_sysvol.py 生成的那两个常量）取，而不是抄在测试里。
+    """
+    path = os.path.join(ROOT, "kernel", "sysvol_data.c")
+    try:
+        txt = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return None, None
+
+    def num(name):
+        m = re.search(r"const\s+uint32_t\s+%s\s*=\s*(\d+)u\s*;" % name, txt)
+        return int(m.group(1)) if m else None
+
+    return num("sysvol_count"), num("sysvol_bytes")
+
+
 def case_sysvol():
     """A 组：format 打不掉系统卷；/bin 只读。"""
     results = []
@@ -119,10 +143,21 @@ def case_sysvol():
             return [("sysvol init line seen", False)]
         snap0 = serial.snapshot()
 
-        # 1) 内置卷真的编进来了（文件数与字节数是生成脚本的实数，编的过不了）
-        results.append(("sysvol ready line with real counts",
-                        "11 files" in snap0 and "16922 bytes" in snap0
-                        and "read-only" in snap0))
+        # 1) 内置卷真的编进来了。文件数/字节数取自 kernel/sysvol_data.c 里
+        #    生成器声明的常量（写死常数会过期，见 sysvol_expected() 的注释）。
+        exp_n, exp_b = sysvol_expected()
+        if exp_n is None or exp_b is None:
+            print("  FAIL A: cannot parse sysvol_count/sysvol_bytes "
+                  "from kernel/sysvol_data.c")
+            results.append(("sysvol counts parseable", False))
+        else:
+            want_n = "%d files" % exp_n
+            want_b = "%d bytes" % exp_b
+            got = (want_n in snap0 and want_b in snap0 and "read-only" in snap0)
+            results.append(("sysvol ready line with real counts "
+                            "(%s, %s)" % (want_n, want_b), got))
+            if not got:
+                print("  expected %s / %s in SYSVOL line" % (want_n, want_b))
         for ln in snap0.splitlines():
             if "SYSVOL:" in ln:
                 print("  klog> " + ln.strip())
