@@ -33,6 +33,13 @@ ZIG="${ZIG:-zig}"
 ann_err()  { echo "::error::$1"  >&2; }
 ann_note() { echo "::notice::$1" >&2; }
 
+# 把失败日志的尾部原样发到 ::error:: 注解。别只 grep 关键字——第一次就是靠
+# "undefined reference" 去 grep 的，结果 CI 上是别的原因，一条注解都没捞到。
+ann_log() {
+    tail -n 30 "$1" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 8 \
+        | while IFS= read -r l; do ann_err "$2: ${l:0:180}"; done
+}
+
 # ERR trap：$LINENO 直接指出是哪一行炸的，省掉"靠猜"这一步。
 trap 'st=$?; \
       echo "[ci] FAILED at line $LINENO (exit $st)" >&2; \
@@ -102,8 +109,7 @@ if ! ( cd rust/ezos_rs && RUSTC_BOOTSTRAP=1 cargo build --release \
         --target ../i686-ezos.json ) > ci-cargo.log 2>&1; then
     echo "[ci] FATAL: cargo build failed, tail:" >&2
     tail -40 ci-cargo.log >&2
-    grep -m8 -E '^(error|warning: unused)' ci-cargo.log 2>/dev/null \
-        | while IFS= read -r l; do ann_err "cargo: $l"; done
+    ann_log ci-cargo.log cargo
     exit 1
 fi
 if [ ! -f "$RUST_LIB" ]; then
@@ -117,8 +123,7 @@ if ! ( cd rust/ezos_zig && "$ZIG" build-obj -target x86-freestanding \
         -O ReleaseSafe ezos_zig.zig ) > ci-zig.log 2>&1; then
     echo "[ci] FATAL: zig build-obj failed, tail:" >&2
     tail -40 ci-zig.log >&2
-    grep -m8 -E '^error' ci-zig.log 2>/dev/null \
-        | while IFS= read -r l; do ann_err "zig: $l"; done
+    ann_log ci-zig.log zig
     exit 1
 fi
 if [ ! -f "$ZIG_OBJ" ]; then
@@ -135,11 +140,22 @@ if ! "$LD" $LDFLAGS -o kernel_raw.bin boot/kernel_entry.o boot/task_switch.o \
         $OBJS "$ZIG_OBJ" "$RUST_LIB" > ci-ld.log 2>&1; then
     echo "[ci] FATAL: link failed, tail:" >&2
     tail -40 ci-ld.log >&2
-    grep -m8 -E 'undefined reference|multiple definition' ci-ld.log 2>/dev/null \
-        | while IFS= read -r l; do ann_err "ld: $l"; done
+    ann_log ci-ld.log ld
+    # 镜像上限是 linker.ld 的 ASSERT(<=0x7C000)。CI 用的 gcc 版本跟开发机不
+    # 一样时，产物大小会漂移几个 KB——把 .o 体积打出来，一眼就能看出是"超
+    # 容量"还是"缺符号"。
+    tot=0
+    for o in $OBJS; do
+        s=$(stat -c%s "$o" 2>/dev/null || echo 0)
+        tot=$((tot + s))
+    done
+    ann_note "sum of kernel .o bytes = $tot (limit 507904 for the linked image)"
     exit 1
 fi
 echo "[ci] ASSEMBLE kernel.bin + os-image.bin (dynamic size)"
 "$PYTHON" tools/make_image.py boot/boot.bin kernel_raw.bin kernel.bin os-image.bin
 
-echo "[ci] BUILD OK: os-image.bin ($(stat -c%s os-image.bin) bytes)"
+SZ=$(stat -c%s os-image.bin)
+echo "[ci] BUILD OK: os-image.bin ($SZ bytes)"
+# 0x7C000 = 507904 是 linker.ld 的硬上限；离顶越近，换个 gcc 就越容易翻车
+ann_note "kernel_raw=$(stat -c%s kernel_raw.bin) / 507904 bytes limit"

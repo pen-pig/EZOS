@@ -43,7 +43,7 @@ PY = sys.executable
 LAYERS = {
     "core": ["image", "vhd", "regress", "fs_matrix", "multilang", "mouse"],
     "fs":   ["fsref", "hostfs", "fatpath", "path", "sysvol", "rmdir",
-             "ext4vol", "f2fsvol", "refsvol"],
+             "ext4vol", "f2fsvol", "refsvol", "exfatvol"],
     "usb":  ["usbenum", "uhci", "uhci_control", "usb", "usbkbd", "usbmouse",
              "usbmsc", "usbboot", "ehci"],
     "net":  ["netapp", "dhcp", "dns"],
@@ -84,8 +84,9 @@ TIMEOUT = {
     # edge 每用例独立起一个 QEMU，实测 416s；420 会刚好卡线超时
     # rmdir 用 screendump+OCR 逐个断言，6 个 FS x ~20 条命令，实测 ~7 分钟
     "rmdir": 900,
-    # 卷容量测试：QEMU -icount 下格式化慢，单项实测 ~3 分钟
-    "ext4vol": 420, "f2fsvol": 420, "refsvol": 420,
+    # 卷容量测试：QEMU -icount 下格式化慢，单项实测 ~3 分钟。
+    # exfatvol 要起两轮 QEMU（中间宿主机改写盘），放宽到 8 分钟。
+    "ext4vol": 420, "f2fsvol": 420, "refsvol": 420, "exfatvol": 480,
 }
 
 # 这些测试要 GUI 像素/OCR，默认不进 core/full 的常规集合（太慢且脆）
