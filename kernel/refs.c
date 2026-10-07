@@ -107,9 +107,10 @@ static void rs_move(uint8_t *d, const uint8_t *s, uint32_t n) {
 #define RS_XTREE0_NO      34       /* format 时树 1..5 */
 #define RS_ROOTDIR0_NO    39
 #define RS_POOL0          40       /* bump 分配起点 */
-#define RS_POOL_MAX       1023     /* 可用块号上限（0..1022） */
-#define RS_VOL_SECS       32767    /* 卷扇区数（rel 0..32766） */
-#define RS_NSECS_FIELD    32766    /* 卷头 nsecs 字段（不含卷头扇区） */
+#define RS_POOL_MAX       1023     /* 兜底块号上限（未挂载时） */
+#define RS_POOL_HARD      0x40000u /* 硬上限：262144 块 x 4KB = 1GB */
+#define RS_VOL_SECS       32767    /* 旧版写死的卷扇区数（现由容量推导） */
+#define RS_NSECS_FIELD    32766    /* 旧版写死的卷头 nsecs 字段 */
 
 /* 卷头字段 */
 #define RVH_NSECS     24
@@ -231,6 +232,7 @@ static uint32_t rs_otree_blk;        /* = rs_trees[0] */
 static uint32_t rs_root_dirblk;      /* 根目录对象节点块号 */
 static uint32_t rs_hint;             /* bump 分配游标 */
 static uint32_t rs_used_blocks;      /* 活动世代总占用块数（df/游标恢复） */
+static uint32_t rs_pool_max = RS_POOL_MAX;  /* 可用块号上限（挂载/格式化时按卷容量设定） */
 static uint64_t rs_next_subid;
 static refs_info_t rs_info;
 
@@ -263,7 +265,7 @@ static int rs_write_block(uint32_t blkno, const uint8_t *buf) {
 }
 /* bump 分配：失败返回 0 */
 static uint32_t rs_alloc(void) {
-    if (rs_hint >= RS_POOL_MAX) return 0;
+    if (rs_hint >= rs_pool_max) return 0;
     return rs_hint++;
 }
 
@@ -279,7 +281,7 @@ static uint32_t rs_alloc(void) {
  *              一致——有的地方 ++ 了有的没加，所以单独传，不能统一按 blocks 算）
  *
  * 不回滚会怎样：块被 rs_hint 划走却没有任何元数据指向它，等于永久泄漏。
- * ReFS 池只有 RS_POOL_MAX 个块，create/mkdir 反复失败几次就会把池耗干，
+ * ReFS 池只有 rs_pool_max 个块，create/mkdir 反复失败几次就会把池耗干，
  * 之后所有写操作一律 -1——表现出来就是"文件系统用着用着突然变成只读"。
  */
 static void rs_rollback_alloc(uint32_t blocks, uint32_t used_delta) {
@@ -549,8 +551,8 @@ static int rs_fileval_parse(const uint8_t *val, uint32_t vsize,
     const uint8_t *dr = rec + rd16(rec + NR_VAL_OFF);
     uint64_t nblocks = rd64(dr + 8);
     uint64_t phys = rd64(dr + 16);
-    if (nblocks == 0 || nblocks >= RS_POOL_MAX || phys >= RS_POOL_MAX ||
-        phys + nblocks > RS_POOL_MAX) return -1;
+    if (nblocks == 0 || nblocks >= rs_pool_max || phys >= rs_pool_max ||
+        phys + nblocks > rs_pool_max) return -1;
     *nblk = (uint32_t)nblocks;
     *dblk = (uint32_t)phys;
     return 0;
@@ -580,7 +582,7 @@ static int rs_obj_blk(const uint8_t *otree, uint64_t objid, uint32_t *blk_out) {
     const uint8_t *rec = rs_node_rec_c(otree, (uint32_t)idx);
     if (rd16(rec + NR_VAL_SIZE) < RS_BREF_SIZE) return -1;
     uint64_t b = rd64(rec + rd16(rec + NR_VAL_OFF) + BR_BLKNO);
-    if (b == 0 || b >= RS_POOL_MAX) return -1;
+    if (b == 0 || b >= rs_pool_max) return -1;
     *blk_out = (uint32_t)b;
     return 0;
 }
@@ -650,7 +652,7 @@ static void rs_build_dir_value(uint8_t *v, uint64_t objid) {
 
 /* ---------- 挂载辅助：块级节点读取 + 校验 ---------- */
 static int rs_load_node(uint32_t blkno, uint8_t *buf) {
-    if (blkno == 0 || blkno >= RS_POOL_MAX) return -1;
+    if (blkno == 0 || blkno >= rs_pool_max) return -1;
     if (rs_read_block(blkno, buf) != 0) return -1;
     return rs_node_check(buf + RS_MBH_SIZE, RS_NODE_AREA, RS_NHO_BLOCK);
 }
@@ -723,6 +725,15 @@ int refs_mount(uint8_t drive, uint32_t part_start) {
     uint32_t nsecs = rd32(vh + RVH_NSECS);
     if (nsecs == 0 || nsecs > 0x10000000u) return -1;
 
+    /* 块池上限随卷大小伸缩（旧版写死 1023 块 -> 大卷上 96% 的扇区摸不到）。
+     * 卷尾最后一个块留给卷头副本，所以可用块是 blocks-1 个。 */
+    {
+        uint32_t blocks = (nsecs + 1) / 8;          /* 4KB 块 */
+        if (blocks > RS_POOL_HARD) blocks = RS_POOL_HARD;
+        if (blocks <= RS_POOL0 + 8) return -1;      /* 卷太小放不下元数据 */
+        rs_pool_max = blocks - 1;
+    }
+
     /* superblock @ 块 30 */
     if (rs_read_block(RS_SUPERBLOCK_NO, rs_blk) != 0) return -1;
     if (rd32(rs_blk + SB_CP_N) != 2) return -1;
@@ -741,7 +752,7 @@ int refs_mount(uint8_t drive, uint32_t part_start) {
     int ok[2] = {0, 0};
     uint32_t cpblk[2] = {cp_a, cp_b};
     for (int c = 0; c < 2; c++) {
-        if (cpblk[c] == 0 || cpblk[c] >= RS_POOL_MAX) continue;
+        if (cpblk[c] == 0 || cpblk[c] >= rs_pool_max) continue;
         if (rs_read_block(cpblk[c], rs_blk2) != 0) continue;
         uint8_t *cp = rs_blk2;
         if (rd16(cp + CPH_MAJ) != 1 || rd16(cp + CPH_MIN) != 2) continue;
@@ -757,7 +768,7 @@ int refs_mount(uint8_t drive, uint32_t part_start) {
                 good = 0; break;
             }
             uint64_t b = rd64(cp + boff + BR_BLKNO);
-            if (b == 0 || b >= RS_POOL_MAX || cp[boff + BR_CKTYPE] == 0 ||
+            if (b == 0 || b >= rs_pool_max || cp[boff + BR_CKTYPE] == 0 ||
                 cp[boff + BR_CKTYPE] > 2) { good = 0; break; }
             trees[c][t] = (uint32_t)b;
         }
@@ -775,7 +786,7 @@ int refs_mount(uint8_t drive, uint32_t part_start) {
     rs_cp_no = cpblk[pick];
     rs_cp_seq = seq[pick];
     for (int t = 0; t < RS_NTREES; t++) rs_trees[t] = trees[pick][t];
-    if (rs_trees[0] == 0 || rs_trees[0] >= RS_POOL_MAX) return -1;
+    if (rs_trees[0] == 0 || rs_trees[0] >= rs_pool_max) return -1;
     rs_otree_blk = rs_trees[0];
 
     /* objects tree -> 根目录对象 */
@@ -1211,7 +1222,7 @@ int refs_create_file(const char *path, const uint8_t *data, uint32_t size) {
     uint32_t dblk = 0;
     if (nblk) {
         dblk = rs_hint;
-        if (dblk + nblk > RS_POOL_MAX) return -1;
+        if (dblk + nblk > rs_pool_max) return -1;
         for (uint32_t b = 0; b < nblk; b++) {
             rs_zero(rs_databuf, RS_META_BLK);
             uint32_t off = b * RS_META_BLK;
@@ -1399,19 +1410,32 @@ int refs_delete_file(const char *path) {
 
 /* ---------- 格式化 ---------- */
 int refs_format(uint8_t drive) {
-    if (drive > 3) return -1;
+    /* 卷容量由块设备实测（fail closed：测不出容量就拒绝格式化） */
+    uint32_t cap_secs = ata_capacity(drive);
+    if (cap_secs == 0) return -1;
     const uint32_t part_start = 1;
+    if (cap_secs <= part_start + 1) return -1;
+    uint32_t vol_secs = cap_secs - part_start;   /* 分区可用扇区 */
+    vol_secs &= ~7u;                             /* 对齐到 4KB 块 */
+    uint32_t vol_blocks = vol_secs / 8;
+    if (vol_blocks > RS_POOL_HARD) {
+        vol_blocks = RS_POOL_HARD;
+        vol_secs = vol_blocks * 8;
+    }
+    if (vol_blocks <= RS_POOL0 + 8) return -1;   /* 放不下元数据 */
+    /* 卷尾最后一块留给卷头副本，不进分配池 */
+    rs_pool_max = vol_blocks - 1;
 
     rs_drive = drive;
     rs_part_lba = part_start;
     rs_mounted = 0;
 
-    /* MBR：分区 0x07 @LBA1，32767 扇区 */
+    /* MBR：分区 0x07 @LBA1（原来写死 32767 扇区 = 16MB） */
     static uint8_t mbr[512] RS_HIBUF;
     rs_zero(mbr, 512);
     mbr[446 + 4] = 0x07;
     wr32(mbr + 446 + 8, part_start);
-    wr32(mbr + 446 + 12, RS_VOL_SECS);
+    wr32(mbr + 446 + 12, vol_secs);
     mbr[510] = 0x55; mbr[511] = 0xAA;
     if (ata_write_sector(drive, 0, mbr) != 0) return -1;
 
@@ -1424,14 +1448,14 @@ int refs_format(uint8_t drive) {
     vh[0x10] = 'F'; vh[0x11] = 'S'; vh[0x12] = 'R'; vh[0x13] = 'S';
     wr16(vh + 0x14, 0x0200);
     wr16(vh + 0x16, rs_fsrs_checksum(vh));
-    wr64(vh + RVH_NSECS, RS_NSECS_FIELD);
+    wr64(vh + RVH_NSECS, vol_secs - 1);        /* 不含卷头扇区 */
     wr32(vh + RVH_SEC, 512);
     wr32(vh + RVH_SPC, 8);                    /* 4KB 簇 */
     vh[RVH_MAJ] = 1; vh[RVH_MIN] = 2;         /* ReFS 1.2 */
     wr64(vh + RVH_SERIAL, 0x455A4F5352454653ull);   /* "EZOSREFS" */
     if (ata_write_sector(drive, part_start, vh) != 0) return -1;
-    /* 卷头副本（卷尾，libfsrefs 惯例） */
-    if (ata_write_sector(drive, part_start + RS_VOL_SECS - 1, vh) != 0)
+    /* 卷头副本（卷尾最后一块，libfsrefs 惯例；该块不进分配池） */
+    if (ata_write_sector(drive, part_start + vol_secs - 1, vh) != 0)
         return -1;
 
     /* superblock @ 块 30 */

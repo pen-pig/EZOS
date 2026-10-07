@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""probe_ext4.py - 最小复现：format ext4 -> write -> ls -> cat，全量打印输出。"""
+"""probe_f2fs.py - 最小复现：format f2fs -> write -> ls -> cat，全量打印输出。"""
 import os
 import shutil
 import subprocess
@@ -18,9 +18,9 @@ from ezos_env import qemu_exe  # noqa: E402
 
 QEMU = qemu_exe()
 IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
-WORK = os.path.join(HERE, "probe_ext4.img").replace("\\", "/")
-QMP_PORT, SER_PORT = 4611, 4612
-VOL = int(os.environ.get("EXT4VOL_MB", "16")) * 1024 * 1024
+WORK = os.path.join(HERE, "probe_f2fs.img").replace("\\", "/")
+QMP_PORT, SER_PORT = 4631, 4632
+VOL = int(os.environ.get("F2FSVOL_MB", "64")) * 1024 * 1024
 
 from test_nvme import SerialReader, Qmp, wait_for, wait_port_free, kill_all_qemu  # noqa
 
@@ -51,20 +51,14 @@ def main():
             print(repr(t))
             return " ".join(t.split())
 
-        run("format ext4", 10.0)
+        run("format f2fs", 20.0)
         run("df", 3.0)
         run("ls", 3.0)
         run("write A.TXT HELLO", 4.0)
         run("ls", 3.0)
-        run("pwd", 3.0)
-        run("cat A.TXT", 3.0)
-        run("cd /", 3.0)
-        run("pwd", 3.0)
         run("cat A.TXT", 3.0)
         run("write B.TXT WORLD", 4.0)
         run("ls", 3.0)
-        run("cat B.TXT", 4.0)
-        run("df", 3.0)
     finally:
         try:
             qmp.quit()

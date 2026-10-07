@@ -921,8 +921,11 @@ static int f2_nat_set(uint32_t nid, uint32_t blkaddr) {
 
 /* 分配一个空闲 nid：NAT 区块顺序扫描（journal 优先已含于 f2_nat_lookup） */
 static uint32_t f2_alloc_nid(void) {
-    uint32_t nat_blocks_cap = (f2_total_blocks - f2_nat_blkaddr) / 2;
-    if (nat_blocks_cap > f2_bps) nat_blocks_cap = f2_bps;  /* 单段 NAT 上限 */
+    /* NAT 区可跨多段：容量 = (SSA 起点 - NAT 起点)/2（两副本） */
+    uint32_t nat_blocks_cap = 0;
+    if (f2_ssa_blkaddr > f2_nat_blkaddr)
+        nat_blocks_cap = (f2_ssa_blkaddr - f2_nat_blkaddr) / 2;
+    if (nat_blocks_cap > 1024) nat_blocks_cap = 1024;   /*  sanity 上限 */
     for (uint32_t nid = 4; ; nid++) {    /* 0..2 保留，3 为 root */
         if (nid / NAT_ENTRY_PER_BLOCK >= nat_blocks_cap) return 0;
         if (f2_nat_lookup(nid) == 0)
@@ -2023,24 +2026,60 @@ int f2fs_mkdir(const char *name) {
  *   CP ver=随机奇数（-> pack1 为 start_cp），CRC 覆盖 [0,4092)
  */
 int f2fs_format(uint8_t drive) {
-    if (drive > 3) return -1;
+    /* 卷容量由块设备实测（fail closed：测不出容量就拒绝格式化，不猜大小） */
+    uint32_t cap_secs = ata_capacity(drive);
+    if (cap_secs == 0) return -1;
 
     /* 卷几何（与 mkfs.f2fs 公式一致，bps=64） */
     const uint32_t part_start = 1;
-    const uint32_t vol_blocks = 4095;      /* 32767 扇区 / 8 */
     const uint32_t bps = 64;
-    const uint32_t seg0 = 63;              /* zone 对齐结果 */
+    const uint32_t seg0 = 63;              /* zone 对齐结果（与卷大小无关） */
+    uint32_t cap_blocks = (cap_secs - part_start) / F2FS_BLK_SECS;
+    if (cap_blocks <= seg0 + 8 * bps) return -1;      /* 至少 8 个段 */
+    uint32_t total_segs = (cap_blocks - seg0) / bps;
+    uint32_t vol_blocks = seg0 + total_segs * bps;    /* 对齐到段边界 */
+
+    /* 元数据段数依赖 main 段数（SIT/NAT/SSA 都按 main 相对段号索引），迭代求不动点 */
+    uint32_t sit_segs = 2, nat_segs = 2, ssa_segs = 1, meta_segs = 7, main_segs = 0;
+    uint32_t sit_blks = 1, nat_blks = 1;
+    for (int it = 0; it < 8; it++) {
+        uint32_t m = (total_segs > meta_segs) ? (total_segs - meta_segs) : 0;
+        uint32_t sb = (m + SIT_ENTRY_PER_BLOCK - 1) / SIT_ENTRY_PER_BLOCK;
+        uint32_t nb = ((uint64_t)m * bps + NAT_ENTRY_PER_BLOCK - 1)
+                      / NAT_ENTRY_PER_BLOCK;
+        uint32_t s_segs = (sit_blks * 2 + bps - 1) / bps;
+        uint32_t n_segs = (nat_blks * 2 + bps - 1) / bps;
+        uint32_t a_segs = (m + bps - 1) / bps;
+        if (s_segs < 2) s_segs = 2;
+        if (n_segs < 2) n_segs = 2;
+        if (a_segs < 1) a_segs = 1;
+        uint32_t nm = 2 + s_segs + n_segs + a_segs;
+        main_segs = m; sit_blks = sb; nat_blks = nb;
+        if (nm == meta_segs) { sit_segs = s_segs; nat_segs = n_segs; ssa_segs = a_segs; break; }
+        meta_segs = nm; sit_segs = s_segs; nat_segs = n_segs; ssa_segs = a_segs;
+    }
+    while (main_segs > 0 && main_segs + meta_segs > total_segs) main_segs--;
+    if (main_segs < 8) return -1;
+    /* 只清真正会被读到的块：SIT/NAT 各副本的 sit_blks/nat_blks 块。
+     * 整段清零（sit_segs*bps）会把格式化的写入量放大一个量级，
+     * 在慢速 PIO 盘上格式化要几十秒——不值得。 */
+
     const uint32_t cp0 = seg0;             /* 63 */
-    const uint32_t sit0 = seg0 + 2 * bps;  /* 191 */
-    const uint32_t nat0 = seg0 + 4 * bps;  /* 319 */
-    const uint32_t ssa0 = seg0 + 6 * bps;  /* 447 */
-    const uint32_t main0 = seg0 + 7 * bps; /* 511 */
-    const uint32_t total_segs = 63;
-    const uint32_t main_segs = total_segs - 7;   /* 56 */
+    const uint32_t sit0 = cp0 + 2 * bps;   /* CP 之后 */
+    const uint32_t nat0 = sit0 + sit_segs * bps;
+    const uint32_t ssa0 = nat0 + nat_segs * bps;
+    const uint32_t main0 = ssa0 + ssa_segs * bps;
     const uint32_t root_nid = 3;
     const uint32_t node_ino = 1, meta_ino = 2;
-    const uint32_t root_dentry_blk = main0 + 3 * bps;       /* 703 */
-    const uint32_t root_inode_blk = main0 + 1;              /* 512 */
+    /* curseg 初始主段（mkfs next_zone/last_zone 公式；小卷时收缩以免越界） */
+    uint32_t cd_hot = 3, cd_cold = 13, cd_warm = 27;
+    if (main_segs < 28) {
+        cd_hot = 1;
+        cd_cold = (main_segs > 3) ? 2 : 1;
+        cd_warm = main_segs - 1;
+    }
+    const uint32_t root_dentry_blk = main0 + cd_hot * bps;
+    const uint32_t root_inode_blk = main0 + 1;         /* HOT_NODE 段内 off 1 */
 
     /* CP 版本（mkfs: rand()|0x1 随机奇数；root footer 与 CP 用同值） */
     {
@@ -2062,7 +2101,7 @@ int f2fs_format(uint8_t drive) {
     mbr[449] = 0x83;
     mbr[450] = 0x00; mbr[451] = 0x3F; mbr[452] = 0xFF;
     f2_wr32(mbr + 454, part_start);
-    f2_wr32(mbr + 458, vol_blocks * F2FS_BLK_SECS - 1);
+    f2_wr32(mbr + 458, vol_blocks * F2FS_BLK_SECS);
     mbr[510] = 0x55; mbr[511] = 0xAA;
     if (ata_write_sector(drive, 0, mbr) != 0) return -1;
 
@@ -2080,9 +2119,9 @@ int f2fs_format(uint8_t drive) {
     f2_wr32(sb + SB_OFF_SECTION_COUNT, main_segs);
     f2_wr32(sb + SB_OFF_SEGMENT_COUNT, total_segs);
     f2_wr32(sb + SB_OFF_SEG_CKPT, 2);
-    f2_wr32(sb + SB_OFF_SEG_SIT, 2);
-    f2_wr32(sb + SB_OFF_SEG_NAT, 2);
-    f2_wr32(sb + SB_OFF_SEG_SSA, 1);
+    f2_wr32(sb + SB_OFF_SEG_SIT, sit_segs);
+    f2_wr32(sb + SB_OFF_SEG_NAT, nat_segs);
+    f2_wr32(sb + SB_OFF_SEG_SSA, ssa_segs);
     f2_wr32(sb + SB_OFF_SEG_MAIN, main_segs);
     f2_wr32(sb + SB_OFF_SEG0_BLKADDR, seg0);
     f2_wr32(sb + SB_OFF_CP_BLKADDR, cp0);
@@ -2133,51 +2172,53 @@ int f2fs_format(uint8_t drive) {
     f2_set_footer(f2_fmt, root_nid, root_nid, root_inode_blk + 1);
     f2_write_block(root_inode_blk, f2_fmt);
 
-    /* ---- SIT 区（两副本；mkfs init_sit_area + 初始有效位 + curseg 型位） ---- */
+    /* ---- SIT 区（两副本；整段清零防旧盘残留，再落初始有效位与 curseg 型位） ---- */
     for (uint32_t copy = 0; copy < 2; copy++) {
-        for (uint32_t i = 0; i < F2FS_BLKSIZE; i++) f2_fmt[i] = 0;
-        /* main 段 0（HOT_NODE）：root inode 块（off 1）有效 */
-        {
-            uint8_t *se = f2_fmt + 0 * SIT_ENTRY_SIZE;
-            f2_set_bit_be(1, se + 2);
-            f2_wr16(se, (uint16_t)(1 | (CURSEG_HOT_NODE << SIT_VBLOCKS_SHIFT)));
-            f2_wr64(se + 2 + SIT_VBLOCK_MAP_SIZE, 1);
-        }
-        /* main 段 3（HOT_DATA）：root dentry 块（off 0）有效 */
-        {
-            uint8_t *se = f2_fmt + 3 * SIT_ENTRY_SIZE;
-            f2_set_bit_be(0, se + 2);
-            f2_wr16(se, (uint16_t)(1 | (CURSEG_HOT_DATA << SIT_VBLOCKS_SHIFT)));
-            f2_wr64(se + 2 + SIT_VBLOCK_MAP_SIZE, 1);
-        }
-        f2_write_block(sit0 + copy * bps, f2_fmt);
-    }
-
-    /* ---- NAT 区（两副本；mkfs init_nat_area + f2fs_update_nat_default） ---- */
-    for (uint32_t copy = 0; copy < 2; copy++) {
-        for (uint32_t i = 0; i < F2FS_BLKSIZE; i++) f2_fmt[i] = 0;
-        /* root(3) -> root inode 块；node(1)/meta(2) -> 块 1（mkfs 语义） */
-        {
-            uint8_t *e = f2_fmt + root_nid * NAT_ENTRY_SIZE;
-            e[0] = 0;
-            f2_wr32(e + 1, root_nid);
-            f2_wr32(e + 5, root_inode_blk);
-            e = f2_fmt + node_ino * NAT_ENTRY_SIZE;
-            f2_wr32(e + 1, node_ino);
-            f2_wr32(e + 5, 1);
-            e = f2_fmt + meta_ino * NAT_ENTRY_SIZE;
-            f2_wr32(e + 1, meta_ino);
-            f2_wr32(e + 5, 1);
-        }
-        f2_write_block(nat0 + copy * bps, f2_fmt);
-    }
-
-    /* ---- SSA（先整段清零防旧盘残留，再写 main 段 0/3 的 summary） ---- */
-    {
-        for (uint32_t b = 0; b < bps; b++) {
+        uint32_t base = sit0 + copy * sit_segs * bps;
+        for (uint32_t b = 0; b < sit_blks; b++) {
             for (uint32_t i = 0; i < F2FS_BLKSIZE; i++) f2_fmt[i] = 0;
-            f2_write_block(ssa0 + b, f2_fmt);
+            /* main 段 0（HOT_NODE）：root inode 块（off 1）有效 */
+            if (b == 0) {
+                uint8_t *se = f2_fmt;
+                f2_set_bit_be(1, se + 2);
+                f2_wr16(se, (uint16_t)(1 | (CURSEG_HOT_NODE << SIT_VBLOCKS_SHIFT)));
+                f2_wr64(se + 2 + SIT_VBLOCK_MAP_SIZE, 1);
+            }
+            /* main 段 cd_hot（HOT_DATA）：root dentry 块（off 0）有效 */
+            if (b == cd_hot / SIT_ENTRY_PER_BLOCK) {
+                uint8_t *se = f2_fmt + (cd_hot % SIT_ENTRY_PER_BLOCK) * SIT_ENTRY_SIZE;
+                f2_set_bit_be(0, se + 2);
+                f2_wr16(se, (uint16_t)(1 | (CURSEG_HOT_DATA << SIT_VBLOCKS_SHIFT)));
+                f2_wr64(se + 2 + SIT_VBLOCK_MAP_SIZE, 1);
+            }
+            f2_write_block(base + b, f2_fmt);
         }
+    }
+
+    /* ---- NAT 区（两副本；整段清零，块 0 落初始映射） ---- */
+    for (uint32_t copy = 0; copy < 2; copy++) {
+        uint32_t base = nat0 + copy * nat_segs * bps;
+        for (uint32_t b = 0; b < nat_blks; b++) {
+            for (uint32_t i = 0; i < F2FS_BLKSIZE; i++) f2_fmt[i] = 0;
+            if (b == 0) {
+                /* root(3) -> root inode 块；node(1)/meta(2) -> 块 1（mkfs 语义） */
+                uint8_t *e = f2_fmt + root_nid * NAT_ENTRY_SIZE;
+                e[0] = 0;
+                f2_wr32(e + 1, root_nid);
+                f2_wr32(e + 5, root_inode_blk);
+                e = f2_fmt + node_ino * NAT_ENTRY_SIZE;
+                f2_wr32(e + 1, node_ino);
+                f2_wr32(e + 5, 1);
+                e = f2_fmt + meta_ino * NAT_ENTRY_SIZE;
+                f2_wr32(e + 1, meta_ino);
+                f2_wr32(e + 5, 1);
+            }
+            f2_write_block(base + b, f2_fmt);
+        }
+    }
+
+    /* ---- SSA（只落 main 段 0 / cd_hot 的 summary；SSA 是读-改-写，不需要整区清零） ---- */
+    {
         for (uint32_t i = 0; i < F2FS_BLKSIZE; i++) f2_fmt[i] = 0;
         f2_fmt[4091] = 1;                          /* SUM_TYPE_NODE */
         uint8_t *s = f2_fmt + 1 * 7;
@@ -2190,7 +2231,7 @@ int f2fs_format(uint8_t drive) {
         s = f2_fmt + 0 * 7;
         f2_wr32(s, root_nid);
         f2_wr16(s + 5, 0);
-        f2_write_block(ssa0 + 3, f2_fmt);
+        f2_write_block(ssa0 + cd_hot, f2_fmt);
     }
 
     /* ---- CP pack（mkfs write_check_point_pack） ---- */
@@ -2209,9 +2250,9 @@ int f2fs_format(uint8_t drive) {
     f2_wr32(cp + CP_OFF_CUR_NODE_SEG + (CURSEG_COLD_NODE - 3) * 4, 2);
     for (int i = 3; i < 8; i++)
         f2_wr32(cp + CP_OFF_CUR_NODE_SEG + i * 4, 0xFFFFFFFFu);
-    f2_wr32(cp + CP_OFF_CUR_DATA_SEG + CURSEG_HOT_DATA * 4, 3);
-    f2_wr32(cp + CP_OFF_CUR_DATA_SEG + CURSEG_COLD_DATA * 4, 13);
-    f2_wr32(cp + CP_OFF_CUR_DATA_SEG + CURSEG_WARM_DATA * 4, 27);
+    f2_wr32(cp + CP_OFF_CUR_DATA_SEG + CURSEG_HOT_DATA * 4, cd_hot);
+    f2_wr32(cp + CP_OFF_CUR_DATA_SEG + CURSEG_COLD_DATA * 4, cd_cold);
+    f2_wr32(cp + CP_OFF_CUR_DATA_SEG + CURSEG_WARM_DATA * 4, cd_warm);
     for (int i = 3; i < 8; i++)
         f2_wr32(cp + CP_OFF_CUR_DATA_SEG + i * 4, 0xFFFFFFFFu);
     f2_wr16(cp + CP_OFF_CUR_NODE_BLKOFF + (CURSEG_HOT_NODE - 3) * 2, 2);
@@ -2220,15 +2261,16 @@ int f2fs_format(uint8_t drive) {
     f2_wr16(cp + CP_OFF_CUR_DATA_BLKOFF + CURSEG_HOT_DATA * 2, 1);
     for (int i = 3; i < 8; i++)
         f2_wr16(cp + CP_OFF_CUR_DATA_BLKOFF + i * 2, 0);
-    f2_wr32(cp + CP_OFF_FREE_SEGS, main_segs - 6);  /* mkfs: usable - 6 used */
+    f2_wr32(cp + CP_OFF_FREE_SEGS, main_segs > 6 ? main_segs - 6 : 0);
     f2_wr32(cp + CP_OFF_CKPT_FLAGS, CP_UMOUNT_FLAG | CP_COMPACT_SUM_FLAG);
     f2_wr32(cp + CP_OFF_PACK_TOTAL, 6);
     f2_wr32(cp + CP_OFF_PACK_START_SUM, 1);        /* journal @ pack+1 */
     f2_wr32(cp + CP_OFF_VALID_NODES, 1);
     f2_wr32(cp + CP_OFF_VALID_INODES, 1);
     f2_wr32(cp + CP_OFF_NEXT_FREE_NID, 4);
-    f2_wr32(cp + CP_OFF_SIT_VER_BYTES, 8);        /* (2/2 段 × 64 块)/8 */
-    f2_wr32(cp + CP_OFF_NAT_VER_BYTES, 8);
+    /* mkfs: ((seg / 2) << log_blocks_per_seg) / 8 */
+    f2_wr32(cp + CP_OFF_SIT_VER_BYTES, ((sit_segs / 2) * bps) / 8);
+    f2_wr32(cp + CP_OFF_NAT_VER_BYTES, ((nat_segs / 2) * bps) / 8);
     f2_wr32(cp + CP_OFF_CKSUM_OFF, CHECKSUM_OFFSET);
     cp[CP_OFF_ALLOC_TYPE + CURSEG_HOT_NODE] = 0;   /* ALLOC_NEXT_SEG */
     cp[CP_OFF_ALLOC_TYPE + CURSEG_HOT_DATA] = 0;
@@ -2251,7 +2293,13 @@ int f2fs_format(uint8_t drive) {
 
         /* SIT journal: 6 槽位（idx=curseg 类型；segno=该 curseg 段；
          * 仅 HOT_NODE(0 段,off1 有效) 与 HOT_DATA(3 段,off0 有效) 有内容） */
-        static const uint32_t curseg_seg[6] = { 3, 27, 13, 0, 1, 2 };
+        uint32_t curseg_seg[6];
+        curseg_seg[0] = cd_hot;                    /* HOT_DATA  */
+        curseg_seg[1] = cd_warm;                   /* WARM_DATA */
+        curseg_seg[2] = cd_cold;                   /* COLD_DATA */
+        curseg_seg[3] = 0;                         /* HOT_NODE  */
+        curseg_seg[4] = 1;                         /* WARM_NODE */
+        curseg_seg[5] = 2;                         /* COLD_NODE */
         for (int t = 0; t < 6; t++) {
             uint8_t *sj = f2_sitj + 2 + (uint32_t)t * SIT_JENTRY_SIZE;
             f2_wr32(sj, curseg_seg[t]);

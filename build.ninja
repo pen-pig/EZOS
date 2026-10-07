@@ -216,6 +216,17 @@ rule lint
 
 build lint: lint tools/lint.py
 
+# 栈帧预算：内核主栈只有 ~21KB（0x8b000..0x90000）、任务内核栈 TASK_KSIZE 16KB，
+# 栈上放大数组会**静默写穿紧邻的 .data**（历史 bug：shell.c cmd_ls 的
+# fs_dir_entry_t entries[64] = 16.9KB 覆盖了 fs.c 的 ro_cwd，症状是提示符变
+# [A.TXT]、cat/write 全挂，伪装成文件系统损坏）。同 lint 一样不进 default。
+# 用法：ninja stack
+rule stack_check
+    command = cmd /c python tools/check_stack.py
+    description = STACK kernel stack budget
+
+build stack: stack_check tools/check_stack.py
+
 # VMware 侧验证：QEMU 的 SeaBIOS 太干净，VMware 的 PhoenixBIOS + 更接近真机的
 # 芯片组是介于 QEMU 与真机之间的第二道关。同样不进 default。用法：ninja vmware
 rule make_vmware

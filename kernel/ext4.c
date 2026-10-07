@@ -1601,9 +1601,12 @@ int ext4_rmdir(const char *name) {
  * 16MB 卷 2 组 = 512 个 inode，够日用（mke2fs 默认 16KB/inode 会给 1024，
  * 这里偏保守，省下 64KB 元数据）。 */
 #define E4_FMT_IPG        256u
-/* 块组上限：256 组 x 8MB = 2GB。更大的盘也只吃前 2GB——32 位块号下够用，
- * 且 PIO 逐块写元数据随组数线性变慢，先在这里封顶。 */
-#define E4_FMT_MAX_GROUPS 256u
+/* 块组上限：1024 组 x 8MB = 8GB。更大的盘也只吃前 8GB。
+ * 运行时 e4_gd() 已经按 gd_off/blksize 跨块读 GDT（1024 组 x 32B = 32KB，
+ * 即 32 个 1KB 块），所以放大这里不需要动读路径。
+ * 代价是 4 张 static 表各 4KB（共 16KB，落在 19MB 的 .bss 区），
+ * 以及 PIO 逐块写元数据随组数线性变慢（8GB 约 34K 次块写）。 */
+#define E4_FMT_MAX_GROUPS 1024u
 /* 保留 inode 1..11（bad blocks / root / resize / ...），分配从 12 开始 */
 #define E4_FMT_FREE_INO_BASE 11u
 
@@ -1718,21 +1721,29 @@ int ext4_format(uint8_t drive) {
     sb[510] = 0x53; sb[511] = 0xEF;                    /* ext signature */
     e4_write_secs(part_start + first_data * blk_per_sec, sb, blk_per_sec);
 
-    /* GDT（块 2..）：每组一个 32 字节描述符 */
-    static uint8_t gd[E4_FMT_MAX_GROUPS * 32] E4_HIBUF;
-    for (uint32_t i = 0; i < sizeof(gd); i++) gd[i] = 0;
-    for (uint32_t g = 0; g < groups; g++) {
-        uint32_t in_group = vol_blocks - (first_data + g * E4_FMT_BPG);
-        if (in_group > E4_FMT_BPG) in_group = E4_FMT_BPG;
-        uint8_t *d = gd + g * 32;
-        e4_wr32(d + 0, bb_blk[g]);                     /* bg_block_bitmap_lo */
-        e4_wr32(d + 4, ib_blk[g]);                     /* bg_inode_bitmap_lo */
-        e4_wr32(d + 8, it_blk[g]);                     /* bg_inode_table_lo */
-        e4_wr16(d + 12, (uint16_t)(in_group - g_used[g]));   /* free_blocks_lo */
-        e4_wr16(d + 14, (uint16_t)(E4_FMT_IPG - E4_FMT_FREE_INO_BASE));
-        e4_wr16(d + 16, (uint16_t)((g == 0) ? 1 : 0));      /* bg_used_dirs_lo */
+    /* GDT（块 2..）：每组一个 32 字节描述符。
+     * 逐块写而不是整表缓冲：1024 组要 32KB，而 .bss.hi 只剩几十 KB 余量
+     * （上限 2MB，已用 ~1.97MB），一次性 static 出来会链接失败。 */
+    static uint8_t gdbuf[1024] E4_HIBUF;
+    const uint32_t gd_per_blk = blksize / 32;           /* 32 */
+    for (uint32_t b = 0; b < gdt_blks; b++) {
+        for (uint32_t i = 0; i < blksize; i++) gdbuf[i] = 0;
+        for (uint32_t k = 0; k < gd_per_blk; k++) {
+            uint32_t g = b * gd_per_blk + k;
+            if (g >= groups) break;
+            uint32_t in_group = vol_blocks - (first_data + g * E4_FMT_BPG);
+            if (in_group > E4_FMT_BPG) in_group = E4_FMT_BPG;
+            uint8_t *d = gdbuf + k * 32;
+            e4_wr32(d + 0, bb_blk[g]);                     /* bg_block_bitmap_lo */
+            e4_wr32(d + 4, ib_blk[g]);                     /* bg_inode_bitmap_lo */
+            e4_wr32(d + 8, it_blk[g]);                     /* bg_inode_table_lo */
+            e4_wr16(d + 12, (uint16_t)(in_group - g_used[g]));   /* free_blocks_lo */
+            e4_wr16(d + 14, (uint16_t)(E4_FMT_IPG - E4_FMT_FREE_INO_BASE));
+            e4_wr16(d + 16, (uint16_t)((g == 0) ? 1 : 0));      /* bg_used_dirs_lo */
+        }
+        e4_write_secs(part_start + (gdt_blk + b) * blk_per_sec, gdbuf,
+                      blk_per_sec);
     }
-    e4_write_secs(part_start + gdt_blk * blk_per_sec, gd, gdt_blks * blk_per_sec);
 
     /* 每组的块位图 / inode 位图 / inode 表。
      *
@@ -1814,8 +1825,25 @@ int ext4_format(uint8_t drive) {
         uint32_t gstart = first_data + g * E4_FMT_BPG;
         e4_wr16(sb + 254, (uint16_t)g);                /* s_block_group_nr */
         e4_write_secs(part_start + gstart * blk_per_sec, sb, blk_per_sec);
-        e4_write_secs(part_start + (gstart + 1) * blk_per_sec, gd,
-                      gdt_blks * blk_per_sec);
+        for (uint32_t b = 0; b < gdt_blks; b++) {
+            /* 重填同一份内容（gdbuf 已被后面的块覆盖，这里逐块重建） */
+            for (uint32_t i = 0; i < blksize; i++) gdbuf[i] = 0;
+            for (uint32_t k = 0; k < gd_per_blk; k++) {
+                uint32_t gg = b * gd_per_blk + k;
+                if (gg >= groups) break;
+                uint32_t in_group = vol_blocks - (first_data + gg * E4_FMT_BPG);
+                if (in_group > E4_FMT_BPG) in_group = E4_FMT_BPG;
+                uint8_t *d = gdbuf + k * 32;
+                e4_wr32(d + 0, bb_blk[gg]);
+                e4_wr32(d + 4, ib_blk[gg]);
+                e4_wr32(d + 8, it_blk[gg]);
+                e4_wr16(d + 12, (uint16_t)(in_group - g_used[gg]));
+                e4_wr16(d + 14, (uint16_t)(E4_FMT_IPG - E4_FMT_FREE_INO_BASE));
+                e4_wr16(d + 16, (uint16_t)((gg == 0) ? 1 : 0));
+            }
+            e4_write_secs(part_start + (gstart + 1 + b) * blk_per_sec, gdbuf,
+                          blk_per_sec);
+        }
     }
     e4_wr16(sb + 254, 0);
 

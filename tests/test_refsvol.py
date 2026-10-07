@@ -1,19 +1,18 @@
 # -*- coding: utf-8 -*-
-"""test_ext4vol.py - ext4 卷必须吃满整块盘（多块组）并与宿主机参考实现对拍。
+"""test_refsvol.py - ReFS 卷必须吃满整块盘，块池上限随卷大小伸缩。
 
-为什么要它：ext4_format 早期把卷大小写死成 1024 块 = 1MB。在 16MB 的数据盘
-上格式化完只剩 6% 可用，剩下 94% 的扇区永远摸不到——而"内核自己读自己写的
-盘"永远是绿的，所以这里必须用**宿主机独立实现**（tests/ref_ext4.py，只读、
-按 spec 解析、与 kernel/ext4.c 零共享）来量：文件系统到底覆盖了卷的百分之几。
+为什么要它：refs_format 早期把卷大小写死成 32767 扇区，更致命的是
+**块池上限 RS_POOL_MAX 写死 1023 块**（bump 分配器 rs_alloc 的硬上界，
+被 8 处边界检查引用）。1023 x 4KB = 4MB，也就是说哪怕在一块 1GB 的盘上
+格式化，最多也只能用掉 4MB，剩下 99.6% 的扇区永远摸不到。现在块池上限
+改成运行时变量 rs_pool_max，由 ata_capacity() 实测推导（卷尾最后一块
+留给卷头副本，所以是 blocks-1）。
 
-顺带把"块组边界"这条也钉死：组边界是 first_data_block + g*bpg（Linux
-ext4_group_first_block_no 的定义），含 1KB 块时的 +1 偏移。按 g*bpg 算会差
-一个块，内核自己完全看不出来，但位图/空闲计数在宿主机侧立刻对不上。
+端口 4641(QMP) / 4642(serial)。
 
-端口 4601(QMP) / 4602(serial)。
+用法：python tests/test_refsvol.py [MB]     默认 64MB
 """
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -30,16 +29,13 @@ from ezos_env import qemu_exe  # noqa: E402
 
 QEMU = qemu_exe()
 IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
-WORK = os.path.join(HERE, "ext4vol_disk.img").replace("\\", "/")
-QMP_PORT, SER_PORT = 4601, 4602
+WORK = os.path.join(HERE, "refsvol_disk.img").replace("\\", "/")
+QMP_PORT, SER_PORT = 4641, 4642
 
-# 16MB 默认：正好跨 2 个块组（1KB 块 x 8192 块/组 = 8MB/组）。
-# 传更大的值（如 320）可以压到 GDT 跨块（>32 组）这条路径。
-MB = int(sys.argv[1]) if len(sys.argv) > 1 else 16
+MB = int(sys.argv[1]) if len(sys.argv) > 1 else 64
 VOL_BYTES = MB * 1024 * 1024
 
 from test_nvme import SerialReader, Qmp, wait_for, wait_port_free, kill_all_qemu  # noqa
-import ref_ext4  # noqa: E402
 
 
 def rec(results, name, ok, detail=""):
@@ -55,8 +51,6 @@ def main():
     if not os.path.isfile(IMG):
         print("MISSING os-image.bin - run ninja first")
         return 2
-    # 每次都从头造一块空盘：格式化的结果必须是**可重现**的，
-    # 拿一块被历史测试写脏的盘来测等于什么都没测。
     with open(WORK, "wb") as f:
         f.truncate(VOL_BYTES)
 
@@ -108,45 +102,49 @@ def main():
                     last = n
             return flat(serial.tail_from(before))
 
-        # 1) 格式化
-        out = run("format ext4", 8.0)
-        rec(results, "format ext4 on %dMB disk" % MB,
-            "Disk formatted as ext4" in out, "| %s" % out[-70:])
+        out = run("format refs", 20.0)
+        rec(results, "format refs on %dMB disk" % MB,
+            "disk formatted as refs" in out.lower(), "| %s" % out[-70:])
 
-        # 2) 根目录可读
         out = run("ls", 2.5)
         rec(results, "ls after format (no error)",
             "error" not in out.lower(), "| %s" % out[-70:])
 
-        # 3) 写文件并读回（跨组也要能写：这里写到 20 个文件）
-        names = []
-        for i in range(20):
-            n = "F%02D.TXT" % i if False else ("F%02d.TXT" % i)
-            names.append((n, "CONTENT%02d" % i))
+        # 容量覆盖：df 的 1K-blocks 总数必须接近整盘（原来写死 16MB）
+        out = run("df", 2.5)
+        total_k = 0
+        for tok in out.split():
+            if tok.isdigit():
+                total_k = int(tok)
+                break
+        want_k = VOL_BYTES // 1024
+        cover = 100.0 * total_k / want_k if want_k else 0.0
+        rec(results, "refs main area covers >=85%% of the %dMB volume" % MB,
+            cover >= 85.0, "| %d KB of %d KB = %.1f%%" % (total_k, want_k, cover))
+
+        names = [("F%02d.TXT" % i, "CONTENT%02d" % i) for i in range(20)]
         for n, v in names:
-            run("write %s %s" % (n, v), 1.2)
+            run("write %s %s" % (n, v), 1.5)
         out = run("ls", 3.0)
         listed = sum(1 for n, _ in names if n.lower() in out.lower())
-        rec(results, "ls shows all 20 files", listed == 20,
-            "| %d/20" % listed)
+        rec(results, "ls shows all 20 files", listed == 20, "| %d/20" % listed)
 
         ok_read = 0
         for n, v in names:
-            out = run("cat " + n, 1.5)
+            out = run("cat " + n, 1.8)
             if v in out:
                 ok_read += 1
         rec(results, "cat reads back all 20 files", ok_read == 20,
             "| %d/20" % ok_read)
 
-        # 4) 删一半再读：释放路径必须把块还回**正确的组**
         for n, _ in names[:10]:
-            run("rm " + n, 1.2)
+            run("rm " + n, 1.5)
         out = run("ls", 3.0)
         gone = sum(1 for n, _ in names[:10] if n.lower() not in out.lower())
         rec(results, "rm removes 10 files", gone == 10, "| %d/10" % gone)
         ok_read = 0
         for n, v in names[10:]:
-            out = run("cat " + n, 1.5)
+            out = run("cat " + n, 1.8)
             if v in out:
                 ok_read += 1
         rec(results, "remaining 10 files intact after rm", ok_read == 10,
@@ -165,47 +163,6 @@ def main():
         except Exception:
             kill_all_qemu()
         wait_port_free(QMP_PORT, 20)
-
-    # ---------- 宿主机侧独立审计 ----------
-    try:
-        fs = ref_ext4.Ext4(WORK)
-    except Exception as e:
-        rec(results, "host ref_ext4 parses the image", False, "| %s" % e)
-        return 1
-    try:
-        vol = fs.volume_bytes()
-        cover = 100.0 * fs.fs_bytes / vol if vol else 0.0
-        rec(results, "ext4 covers >=95%% of the %dMB volume "
-                     "(was 6%% with hardcoded 1MB)" % MB, cover >= 95.0,
-            "| %d B of %d B = %.1f%%" % (fs.fs_bytes, vol, cover))
-
-        rec(results, "uses more than one block group", fs.groups >= 2,
-            "| groups=%d blocks=%d" % (fs.groups, fs.blocks_total))
-
-        problems = fs.audit()
-        rec(results, "ref_ext4.audit() clean", not problems,
-            "| %s" % ("; ".join(problems[:3]) if problems else "0 problems"))
-
-        # 内核写的目录项，宿主机必须能独立读出来（双向对拍）
-        got = {}
-        try:
-            for ent in fs.dir_entries(2):
-                name = ent["name"]
-                if name in (".", ".."):
-                    continue
-                ino = ent["ino"]
-                if ino:
-                    got[name] = fs.read_inode(ino).rstrip(b"\x00")
-        except Exception as e:
-            rec(results, "host reads root dir", False, "| %s" % e)
-            got = {}
-        want = {n: v.encode() for n, v in names[10:]}
-        match = sum(1 for n, v in want.items()
-                    if got.get(n, b"").strip() == v)
-        rec(results, "host ref reads the same 10 files",
-            match == len(want), "| %d/%d" % (match, len(want)))
-    finally:
-        fs.close()
 
     bad = [n for n, ok in results if not ok]
     print("\n%d/%d passed" % (len(results) - len(bad), len(results)))

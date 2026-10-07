@@ -10,6 +10,7 @@
     fs      文件系统相关：exFAT/FAT/路径/系统卷
     usb     USB/输入栈
     net     网络栈
+    static  静态检查：内核栈帧预算（tools/check_stack.py，不跑 QEMU）
     full    全部
     changed 按 git 改动自动选（长程任务里最常用）
     <名字>  直接跑指定测试（可多个）
@@ -31,12 +32,18 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TESTS = os.path.join(ROOT, "tests")
 REPORT = os.path.join(ROOT, "temp", "test_report.txt")
+# 互斥锁：run_tests 每项开始前会 taskkill 掉所有 QEMU（清上一项残留）。
+# 两个实例同时跑就会互相杀——症状是某项莫名其妙 ConnectionRefused/FAIL，
+# 看起来像测试坏了。踩过一次，所以加文件锁挡住。
+LOCK = os.path.join(ROOT, "temp", "run_tests.lock")
+LOCK_MAX_AGE = 4 * 3600.0
 PY = sys.executable
 
 # 层级定义。key 是层级名，value 是测试模块名（不含 test_ 前缀与 .py）。
 LAYERS = {
     "core": ["image", "vhd", "regress", "fs_matrix", "multilang", "mouse"],
-    "fs":   ["fsref", "hostfs", "fatpath", "path", "sysvol", "rmdir"],
+    "fs":   ["fsref", "hostfs", "fatpath", "path", "sysvol", "rmdir",
+             "ext4vol", "f2fsvol", "refsvol"],
     "usb":  ["usbenum", "uhci", "uhci_control", "usb", "usbkbd", "usbmouse",
              "usbmsc", "usbboot", "ehci"],
     "net":  ["netapp", "dhcp", "dns"],
@@ -44,6 +51,8 @@ LAYERS = {
     "deep": ["step7_sock", "step7_tcp"],
     "hw":   ["ahci", "nvme", "power", "edge", "heap", "jobs", "lock"],
     "util": ["digest"],
+    # 静态检查（不是 tests/test_*.py，而是 tools/*.py）
+    "static": ["stack"],
 }
 
 # 改动文件 -> 必跑层级。键是路径子串。
@@ -54,7 +63,9 @@ WATCH = [
     ("keyboard", "usb"), ("uhci", "usb"), ("ehci", "usb"), ("usbc", "usb"),
     ("usb.", "usb"), ("usbenum", "usb"), ("usbhc", "usb"),
     ("net.c", "net"), ("rtl8139", "net"), ("dhcp", "net"), ("dns", "net"),
-    ("shell", "core"), ("task", "core hw"), ("paging", "core hw"),
+    # 静态检查不跑 QEMU，10~30s 就完事，所以 kernel/ 下任何 .c 改动都带上
+    ("kernel/", "static"), ("shell", "core"),
+    ("fs.c", "core fs"), ("ext4", "fs"), ("f2fs", "fs"), ("refs", "fs"),
     ("kmalloc", "core hw"), ("pmm", "core hw"), ("lockselftest", "core hw"),
     ("fd.c", "core"), ("elf", "core"), ("exec", "core"),
     ("syscall", "core"), ("kernel.c", "core"), ("build.ninja", "core"),
@@ -70,6 +81,10 @@ TIMEOUT = {
     "vi_color": 420, "vi": 420, "dhcp": 420, "dns": 420,
     "fs_matrix": 600, "hostfs": 900, "netapp": 600, "edge": 420,
     "power": 420, "ahci": 420, "nvme": 600, "regress": 600,
+    # rmdir 用 screendump+OCR 逐个断言，6 个 FS x ~20 条命令，实测 ~7 分钟
+    "rmdir": 900,
+    # 卷容量测试：QEMU -icount 下格式化慢，单项实测 ~3 分钟
+    "ext4vol": 420, "f2fsvol": 420, "refsvol": 420,
 }
 
 # 这些测试要 GUI 像素/OCR，默认不进 core/full 的常规集合（太慢且脆）
@@ -181,15 +196,53 @@ def main():
             print("PREFLIGHT FAIL: %s" % p)
         return 2
 
+    # 互斥：见 LOCK 的注释。锁文件比进程探测可靠（Ctrl-C 死掉的进程留不下痕迹，
+    # 但锁文件会——所以超过 4 小时的陈旧锁自动忽略）。
+    if os.path.exists(LOCK):
+        try:
+            age = time.time() - os.path.getmtime(LOCK)
+        except OSError:
+            age = 0.0
+        if age < LOCK_MAX_AGE:
+            print("PREFLIGHT FAIL: %s 存在（%.1f 分钟前创建）\n"
+                  "  run_tests 每项开始前会 taskkill 掉所有 QEMU，两个实例同时跑"
+                  "会互相杀。\n  确认没有别的实例在跑后，删掉 %s 再重试。"
+                  % (LOCK, age / 60.0, LOCK))
+            return 2
+    try:
+        with open(LOCK, "w", encoding="utf-8") as f:
+            f.write("pid=%d started=%s\n" % (os.getpid(), time.ctime()))
+    except OSError as e:
+        print("PREFLIGHT FAIL: 写不了锁文件 %s (%s)" % (LOCK, e))
+        return 2
+
+    try:
+        return run_all(names)
+    finally:
+        try:
+            os.remove(LOCK)
+        except OSError:
+            pass
+
+
+def run_all(names):
+    """串行跑完所有项，返回退出码。"""
     print("=== 串行回归：%d 项 ===" % len(names))
     results = []
     t_all = time.time()
     for i, name in enumerate(names, 1):
         script = os.path.join(TESTS, "test_%s.py" % name)
         if not os.path.isfile(script):
-            results.append((name, "MISSING", 0.0, ""))
-            print("[%2d/%2d] %-14s MISSING" % (i, len(names), name))
-            continue
+            # 静态检查类：tools/<name>.py 或 tools/check_<name>.py（如 stack）
+            for cand in (os.path.join(ROOT, "tools", "%s.py" % name),
+                         os.path.join(ROOT, "tools", "check_%s.py" % name)):
+                if os.path.isfile(cand):
+                    script = cand
+                    break
+            else:
+                results.append((name, "MISSING", 0.0, ""))
+                print("[%2d/%2d] %-14s MISSING" % (i, len(names), name))
+                continue
         limit = TIMEOUT.get(name, 360)
         kill_stale_qemu()
         print("[%2d/%2d] %-14s ... " % (i, len(names), name), end="",

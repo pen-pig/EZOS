@@ -163,7 +163,9 @@ def fs_cases(qmp, name):
     """返回 [(用例名, 通过?)]"""
     r = []
 
-    t = run(qmp, "format " + name, 10.0)
+    # 格式化现在按磁盘实际容量铺满整卷（不再是写死的 1~16MB），慢盘上远超
+    # 10 秒；给它单独的超时，否则后面的命令会叠进来。
+    t = run(qmp, "format " + name, 60.0)
     r.append(("%s: format ok" % name,
               ("disk formatted as" in t) and ("format failed" not in t)))
     r.append(("%s: df reports type" % name, name in run(qmp, "df")))

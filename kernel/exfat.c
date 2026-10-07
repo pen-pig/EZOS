@@ -105,7 +105,11 @@ static uint32_t exfat_find_free_cluster(void) {
 // 位映射：簇2 → bit0，簇3 → bit1 ...（簇号减 2）
 static int exfat_bitmap_set(uint32_t cluster, int used) {
     if (cluster < 2) return -1;
-    uint8_t bmp[512 * 16];
+    /* 8KB：必须 static。主栈只有约 21KB、任务内核栈 TASK_KSIZE 只有 16KB，
+     * 8KB 栈帧再叠上调用链随时会写穿（shell.c 的 cmd_ls 就踩过：17KB 栈帧
+     * 覆盖了 fs.c 的 ro_cwd，提示符变成 [A.TXT]）。放 .bss（19MB 区）。
+     * 每次使用前都由 exfat_read_cluster 整块重写，不依赖零初始化。 */
+    static uint8_t bmp[512 * 16];
     uint32_t bmp_cluster = exfat_bitmap_cluster;   // 从根目录 0x81 条目解析
     if (bmp_cluster < 2) return -1;
     if (exfat_read_cluster(bmp_cluster, bmp) != 0) return -1;
@@ -749,7 +753,9 @@ int exfat_mkdir(const char *name) {
     if (exfat_write_cluster(new_cluster, sub_dir) != 0) goto restore;
 
     uint32_t parent_cluster = exfat_cwd_cluster();
-    uint8_t dir_data[512 * 16];
+    /* 8KB：同 exfat_bitmap_set 的理由，不能放栈上（栈预算 ~21KB/16KB）。
+     * 使用前必由 exfat_read_dir_chain 整块填充。 */
+    static uint8_t dir_data[512 * 16];
     uint8_t *dbuf = dir_data;
     uint32_t dir_clusters = exfat_read_dir_chain(parent_cluster, dbuf, 16);
     if (dir_clusters == 0) goto restore;
