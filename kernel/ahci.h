@@ -46,6 +46,9 @@ int ahci_port_present(uint8_t port);
 /* 已上线（已初始化且可用）的端口数 */
 uint8_t ahci_port_count(void);
 
+/* 端口总扇区数（512B）。未上线或容量不可信返回 0（fail closed）。 */
+uint32_t ahci_capacity(uint8_t port);
+
 /* 单扇区（512B）读/写，对齐 ata_read_sector / ata_write_sector 的调用形态。
  * 返回 0 成功，-1 失败。port 越界或不存在直接失败（fail closed）。 */
 int ahci_read_sector(uint8_t port, uint32_t lba, uint8_t *buffer);

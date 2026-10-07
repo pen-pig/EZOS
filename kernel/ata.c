@@ -138,6 +138,81 @@ int ata_drive_present(uint8_t drive) {
     }
 }
 
+/* ============================================================
+ * 容量查询（ata_capacity）
+ *
+ * 为什么要在块层提供它：format 必须知道盘有多大才能决定文件系统布局。
+ * 之前 ext4_format 硬编码 1MB、ntfs_format 硬编码 2MB——在 16MB 的数据盘上
+ * 只用掉 6%/12%，剩下的永远摸不到。没有容量接口就只能写死，写死就不是
+ * 生产系统。
+ *
+ * 四条通路各自已经有容量信息（AHCI 有 IDENTIFY 缓冲、NVMe 有 NSZE、
+ * USB-MSC 有 READ CAPACITY），这里只是把它们统一成一个入口。
+ *
+ * fail closed：拿不到容量返回 0，让调用方拒绝格式化，绝不猜一个值写盘。
+ * ============================================================ */
+
+/* PATA：发 IDENTIFY DEVICE 并收 256 words（buf 需 512 字节）。
+ * 返回 0 成功；-1 = 不存在 / ATAPI（无 ATA 数据阶段）/ 超时。 */
+static int ata_identify_pata(uint8_t drive, uint16_t *buf) {
+    if (drive > 3) return -1;
+    uint16_t base = ata_io_base(drive);
+    if (ata_select(drive) != 0) return -1;
+
+    outb(base + 2, 0);
+    outb(base + 3, 0);
+    outb(base + 4, 0);
+    outb(base + 5, 0);
+    outb(base + 7, 0xEC);                       /* IDENTIFY DEVICE */
+
+    uint32_t t = ATA_TIMEOUT;
+    for (;;) {
+        uint8_t status = inb(base + 7);
+        if (status == 0xFF || status == 0x00) return -1;
+        if (status & ATA_STAT_ERR) return -1;   /* ATAPI 等：无 ATA 数据阶段 */
+        if (status & ATA_STAT_DRQ) break;
+        if (--t == 0) return -1;
+    }
+    for (int i = 0; i < 256; i++) {
+        uint16_t w = inw(base);
+        if (buf) buf[i] = w;
+    }
+    if (ata_wait_idle(base) != 0) return -1;
+    /* 字 0 bit15：1 = ATAPI 设备，那份数据不是 ATA IDENTIFY，不能用 */
+    if (buf && (buf[0] & 0x8000u)) return -1;
+    return 0;
+}
+
+uint32_t ata_capacity(uint8_t drive) {
+    if (drive >= NVME_DRIVE_BASE)
+        return nvme_ns_sectors((uint8_t)(drive - NVME_DRIVE_BASE));
+    if (drive >= USBMSC_DRIVE_BASE)
+        return usbmsc_sectors((uint8_t)(drive - USBMSC_DRIVE_BASE));
+    if (drive >= AHCI_DRIVE_BASE) {
+        uint8_t p = (uint8_t)(drive - AHCI_DRIVE_BASE);
+        if (p >= AHCI_MAX_PORTS) return 0;
+        return ahci_capacity(p);
+    }
+    if (drive > 3) return 0;
+
+    /* 512B IDENTIFY 缓冲。放在 static（而非栈）：内核栈只有几 KB，
+     * 且这块只在 format/diskinfo 时偶尔用一次。 */
+    static uint16_t id[256];
+    if (ata_identify_pata(drive, id) != 0) return 0;
+
+    uint32_t n = 0;
+    /* 字 83 bit10 = LBA48 支持；支持时字 100-103 是 64 位扇区数 */
+    if (id[83] & 0x0400u) {
+        n = (uint32_t)id[100] | ((uint32_t)id[101] << 16);
+    }
+    if (n == 0) {
+        n = (uint32_t)id[60] | ((uint32_t)id[61] << 16);   /* LBA28 */
+    }
+    if (n == 0 || n == 0x0FFFFFFFu) return 0;   /* 0 与 LBA28 截断哨兵都不可信 */
+    if (n > 0xFFFFFFFEu) n = 0xFFFFFFFEu;       /* lba 是 uint32：>2TB 截断 */
+    return n;
+}
+
 int ata_read_sector(uint8_t drive, uint32_t lba, uint8_t *buffer) {
     if (drive >= NVME_DRIVE_BASE) {
         return nvme_read_sector((uint8_t)(drive - NVME_DRIVE_BASE), lba, buffer);

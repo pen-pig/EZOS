@@ -20,12 +20,19 @@
 import struct
 
 EXT4_MAGIC = 0xEF53
+EXT4_EXT_MAGIC = 0xF30A
+EXT4_EXTENTS_FL = 0x00080000  # i_flags: 该 inode 用 extent 树
 
-# i_block 索引含义
+# i_block 索引含义。i_block 只有 **15** 项（0..14）：
+#   0..11  直接块 | 12 一级间接 | 13 二级间接 | 14 三级间接
+# 早期写成 12/13/14/15，SINGLE/DOUBLE 各偏一位、TRIPLE 直接越界——
+# 于是 dir_entries() 一碰根目录就 IndexError，而"参考实现跑不起来"很容易
+# 被误读成"内核的盘有问题"。IDX_DIRECT 保持 12 = 直接块个数。
 IDX_DIRECT = 12
-IDX_SINGLE = 13
-IDX_DOUBLE = 14
-IDX_TRIPLE = 15
+IDX_SINGLE = 12
+IDX_DOUBLE = 13
+IDX_TRIPLE = 14
+IDX_COUNT = 15
 
 # 目录项 file_type
 FT_UNKNOWN, FT_REG, FT_DIR, FT_CHR, FT_BLK, FT_FIFO, FT_SOCK, FT_LNK = range(8)
@@ -187,6 +194,7 @@ class Ext4(object):
             "flags": _u32(d, 32),
             "size": _u32(d, 4) | (_u32(d, 108) << 32),
             "iblock": [_u32(d, 40 + 4 * i) for i in range(15)],
+            "iblock_raw": bytes(d[40:40 + 60]),
             "raw": d,
         }
         mode = e["mode"]
@@ -194,14 +202,53 @@ class Ext4(object):
         e["is_reg"] = (mode & 0xF000) == 0x8000
         return e
 
+    def _extent_map(self, ib):
+        """展开 extent 树，返回 [(logical, phys, len)]（按 logical 排序）。
+
+        内核写文件走的是 extent 树（incompat EXTENTS），不是间接块。只读
+        间接块的参考实现会把 extent 头（magic 0xF30A）当成块号去读，读出
+        来的东西毫无意义——所以这里必须两种都支持。"""
+        out = []
+
+        def walk(buf):
+            magic = _u16(buf, 0)
+            if magic != EXT4_EXT_MAGIC:
+                raise Ext4Error("bad extent header 0x%04X (want 0xF30A)" % magic)
+            entries = _u16(buf, 2)
+            depth = _u16(buf, 6)
+            for i in range(entries):
+                e = buf[12 + i * 12: 12 + (i + 1) * 12]
+                if len(e) < 12:
+                    break
+                if depth == 0:
+                    logical = _u32(e, 0)
+                    ln = _u16(e, 4)
+                    phys = _u32(e, 8) | (_u16(e, 6) << 32)
+                    if ln > 32768:          # 未初始化 extent：高位是标志
+                        ln -= 32768
+                    out.append((logical, phys, ln))
+                else:
+                    leaf = _u32(e, 4) | (_u32(e, 8) << 32)
+                    if leaf:
+                        walk(self.block(leaf))
+        walk(ib)
+        out.sort(key=lambda t: t[0])
+        return out
+
     def blocks_of(self, ino):
-        """按 i_block 间接映射展开文件的数据块列表。"""
+        """按 i_block 展开文件的数据块列表（extent 树 或 间接块，二选一）。"""
         e = self.inode(ino)
         out = []
 
         def add_direct(blk):
             if blk:
                 out.append(blk)
+
+        if e["flags"] & EXT4_EXTENTS_FL:
+            for _logical, phys, ln in self._extent_map(e["iblock_raw"]):
+                for k in range(ln):
+                    add_direct(phys + k)
+            return out
 
         for i in range(12):
             add_direct(e["iblock"][i])
@@ -306,9 +353,11 @@ class Ext4(object):
         if self.blocks_total <= self.first_data_block:
             p.append("blocks_count=%d <= first_data_block" % self.blocks_total)
 
-        # 2) 容量：文件系统实际使用 vs 卷大小（内核 ext4_format 写死 1MB）
+        # 2) 容量：文件系统实际使用 vs 卷大小（内核 ext4_format 曾写死 1MB）
+        #    允许的正常损耗 = 引导块区(first_data_block) + 尾扇区凑整(1 块)
         vol = self.volume_bytes()
-        if vol and self.fs_bytes < vol:
+        slack = (self.first_data_block + 1) * self.block_size
+        if vol and self.fs_bytes + slack < vol:
             p.append("filesystem covers %d B but volume is %d B (%.0f%% wasted)"
                      % (self.fs_bytes, vol, 100.0 * (vol - self.fs_bytes) / vol))
 

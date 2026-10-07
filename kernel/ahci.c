@@ -377,6 +377,31 @@ int ahci_port_present(uint8_t port) {
 
 uint8_t ahci_port_count(void) { return g_port_count; }
 
+/* 端口总扇区数（512B/扇区）。未上线/解析不出容量时返回 0（fail closed，
+ * 调用方据此拒绝格式化，而不是按猜的大小写盘）。
+ *
+ * IDENTIFY 字段：字 60-61 = LBA28 扇区数；字 100-103 = LBA48 扇区数
+ * （低 32 位在字 100-101）。支持 LBA48 时优先用它——LBA28 上限 128GB，
+ * 大盘上字 60-61 会被截断成 0x0FFFFFFF。 */
+uint32_t ahci_capacity(uint8_t port) {
+    if (port >= AHCI_MAX_PORTS || !g_online[port]) return 0;
+    const uint8_t *id = g_id[port];
+    uint32_t n = 0;
+    if (g_lba48[port]) {
+        n = (uint32_t)id[200] | ((uint32_t)id[201] << 8) |
+            ((uint32_t)id[202] << 16) | ((uint32_t)id[203] << 24);
+    }
+    if (n == 0) {
+        n = (uint32_t)id[120] | ((uint32_t)id[121] << 8) |
+            ((uint32_t)id[122] << 16) | ((uint32_t)id[123] << 24);
+    }
+    /* 0 或 0x0FFFFFFF（LBA28 截断哨兵）都当作"不可信" */
+    if (n == 0 || n == 0x0FFFFFFFu) return 0;
+    /* 块层 lba 是 uint32：>2TB 的部分截断，不溢出 */
+    if (n > 0xFFFFFFFEu) n = 0xFFFFFFFEu;
+    return n;
+}
+
 int ahci_read_sector(uint8_t port, uint32_t lba, uint8_t *buffer) {
     if (port >= AHCI_MAX_PORTS || !g_online[port]) return -1;
     uint8_t cmd = g_lba48[port] ? 0x25u : 0xC8u;   /* READ DMA EXT / READ DMA */

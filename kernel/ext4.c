@@ -111,6 +111,7 @@ static uint32_t e4_part_lba;            /* 卷起始 LBA */
 static uint32_t e4_blksize;             /* 1024<<log */
 static uint32_t e4_blk_per_sec;         /* blocksize/512 */
 static uint32_t e4_bpg, e4_ipg, e4_ino_size;
+static uint32_t e4_groups;              /* 块组数 = ceil(blocks_total / bpg) */
 static uint32_t e4_first_data_blk;
 static uint32_t e4_desc_size;           /* 32 或 64 */
 static uint64_t e4_blocks_total;
@@ -177,6 +178,14 @@ int ext4_mount(uint8_t drive, uint32_t part_start) {
     }
 
     e4_first_data_blk = rd32(sb + SB_OFF_FIRST_DATA);
+    /* 组边界必须是 first_data_block + g*bpg（Linux ext4_group_first_block_no
+     * 的定义）。早期版本按 g*bpg 算，两组之间差 1 个块——1KB 块时 group 1 的
+     * 起始是 8193 而不是 8192。差一个块自己完全看不出来（读写都自洽），但
+     * e2fsck / 宿主机按规范算组归属时会把块 8192 当成 group 0 的最后一块，
+     * 位图与空闲计数立刻对不上。 */
+    e4_groups = (uint32_t)((e4_blocks_total - e4_first_data_blk + e4_bpg - 1) /
+                           e4_bpg);
+    if (e4_groups == 0) return -1;               /* 0 块的卷：不可信，拒绝挂载 */
     e4_vol_sectors = (uint32_t)(e4_blocks_total * e4_blk_per_sec);
     /* GDT：superblock 所在块（1K 块时 SB 在第 1 块，否则第 0 块）的下一块 */
     e4_gdt_blk = (e4_blksize == 1024) ? 2 : 1;
@@ -650,8 +659,13 @@ static uint32_t e4_gd_inode_table(uint32_t group) {
     return rd32(gd + GD_OFF_INO_TABLE_LO);
 }
 
-/* 更新 GDT 和 SB 的 free blocks / free inodes 计数 */
-static void e4_update_counts(int delta_blocks, int delta_inodes) {
+/* 更新 SB 和 **指定组** 的 free blocks / free inodes 计数。
+ *
+ * 必须传 group：多块组卷里，块 X 属于组 X/bpg、inode N 属于组 (N-1)/ipg。
+ * 早期版本一律改组 0 的描述符——单组卷看不出问题，一旦卷超过一个组，
+ * 后半盘的分配/释放就把计数记到错误的组上，e2fsck 会报 free blocks 错。 */
+static void e4_update_counts(uint32_t group, int delta_blocks, int delta_inodes) {
+    if (group >= e4_groups) group = 0;           /* 越界保护：绝不写到别的组 */
     /* SB */
     static uint8_t sb[1024] E4_HIBUF;
     e4_read_secs(e4_part_lba + (e4_blksize == 1024 ? 2 : 0), sb,
@@ -663,52 +677,85 @@ static void e4_update_counts(int delta_blocks, int delta_inodes) {
     e4_write_secs(e4_part_lba + (e4_blksize == 1024 ? 2 : 0), sb,
                   e4_blksize == 1024 ? 2 : (e4_blksize / 512));
 
-    /* GDT group 0 */
+    /* 该组的组描述符。
+     * bg_free_blocks_count_lo / bg_free_inodes_count_lo 是 **u16**（偏移
+     * 12 与 14），bg_used_dirs_count_lo 在 16。早期按 u32 写在 12 和 16，
+     * 结果 free_inodes 的 4 字节把 used_dirs 覆盖掉、而宿主按规范从 14 读
+     * 出来是 0 —— 内核自己 rd32(16) 读的是自己写的位置，所以自证清白。 */
     uint32_t gd_blk;
-    uint8_t *gd = e4_gd_ptr(0, &gd_blk);
-    uint32_t gfb = rd32(gd + 12);  /* bg_free_blocks_count_lo */
-    uint32_t gfi = rd32(gd + 16);  /* bg_free_inodes_count_lo */
-    e4_wr32(gd + 12, (uint32_t)((int)gfb + delta_blocks));
-    e4_wr32(gd + 16, (uint32_t)((int)gfi + delta_inodes));
+    uint8_t *gd = e4_gd_ptr(group, &gd_blk);
+    uint16_t gfb = rd16(gd + 12);  /* bg_free_blocks_count_lo */
+    uint16_t gfi = rd16(gd + 14);  /* bg_free_inodes_count_lo */
+    e4_wr16(gd + 12, (uint16_t)((int)gfb + delta_blocks));
+    e4_wr16(gd + 14, (uint16_t)((int)gfi + delta_inodes));
     e4_write_blk(gd_blk, e4_blk);
 
     e4_blocks_free = (uint32_t)((int)e4_blocks_free + delta_blocks);
 }
 
-/* 在块位图中分配一个块；返回块号，失败返回 0 */
+/* 组 g 的第一个**卷内块号** / 块号 -> 组号 / 块号 -> 组内位号。
+ * 边界含 s_first_data_block（1KB 块时为 1）：与 Linux 及宿主机参考实现一致。 */
+static uint32_t e4_group_first_block(uint32_t g) {
+    return e4_first_data_blk + g * e4_bpg;
+}
+static uint32_t e4_group_of_block(uint32_t blkno) {
+    if (blkno < e4_first_data_blk) return 0;
+    return (blkno - e4_first_data_blk) / e4_bpg;
+}
+static uint32_t e4_block_in_group(uint32_t blkno) {
+    return blkno - e4_group_first_block(e4_group_of_block(blkno));
+}
+/* inode 号从 1 开始，与块不同：组 = (ino-1)/ipg，不受 first_data_block 影响 */
+static uint32_t e4_group_of_inode(uint32_t ino)   { return (ino - 1) / e4_ipg; }
+
+/* 在块位图中分配一个块；返回**卷内块号**，失败返回 0。
+ *
+ * 遍历所有块组：单组卷（<8MB @1KB 块）只在组 0 找，行为与以前完全一致；
+ * 多组卷上组 0 用完后继续往后找，否则卷再大也只有前 8MB 可写。
+ * 每个组的位图是"组内块号 -> 位"的，故位号 = blk - group*bpg。 */
 static uint32_t e4_alloc_block(void) {
-    /* 仅组 0（单块组卷）；位图位号 = 组内块号（组 0 即卷块号）。
-     * 注意：e4_gd_* 都会重读 GDT 覆盖 e4_blk，必须先取完 GD 字段再加载位图 */
-    uint32_t itbl = e4_gd_inode_table(0);
-    uint32_t bmp_blk = e4_gd_block_bitmap(0);
+    /* 注意：e4_gd_* 都会重读 GDT 覆盖 e4_blk，必须先取完 GD 字段再加载位图 */
     uint32_t itbl_blks = (e4_ipg * e4_ino_size + e4_blksize - 1) / e4_blksize;
-    uint32_t start = itbl + itbl_blks;
-    if (start < e4_first_data_blk + 1) start = e4_first_data_blk + 1;
-    uint32_t limit = e4_blocks_total < e4_bpg ? (uint32_t)e4_blocks_total : e4_bpg;
-    e4_read_blk(bmp_blk, e4_blk);
-    for (uint32_t i = start; i < limit; i++) {
-        uint32_t byte_idx = i / 8;
-        uint32_t bit_idx = i % 8;
-        if (byte_idx >= e4_blksize) break;
-        if (!(e4_blk[byte_idx] & (1u << bit_idx))) {
-            e4_blk[byte_idx] |= (1u << bit_idx);
-            e4_write_blk(bmp_blk, e4_blk);
-            e4_update_counts(-1, 0);
-            return i;
+    for (uint32_t g = 0; g < e4_groups; g++) {
+        uint32_t gstart = e4_group_first_block(g);
+        uint32_t glimit = e4_blocks_total - gstart;    /* 本组实际块数 */
+        if (glimit > e4_bpg) glimit = e4_bpg;
+        if (glimit <= e4_first_data_blk) continue;
+        uint32_t itbl = e4_gd_inode_table(g);
+        uint32_t bmp_blk = e4_gd_block_bitmap(g);
+        if (bmp_blk == 0) continue;
+        uint32_t start = itbl + itbl_blks - gstart;    /* 转成组内块号 */
+        if (start < 2) start = 2;                      /* 组 0：跳过块 0/1 */
+        e4_read_blk(bmp_blk, e4_blk);
+        for (uint32_t i = start; i < glimit; i++) {
+            uint32_t byte_idx = i / 8;
+            uint32_t bit_idx = i % 8;
+            if (byte_idx >= e4_blksize) break;
+            if (!(e4_blk[byte_idx] & (1u << bit_idx))) {
+                e4_blk[byte_idx] |= (1u << bit_idx);
+                e4_write_blk(bmp_blk, e4_blk);
+                e4_update_counts(g, -1, 0);
+                return gstart + i;
+            }
         }
     }
     return 0;
 }
 
 static void e4_free_block(uint32_t blkno) {
-    uint32_t bmp_blk = e4_gd_block_bitmap(0);
+    if (blkno == 0) return;
+    uint32_t g = e4_group_of_block(blkno);
+    if (g >= e4_groups) return;
+    uint32_t bmp_blk = e4_gd_block_bitmap(g);
+    if (bmp_blk == 0) return;
     e4_read_blk(bmp_blk, e4_blk);
-    uint32_t byte_idx = blkno / 8;
-    uint32_t bit_idx = blkno % 8;
+    uint32_t in_g = e4_block_in_group(blkno);
+    uint32_t byte_idx = in_g / 8;
+    uint32_t bit_idx = in_g % 8;
     if (byte_idx < e4_blksize)
         e4_blk[byte_idx] &= ~(1u << bit_idx);
     e4_write_blk(bmp_blk, e4_blk);
-    e4_update_counts(1, 0);
+    e4_update_counts(g, 1, 0);
 }
 
 /* ---------- 多 extent 碎片化写入支持 ----------
@@ -730,20 +777,26 @@ static uint8_t e4_leaf[EXT4_MAX_BLOCKSIZE] E4_HIBUF;
  * 返回起始块号，*got 输出实际分到的块数；无空闲返回 0。 */
 static uint32_t e4_alloc_run(uint32_t want, uint32_t *got) {
     *got = 0;
-    /* 位图扫描区（跳过 SB/GDT/位图/inode 表元数据区） */
-    uint32_t itbl = e4_gd_inode_table(0);
-    uint32_t bmp_blk = e4_gd_block_bitmap(0);
+    /* 位图扫描区（跳过 SB/GDT/位图/inode 表元数据区）。与 e4_alloc_block
+     * 一样要遍历所有块组，否则多组卷上连续段只能落在组 0。 */
     uint32_t itbl_blks = (e4_ipg * e4_ino_size + e4_blksize - 1) / e4_blksize;
-    uint32_t start = itbl + itbl_blks;
-    if (start < e4_first_data_blk + 1) start = e4_first_data_blk + 1;
-    uint32_t limit = e4_blocks_total < e4_bpg ? (uint32_t)e4_blocks_total : e4_bpg;
+    for (uint32_t g = 0; g < e4_groups && *got == 0; g++) {
+    uint32_t gstart = e4_group_first_block(g);
+    uint32_t glimit = e4_blocks_total - gstart;
+    if (glimit > e4_bpg) glimit = e4_bpg;
+    if (glimit <= e4_first_data_blk) continue;
+    uint32_t itbl = e4_gd_inode_table(g);
+    uint32_t bmp_blk = e4_gd_block_bitmap(g);
+    if (bmp_blk == 0) continue;
+    uint32_t start = itbl + itbl_blks - gstart;
+    if (start < 2) start = 2;
     e4_read_blk(bmp_blk, e4_blk);
 
     /* 贪心：找第一个 >= want 的洞就取 want 块；
      * 否则取整个过程中遇到的最大洞。 */
     uint32_t best_start = 0, best_len = 0;
     uint32_t cur_start = 0, cur_len = 0;
-    for (uint32_t i = start; i < limit; i++) {
+    for (uint32_t i = start; i < glimit; i++) {
         uint32_t byte_idx = i / 8;
         uint32_t bit_idx = i % 8;
         if (byte_idx >= e4_blksize) break;
@@ -757,7 +810,7 @@ static uint32_t e4_alloc_run(uint32_t want, uint32_t *got) {
         }
     }
     if (cur_len > best_len) { best_len = cur_len; best_start = cur_start; }
-    if (best_len == 0) return 0;
+    if (best_len == 0) continue;
 
     /* 标记位图 */
     for (uint32_t i = 0; i < best_len; i++) {
@@ -765,9 +818,11 @@ static uint32_t e4_alloc_run(uint32_t want, uint32_t *got) {
         e4_blk[b / 8] |= (1u << (b % 8));
     }
     e4_write_blk(bmp_blk, e4_blk);
-    e4_update_counts(-(int)best_len, 0);
+    e4_update_counts(g, -(int)best_len, 0);
     *got = best_len;
-    return best_start;
+    return gstart + best_start;
+    }   /* for groups */
+    return 0;
 }
 
 /* 叶子块容量（extent 块除 12B 头外每项 12B） */
@@ -906,35 +961,44 @@ static int e4_extent_append(uint8_t *dino, uint32_t lblk, uint32_t pb) {
     return -1;   /* depth >=2 目录不做增量增长（删除重写即可恢复） */
 }
 
-/* 分配一个 inode；返回 inode 号，失败返回 0 */
+/* 分配一个 inode；返回 inode 号，失败返回 0。
+ * 遍历所有块组：inode 号 = 组号*ipg + 组内索引 + 1。 */
 static uint32_t e4_alloc_inode(void) {
-    uint32_t bmp_blk = e4_gd_inode_bitmap(0);
-    e4_read_blk(bmp_blk, e4_blk);
-    /* inode 号从 1 开始；前 11 个保留（EXT4_FIRST_INO=11 for 1KB 块） */
+    /* inode 号从 1 开始；每组前 11 个保留（EXT4_FIRST_INO=11 for 1KB 块） */
     uint32_t first = 11;
-    for (uint32_t i = first; i < e4_ipg; i++) {
-        uint32_t byte_idx = i / 8;
-        uint32_t bit_idx = i % 8;
-        if (!(e4_blk[byte_idx] & (1u << bit_idx))) {
-            e4_blk[byte_idx] |= (1u << bit_idx);
-            e4_write_blk(bmp_blk, e4_blk);
-            e4_update_counts(0, -1);
-            return i + 1;         /* inode 号 = 索引 + 1 */
+    for (uint32_t g = 0; g < e4_groups; g++) {
+        uint32_t bmp_blk = e4_gd_inode_bitmap(g);
+        if (bmp_blk == 0) continue;
+        e4_read_blk(bmp_blk, e4_blk);
+        for (uint32_t i = first; i < e4_ipg; i++) {
+            uint32_t byte_idx = i / 8;
+            uint32_t bit_idx = i % 8;
+            if (byte_idx >= e4_blksize) break;
+            if (!(e4_blk[byte_idx] & (1u << bit_idx))) {
+                e4_blk[byte_idx] |= (1u << bit_idx);
+                e4_write_blk(bmp_blk, e4_blk);
+                e4_update_counts(g, 0, -1);
+                return g * e4_ipg + i + 1;   /* inode 号 = 组基 + 索引 + 1 */
+            }
         }
     }
     return 0;
 }
 
 static void e4_free_inode(uint32_t ino) {
-    uint32_t bmp_blk = e4_gd_inode_bitmap(0);
+    if (ino == 0) return;
+    uint32_t g = e4_group_of_inode(ino);
+    if (g >= e4_groups) return;
+    uint32_t bmp_blk = e4_gd_inode_bitmap(g);
+    if (bmp_blk == 0) return;
     e4_read_blk(bmp_blk, e4_blk);
-    uint32_t idx = ino - 1;
+    uint32_t idx = (ino - 1) % e4_ipg;
     uint32_t byte_idx = idx / 8;
     uint32_t bit_idx = idx % 8;
     if (byte_idx < e4_blksize)
         e4_blk[byte_idx] &= ~(1u << bit_idx);
     e4_write_blk(bmp_blk, e4_blk);
-    e4_update_counts(0, 1);
+    e4_update_counts(g, 0, 1);
 }
 
 /* 写 inode 回 inode 表 */
@@ -994,26 +1058,44 @@ static int e4_dir_add_entry(uint32_t dir_ino, const char *name,
         uint32_t off = 0;
         while (off + 8 <= e4_blksize) {
             uint32_t rec_len = rd16(e4_dblk + off + DE_OFF_RECLEN);
-            if (rec_len < 8) break;
+            if (rec_len < 8 || (rec_len & 3u)) break;
+            if (off + rec_len > e4_blksize) break;
             uint32_t child = rd32(e4_dblk + off + DE_OFF_INODE);
             uint32_t existing_len = e4_dblk[off + DE_OFF_NAMELEN];
             uint32_t actual = (8 + existing_len + 3) & ~3u;
-            /* 尾部空闲条目：child==0 或 rec_len 远大于 actual */
+            if (actual > rec_len) break;            /* 目录项损坏：不再往下扫 */
+            uint32_t remain = rec_len - actual;
+
+            /* 情况一：复用删除留下的空项（child==0） */
             if (child == 0 && rec_len >= need) {
-                /* 在此处插入，截断 rec_len */
-                uint32_t remain = rec_len - actual;
-                if (remain >= need) {
-                    e4_wr16(e4_dblk + off + DE_OFF_RECLEN, (uint16_t)actual);
-                    uint32_t noff = off + actual;
-                    e4_wr32(e4_dblk + noff + DE_OFF_INODE, target_ino);
-                    e4_wr16(e4_dblk + noff + DE_OFF_RECLEN, (uint16_t)remain);
-                    e4_dblk[noff + DE_OFF_NAMELEN] = (uint8_t)name_len;
-                    e4_dblk[noff + DE_OFF_TYPE] = ftype;
-                    for (uint32_t i = 0; i < name_len; i++)
-                        e4_dblk[noff + DE_OFF_NAME + i] = (uint8_t)name[i];
-                    e4_write_blk(pb, e4_dblk);
-                    return 0;
-                }
+                e4_wr32(e4_dblk + off + DE_OFF_INODE, target_ino);
+                e4_wr16(e4_dblk + off + DE_OFF_RECLEN, (uint16_t)rec_len);
+                e4_dblk[off + DE_OFF_NAMELEN] = (uint8_t)name_len;
+                e4_dblk[off + DE_OFF_TYPE] = ftype;
+                for (uint32_t i = 0; i < name_len; i++)
+                    e4_dblk[off + DE_OFF_NAME + i] = (uint8_t)name[i];
+                e4_write_blk(pb, e4_dblk);
+                return 0;
+            }
+
+            /* 情况二：分裂**最后一项**的尾部空间。
+             *
+             * ext4 目录块的最后一项 rec_len 恒覆盖到块尾的剩余空间（format
+             * 写的 '..' 就是 rec_len=1012，实际只占 12）。早期版本只肯在
+             * child==0 的空项上分裂，于是每个新文件都走"扩展一个新块"分支
+             * ——1KB 的目录块只能放 1 个文件，写 12 个就把 12 个直接块撑满
+             * 然后开始失败。症状是"ls 看得到、重启后只剩一个"。 */
+            if (remain >= need) {
+                e4_wr16(e4_dblk + off + DE_OFF_RECLEN, (uint16_t)actual);
+                uint32_t noff = off + actual;
+                e4_wr32(e4_dblk + noff + DE_OFF_INODE, target_ino);
+                e4_wr16(e4_dblk + noff + DE_OFF_RECLEN, (uint16_t)remain);
+                e4_dblk[noff + DE_OFF_NAMELEN] = (uint8_t)name_len;
+                e4_dblk[noff + DE_OFF_TYPE] = ftype;
+                for (uint32_t i = 0; i < name_len; i++)
+                    e4_dblk[noff + DE_OFF_NAME + i] = (uint8_t)name[i];
+                e4_write_blk(pb, e4_dblk);
+                return 0;
             }
             off += rec_len;
         }
@@ -1500,101 +1582,214 @@ int ext4_rmdir(const char *name) {
 /* ============================================================
  * 格式化
  * refs: e2fsprogs misc/mke2fs.c - 布局参数参考
- * 简化布局（单块组，1024B 块，与 gen_diskimg.py 对齐）：
- *   块 0: 全零（1K 块保留）
- *   块 1: superblock
- *   块 2: GDT
- *   块 3: block bitmap
- *   块 4: inode bitmap
- *   块 5-8: inode table (32 inodes x 128B)
- *   块 9+: data blocks
+ *
+ * 布局（1KB 块，blocks_per_group=8192，inodes_per_group=256）：
+ *   组 0:    块 0 保留 | 块 1 超级块 | 块 2..  GDT | 块位图 | inode 位图
+ *            | inode 表(32 块) | 根目录块 | 数据 ...
+ *   备份组:  组内开头放 SB + GDT 副本（3/5/7 的幂，含组 1），再放位图/inode 表
+ *   普通组:  块位图 | inode 位图 | inode 表 | 数据 ...
+ *
+ * 卷大小**由磁盘实际容量决定**（ata_capacity）。早期版本写死 1024 块=1MB，
+ * 在 16MB 的数据盘上只做出 6% 的可用空间，剩下 94% 的扇区永远摸不到。
+ * 拿不到容量就拒绝格式化——猜一个大小写下去会造出越界的文件系统。
  * ============================================================ */
-int ext4_format(uint8_t drive) {
-    if (drive > 3) return -1;
 
+/* 1KB 块时块位图只有 1024 字节 = 8192 位，故 blocks_per_group 上限 8192。
+ * 想更大就得换更大的块或让位图占多块——都没必要。 */
+#define E4_FMT_BPG        8192u
+/* 每组 256 个 inode：inode 表 = 256 x 128B = 32KB = 32 块。
+ * 16MB 卷 2 组 = 512 个 inode，够日用（mke2fs 默认 16KB/inode 会给 1024，
+ * 这里偏保守，省下 64KB 元数据）。 */
+#define E4_FMT_IPG        256u
+/* 块组上限：256 组 x 8MB = 2GB。更大的盘也只吃前 2GB——32 位块号下够用，
+ * 且 PIO 逐块写元数据随组数线性变慢，先在这里封顶。 */
+#define E4_FMT_MAX_GROUPS 256u
+/* 保留 inode 1..11（bad blocks / root / resize / ...），分配从 12 开始 */
+#define E4_FMT_FREE_INO_BASE 11u
+
+/* 稀疏超级块（ro_compat SPARSE_SUPER）：只在 3/5/7 的幂（含 1）这些组里
+ * 放 SB+GDT 备份。开了这个特性就必须按同一集合写备份，否则 e2fsck 报
+ * "backup superblock missing"——两边必须对上。 */
+static int e4_is_backup_group(uint32_t g) {
+    if (g == 0) return 0;                 /* 组 0 是主超级块，不算备份 */
+    uint32_t v;
+    v = g; while (v % 3u == 0) v /= 3u;  if (v == 1u) return 1;
+    v = g; while (v % 5u == 0) v /= 5u;  if (v == 1u) return 1;
+    v = g; while (v % 7u == 0) v /= 7u;  if (v == 1u) return 1;
+    return 0;
+}
+
+int ext4_format(uint8_t drive) {
     /* 所有结构写入都经 e4_write_secs，而它只用全局 e4_drive；必须先指向目标盘，
      * 否则会写到上一次挂载残留的 e4_drive（默认 0=引导盘），导致 mount 读不到 SB。 */
     e4_drive = drive;
 
-    uint32_t part_start = 1;
-    uint32_t vol_blocks = 1024;     /* 1MB 卷 */
-    uint32_t blksize = 1024;
-    uint32_t blk_per_sec = blksize / 512;
-    uint32_t bpg = 8192;
-    uint32_t ipg = 32;
-    uint32_t ino_size = 128;
-    uint32_t first_data_blk = 1;   /* 1K 块恒为 1 */
+    /* 容量是布局的唯一依据，拿不到就拒绝（fail closed）。 */
+    uint32_t disk_secs = ata_capacity(drive);
+    if (disk_secs == 0) return -1;
 
-    /* MBR: 分区 0x83 从 LBA 1 起 */
+    const uint32_t part_start = 1;
+    const uint32_t blksize = 1024;
+    const uint32_t blk_per_sec = blksize / 512;
+    const uint32_t ino_size = 128;
+    const uint32_t itb_blks = E4_FMT_IPG * ino_size / blksize;   /* 32 */
+    const uint32_t first_data = 1;         /* 1KB 块：块 0 是引导/保留块 */
+
+    if (disk_secs <= part_start + 64) return -1;      /* 太小的盘不值得格式化 */
+    uint32_t vol_blocks = (disk_secs - part_start) / blk_per_sec;
+    /* 组数按 **first_data 之后** 的块数算（组边界含 first_data 偏移） */
+    uint32_t data_blocks = (vol_blocks > first_data) ? (vol_blocks - first_data) : 0;
+    uint32_t groups = (data_blocks + E4_FMT_BPG - 1) / E4_FMT_BPG;
+    if (groups == 0) return -1;
+    if (groups > E4_FMT_MAX_GROUPS) {
+        groups = E4_FMT_MAX_GROUPS;
+        vol_blocks = first_data + groups * E4_FMT_BPG;
+    }
+    uint32_t gdt_blks = (groups * 32 + blksize - 1) / blksize;
+    if (gdt_blks == 0) gdt_blks = 1;
+
+    /* 逐组元数据块号。放 static：内核栈只有几 KB，256 项 x 4 数组会爆。 */
+    static uint32_t bb_blk[E4_FMT_MAX_GROUPS];
+    static uint32_t ib_blk[E4_FMT_MAX_GROUPS];
+    static uint32_t it_blk[E4_FMT_MAX_GROUPS];
+    static uint32_t g_used[E4_FMT_MAX_GROUPS];
+
+    const uint32_t gdt_blk = 2;           /* 1KB 块时 GDT 恒在块 2 */
+    uint32_t root_blk = 0;
+    uint32_t total_free = 0;
+
+    for (uint32_t g = 0; g < groups; g++) {
+        /* 组边界含 first_data 偏移：组 1 从块 8193 起，不是 8192 */
+        uint32_t gstart = first_data + g * E4_FMT_BPG;
+        uint32_t next;
+        if (g == 0) {
+            next = first_data + 1 + gdt_blks;  /* 块 1 = 主 SB，块 2.. = GDT */
+        } else if (e4_is_backup_group(g)) {
+            next = gstart + 1 + gdt_blks;      /* 备份 SB 在组首，备份 GDT 紧跟 */
+        } else {
+            next = gstart;
+        }
+        bb_blk[g] = next++;
+        ib_blk[g] = next++;
+        it_blk[g] = next;
+        next += itb_blks;
+        if (g == 0) root_blk = next++;     /* 根目录占一个数据块 */
+        g_used[g] = next - gstart;
+
+        uint32_t in_group = vol_blocks - gstart;
+        if (in_group > E4_FMT_BPG) in_group = E4_FMT_BPG;
+        if (g_used[g] > in_group) return -1;    /* 元数据在本组放不下：拒绝 */
+        total_free += in_group - g_used[g];
+    }
+
+    /* MBR：分区 0x83 从 LBA 1 起，长度 = 卷扇区数（不是 -1，早期写错过） */
     uint8_t mbr[512];
     for (int i = 0; i < 512; i++) mbr[i] = 0;
     mbr[447] = 0x00; mbr[448] = 0x02; mbr[449] = 0x00;
     mbr[450] = 0x83;
     mbr[451] = 0x00; mbr[452] = 0x3F; mbr[453] = 0xFF;
     e4_wr32(mbr + 454, part_start);
-    e4_wr32(mbr + 458, vol_blocks * blk_per_sec - 1);
+    e4_wr32(mbr + 458, vol_blocks * blk_per_sec);
     mbr[510] = 0x55; mbr[511] = 0xAA;
     if (ata_write_sector(drive, 0, mbr) != 0) return -1;
 
-    /* Superblock（块 1 = LBA 2-3） */
+    /* Superblock（块 1） */
     static uint8_t sb[1024] E4_HIBUF;
     for (uint32_t i = 0; i < 1024; i++) sb[i] = 0;
-    e4_wr32(sb + 0, ipg);                  /* s_inodes_count */
-    e4_wr32(sb + 4, vol_blocks);            /* s_blocks_count_lo */
-    e4_wr32(sb + 12, vol_blocks - 10);     /* s_free_blocks_count_lo */
-    e4_wr32(sb + 16, ipg - 2);             /* s_free_inodes_count */
-    e4_wr32(sb + 20, first_data_blk);      /* s_first_data_block */
-    e4_wr32(sb + 24, 0);                   /* s_log_block_size = 0 (1024B) */
-    e4_wr32(sb + 28, 0);                   /* s_log_cluster_size */
-    e4_wr32(sb + 32, bpg);                 /* s_blocks_per_group */
-    e4_wr32(sb + 36, bpg);                 /* s_clusters_per_group */
-    e4_wr32(sb + 40, ipg);                 /* s_inodes_per_group */
+    e4_wr32(sb + 0, groups * E4_FMT_IPG);              /* s_inodes_count */
+    e4_wr32(sb + 4, vol_blocks);                       /* s_blocks_count_lo */
+    e4_wr32(sb + 8, 0);                                /* s_r_blocks_count_lo */
+    e4_wr32(sb + 12, total_free);                      /* s_free_blocks_count_lo */
+    e4_wr32(sb + 16, groups * (E4_FMT_IPG - E4_FMT_FREE_INO_BASE));/* free_inodes */
+    e4_wr32(sb + 20, 1);                               /* s_first_data_block */
+    e4_wr32(sb + 24, 0);                               /* s_log_block_size = 0 */
+    e4_wr32(sb + 28, 0);                               /* s_log_cluster_size */
+    e4_wr32(sb + 32, E4_FMT_BPG);                      /* s_blocks_per_group */
+    e4_wr32(sb + 36, E4_FMT_BPG);                      /* s_clusters_per_group */
+    e4_wr32(sb + 40, E4_FMT_IPG);                      /* s_inodes_per_group */
     e4_wr16(sb + 56, EXT4_MAGIC);
-    e4_wr32(sb + 76, 1);                   /* s_rev_level = dynamic */
-    e4_wr32(sb + 84, 11);                  /* s_first_ino */
-    e4_wr16(sb + 88, ino_size);            /* s_inode_size */
-    e4_wr32(sb + 96, 0x0042);             /* incompat: FILETYPE | EXTENTS */
-    e4_wr32(sb + 100, 0);                 /* ro_compat */
-    e4_wr16(sb + 282, 0);                  /* s_desc_size = 0 (32B GDT) */
-    sb[510] = 0x53; sb[511] = 0xEF;       /* ext signature */
-    e4_write_secs(part_start + 2, sb, 2);
+    e4_wr16(sb + 58, 1);                               /* s_state = 干净卸载 */
+    e4_wr32(sb + 76, 1);                               /* s_rev_level = dynamic */
+    e4_wr32(sb + 84, E4_FMT_FREE_INO_BASE);            /* s_first_ino = 11 */
+    e4_wr16(sb + 88, (uint16_t)ino_size);              /* s_inode_size */
+    e4_wr32(sb + 96, 0x0042);                          /* incompat: FILETYPE|EXTENTS */
+    e4_wr32(sb + 100, 0x0001);                         /* ro_compat: SPARSE_SUPER */
+    e4_wr16(sb + 282, 0);                              /* s_desc_size = 0 (32B) */
+    sb[510] = 0x53; sb[511] = 0xEF;                    /* ext signature */
+    e4_write_secs(part_start + first_data * blk_per_sec, sb, blk_per_sec);
 
-    /* GDT（块 2）：组 0 描述符 */
-    static uint8_t gd[1024] E4_HIBUF;
-    for (uint32_t i = 0; i < 1024; i++) gd[i] = 0;
-    e4_wr32(gd + 0, 3);                    /* bg_block_bitmap_lo = block 3 */
-    e4_wr32(gd + 4, 4);                    /* bg_inode_bitmap_lo = block 4 */
-    e4_wr32(gd + 8, 5);                    /* bg_inode_table_lo = block 5 */
-    e4_wr32(gd + 12, vol_blocks - 10);     /* bg_free_blocks_count_lo */
-    e4_wr32(gd + 16, ipg - 2);             /* bg_free_inodes_count_lo */
-    e4_write_secs(part_start + 2 * blk_per_sec, gd, blk_per_sec);
+    /* GDT（块 2..）：每组一个 32 字节描述符 */
+    static uint8_t gd[E4_FMT_MAX_GROUPS * 32] E4_HIBUF;
+    for (uint32_t i = 0; i < sizeof(gd); i++) gd[i] = 0;
+    for (uint32_t g = 0; g < groups; g++) {
+        uint32_t in_group = vol_blocks - (first_data + g * E4_FMT_BPG);
+        if (in_group > E4_FMT_BPG) in_group = E4_FMT_BPG;
+        uint8_t *d = gd + g * 32;
+        e4_wr32(d + 0, bb_blk[g]);                     /* bg_block_bitmap_lo */
+        e4_wr32(d + 4, ib_blk[g]);                     /* bg_inode_bitmap_lo */
+        e4_wr32(d + 8, it_blk[g]);                     /* bg_inode_table_lo */
+        e4_wr16(d + 12, (uint16_t)(in_group - g_used[g]));   /* free_blocks_lo */
+        e4_wr16(d + 14, (uint16_t)(E4_FMT_IPG - E4_FMT_FREE_INO_BASE));
+        e4_wr16(d + 16, (uint16_t)((g == 0) ? 1 : 0));      /* bg_used_dirs_lo */
+    }
+    e4_write_secs(part_start + gdt_blk * blk_per_sec, gd, gdt_blks * blk_per_sec);
 
-    /* Block bitmap（块 3）：前 10 块已用（块 1-9），bit 0 = 块 0(保留) */
+    /* 每组的块位图 / inode 位图 / inode 表。
+     *
+     * inode 表**不整表缓冲**：256 个 inode x 128B = 32KB，而 .bss.hi 只剩
+     * 几十 KB 余量（上限 2MB，已用 ~1.97MB），一加上就链接失败。改成
+     * 逐块写：组 0 的第一块填好根目录后写出，其余块用同一个全零块刷。
+     * 扇区写入次数不变，缓冲从 32KB 降到 2KB。 */
     static uint8_t bmp[1024] E4_HIBUF;
-    for (uint32_t i = 0; i < 1024; i++) bmp[i] = 0;
-    /* 块 0-9 已用：bits 0-9 置 1 */
-    for (uint32_t i = 0; i <= 9; i++)
-        bmp[i / 8] |= (1u << (i % 8));
-    e4_write_secs(part_start + 3 * blk_per_sec, bmp, blk_per_sec);
+    static uint8_t iblk[1024] E4_HIBUF;    /* inode 表当前块 */
+    static uint8_t zblk[1024] E4_HIBUF;    /* 全零块 */
+    for (uint32_t i = 0; i < 1024; i++) zblk[i] = 0;
+    for (uint32_t g = 0; g < groups; g++) {
+        /* 块位图：本组前 g_used 块（元数据 + 根目录）已用。
+         * 位号是**组内**块号，不是卷内块号。 */
+        for (uint32_t i = 0; i < 1024; i++) bmp[i] = 0;
+        for (uint32_t i = 0; i < g_used[g] && i < 8192; i++)
+            bmp[i / 8] |= (uint8_t)(1u << (i % 8));
+        e4_write_secs(part_start + bb_blk[g] * blk_per_sec, bmp, blk_per_sec);
 
-    /* Inode bitmap（块 4）：inode 1-2 已用（保留 + root） */
-    for (uint32_t i = 0; i < 1024; i++) bmp[i] = 0;
-    bmp[0] |= 0x03;  /* inode 1 + 2 */
-    e4_write_secs(part_start + 4 * blk_per_sec, bmp, blk_per_sec);
+        /* inode 位图：每组前 11 个保留（与 e4_alloc_inode 的起始下标一致） */
+        for (uint32_t i = 0; i < 1024; i++) bmp[i] = 0;
+        for (uint32_t i = 0; i < E4_FMT_FREE_INO_BASE; i++)
+            bmp[i / 8] |= (uint8_t)(1u << (i % 8));
+        e4_write_secs(part_start + ib_blk[g] * blk_per_sec, bmp, blk_per_sec);
 
-    /* Inode table（块 5-8 = 4 块 x 1024 = 4096B = 32 x 128B） */
-    static uint8_t itab[4096] E4_HIBUF;
-    for (uint32_t i = 0; i < 4096; i++) itab[i] = 0;
-    /* inode 1 (index 0): 保留（bad blocks），mode=0 */
-    /* inode 2 (index 1): root directory */
-    uint8_t *root = itab + 1 * 128;
-    e4_wr16(root + INO_OFF_MODE, 0x41ED);      /* dir 0755 */
-    e4_wr32(root + INO_OFF_SIZE_LO, blksize);   /* 1 block */
-    e4_wr32(root + INO_OFF_BLOCKS_LO, blk_per_sec);
-    e4_wr32(root + INO_OFF_IBLOCK, 9);          /* root dir = block 9 */
-    e4_write_secs(part_start + 5 * blk_per_sec, itab, 4 * blk_per_sec);
+        /* inode 表：逐块清零；组 0 的第 0 块里填根目录（inode 2） */
+        for (uint32_t i = 0; i < 1024; i++) iblk[i] = 0;
+        if (g == 0) {
+            uint8_t *root = iblk + 1 * ino_size;
+            e4_wr16(root + INO_OFF_MODE, 0x41ED);      /* dir 0755 */
+            e4_wr16(root + INO_OFF_LINKS, 2);          /* . 与 .. */
+            e4_wr32(root + INO_OFF_SIZE_LO, blksize);  /* 1 block */
+            e4_wr32(root + INO_OFF_BLOCKS_LO, blk_per_sec);
+            /* 根目录用 **extent 映射**，与 mkdir 出来的目录同构。
+             * 早期这里只写 i_block[0] 而不置 EXTENTS_FL → legacy 直接块目录，
+             * 最多 12 块（e4_extent_append 对 lblk>=12 直接返回 -1）。1KB 块
+             * 下 12 块约 700 个条目就写不进去了，而且这是内核自己 format 出来
+             * 的根目录——日用系统里最容易撑满的那个目录。 */
+            uint8_t *hdr = root + INO_OFF_IBLOCK;
+            e4_wr16(hdr + EH_OFF_MAGIC, EXT4_EXT_MAGIC);
+            e4_wr16(hdr + EH_OFF_ENTRIES, 1);
+            e4_wr16(hdr + 4, 4);                    /* eh_max = 4（根内嵌） */
+            e4_wr16(hdr + EH_OFF_DEPTH, 0);
+            uint8_t *ex = hdr + 12;
+            e4_wr32(ex + EE_OFF_BLOCK, 0);          /* 逻辑块 0 */
+            e4_wr16(ex + EE_OFF_LEN, 1);
+            e4_wr16(ex + EE_OFF_START_HI, 0);
+            e4_wr32(ex + EE_OFF_START_LO, root_blk);
+            e4_wr32(root + INO_OFF_FLAGS, EXT4_EXTENTS_FL);
+        }
+        e4_write_secs(part_start + it_blk[g] * blk_per_sec, iblk, blk_per_sec);
+        for (uint32_t b = 1; b < itb_blks; b++)
+            e4_write_secs(part_start + (it_blk[g] + b) * blk_per_sec, zblk,
+                          blk_per_sec);
+    }
 
-    /* Root directory block（块 9） */
+    /* Root directory block */
     static uint8_t rootblk[1024] E4_HIBUF;
     for (uint32_t i = 0; i < 1024; i++) rootblk[i] = 0;
     /* '.' entry */
@@ -1610,7 +1805,19 @@ int ext4_format(uint8_t drive) {
     rootblk[12 + DE_OFF_TYPE] = 2;
     rootblk[12 + DE_OFF_NAME] = '.';
     rootblk[12 + DE_OFF_NAME + 1] = '.';
-    e4_write_secs(part_start + 9 * blk_per_sec, rootblk, blk_per_sec);
+    e4_write_secs(part_start + root_blk * blk_per_sec, rootblk, blk_per_sec);
+
+    /* 备份超级块 + 备份 GDT（稀疏超级块集合）。
+     * 必须与 ro_compat SPARSE_SUPER 声明的集合完全一致。 */
+    for (uint32_t g = 1; g < groups; g++) {
+        if (!e4_is_backup_group(g)) continue;
+        uint32_t gstart = first_data + g * E4_FMT_BPG;
+        e4_wr16(sb + 254, (uint16_t)g);                /* s_block_group_nr */
+        e4_write_secs(part_start + gstart * blk_per_sec, sb, blk_per_sec);
+        e4_write_secs(part_start + (gstart + 1) * blk_per_sec, gd,
+                      gdt_blks * blk_per_sec);
+    }
+    e4_wr16(sb + 254, 0);
 
     /* 挂载 */
     if (ext4_mount(drive, part_start) != 0) return -1;

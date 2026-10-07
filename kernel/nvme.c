@@ -275,6 +275,12 @@ int nvme_write_sector(uint8_t ns, uint32_t lba, const uint8_t *buffer) {
     return n_io_sector(ns, lba, (uint8_t *)(unsigned long)buffer, 1);
 }
 
+/* namespace 总逻辑块数（512B）。未上线返回 0（fail closed）。 */
+uint32_t nvme_ns_sectors(uint8_t ns) {
+    if (!g_ready || ns >= g_ns_n) return 0;
+    return g_ns_sect[ns];
+}
+
 int nvme_ns_present(uint8_t ns) {
     return (g_ready && ns < g_ns_n && g_ns_sect[ns] > 0u) ? 1 : 0;
 }

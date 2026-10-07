@@ -317,6 +317,13 @@ int usbmsc_present(uint8_t unit) {
     return (g_msc[unit].d && g_msc[unit].ready) ? 1 : 0;
 }
 
+/* U 盘总扇区数（512B）。未在线返回 0（fail closed）。 */
+uint32_t usbmsc_sectors(uint8_t unit) {
+    if (unit >= (uint8_t)USBMSC_MAX_DEV) return 0;
+    if (!g_msc[unit].d || !g_msc[unit].ready) return 0;
+    return g_msc[unit].sectors;
+}
+
 static msc_dev_t *msc_get(uint8_t unit, uint32_t lba) {
     if (unit >= (uint8_t)USBMSC_MAX_DEV) return NULL;
     msc_dev_t *u = &g_msc[unit];

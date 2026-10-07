@@ -1890,12 +1890,19 @@ fail_free:
  * MFT 记录位图 = $MFT（记录 0）驻留 $BITMAP 属性（16 位）
  * ============================================================ */
 int ntfs_format(uint8_t drive) {
-    if (drive > 3) return -1;
-
     uint32_t part_start = 1;
     uint32_t spc = 8;                       /* 4KB 簇 */
-    uint32_t total_secs = 4095;             /* 2MB 盘 - MBR */
-    uint32_t total_clusters = total_secs / spc;   /* 511 */
+
+    /* 卷大小由磁盘实际容量决定。早期写死 4095 扇区 = 2MB，在 16MB 的数据盘
+     * 上只做出 12% 的可用空间。拿不到容量就拒绝（fail closed）。
+     * 上限：$Bitmap 是驻留属性，最多 NT_BITMAP_CAP=8192 字节 = 65536 簇
+     * = 256MB（4KB 簇）。更大的盘只吃前 256MB。 */
+    uint32_t disk_secs = ata_capacity(drive);
+    if (disk_secs == 0) return -1;
+    if (disk_secs <= part_start + 64) return -1;
+    uint32_t total_secs = disk_secs - part_start;
+    if (total_secs > 65536u * spc) total_secs = 65536u * spc;
+    uint32_t total_clusters = total_secs / spc;
     uint32_t mft_lcn = 8;
     uint32_t mft_clu = 4;                   /* 16KB / 4KB */
     uint32_t rec_bytes = 1024;
@@ -1944,7 +1951,9 @@ int ntfs_format(uint8_t drive) {
         if (ata_write_sector(drive, part_start + i, zero) != 0) return -1;
 
     /* $Bitmap 数据（驻留于记录 6）：纯簇位图，LCN 0-11 用 */
-    uint8_t vbmp[NT_BITMAP_CAP];
+    /* 直接复用运行时的 nt_vbmp（已在 .bss.hi）：再开一个 8KB 的 static
+     * 会把 .bss.hi（上限 2MB，已用 ~1.97MB）顶爆。 */
+    uint8_t *vbmp = nt_vbmp;
     for (i = 0; i < NT_BITMAP_CAP; i++) vbmp[i] = 0;
     uint32_t bmp_total = (total_clusters + 7) / 8;
     vbmp[0] = 0xFF; vbmp[1] = 0x0F;         /* 簇 0-11 */

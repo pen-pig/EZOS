@@ -42,6 +42,9 @@ int usbmsc_count(void);
 /* unit 是否在线（越界返回 0） */
 int usbmsc_present(uint8_t unit);
 
+/* U 盘总扇区数（512B，来自 SCSI READ CAPACITY）。未在线返回 0（fail closed）。 */
+uint32_t usbmsc_sectors(uint8_t unit);
+
 /* 单扇区（512B）读/写，对齐 ahci_read_sector 的调用形态。
  * 返回 0 成功，-1 失败。unit 越界 / 不在线 / LBA 越界直接失败。 */
 int usbmsc_read_sector(uint8_t unit, uint32_t lba, uint8_t *buffer);

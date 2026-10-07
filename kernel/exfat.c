@@ -820,12 +820,45 @@ int exfat_format(void) {
     exfat_info.bytes_per_sector = 512;
     exfat_info.sectors_per_cluster = 1;
     exfat_info.fat_offset = 25;         // 备份启动区占 13-24，FAT 必须从 25 开始
-    exfat_info.fat_length = 1;
-    exfat_info.cluster_heap_offset = 26;  // >= FatOffset + FatLength
-    exfat_info.cluster_count = 100;
     exfat_info.root_dir_cluster = 2;
-    exfat_info.volume_length = 32767;   // 分区长度 = 16MB/512 - 1（MBR 占 1 扇区）
     exfat_partition_start = 1;
+
+    /* 卷几何**由磁盘实际容量决定**。
+     * 早期写死：volume_length=32767 扇区、cluster_count=100、fat_length=1
+     * ——1 个 FAT 扇区最多 128 项，于是簇数被自己的 FAT 卡死在 100，
+     * 16MB 盘上只有 50KB 可用（0.3%）。拿不到容量就拒绝（fail closed）。 */
+    uint32_t disk_secs = ata_capacity(exfat_drive);
+    if (disk_secs == 0) return -1;
+    if (disk_secs <= exfat_partition_start + 64) return -1;
+    uint32_t volume_length = disk_secs - exfat_partition_start;
+
+    /* FAT 长度与簇数互相依赖（FAT 本身也要占扇区）：迭代到收敛。
+     * FAT 每项 4 字节，要覆盖 cluster_count+2 项（含 0 号与 1 号）。 */
+    const uint32_t spc = exfat_info.sectors_per_cluster;
+    uint32_t fat_length = 1;
+    uint32_t cluster_count = 0;
+    for (int it = 0; it < 12; it++) {
+        uint32_t h = exfat_info.fat_offset + fat_length;
+        cluster_count = (volume_length > h) ? (volume_length - h) / spc : 0;
+        uint32_t need = ((cluster_count + 2u) * 4u + 511u) / 512u;
+        if (need == fat_length) break;
+        fat_length = need;
+    }
+    uint32_t heap = exfat_info.fat_offset + fat_length;
+    cluster_count = (volume_length > heap) ? (volume_length - heap) / spc : 0;
+    if (cluster_count < 16) return -1;          /* 太小，格式化没意义 */
+
+    exfat_info.fat_length = fat_length;
+    exfat_info.cluster_heap_offset = heap;
+    exfat_info.cluster_count = cluster_count;
+    exfat_info.volume_length = volume_length;
+
+    /* Allocation Bitmap：每簇 1 bit，按 512B/簇 展开成若干簇。
+     * 簇 2 = 根目录，簇 3.. = 位图，位图之后 = Up-case 表。 */
+    uint32_t bmp_bytes = (cluster_count + 7u) / 8u;
+    uint32_t bmp_clusters = (bmp_bytes + 511u) / 512u;
+    uint32_t bmp_first = 3;
+    uint32_t upcase_first = bmp_first + bmp_clusters;
 
     // 0. 标准 MBR（分区表：1 个 exFAT 分区，从扇区 1 开始）
     uint8_t mbr[512];
@@ -834,12 +867,20 @@ int exfat_format(void) {
     mbr[446] = 0x00;                    // boot flag
     mbr[447] = 0x00; mbr[448] = 0x02; mbr[449] = 0x00;   // CHS start = 0/0/2
     mbr[450] = 0x07;                    // 分区类型: exFAT
-    // CHS end（按 16 磁头 / 63 扇区换算，末 LBA = 1 + 32767 - 1 = 32767）：
-    //   cyl 32 / head 8 / sector 8 —— 与 temp/gen_diskimg.py make_mbr 一致。
+    // CHS end（按 16 磁头 / 63 扇区换算）。末 LBA 必须**精确整除**——
+    // 随便填一个 CHS 会让部分工具算出与实际不符的几何。
     // LBA 字段（454/458）才是权威值，CHS 只是给不认 LBA 的老工具看。
-    mbr[451] = 8; mbr[452] = 8; mbr[453] = 32;
+    {
+        uint32_t last = exfat_partition_start + volume_length - 1;
+        uint32_t cyl = last / (16u * 63u);
+        uint32_t head = (last / 63u) % 16u;
+        uint32_t sect = (last % 63u) + 1u;
+        if (cyl > 1023u) { cyl = 1023u; head = 15u; sect = 63u; }
+        mbr[451] = (uint8_t)head; mbr[452] = (uint8_t)(sect | ((cyl >> 8) << 6));
+        mbr[453] = (uint8_t)(cyl & 0xFF);
+    }
     *((uint32_t*)(mbr + 454)) = 1;      // LBA start = 1
-    *((uint32_t*)(mbr + 458)) = 32767;  // 分区扇区数
+    *((uint32_t*)(mbr + 458)) = volume_length;  // 分区扇区数
     mbr[510] = 0x55;
     mbr[511] = 0xAA;
     if (exfat_write_sector(0, mbr) != 0) return -1;
@@ -902,15 +943,20 @@ int exfat_format(void) {
 
     // 2. FAT 表
     // FAT[0]=0xFFFFFFF8, FAT[1]=0xFFFFFFFF
-    // 簇2 根目录、簇3 bitmap、簇4-5 upcase
-    uint8_t fat_sector[512];
-    for (int i = 0; i < 512; i++) fat_sector[i] = 0;
-    *((uint32_t*)(fat_sector + 0)) = 0xFFFFFFF8;
-    *((uint32_t*)(fat_sector + 4)) = 0xFFFFFFFF;
-    *((uint32_t*)(fat_sector + 8)) = 0xFFFFFFFF;   // 簇2 根目录链尾
-    *((uint32_t*)(fat_sector + 12)) = 0xFFFFFFFF;  // 簇3 bitmap 链尾
-    *((uint32_t*)(fat_sector + 16)) = 0xFFFFFFFF;  // 簇4 upcase 链尾
-    if (exfat_write_sector(exfat_partition_start + exfat_info.fat_offset, fat_sector) != 0) return -1;
+    // 簇2 根目录、簇3.. 位图、位图之后 upcase，各自链尾 0xFFFFFFFF
+    for (uint32_t s = 0; s < exfat_info.fat_length; s++) {
+        uint8_t fat_sector[512];
+        for (int i = 0; i < 512; i++) fat_sector[i] = 0;
+        if (s == 0) {
+            *((uint32_t*)(fat_sector + 0)) = 0xFFFFFFF8;
+            *((uint32_t*)(fat_sector + 4)) = 0xFFFFFFFF;
+            /* 根目录 + 位图 + upcase 都是单簇定长链：链尾全写 0xFFFFFFFF */
+            for (uint32_t c = 2; c <= upcase_first && c < 128u; c++)
+                *((uint32_t*)(fat_sector + c * 4)) = 0xFFFFFFFF;
+        }
+        if (exfat_write_sector(exfat_partition_start + exfat_info.fat_offset + s,
+                               fat_sector) != 0) return -1;
+    }
 
     // 3. 根目录簇（簇2）：0x83 卷标 + 0xC0 卷标流 + 0x81 位图 + 0x82 大写表
     //
@@ -932,11 +978,11 @@ int exfat_format(void) {
     // 0x81 Allocation Bitmap（FirstCluster@+0x14, DataLength@+0x18）
     root_cluster[64] = 0x81;
     root_cluster[65] = 0x01;  // AllocationPossible = 1
-    *((uint32_t*)(root_cluster + 64 + 0x14)) = 3;   // FirstCluster
-    *((uint64_t*)(root_cluster + 64 + 0x18)) = 13;  // DataLength (100簇/8=12.5→13)
+    *((uint32_t*)(root_cluster + 64 + 0x14)) = bmp_first;   // FirstCluster
+    *((uint64_t*)(root_cluster + 64 + 0x18)) = bmp_bytes;   // DataLength
     // 0x82 Up-case Table（FirstCluster@+0x14, DataLength@+0x18）
     root_cluster[96] = 0x82;
-    *((uint32_t*)(root_cluster + 96 + 0x14)) = 4;   // FirstCluster
+    *((uint32_t*)(root_cluster + 96 + 0x14)) = upcase_first;   // FirstCluster
     *((uint64_t*)(root_cluster + 96 + 0x18)) = 124; // DataLength（压缩 upcase 表：4 校验和 + 12 保留 + 26*4 映射 + 4 终止符）
     // 卷标 entry set 的 SetChecksum（覆盖 0x83 + 0xC0 共 64 字节，跳过 0x83 的字节 2-3）
     uint16_t esc = exfat_set_checksum(root_cluster, 64);
@@ -944,11 +990,19 @@ int exfat_format(void) {
     root_cluster[3] = (uint8_t)((esc >> 8) & 0xFF);
     if (exfat_write_cluster(exfat_info.root_dir_cluster, root_cluster) != 0) return -1;
 
-    // 4. Allocation Bitmap 簇（簇3）
+    // 4. Allocation Bitmap 簇（簇 bmp_first 起，共 bmp_clusters 簇）
+    // exFAT 位图 bit 0 = 簇 2，故簇 c 对应 bit (c-2)。
     uint8_t bmp[512];
-    for (int i = 0; i < 512; i++) bmp[i] = 0;
-    bmp[0] = 0x0F;   // 簇2,3,4,5 已用（bit0-3）
-    if (exfat_write_cluster(3, bmp) != 0) return -1;
+    for (uint32_t i = 0; i < bmp_clusters; i++) {
+        for (int k = 0; k < 512; k++) bmp[k] = 0;
+        for (uint32_t c = 2; c <= upcase_first; c++) {
+            uint32_t bit = c - 2;
+            if (bit / 8 >= 512) break;
+            if (bit / 8 >= i * 512 && bit / 8 < (i + 1) * 512)
+                bmp[bit / 8 - i * 512] |= (uint8_t)(1u << (bit % 8));
+        }
+        if (exfat_write_cluster(bmp_first + i, bmp) != 0) return -1;
+    }
 
     // 5. Up-case Table 簇（簇4）：压缩表，仅含非恒等映射
     uint8_t upcase[512];
@@ -972,9 +1026,9 @@ int exfat_format(void) {
         chk = ((chk << 31) | (chk >> 1)) + upcase[i];
     }
     *((uint32_t*)(upcase + 0)) = chk;
-    if (exfat_write_cluster(4, upcase) != 0) return -1;
+    if (exfat_write_cluster(upcase_first, upcase) != 0) return -1;
 
-    exfat_bitmap_cluster = 3;   // format 阶段 Allocation Bitmap 固定为簇3
+    exfat_bitmap_cluster = bmp_first;   // Allocation Bitmap 的首簇
     exfat_ready = 1;
     return 0;
 }
