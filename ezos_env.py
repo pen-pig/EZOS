@@ -114,6 +114,23 @@ def cargo_exe():
         "  若只想跳过 Rust/Zig 增量：设 EZOS_SKIP_RUSTZIG=1（会退回纯 C 实现）。")
 
 
+def kernel_version():
+    """内核版本号，从 kernel/version.h 解析（唯一事实来源）。
+
+    别在测试里抄版本字符串：git 上早就打了 v1.1.0，而内核里还印着 0.9.0，
+    tests/ 里抄的四份也全是 0.9.0——改一处漏三处，版本号永远对不上，测试
+    里那份过期还会变成一次莫名其妙的假红。
+    """
+    import re as _re
+    path = os.path.join(ROOT, "kernel", "version.h")
+    try:
+        txt = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return None
+    m = _re.search(r'#define\s+EZOS_VERSION\s+"([^"]+)"', txt)
+    return m.group(1) if m else None
+
+
 def preflight(need=("cc", "ld", "objcopy", "nasm")):
     """构建前检查，返回缺失清单（空 = 齐备）。"""
     missing = []

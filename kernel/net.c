@@ -32,6 +32,7 @@
  * 各自取反相加会算出错误校验和，slirp 等真协议栈直接丢包。
  */
 #include "net.h"
+#include "version.h"
 #include "rtl8139.h"
 #include "kmalloc.h"
 #include "syscall.h"
@@ -1893,7 +1894,7 @@ int net_httpd_once(void) {
         "Connection: close\r\n"
         "\r\n"
         "<html><head><title>EZOS</title></head><body>"
-        "<h1>EZOS 0.9.0</h1>"
+        "<h1>EZOS " EZOS_VERSION "</h1>"
         "<p>Hello from a hand-written i686 kernel - "
         "TCP/IP stack included, no libc required.</p>"
         "</body></html>";

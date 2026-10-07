@@ -1,4 +1,5 @@
 #include "tty.h"
+#include "version.h"
 #include "keyboard.h"
 #include "idt.h"
 #include "isr.h"
@@ -395,7 +396,7 @@ void kernel_main(void) {
      * 必须在 paging_init 之后——池本身要能正常访问。 */
     pmm_init();
 
-    klog("EZOS Kernel 0.9.0 loaded at 0x10000, i686 protected mode");
+    klog("EZOS Kernel " EZOS_VERSION " loaded at 0x10000, i686 protected mode");
     /* 扇区数不再写死：tools/make_image.py 按 kernel_raw.bin 真实大小算出后写进
      * 引导扇区 0x1FC，boot.asm 运行时读取（0 或 >992 时兜底 992）。 */
     klog("Boot: kernel image read by BIOS INT 13h AH=42h (64-sector batches, 3 retries, sector count from boot sector 0x1FC)");

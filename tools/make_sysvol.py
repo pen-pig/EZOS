@@ -69,10 +69,18 @@ def main():
     # /system 下放两个纯文本元信息文件，方便 shell/E2E 直接 cat 验证
     stamp = time.strftime("%Y-%m-%d")
     names = "".join(n + "\n" for n in BIN_FILES)
+    sys.path.insert(0, ROOT)
+    import ezos_env  # noqa: E402
+    ver = ezos_env.kernel_version()
+    if not ver:
+        sys.stderr.write("make_sysvol: cannot read version from "
+                         "kernel/version.h\n")
+        sys.exit(1)
     version = ("EZOS built-in system volume\n"
+               "version=%s\n"
                "mount=/system /bin\n"
                "readonly=yes\n"
-               "built=%s\n" % stamp).encode("ascii")
+               "built=%s\n" % (ver, stamp)).encode("ascii")
     files = ("# /bin contents\n" + names).encode("ascii")
 
     entries.append(("/system/version", version))

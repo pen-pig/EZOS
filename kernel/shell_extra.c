@@ -12,6 +12,7 @@
  */
 
 #include "shell_extra.h"
+#include "version.h"
 #include "tty.h"
 #include "keyboard.h"
 #include "types.h"
@@ -233,7 +234,7 @@ const char *shell_extra_lookup_alias(const char *name) {
 /* ver: 显示内核版本 */
 void cmd_ver(const char *args) {
     (void)args;
-    ezos_console_write("EZOS Kernel version 0.9.0 (i386)\n");
+    ezos_console_write("EZOS Kernel version " EZOS_VERSION " (i386)\n");
 }
 
 /* sysinfo: 汇总系统信息（CPU / 内存 / 时间 / 版本） */
@@ -262,7 +263,7 @@ void cmd_sysinfo(const char *args) {
 
     ezos_console_write("EZOS System Information\n");
     ezos_console_write("------------------------\n");
-    ezos_console_write("Version : 0.9.0 (i386)\n");
+    ezos_console_write("Version : " EZOS_VERSION " (i386)\n");
     ezos_console_write("CPU     : ");
     x_print_cpu_vendor();
     ezos_console_write("\n");

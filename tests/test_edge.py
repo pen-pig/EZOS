@@ -20,7 +20,10 @@ import os as _os_ezos
 import sys as _sys_ezos
 _sys_ezos.path.append(_os_ezos.path.dirname(
     _os_ezos.path.dirname(_os_ezos.path.abspath(__file__))))
-from ezos_env import qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe  # noqa: E402
+from ezos_env import (qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe,  # noqa: E402
+                      kernel_version)
+
+VER = kernel_version() or "0.0.0"   # 版本号取自 kernel/version.h
 
 import json
 import os
@@ -192,7 +195,7 @@ def main():
                 # 之后系统仍须可用：再跑一条 ver
                 t2 = flat(run_cmd(qmp, "ver", shot, 4.0))
                 results.append(("%s: still responsive" % name,
-                                "version 0.9.0" in t2))
+                                ("version " + VER) in t2))
             except Exception as e:
                 results.append(("%s: error %r" % (name, e), False))
             finally:

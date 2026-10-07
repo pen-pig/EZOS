@@ -21,7 +21,10 @@ import os as _os_ezos
 import sys as _sys_ezos
 _sys_ezos.path.append(_os_ezos.path.dirname(
     _os_ezos.path.dirname(_os_ezos.path.abspath(__file__))))
-from ezos_env import qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe  # noqa: E402
+from ezos_env import (qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe,  # noqa: E402
+                      kernel_version)
+
+VER = kernel_version() or "0.0.0"   # 版本号取自 kernel/version.h
 
 import json
 import os
@@ -172,7 +175,7 @@ def main():
 
         # (命令, 期望子串（小写，可为 None = 只查不 panic）, 等待秒)
         cases = [
-            ("ver",              "version 0.9.0", 2.5),
+            ("ver",              ("version " + VER), 2.5),
             ("ps",               "pid",           2.5),
             ("ls",               "readme.txt",    3.0),
             ("cat README.TXT",   "welcome to ezos", 3.0),
@@ -182,7 +185,7 @@ def main():
             ("selftest",         "pass",          15.0),
             ("mem 0xFFFFFFFF 4096", None,         3.0),   # 边界：曾整机 panic
             ("calc",             None,            2.5),   # 空参数
-            ("ver",              "version 0.9.0", 3.0),   # 末尾仍可用
+            ("ver",              ("version " + VER), 3.0),   # 末尾仍可用
         ]
         for cmd, expect, wait in cases:
             try:

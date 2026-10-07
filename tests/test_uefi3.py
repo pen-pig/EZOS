@@ -18,7 +18,10 @@ import os as _os_ezos
 import sys as _sys_ezos
 _sys_ezos.path.append(_os_ezos.path.dirname(
     _os_ezos.path.dirname(_os_ezos.path.abspath(__file__))))
-from ezos_env import qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe  # noqa: E402
+from ezos_env import (qemu_exe, qemu32_exe, ovmf_fd, qemu_img_exe,  # noqa: E402
+                      kernel_version)
+
+VER = kernel_version() or "0.0.0"   # 版本号取自 kernel/version.h
 
 import json
 import os
@@ -323,7 +326,7 @@ def main():
         qmp.type_line("ver")
         time.sleep(3)
         t = flat(ocr_720(shot(SHOT)))
-        check("shell after GUI: ver works", "version 0.9.0" in t)
+        check("shell after GUI: ver works", ("version " + VER) in t)
         check("run: no kernel panic (final)", "kernel panic" not in serial())
     except Exception as e:
         results.append(("harness: %r" % e, False))
