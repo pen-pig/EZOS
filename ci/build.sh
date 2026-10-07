@@ -66,7 +66,14 @@ else
 fi
 
 # ---- 编译内核 C 源（自动收集，主/dev 分支通用） ----
-CFLAGS="-m32 -ffreestanding -O2 -Wall -Wextra \
+# **-Os 不是随手选的**：同一份源码，开发机的 i686-elf-gcc -O2 编出 504KB，
+# CI 的 Ubuntu gcc 13 -O2 编出 579KB——直接撞穿 linker.ld 的 496KB 上限
+# （镜像加载在 0x10000，主栈在 0x90000，中间只有 512KB）。-Os 把 gcc 13 的
+# 产物压到 443KB，两边都留出几十 KB 余量；-O2 时本机只剩 3.2KB、栈余量
+# 160 字节，等于贴着悬崖边跑。
+# （-ffunction-sections + --gc-sections 实测只省 288 字节：没有死代码可丢，
+#  真要瘦身只能靠优化档位。）
+CFLAGS="-m32 -ffreestanding -Os -Wall -Wextra \
         -fno-pie -fno-pic -fno-stack-protector \
         -fno-asynchronous-unwind-tables \
         -Ikernel -MMD"

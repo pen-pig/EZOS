@@ -14,7 +14,11 @@ ZIG     = D:/MyOS/tools/zig/zig-x86_64-windows-0.15.1/zig.exe
 CARGO   = C:/Users/admin/.cargo/bin/cargo.exe
 
 # ===================== ?????? =====================
-CFLAGS  = -ffreestanding -O2 -Wall -Wextra -Werror -Ikernel -MMD
+# -Os：见 ci/build.sh 里的同一段说明。**必须和 CI 保持一致**——CI 用的是
+# Ubuntu 系统 gcc 13，同一份源码 -O2 会编出 579KB，撞穿 linker.ld 的
+# 496KB 上限（镜像 0x10000、主栈 0x90000，中间只有 512KB）。-Os 下两边都
+# 有几十 KB 余量。
+CFLAGS  = -ffreestanding -Os -Wall -Wextra -Werror -Ikernel -MMD
 LDFLAGS = -m elf_i386 -T linker.ld --oformat binary -e _start
 
 # ===================== ???? =====================
@@ -60,7 +64,7 @@ build rust/ezos_zig/ezos_zig.o: zig_obj rust/ezos_zig/ezos_zig.zig
 # ---- 用户态程序（步骤 5c）：静态 ELF32，链接到 USER_IMAGE_BASE，
 #      保留 ELF 结构（不能 --oformat binary），-s 去掉符号表以缩小体积 ----
 rule cc_user
-    command = $CC -ffreestanding -O2 -Wall -Wextra -Iuser -MMD -MF $out.d -c $in -o $out
+    command = $CC -ffreestanding -Os -Wall -Wextra -Iuser -MMD -MF $out.d -c $in -o $out
     description = CC-USER $in
     depfile = $out.d
     deps = gcc

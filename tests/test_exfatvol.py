@@ -49,9 +49,10 @@ from test_nvme import SerialReader, Qmp, wait_for, wait_port_free, kill_all_qemu
 import ref_exfat  # noqa: E402
 from ref_exfat import _u32, _u64  # noqa: E402
 
-# 宿主机要建的"大文件"：600 簇 = 300KB。目的不是测大文件，而是把已用簇推过
-# 512（= 第一个位图簇能表示的簇数上限），逼内核的分配器写到位图第二簇里去。
-BIG_CLUSTERS = 600
+# 宿主机要预填多少簇。目的不是测大文件，而是把已用簇推过第一个位图簇能表示
+# 的范围：512B/簇的位图，一簇只有 4096 位 = 4096 个簇。簇 c 落在位图第
+# (c-2)/8 字节，所以要用到位图第二簇，必须分配到 c >= 4098。取 4300 留余量。
+PREFILL_CLUSTERS = 4300
 
 
 def rec(results, name, ok, detail=""):
@@ -299,17 +300,29 @@ def main():
         rec(results, "host writer opens the image", False, "| %s" % e)
         return 1
     try:
-        payload = bytes((i * 7 + 11) & 0xFF
-                        for i in range(BIG_CLUSTERS * rw.cluster_size))
-        _, used = rw.create(rw.root, "BIG.BIN", payload)
+        # 把"前 4300 个簇"在宿主机侧标记成已用（FAT=EOC + 位图置 1），不建真
+        # 文件。为什么不用真文件：要让下一个被分配的簇落进位图第二簇，需要
+        # 用到簇号 >= 4098，而参考实现的链长上限 MAX_CHAIN=4096，造一个 4200
+        # 簇的文件反而会让 audit() 读链时被截断、报出假故障。
+        # "已用但没有文件引用"在真盘上也很常见（碎片/异常掉电后的泄漏簇），
+        # 而且这正是要考的那条路径：内核分配时必须往位图的**第二个簇**里写。
+        marked = 0
+        c = 2
+        while c <= PREFILL_CLUSTERS and c < rw.cluster_count + 2:
+            if rw.fat(c) == 0 and not rw.bmp_get(c):
+                rw.set_fat(c, 0xFFFFFFFF)
+                rw.bmp_set(c, 1)
+                marked += 1
+            c += 1
         rw.flush()
-        rec(results, "host creates a %d-cluster file to push past "
-                     "bitmap cluster #1" % BIG_CLUSTERS, len(used) >= BIG_CLUSTERS,
-            "| clusters %d..%d" % (used[0], used[-1]))
+        rec(results, "host marks %d clusters used to push past "
+                     "bitmap cluster #1" % PREFILL_CLUSTERS, marked > 4000,
+            "| marked %d clusters" % marked)
         # 关键前提：下一个被分配的簇，其位图字节必须落在**第二个**位图簇里。
         rec(results, "next allocation lands in bitmap cluster #2",
-            (used[-1] + 1 - 2) // 8 >= rw.cluster_size,
-            "| byte index %d >= %d" % ((used[-1] + 1 - 2) // 8, rw.cluster_size))
+            (PREFILL_CLUSTERS + 1 - 2) // 8 >= rw.cluster_size,
+            "| byte index %d >= %d"
+            % ((PREFILL_CLUSTERS + 1 - 2) // 8, rw.cluster_size))
     except Exception as e:
         rec(results, "host writer prefills the disk", False, "| %s" % e)
         return 1
@@ -324,8 +337,11 @@ def main():
     try:
         g.boot_wait()
         out = g.run("ls", 3.0)
-        rec(results, "kernel sees the host-created BIG.BIN",
-            "big.bin" in out.lower(), "| %s" % out[-70:])
+        rec(results, "kernel still lists the volume after host prefill",
+            "error" not in out.lower(), "| %s" % out[-70:])
+        ok_seen = sum(1 for n, _ in names[5:] if n.lower() in out.lower())
+        rec(results, "the 5 files are still there", ok_seen == 5,
+            "| %d/5" % ok_seen)
 
         # df：两个断言都在真量东西——总量必须覆盖整块盘（卷写死小了这里立刻
         # 红），耗时必须短（大卷上曾经因为"每读一个 FAT 项都真读一次盘"要
@@ -346,6 +362,11 @@ def main():
             rec(results, "df cluster count matches the host-side geometry",
                 abs(int(m.group(5)) - fs_cluster_count) <= 2,
                 "| guest=%s host=%d" % (m.group(5), fs_cluster_count))
+            # 宿主机预填的那 4300 个簇，内核的空闲统计必须看得到
+            used_kb = int(m.group(2))
+            rec(results, "df sees the host-prefilled clusters as used",
+                used_kb >= 1500, "| used %d KB (~%d clusters)"
+                % (used_kb, PREFILL_CLUSTERS // 2))
         rec(results, "df finishes in <15s (was >20s before the FAT cache)",
             dt < 15.0, "| %.1fs" % dt)
 

@@ -162,16 +162,21 @@ static void dm_mirror(const char *body, const char *tail) {
     while (v) { t[n++] = (char)('0' + v % 10); v /= 10; }
     line[o++] = '['; line[o++] = ' ';
     while (n && o + 1 < sizeof(line)) line[o++] = t[--n];
-    line[o++] = '.';
+    /* 下面每个字符都要各自判一次边界：曾经只在循环里判，循环退出时 o 已经
+     * 顶到 sizeof(line)，紧接着的 `line[o++] = ']'` 就直接写穿了（gcc 13
+     * -Wstringop-overflow 报 "writing 1 byte into a region of size 0"）。
+     * 栈上越界在这里不崩，只是静默踩坏相邻变量。 */
+    if (o + 1 < sizeof(line)) line[o++] = '.';
     for (int32_t d = 100000; d; d /= 10) {
         if (o + 1 >= (int32_t)sizeof(line)) break;
         line[o++] = (char)('0' + (us / d) % 10);
     }
-    line[o++] = ']'; line[o++] = ' ';
+    if (o + 1 < sizeof(line)) line[o++] = ']';
+    if (o + 1 < sizeof(line)) line[o++] = ' ';
     for (const char *p = body; *p && o + 1 < sizeof(line); p++) line[o++] = *p;
     for (const char *p = tail; *p && o + 1 < sizeof(line); p++) line[o++] = *p;
     if (o + 1 < sizeof(line)) line[o++] = '\n';
-    line[o] = 0;
+    line[(o < sizeof(line)) ? o : sizeof(line) - 1] = 0;
     dmesg_write(line);
 }
 
