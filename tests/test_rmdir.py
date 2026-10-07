@@ -166,9 +166,20 @@ def fs_cases(qmp, name):
     # 格式化现在按磁盘实际容量铺满整卷（不再是写死的 1~16MB），慢盘上远超
     # 10 秒；给它单独的超时，否则后面的命令会叠进来。
     t = run(qmp, "format " + name, 60.0)
-    r.append(("%s: format ok" % name,
-              ("disk formatted as" in t) and ("format failed" not in t)))
-    r.append(("%s: df reports type" % name, name in run(qmp, "df")))
+    ok_fmt = ("disk formatted as" in t) and ("format failed" not in t)
+    r.append(("%s: format ok" % name, ok_fmt))
+    ok_df = name in run(qmp, "df")
+    r.append(("%s: df reports type" % name, ok_df))
+
+    # 格式化没生效就**立刻收手**，别继续往下跑。
+    # 以前这里没有这道闸：`format fat32` 在 16MB 盘上被正确地拒绝（FAT32
+    # 需要 >= 65525 簇），但后面 11 条 mkdir/ls/rmdir 全在**上一个 FS 留下的
+    # 卷**上跑，于是标签写着 fat32、断言却在 exFAT 上通过——11 条假绿。
+    # 测试看起来"只红 2 条"，实际上整个 fat32 分组根本没被测过。
+    if not (ok_fmt and ok_df):
+        print("  !! %s: format/df 未生效，跳过该分组后续用例"
+              "（否则会在上一个卷上跑出假绿）" % name)
+        return r
 
     # 1) 空目录：mkdir -> ls 可见 -> rmdir -> ls 不可见
     r.append(("%s: mkdir SD" % name, "mkdir: failed" not in run(qmp, "mkdir SD")))
@@ -210,7 +221,15 @@ def main():
         if not os.path.isfile(p):
             print("MISSING %s - run ninja first" % p)
             return 2
-    shutil.copyfile(src, disk)
+    shutil.copyfile(src, disk)             # 格式化会改盘：必须用副本
+
+    # FAT32 需要 >= 65525 个簇（512B 扇区 x 1 扇区/簇 => 至少要 ~33MB），
+    # 而 disk.vhd 只有 16MB，`format fat32` 会被**正确地**拒绝。这里跟
+    # test_fs_matrix.py 一样把副本扩到 64MB，否则 fat32 分组根本测不到。
+    DISK_BYTES = 64 * 1024 * 1024
+    if os.path.getsize(disk) < DISK_BYTES:
+        with open(disk, "r+b") as f:
+            f.truncate(DISK_BYTES)
 
     if port_in_use(PORT):
         subprocess.call(["taskkill", "//F", "//IM", "qemu-system-x86_64.exe"],
