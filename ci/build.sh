@@ -14,6 +14,10 @@
 # 这里历史上漏过两个：boot/task_switch.o（task_irq_trampoline / switch_to）
 # 和 Rust/Zig 产物（*_rs / *_zig）——CI 因此连续红了很多次。
 #
+# **排查通道**：GitHub 的 job log 要仓库管理员权限才能下载（403），CI 红了
+# 我们看不到原文。所以关键错误必须同时走两路：stderr 尾部输出 + `::error::`
+# 注解（注解通过 check-runs API 公开可读）。同理工具链版本走 `::notice::`。
+#
 # 用法: bash ci/build.sh
 # 产物: os-image.bin
 # ============================================================
@@ -23,11 +27,36 @@ cd "$(dirname "$0")/.."
 CC="${CC:-gcc}"
 LD="${LD:-ld}"
 ASM="${ASM:-nasm}"
-OBJCOPY="${OBJCOPY:-objcopy}"
 PYTHON="${PYTHON:-python3}"
 ZIG="${ZIG:-zig}"
 
-# ---- 镜像大小动态化（单一事实来源：tools/make_image.py） ----
+ann_err()  { echo "::error::$1"  >&2; }
+ann_note() { echo "::notice::$1" >&2; }
+
+# ERR trap：$LINENO 直接指出是哪一行炸的，省掉"靠猜"这一步。
+trap 'st=$?; \
+      echo "[ci] FAILED at line $LINENO (exit $st)" >&2; \
+      ann_err "[ci] build.sh failed at line $LINENO (exit $st)"' ERR
+
+# 工具链体检：CI 上装的和开发机上用的必须是同一套（stable + rust-src），
+# 否则就是"本地绿、CI 红"的经典死循环。版本打到注解里，方便远程核对。
+rustc_v="$(rustc --version 2>/dev/null | head -1 || echo 'rustc: MISSING')"
+cargo_v="$(cargo --version 2>/dev/null | head -1 || echo 'cargo: MISSING')"
+zig_v="$("$ZIG" version 2>/dev/null | head -1 || echo 'zig: MISSING')"
+echo "[ci] rustc  : $rustc_v"
+echo "[ci] cargo  : $cargo_v"
+echo "[ci] zig    : $zig_v"
+echo "[ci] gcc    : $("$CC" --version 2>/dev/null | head -1 || echo MISSING)"
+ann_note "rustc=$rustc_v"
+ann_note "cargo=$cargo_v"
+ann_note "zig=$zig_v"
+# -Z build-std 要 rust-src；没装的话 cargo 会在开编前就退出，症状是"20 秒速红"。
+sysroot="$(rustc --print sysroot 2>/dev/null || echo '')"
+if [ -n "$sysroot" ] && [ -f "$sysroot/lib/rustlib/src/rust/Cargo.toml" ]; then
+    ann_note "rust-src=OK ($sysroot/lib/rustlib/src/rust)"
+else
+    ann_note "rust-src=MISSING (sysroot=${sysroot:-none})"
+fi
 
 # ---- 编译内核 C 源（自动收集，主/dev 分支通用） ----
 CFLAGS="-m32 -ffreestanding -O2 -Wall -Wextra \
@@ -60,23 +89,41 @@ echo "[ci] ASM boot/task_switch.asm (elf32)"
 # *_zig 做三路对拍。这两个产物不是"可选加速"，缺了就是链接期 undefined
 # reference。所以 CI 必须真的编译它们，而不是退回 C 实现——退回就等于在测
 # 一份跟发布版不同的内核（生产路径那份反而没人验过）。
+#
+# 注：-Zjson-target-spec **不能删**。cargo 1.96 实测
+#   "`.json` target specs require -Zjson-target-spec to be added to the cargo
+#    invocation"，自定义 target 仍是 -Z 开关。
 RUST_LIB="rust/ezos_rs/target/i686-ezos/release/libezos_rs.a"
 ZIG_OBJ="rust/ezos_zig/ezos_zig.o"
 
 echo "[ci] CARGO libezos_rs.a"
-( cd rust/ezos_rs && RUSTC_BOOTSTRAP=1 cargo build --release \
-    -Z build-std=core,compiler_builtins -Zjson-target-spec \
-    --target ../i686-ezos.json )
+if ! ( cd rust/ezos_rs && RUSTC_BOOTSTRAP=1 cargo build --release \
+        -Z build-std=core,compiler_builtins -Zjson-target-spec \
+        --target ../i686-ezos.json ) > ci-cargo.log 2>&1; then
+    echo "[ci] FATAL: cargo build failed, tail:" >&2
+    tail -40 ci-cargo.log >&2
+    grep -m8 -E '^(error|warning: unused)' ci-cargo.log 2>/dev/null \
+        | while IFS= read -r l; do ann_err "cargo: $l"; done
+    exit 1
+fi
 if [ ! -f "$RUST_LIB" ]; then
-    echo "[ci] FATAL: $RUST_LIB 没生成（rust nightly + rust-src 装了吗？）" >&2
+    echo "[ci] FATAL: $RUST_LIB 没生成" >&2
+    ann_err "cargo produced no $RUST_LIB"
     exit 1
 fi
 
 echo "[ci] ZIG ezos_zig.o"
-( cd rust/ezos_zig && "$ZIG" build-obj -target x86-freestanding \
-    -O ReleaseSafe ezos_zig.zig )
+if ! ( cd rust/ezos_zig && "$ZIG" build-obj -target x86-freestanding \
+        -O ReleaseSafe ezos_zig.zig ) > ci-zig.log 2>&1; then
+    echo "[ci] FATAL: zig build-obj failed, tail:" >&2
+    tail -40 ci-zig.log >&2
+    grep -m8 -E '^error' ci-zig.log 2>/dev/null \
+        | while IFS= read -r l; do ann_err "zig: $l"; done
+    exit 1
+fi
 if [ ! -f "$ZIG_OBJ" ]; then
-    echo "[ci] FATAL: $ZIG_OBJ 没生成（zig 0.15.1 在 PATH 里吗？）" >&2
+    echo "[ci] FATAL: $ZIG_OBJ 没生成" >&2
+    ann_err "zig produced no $ZIG_OBJ"
     exit 1
 fi
 
@@ -84,8 +131,14 @@ fi
 # 顺序与 build.ninja 一致：启动/切换 .o → 内核 .o → Zig → Rust 静态库
 # （静态库必须放最后，否则归档里的符号可能解析不到）。
 echo "[ci] LD kernel_raw.bin"
-"$LD" $LDFLAGS -o kernel_raw.bin boot/kernel_entry.o boot/task_switch.o \
-    $OBJS "$ZIG_OBJ" "$RUST_LIB"
+if ! "$LD" $LDFLAGS -o kernel_raw.bin boot/kernel_entry.o boot/task_switch.o \
+        $OBJS "$ZIG_OBJ" "$RUST_LIB" > ci-ld.log 2>&1; then
+    echo "[ci] FATAL: link failed, tail:" >&2
+    tail -40 ci-ld.log >&2
+    grep -m8 -E 'undefined reference|multiple definition' ci-ld.log 2>/dev/null \
+        | while IFS= read -r l; do ann_err "ld: $l"; done
+    exit 1
+fi
 echo "[ci] ASSEMBLE kernel.bin + os-image.bin (dynamic size)"
 "$PYTHON" tools/make_image.py boot/boot.bin kernel_raw.bin kernel.bin os-image.bin
 

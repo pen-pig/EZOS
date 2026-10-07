@@ -1,0 +1,21 @@
+# ============================================================
+# 锁死 Rust 工具链，别让 CI 变成掷骰子。
+#
+# 背景：CI 曾经装 nightly（`rustup default nightly`）而开发机是 stable，两边
+# 版本差着好几个月的 -Z 开关变动，`-Zjson-target-spec` / `-Z build-std` 这种
+# 不稳定开关随时可能被摘掉或改名——构建脚本一步就红，而且 job log 要管理员
+# 权限才看得到，排查全靠猜。
+#
+# 这里显式钉住 stable + rust-src：
+#   - channel = "stable"：与开发机一致（rustc 1.96.0，ci/build.sh 里靠
+#     RUSTC_BOOTSTRAP=1 打开 -Z）。
+#   - components = ["rust-src"]：`-Z build-std=core,compiler_builtins` 需要它；
+#     没装的话 cargo 会在真正开编之前就退出（症状：构建步骤 20 秒速红）。
+#
+# rustup 只要在这个目录里跑 cargo 就会按本文件自动选工具链、自动补组件，
+# 所以 CI 的 `rustup default` 是什么都不影响结果。
+# ============================================================
+[toolchain]
+channel = "stable"
+components = ["rust-src"]
+profile = "minimal"

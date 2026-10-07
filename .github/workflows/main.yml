@@ -42,12 +42,20 @@ jobs:
       # rust_bridge.h 里 EZ_EXFAT_IMPL 默认 1 = Rust，exFAT 校验和的**生产
       # 路径**就走 *_rs；`rstest` 还要 *_zig 做三路对拍。这两个产物缺了就是
       # 链接期 undefined reference（CI 因此连红了十几次），所以必须真装真编。
-      - name: Install Rust nightly (+ rust-src for build-std)
+      #
+      # 工具链刻意**与开发机一致**：stable + RUSTC_BOOTSTRAP=1（ci/build.sh
+      # 里已设），而不是 nightly——nightly 每夜变，`-Z build-std` /
+      # `-Z json-target-spec` 这些不稳定开关随时可能被摘掉，CI 就成了掷骰子。
+      - name: Install rust-src (needed by -Z build-std)
         run: |
-          rustup toolchain install nightly --profile minimal --component rust-src
-          rustup default nightly
           rustc --version
           cargo --version
+          if command -v rustup >/dev/null 2>&1; then
+            rustup component add rust-src
+            rustup component list --installed
+          else
+            echo "::warning::no rustup in PATH; relying on rust-toolchain.toml"
+          fi
 
       - name: Install Zig 0.15.1
         run: |
