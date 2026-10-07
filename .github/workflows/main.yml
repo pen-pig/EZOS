@@ -79,8 +79,24 @@ jobs:
       - name: Image layout guard
         run: python3 tests/test_image.py
 
+      # 栈预算：内核主栈只有 ~21KB、任务栈 16KB，而且越界**不崩**——只是静默
+      # 写穿紧邻的 .data（历史上 shell 的 cmd_ls 把 fs.c 的 ro_cwd 覆盖成
+      # 文件名，症状伪装成文件系统损坏）。这一关守的就是"栈上放大数组"。
+      # CI 没有交叉编译器，用 gcc-multilib 的 gcc 顶上：脚本里已显式 -m32，
+      # 且 CFLAGS 与 build.ninja 一致（-Os），量到的才是真构建的那份栈用量。
+      - name: Stack budget guard
+        env:
+          EZOS_CC: gcc
+        run: python3 tools/check_stack.py
+
       - name: Generate data disk
         run: python3 temp/gen_diskimg.py disk.img
+
+      # 宿主机侧只读体检：Boot Checksum（主/备）、备份 VBR、位图↔FAT 一致性、
+      # Up-case 校验和、根目录次级条目标志位、MBR。这几个地方写错的话，内核
+      # 读自己写的盘照样绿、Windows 却直接弹"需要格式化"——只有独立实现能抓。
+      - name: Disk image health probe
+        run: python3 tools/host_probe.py disk.img
 
       # 不再只判断「QEMU 12 秒没崩」——那是个弱断言：内核卡在 shell 之前、
       # 25 个子系统自检全红、文件系统没挂上，它照样绿。现在 ci/smoke.sh 把

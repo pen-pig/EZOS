@@ -42,8 +42,12 @@ FAIL_LIMIT = 12 * 1024
 # 软上限：4KB 以上就列出来提醒（可能是可以搬走的缓冲，也可能确实需要）。
 WARN_LIMIT = 4 * 1024
 
-# 与 build.ninja 的 CFLAGS 保持一致（-Werror 在这里无所谓，只求栈用量一致）
-CFLAGS = ["-ffreestanding", "-O2", "-Wall", "-Wextra", "-Ikernel", "-MMD"]
+# 必须与 build.ninja / ci/build.sh 的 CFLAGS 一致，否则量出来的栈帧不是真构建
+# 的那一份——优化档位直接影响内联与栈槽布局（-O2 与 -Os 差出好几 KB）。
+# 显式带 -m32：CI 上没有交叉编译器，用的是装了 gcc-multilib 的系统 gcc，
+# 不给 -m32 就会按 64 位编，栈用量完全没有参考价值。
+CFLAGS = ["-m32", "-ffreestanding", "-Os", "-Wall", "-Wextra",
+          "-fno-pie", "-fno-pic", "-fno-stack-protector", "-Ikernel", "-MMD"]
 
 
 def main():
