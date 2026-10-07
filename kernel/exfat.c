@@ -1454,7 +1454,14 @@ int exfat_create_file(const char *name, const uint8_t *data, uint32_t size) {
             return -1;
         }
         exfat_write_fat_entry(cl, 0xFFFFFFFF);  // 先标记为链尾
-        exfat_bitmap_set(cl, 1);
+        /* 位图同步失败**必须让整个写失败**：FAT 说占用、位图说空闲，内核
+         * 不看位图所以当时一切正常，宿主一挂载就看到互相矛盾的元数据
+         * （典型下场：chkdsk 报卷损坏）。宁可写不进去，也不留一个坏卷。 */
+        if (exfat_bitmap_set(cl, 1) != 0) {
+            exfat_write_fat_entry(cl, 0);            /* 把簇还回去 */
+            if (first_cluster) exfat_free_cluster_chain(first_cluster);
+            return -1;
+        }
         if (first_cluster == 0) first_cluster = cl;
         else exfat_write_fat_entry(prev_cluster, cl);
         prev_cluster = cl;
