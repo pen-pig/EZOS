@@ -8,6 +8,8 @@ static exfat_info_t exfat_info;
 static int exfat_ready = 0;
 static uint32_t exfat_partition_start = 0;
 static uint32_t exfat_bitmap_cluster = 3;   // Allocation Bitmap 簇号（0x81 条目解析，默认 3）
+static uint32_t exfat_bitmap_bytes = 0;     // 位图长度（0x81 的 DataLength），0=未知
+static void exfat_fat_cache_drop(void);     /* 定义见 FAT 扇区缓存一节 */
 
 static uint8_t exfat_drive = 1;   // 默认从盘，可修改
 
@@ -37,6 +39,7 @@ static int my_strcmp(const char *a, const char *b) {
 #define EXFAT_MERGED_CLUSTER_OFF 600
 #define EXFAT_MERGED_SIZE_OFF    604
 void exfat_set_drive(uint8_t drive) {
+    if (drive != exfat_drive) exfat_fat_cache_drop();   /* 换盘：旧 FAT 缓存作废 */
     exfat_drive = drive;
 }
 static int exfat_read_sector(uint32_t sector, uint8_t *buffer) {
@@ -73,12 +76,27 @@ static int exfat_write_cluster(uint32_t cluster, const uint8_t *buffer) {
     return 0;
 }
 
+/* FAT 扇区缓存：**没有它就是"扫一遍 FAT = 每个簇一次磁盘读"**。
+ * 一个 512B 扇区装 128 个簇项，命中率 ~127/128，于是 df / 分配这类要遍历
+ * FAT 的操作从 O(簇数) 次 PIO 读降到 O(簇数/128)。实测 64MB 卷（13 万簇）
+ * 上 `df` 要 20 多秒——32GB 卷就是几小时，等于不可用。
+ * 凡绕过 exfat_write_fat_entry 直接写 FAT 扇区的地方（exfat_format）以及
+ * 挂载/换盘时，都必须 exfat_fat_cache_drop()，否则会读到上一个卷的 FAT。 */
+static uint8_t g_fat_sector[512];
+static uint32_t g_fat_sector_no = 0xFFFFFFFF;
+static void exfat_fat_cache_drop(void) { g_fat_sector_no = 0xFFFFFFFF; }
+
 static uint32_t exfat_read_fat_entry(uint32_t cluster) {
     uint32_t fat_sector = exfat_partition_start + exfat_info.fat_offset + (cluster / 128);
     uint32_t fat_offset = (cluster % 128) * 4;
-    uint8_t sector[512];
-    if (exfat_read_sector(fat_sector, sector) != 0) return 0xFFFFFFFF;
-    return *((uint32_t*)(sector + fat_offset));
+    if (g_fat_sector_no != fat_sector) {
+        if (exfat_read_sector(fat_sector, g_fat_sector) != 0) {
+            g_fat_sector_no = 0xFFFFFFFF;
+            return 0xFFFFFFFF;
+        }
+        g_fat_sector_no = fat_sector;
+    }
+    return *((uint32_t*)(g_fat_sector + fat_offset));
 }
 
 static int exfat_write_fat_entry(uint32_t cluster, uint32_t value) {
@@ -88,6 +106,7 @@ static int exfat_write_fat_entry(uint32_t cluster, uint32_t value) {
     if (exfat_read_sector(fat_sector, sector) != 0) return -1;
     *((uint32_t*)(sector + fat_offset)) = value;
     if (exfat_write_sector(fat_sector, sector) != 0) return -1;
+    exfat_fat_cache_drop();     /* 缓存里的这一扇区已经过时 */
     return 0;
 }
 
@@ -112,14 +131,34 @@ static int exfat_bitmap_set(uint32_t cluster, int used) {
     static uint8_t bmp[512 * 16];
     uint32_t bmp_cluster = exfat_bitmap_cluster;   // 从根目录 0x81 条目解析
     if (bmp_cluster < 2) return -1;
-    if (exfat_read_cluster(bmp_cluster, bmp) != 0) return -1;
+    uint32_t cluster_size = (uint32_t)exfat_info.bytes_per_sector *
+                            exfat_info.sectors_per_cluster;
+    if (cluster_size == 0 || cluster_size > sizeof(bmp)) return -1;
     uint32_t bit = cluster - 2;
     uint32_t byte_idx = bit / 8;
-    uint8_t mask = (uint8_t)(1 << (bit % 8));
-    if (byte_idx >= exfat_info.bytes_per_sector * exfat_info.sectors_per_cluster) return -1;
-    if (used) bmp[byte_idx] |= mask;
-    else bmp[byte_idx] &= (uint8_t)~mask;
-    return exfat_write_cluster(bmp_cluster, bmp);
+    /* 位图长度上界（0x81 的 DataLength）。不知道就不校验，别因为元数据缺失
+     * 把正常分配挡掉。 */
+    if (exfat_bitmap_bytes && byte_idx >= exfat_bitmap_bytes) return -1;
+    /* **位图是可以跨簇的**——它就是一个普通文件（0x81 条目），长度
+     * ceil(cluster_count / 8) 字节。512B/簇时一簇只覆盖 4096 个簇 = 2MB，
+     * 超过这个体积的卷，位图必然有多簇。以前只读写第一簇、byte_idx 超出就
+     * 直接 return -1，于是簇号 >= 4098 的分配**位图永远同步不上**：FAT 里
+     * 是占用、位图里还是"空闲"。内核不看位图所以毫无察觉，Windows 一挂载
+     * 就看到两者互相矛盾（典型下场：chkdsk 报卷损坏）。
+     * 位图在 FAT 里是条链（不是 NoFatChain），所以沿链走到位图的第 idx 簇。 */
+    uint32_t idx = byte_idx / cluster_size;
+    uint32_t cur = bmp_cluster;
+    for (uint32_t i = 0; i < idx; i++) {
+        uint32_t nxt = exfat_read_fat_entry(cur);
+        if (nxt < 2 || nxt >= exfat_info.cluster_count + 2) return -1;  /* 链断了：失败，不猜 */
+        cur = nxt;
+    }
+    if (exfat_read_cluster(cur, bmp) != 0) return -1;
+    uint32_t off = byte_idx % cluster_size;
+    uint8_t mask = (uint8_t)(1u << (bit % 8));
+    if (used) bmp[off] |= mask;
+    else bmp[off] &= (uint8_t)~mask;
+    return exfat_write_cluster(cur, bmp);
 }
 
 /* ============ 标准 exFAT 目录项（entry set）支持 ============ */
@@ -949,19 +988,34 @@ int exfat_format(void) {
 
     // 2. FAT 表
     // FAT[0]=0xFFFFFFF8, FAT[1]=0xFFFFFFFF
-    // 簇2 根目录、簇3.. 位图、位图之后 upcase，各自链尾 0xFFFFFFFF
-    for (uint32_t s = 0; s < exfat_info.fat_length; s++) {
-        uint8_t fat_sector[512];
-        for (int i = 0; i < 512; i++) fat_sector[i] = 0;
-        if (s == 0) {
-            *((uint32_t*)(fat_sector + 0)) = 0xFFFFFFF8;
-            *((uint32_t*)(fat_sector + 4)) = 0xFFFFFFFF;
-            /* 根目录 + 位图 + upcase 都是单簇定长链：链尾全写 0xFFFFFFFF */
-            for (uint32_t c = 2; c <= upcase_first && c < 128u; c++)
-                *((uint32_t*)(fat_sector + c * 4)) = 0xFFFFFFFF;
+    // 簇2 根目录（单簇）；位图是**一条链**（0x81 的 DataLength 一超过一簇
+    // 就必须成链，Windows 就是按链读位图的——以前每个元数据簇都写成
+    // "链尾"，等于宣称位图只有一簇，宿主读到的位图是截断的）；
+    // upcase 表同样单簇链尾。
+    //
+    // 另一个老坑：这段以前写 `c < 128u`，只覆盖第一个 FAT 扇区。盘一大
+    // （位图 >= 125 簇，即 256MB+ 的卷）后面的元数据簇在 FAT 里还是"空闲"，
+    // 分配器会把位图自己的簇当数据簇发出去，卷立刻自毁。所以这里按簇号
+    // 落到各自所属的 FAT 扇区，不再有 128 的上限。
+    {
+        uint32_t bmp_last = bmp_first + bmp_clusters - 1;
+        for (uint32_t s = 0; s < exfat_info.fat_length; s++) {
+            uint8_t fat_sector[512];
+            for (int i = 0; i < 512; i++) fat_sector[i] = 0;
+            if (s == 0) {
+                *((uint32_t*)(fat_sector + 0)) = 0xFFFFFFF8;
+                *((uint32_t*)(fat_sector + 4)) = 0xFFFFFFFF;
+            }
+            for (uint32_t c = 2; c <= upcase_first; c++) {
+                if (c / 128u != s) continue;
+                uint32_t v = 0xFFFFFFFF;
+                if (c >= bmp_first && c < bmp_last) v = c + 1u;   /* 位图链 */
+                *((uint32_t*)(fat_sector + (c % 128u) * 4)) = v;
+            }
+            if (exfat_write_sector(exfat_partition_start + exfat_info.fat_offset + s,
+                                   fat_sector) != 0) return -1;
         }
-        if (exfat_write_sector(exfat_partition_start + exfat_info.fat_offset + s,
-                               fat_sector) != 0) return -1;
+        exfat_fat_cache_drop();   /* 上面是直接写扇区，绕过了写缓存 */
     }
 
     // 3. 根目录簇（簇2）：0x83 卷标 + 0xC0 卷标流 + 0x81 位图 + 0x82 大写表
@@ -1035,12 +1089,18 @@ int exfat_format(void) {
     if (exfat_write_cluster(upcase_first, upcase) != 0) return -1;
 
     exfat_bitmap_cluster = bmp_first;   // Allocation Bitmap 的首簇
+    exfat_bitmap_bytes = bmp_bytes;     // 0x81 DataLength（位图可能跨簇）
     exfat_ready = 1;
     return 0;
 }
 
 int exfat_init(void) {
     uint8_t mbr[512];
+
+    /* 挂载=可能换了卷/换了几何：FAT 缓存必须作废，否则会按旧卷的
+     * fat_offset 解析新卷的簇链。 */
+    exfat_fat_cache_drop();
+    exfat_bitmap_bytes = 0;
 
     if (exfat_read_sector(0, mbr) != 0) {
         return -1;
@@ -1110,6 +1170,8 @@ int exfat_init(void) {
                 uint32_t bmp_cluster = *((uint32_t*)(e + 0x14));
                 if (bmp_cluster >= 2 && bmp_cluster < exfat_info.cluster_count + 2)
                     exfat_bitmap_cluster = bmp_cluster;
+                uint64_t dl = *((uint64_t*)(e + 0x18));   /* DataLength */
+                exfat_bitmap_bytes = (dl <= 0xFFFFFFFFull) ? (uint32_t)dl : 0;
                 break;
             }
         }
