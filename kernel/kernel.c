@@ -553,13 +553,24 @@ void kernel_main(void) {
 
     int ret = fs_init();
     if (ret == -2) {
-        klog("FS: no filesystem on data drive, auto-formatting exFAT...");
-        if (fs_format(FS_EXFAT) == 0) {
-            klog_ok("FS: formatted, creating README.TXT");
-            const char *example = "Hello from EZOS exFAT!\n";
-            fs_create_file("README.TXT", (const uint8_t*)example, my_strlen(example));
+        /* -2 only means "no filesystem recognized". That covers a blank disk
+         * AND a disk holding something EZOS does not know (btrfs, XFS, ...).
+         * Auto-formatting the latter would destroy the user's data, so the
+         * disk has to be proven blank first. */
+        if (!fs_drive_blank()) {
+            klog_fail("FS: unrecognized data on drive - NOT formatting");
+            terminal_writestring("       (use 'format <fs>' only if you are"
+                                 " sure the disk is expendable)\n");
         } else {
-            klog_fail("FS: auto-format failed");
+            klog("FS: no filesystem on data drive, auto-formatting exFAT...");
+            if (fs_format(FS_EXFAT) == 0) {
+                klog_ok("FS: formatted, creating README.TXT");
+                const char *example = "Hello from EZOS exFAT!\n";
+                fs_create_file("README.TXT", (const uint8_t*)example,
+                               my_strlen(example));
+            } else {
+                klog_fail("FS: auto-format failed");
+            }
         }
     } else if (ret == 0) {
         klog_prefix();

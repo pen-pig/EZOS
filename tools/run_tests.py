@@ -44,7 +44,7 @@ PY = sys.executable
 LAYERS = {
     "core": ["image", "vhd", "regress", "fs_matrix", "multilang", "mouse"],
     "fs":   ["fsref", "hostfs", "fatpath", "path", "sysvol", "rmdir",
-             "reformat", "ext4vol", "f2fsvol", "refsvol", "exfatvol"],
+             "reformat", "autofmt", "ext4vol", "f2fsvol", "refsvol", "exfatvol"],
     "usb":  ["usbenum", "uhci", "uhci_control", "usb", "usbkbd", "usbmouse",
              "usbmsc", "usbboot", "ehci"],
     "net":  ["netapp", "dhcp", "dns"],
@@ -95,6 +95,8 @@ TIMEOUT = {
     # reformat：10 轮 x 2 台 QEMU（格式化 + 重启探测）+ 5 轮分区@2048，
     # 实测 ~1.5 分钟；留 4 分钟余量给慢机器。
     "reformat": 240,
+    # autofmt：3 台 QEMU（全零/全 FF/陌生盘），实测 ~10 秒
+    "autofmt": 180,
     # 坏盘健壮性：6 个 FS 各起 1 台机器做黄金盘 + 3 台跑坏盘，实测 ~15 分钟
     # corrupt：故意把盘改坏后断言内核不卡死。每个 FS 要重新格式化黄金盘，
     # 外加干净盘重启 + 3 个随机种子 + 定向用例，6 个 FS 约 45 分钟

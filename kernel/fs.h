@@ -67,6 +67,11 @@ void fs_set_drive(uint8_t drive);
  * 拒绝格式化 0 号引导盘。成功后立即挂载为该类型） */
 int fs_format(int fs_type);
 
+/* 首选数据盘是否处于"擦除态"（全 0x00 或全 0xFF）。
+ * 只有这个为真时才允许自动格式化——fs_init 返回 -2 只说明"认不出来"，
+ * 装着一个 EZOS 不认识的文件系统的盘也是 -2，那种盘不能碰。 */
+int fs_drive_blank(void);
+
 /* ---- 以下 API 语义与原 exfat_* 完全一致 ---- */
 int      fs_read_file(const char *name, uint8_t *buffer, uint32_t max_size);
 uint32_t fs_get_file_size(const char *name);

@@ -336,6 +336,41 @@ static void fs_wipe_head(uint8_t drive, uint32_t start) {
         ata_write_sector(drive, start + i, sec);
 }
 
+/* Is the data drive actually blank (erased)?
+ *
+ * fs_init() returns -2 for "disk present but no filesystem recognized", which
+ * covers two very different situations:
+ *   (a) the disk is empty / freshly erased  -> auto-format is fine
+ *   (b) it holds a filesystem EZOS does not know (btrfs, XFS, an encrypted
+ *       volume, ...)                        -> auto-format destroys the data
+ * Only (a) may be auto-formatted. A blank disk reads as all-0x00 or all-0xFF
+ * for a good stretch at both LBA 0 and the partition start. Anything else is
+ * treated as "hands off".
+ * Read errors count as not-blank: fail closed, never format what we cannot
+ * read. */
+#define FS_BLANK_SCAN 16
+static int sec_blank(const uint8_t *s) {
+    uint8_t a = s[0];
+    for (uint32_t i = 1; i < 512; i++) {
+        if (s[i] != a) return 0;
+    }
+    return a == 0x00 || a == 0xFF;
+}
+
+int fs_drive_blank(void) {
+    static uint8_t sec[512];
+    uint32_t start = fs_volume_start(fs_preferred_drive);
+    for (uint32_t i = 0; i < FS_BLANK_SCAN; i++) {
+        if (ata_read_sector(fs_preferred_drive, i, sec) != 0) return 0;
+        if (!sec_blank(sec)) return 0;
+    }
+    for (uint32_t i = 0; i < FS_BLANK_SCAN; i++) {
+        if (ata_read_sector(fs_preferred_drive, start + i, sec) != 0) return 0;
+        if (!sec_blank(sec)) return 0;
+    }
+    return 1;
+}
+
 int fs_format(int fs_type) {
     /* 0 号盘是引导盘：拒绝格式化，防止把启动镜像抹掉 */
     if (fs_preferred_drive == 0) return -1;
