@@ -12,6 +12,10 @@ root_dir_cluster_value()，这条测试就是守这个差异的）。
 
 端口 4517(QMP) / 4518(serial)。
 """
+import os as _os_ez
+import sys as _sys_ez
+_sys_ez.path.insert(0, _os_ez.path.dirname(_os_ez.path.abspath(__file__)))
+from ezos_qemu import alloc_port, image_path, disk_path, log_path
 import os as _os_ezos
 import sys as _sys_ezos
 _sys_ezos.path.append(_os_ezos.path.dirname(
@@ -30,10 +34,10 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 
 QEMU = qemu_exe()
-QMP_PORT = 4517
-SERIAL_PORT = 4518
-IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
-DISK = os.path.join(ROOT, "disk.vhd")
+QMP_PORT = alloc_port()
+SERIAL_PORT = alloc_port()
+IMG = image_path()
+DISK = disk_path()
 WORK = os.path.join(HERE, "fatpath_disk.vhd").replace("\\", "/")
 
 from test_nvme import SerialReader, Qmp, wait_for, wait_port_free, kill_all_qemu  # noqa

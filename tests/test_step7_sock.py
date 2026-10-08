@@ -28,6 +28,10 @@ slirp 不会改写 guest→host 方向的帧内容）：
 退出码 0 = 全部断言通过。
 注：开机等待 BOOT_WAIT_S 是保守值；机器慢导致键入落空时把它调大。
 """
+import os as _os_ez
+import sys as _sys_ez
+_sys_ez.path.insert(0, _os_ez.path.dirname(_os_ez.path.abspath(__file__)))
+from ezos_qemu import alloc_port, image_path, disk_path, log_path
 import os as _os_ezos
 import sys as _sys_ezos
 _sys_ezos.path.append(_os_ezos.path.dirname(
@@ -44,8 +48,8 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QEMU = qemu_exe()
 GUEST_IP = "10.0.2.15"
-UDP_PORT = 7000
-TCP_PORT = 7001
+UDP_PORT = alloc_port()
+TCP_PORT = alloc_port()
 MON_PORT = 55555                 # QEMU human monitor（TCP；两阶段串行，复用无冲突）
 BOOT_WAIT_S = 10.0               # 开机到 shell 提示符的保守等待
 KEY_DELAY_S = 0.02               # 相邻 sendkey 的间隔

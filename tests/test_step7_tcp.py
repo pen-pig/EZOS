@@ -18,6 +18,10 @@
 前置：ninja 已产出 os-image.bin / disk.vhd（disk.vhd 需含 NETCLI.ELF）
 端口：netdev 4476（QEMU listen，脚本连），monitor 55666（sendkey 键入）
 """
+import os as _os_ez
+import sys as _sys_ez
+_sys_ez.path.insert(0, _os_ez.path.dirname(_os_ez.path.abspath(__file__)))
+from ezos_qemu import alloc_port, image_path, disk_path, log_path
 import os as _os_ezos
 import sys as _sys_ezos
 _sys_ezos.path.append(_os_ezos.path.dirname(
@@ -33,15 +37,15 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QEMU = qemu_exe()
-NET_PORT = 4476
-MON_PORT = 55666
+NET_PORT = alloc_port()
+MON_PORT = alloc_port()
 BOOT_WAIT_S = 10.0
 
 GUEST_MAC = bytes([0x52, 0x54, 0x00, 0x12, 0x34, 0x56])
 GUEST_IP = bytes([10, 0, 2, 15])
 HOST_MAC = bytes([0x02, 0x00, 0x00, 0x00, 0x00, 0x02])
 HOST_IP = bytes([10, 0, 2, 2])
-HOST_PORT = 7002
+HOST_PORT = alloc_port()
 
 FIN, SYN, RST, PSH, ACK = 0x01, 0x02, 0x04, 0x08, 0x10
 M32 = 0xFFFFFFFF

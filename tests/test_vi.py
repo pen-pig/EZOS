@@ -8,6 +8,11 @@ vi 的渲染被改成了逐字符着色渲染（语法高亮），画字符的�
 用法：python tests/test_vi.py   （退出码 0 = 全通过）
 端口 4482（端口必须每脚本唯一，见 tests/README.md）。
 """
+import os as _os_ez
+import sys as _sys_ez
+_sys_ez.path.insert(0, _os_ez.path.dirname(_os_ez.path.abspath(__file__)))
+from ezos_qemu import (alloc_port, image_path,
+                       disk_path, log_path, kill_stale_qemu)
 import os
 import shutil
 import subprocess
@@ -19,7 +24,7 @@ sys.path.insert(0, HERE)
 import test_rmdir as T
 from test_rmdir import Qmp, ROOT, QEMU  # noqa: F401
 
-PORT = 4482
+PORT = alloc_port()
 NAME = "VITEST.C"
 TEXT = "int main"          # 只用字母和空格：QEMU sendkey 对标点符号键名很挑
 
@@ -48,11 +53,10 @@ def type_text(qmp, s):
 def main():
     disk = os.path.join(HERE, "disk_vi.vhd").replace("\\", "/")
     shutil.copyfile(os.path.join(ROOT, "disk.vhd"), disk)
-    img = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
+    img = image_path()
 
     if T.port_in_use(PORT):
-        subprocess.call(["taskkill", "//F", "//IM", "qemu-system-x86_64.exe"],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        kill_stale_qemu("qemu-system-x86_64.exe")
         T.wait_port_free(PORT, 15)
 
     proc = subprocess.Popen([

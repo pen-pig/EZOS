@@ -14,6 +14,11 @@
 端口 4464（端口每脚本唯一，见 tests/README.md）。
 用法：python tests/test_uefi3.py   （退出码 0 = 全通过）
 """
+import os as _os_ez
+import sys as _sys_ez
+_sys_ez.path.insert(0, _os_ez.path.dirname(_os_ez.path.abspath(__file__)))
+from ezos_qemu import (alloc_port, image_path,
+                       disk_path, log_path, kill_stale_qemu)
 import os as _os_ezos
 import sys as _sys_ezos
 _sys_ezos.path.append(_os_ezos.path.dirname(
@@ -45,7 +50,7 @@ BOOT_EFI = os.path.join(ESP, "EFI/BOOT/BOOTIA32.EFI").replace("\\", "/")
 DISK_SRC = os.path.join(ROOT, "disk.vhd").replace("\\", "/")
 DISK = os.path.join(HERE, "uefi3_disk.vhd").replace("\\", "/")
 LOG = os.path.join(ROOT, "uefi/serial.log").replace("\\", "/")
-PORT = 4464
+PORT = alloc_port()
 BOOT_WAIT = 120
 SHOT = os.path.join(HERE, "uefi3_shot.ppm").replace("\\", "/")
 SHOT2 = os.path.join(HERE, "uefi3_shot2.ppm").replace("\\", "/")
@@ -209,8 +214,7 @@ def main():
         os.remove(LOG)
 
     if port_in_use(PORT):                # 上轮残留：清掉再跑
-        subprocess.call(["taskkill", "//F", "//IM", "qemu-system-i386.exe"],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        kill_stale_qemu("qemu-system-i386.exe")
         wait_port_free(PORT, 15)
     if not wait_port_free(PORT, 10):
         print("PORT %d still occupied - abort" % PORT)

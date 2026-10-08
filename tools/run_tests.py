@@ -22,13 +22,24 @@
     python tools/run_tests.py full
     python tools/run_tests.py test_mouse test_hostfs
 
+并行（--jobs / -j，默认 1 = 串行）：
+    python tools/run_tests.py core fs -j 4
+
+原来只能串行，因为所有测试共享 os-image.bin、disk.vhd 和写死在脚本里的
+QEMU 端口——两个一起跑就会互相踩。现在每个并行槽位（EZOS_SLOT）有自己的
+端口段和一份镜像/数据盘副本（见 tests/ezos_qemu.py），所以能并行：
+core+fs 从 43 分钟降到十几分钟。slot 0 = 不并行，路径与以前逐字节一致，
+所以并行功能的风险不会波及默认回归。
+
 输出：每项 PASS/FAIL/TIMEOUT + 耗时，末尾汇总；报告同时写 temp/test_report.txt。
 退出码非 0 = 有失败（可直接串进 CI/ninja）。
 """
 import os
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TESTS = os.path.join(ROOT, "tests")
@@ -180,7 +191,19 @@ def kill_stale_qemu():
 
 
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    argv = sys.argv[1:]
+    # -j/--jobs：默认 1，也就是原来的串行路径（行为完全不变）。
+    # 并行靠 EZOS_SLOT 给每个 worker 分端口段 + 私有镜像副本，见
+    # tests/ezos_qemu.py。
+    jobs, taken = 1, set()
+    for i, a in enumerate(argv):
+        if a in ("-j", "--jobs") and i + 1 < len(argv):
+            jobs = max(1, int(argv[i + 1]))
+            taken.add(i + 1)          # 别把 "4" 当成测试名
+        elif a.startswith("--jobs="):
+            jobs = max(1, int(a.split("=", 1)[1]))
+    args = [a for i, a in enumerate(argv)
+            if not a.startswith("-") and i not in taken]
     if not args:
         print(__doc__)
         return 2
@@ -235,7 +258,7 @@ def main():
         return 2
 
     try:
-        return run_all(names)
+        return run_all(names, jobs)
     finally:
         try:
             os.remove(LOCK)
@@ -243,7 +266,150 @@ def main():
             pass
 
 
-def run_all(names):
+def run_all(names, jobs=1):
+    """调度入口。jobs<=1 走原来的串行路径（行为逐字不变）。"""
+    if jobs <= 1:
+        return run_serial(names)
+    return run_parallel(names, jobs)
+
+
+def resolve_script(name):
+    """测试名 -> 脚本路径；找不到返回 None（静态检查类在 tools/ 下）。"""
+    script = os.path.join(TESTS, "test_%s.py" % name)
+    if os.path.isfile(script):
+        return script
+    for cand in (os.path.join(ROOT, "tools", "%s.py" % name),
+                 os.path.join(ROOT, "tools", "check_%s.py" % name)):
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def run_one(name, script, limit, env):
+    """跑一项，返回 (name, state, 耗时, 备注)。"""
+    t0 = time.time()
+    try:
+        p = subprocess.run([PY, script], cwd=ROOT, timeout=limit,
+                           capture_output=True, text=True,
+                           encoding="latin1", errors="replace", env=env)
+        code, tail = p.returncode, (p.stdout or "").strip().splitlines()
+        state = "PASS" if code == 0 else "FAIL"
+    except subprocess.TimeoutExpired:
+        code, tail, state = -1, ["timeout after %ds" % limit], "TIMEOUT"
+    except Exception as e:                                  # noqa: BLE001
+        code, tail, state = -1, [str(e)], "ERROR"
+    dt = time.time() - t0
+    note = tail[-1][:110] if (state != "PASS" and tail) else ""
+    return name, state, dt, note
+
+
+def last_times():
+    """从上一份报告里读耗时，用来把测试平均分给各 worker。
+
+    没有历史就按 60s 估算——比平均分好不了多少，但至少 rmdir（10 分钟）
+    不会被和一堆小测试塞进同一组。
+    """
+    times = {}
+    try:
+        with open(REPORT, encoding="utf-8") as f:
+            for line in f:
+                p = line.split()
+                if len(p) >= 3 and p[0] in ("PASS", "FAIL", "TIMEOUT", "ERROR"):
+                    try:
+                        times[p[1]] = float(p[2].rstrip("s"))
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    return times
+
+
+def split_groups(names, jobs):
+    """贪心分组：长的先放，每次放进当前预计总耗时最小的组。"""
+    times = last_times()
+    groups = [[] for _ in range(jobs)]
+    load = [0.0] * jobs
+    for n in sorted(names, key=lambda x: -times.get(x, 60.0)):
+        i = load.index(min(load))
+        groups[i].append(n)
+        load[i] += times.get(n, 60.0)
+    return groups, load
+
+
+def run_parallel(names, jobs):
+    """并行跑。
+
+    能并行的前提是三样东西都不再共享：端口（每个 slot 独占一段）、
+    os-image.bin / disk.vhd（每个 slot 一份副本）、串口日志文件（加 slot
+    前缀）——都由 tests/ezos_qemu.py 按 EZOS_SLOT 分配。
+
+    注意这里**不做** kill_stale_qemu()：它 taskkill 的是所有 QEMU，并行时
+    会杀掉别的 worker 正在跑的机器。残留进程改由端口探测规避（alloc_port
+    会跳过已被监听的端口），全部跑完后再统一清理一次。
+    """
+    groups, load = split_groups(names, jobs)
+    kill_stale_qemu()          # 此时还没有 worker 启动，清上一轮残留是安全的
+    print("=== 并行回归：%d 项 / %d 路 ===" % (len(names), jobs))
+    for i, (g, t) in enumerate(zip(groups, load)):
+        if g:
+            print("  槽位 %d: %s   (预计 %.1f min)"
+                  % (i + 1, " ".join(g), t / 60.0))
+    results, lock = [], threading.Lock()
+
+    def worker(gid, group):
+        # slot 0 留给"不并行"的路径；worker 从 1 开始编号
+        env = dict(os.environ, EZOS_SLOT=str(gid + 1))
+        for name in group:
+            script = resolve_script(name)
+            if script is None:
+                with lock:
+                    results.append((name, "MISSING", 0.0, ""))
+                    print("[槽%d] %-14s MISSING" % (gid + 1, name))
+                continue
+            # CPU 被分摊了，超时放宽；宁可慢判也不要误判 TIMEOUT
+            limit = int(TIMEOUT.get(name, 360) * 1.6)
+            name_, state, dt, note = run_one(name, script, limit, env)
+            with lock:
+                results.append((name_, state, dt, note))
+                print("[槽%d] %-14s %-7s %6.1fs %s"
+                      % (gid + 1, name_, state, dt, note))
+                write_report(sys.argv[1:], results)
+
+    t_all = time.time()
+    with ThreadPoolExecutor(max_workers=jobs) as ex:
+        for gid, group in enumerate(groups):
+            if group:
+                ex.submit(worker, gid, group)
+    kill_stale_qemu()
+    return summarize(results, t_all, names)
+
+
+def write_report(argv, results):
+    order = {n: i for i, n in enumerate(results)}
+    lines = ["run_tests %s" % " ".join(argv)]
+    for n, s, d, note in sorted(results, key=lambda r: order.get(r[0], 0)):
+        lines.append("  %-8s %-14s %6.1fs %s" % (s, n, d, note))
+    try:
+        with open(REPORT, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError:
+        pass
+
+
+def summarize(results, t_all, names):
+    pos = {n: i for i, n in enumerate(names)}
+    results.sort(key=lambda r: pos.get(r[0], 999))
+    bad = [r for r in results if r[1] != "PASS"]
+    total = time.time() - t_all
+    print("\n---- %d/%d passed, %.1f min ----"
+          % (len(results) - len(bad), len(results), total / 60.0))
+    if bad:
+        print("FAILED: %s" % ", ".join("%s(%s)" % (n, s) for n, s, _, _ in bad))
+    print("报告: %s" % REPORT)
+    return 1 if bad else 0
+
+
+def run_serial(names):
     """串行跑完所有项，返回退出码。"""
     print("=== 串行回归：%d 项 ===" % len(names))
     results = []
@@ -283,19 +449,9 @@ def run_all(names):
         print("%-7s %6.1fs %s" % (state, dt, note))
         results.append((name, state, dt, note))
         # 每项结束就落盘，中途被打断也留痕
-        with open(REPORT, "w", encoding="utf-8") as f:
-            f.write("run_tests %s\n" % " ".join(sys.argv[1:]))
-            for n, s, d, note2 in results:
-                f.write("  %-8s %-14s %6.1fs %s\n" % (s, n, d, note2))
+        write_report(sys.argv[1:], results)
 
-    bad = [r for r in results if r[1] != "PASS"]
-    total = time.time() - t_all
-    print("\n---- %d/%d passed, %.1f min ----"
-          % (len(results) - len(bad), len(results), total / 60.0))
-    if bad:
-        print("FAILED: %s" % ", ".join("%s(%s)" % (n, s) for n, s, _, _ in bad))
-    print("报告: %s" % REPORT)
-    return 1 if bad else 0
+    return summarize(results, t_all, names)
 
 
 if __name__ == "__main__":

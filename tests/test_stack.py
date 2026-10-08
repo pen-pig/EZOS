@@ -21,6 +21,10 @@ TASK_KSIZE 只有 16KB。栈越界在这里不会崩，只会静默写穿紧邻�
 
 端口 4661(QMP) / 4662(serial)。
 """
+import os as _os_ez
+import sys as _sys_ez
+_sys_ez.path.insert(0, _os_ez.path.dirname(_os_ez.path.abspath(__file__)))
+from ezos_qemu import alloc_port, image_path, disk_path, log_path
 import os
 import re
 import subprocess
@@ -38,10 +42,10 @@ _sys_ezos.path.append(_os_ezos.path.dirname(
 from ezos_env import qemu_exe  # noqa: E402
 
 QEMU = qemu_exe()
-IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
+IMG = image_path()
 # 一块干净的小裸盘就够了：本测试不格式化、不写盘（避免脏了共享的 disk.vhd）
 WORK = os.path.join(HERE, "stack_scratch.img").replace("\\", "/")
-QMP_PORT, SER_PORT = 4661, 4662
+QMP_PORT, SER_PORT = alloc_port(2)
 
 from test_nvme import SerialReader, Qmp, wait_for, wait_port_free, kill_all_qemu  # noqa
 

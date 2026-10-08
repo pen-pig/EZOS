@@ -53,6 +53,11 @@ shell 每敲一个字符会重画整行，所以串口上"提示符个数"会暴
 端口 4587（4585/4586 被 test_mouse.py 占用，端口必须每脚本唯一）。
 用法：python tests/test_corrupt.py   （退出码 0 = 全通过）
 """
+import os as _os_ez
+import sys as _sys_ez
+_sys_ez.path.insert(0, _os_ez.path.dirname(_os_ez.path.abspath(__file__)))
+from ezos_qemu import (alloc_port, image_path,
+                       disk_path, log_path, kill_stale_qemu)
 import os as _os_ezos
 import sys as _sys_ezos
 _sys_ezos.path.append(_os_ezos.path.dirname(
@@ -73,14 +78,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
 QEMU = qemu_exe()
-PORT = 4587
+PORT = alloc_port()
 PROMPT = b"[/] > "          # 引导结束标志
 BOOT_TIMEOUT = 120.0        # 坏盘上首次挂载可能很慢，给足
 CMD_TIMEOUT = 45.0
 
-IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
-SRC = os.path.join(ROOT, "disk.vhd")
-LOG = os.path.join(HERE, "corrupt_serial.log").replace("\\", "/")
+IMG = image_path()
+SRC = disk_path()
+LOG = log_path(os.path.join(HERE, "corrupt_serial.log").replace("\\", "/"))
 DISK = os.path.join(HERE, "corrupt_disk.img").replace("\\", "/")
 DISK_BYTES = 64 * 1024 * 1024   # FAT32 需要 >= 65525 簇，16MB 盘会被正确拒绝
 
@@ -201,8 +206,7 @@ def wait_port_free(port, timeout=15):
 def launch(disk):
     """起一台 QEMU。每个用例一台，绝不复用（坏盘可能把内核拖进怪状态）。"""
     if port_in_use(PORT):
-        subprocess.call(["taskkill", "//F", "//IM", "qemu-system-x86_64.exe"],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        kill_stale_qemu("qemu-system-x86_64.exe")
         wait_port_free(PORT, 15)
     if not wait_port_free(PORT, 10):
         raise RuntimeError("PORT %d occupied" % PORT)

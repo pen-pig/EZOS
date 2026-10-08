@@ -28,6 +28,11 @@ QEMU 侧两个必知的坑（都实测过，别改回去）：
 
 用法：python tests/test_usbmouse.py   （退出码 0 = 全通过）
 """
+import os as _os_ez
+import sys as _sys_ez
+_sys_ez.path.insert(0, _os_ez.path.dirname(_os_ez.path.abspath(__file__)))
+from ezos_qemu import (alloc_port, image_path,
+                       disk_path, log_path, kill_stale_qemu)
 import os as _os_ezos
 import sys as _sys_ezos
 _sys_ezos.path.append(_os_ezos.path.dirname(
@@ -45,16 +50,16 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 QEMU = qemu_exe()
-QMP_PORT = 4505
-SERIAL_PORT = 4506
+QMP_PORT = alloc_port()
+SERIAL_PORT = alloc_port()
 # icount shift=auto 下这台 QEMU 开机很慢（实测 45s 才走到 shell 提示符），
 # 等 shell 一律按"看得见证据"为准（串口出现 shell banner），不按乐观估计。
 BOOT_WAIT = 150
 SHELL_WAIT = 120
 MOVE_WAIT = 6
 
-IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
-DISK = os.path.join(ROOT, "disk.vhd")
+IMG = image_path()
+DISK = disk_path()
 
 
 class SerialReader(object):
@@ -165,8 +170,7 @@ def wait_for(serial, marker, timeout):
 
 
 def kill_all_qemu():
-    subprocess.call(["taskkill", "/F", "/IM", "qemu-system-x86_64.exe"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    kill_stale_qemu("qemu-system-x86_64.exe")
 
 
 def pick_hid_mouse(qmp):

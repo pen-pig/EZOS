@@ -33,6 +33,10 @@
 
 用法：python tests/test_dns.py   （退出码 0 = 全通过）
 """
+import os as _os_ez
+import sys as _sys_ez
+_sys_ez.path.insert(0, _os_ez.path.dirname(_os_ez.path.abspath(__file__)))
+from ezos_qemu import alloc_port, image_path, disk_path, log_path
 import os as _os_ezos
 import sys as _sys_ezos
 _sys_ezos.path.append(_os_ezos.path.dirname(
@@ -58,15 +62,15 @@ from test_dhcp import (HOST_MAC, SERVER_IP, OFFER_IP, MASK, BCAST_MAC,  # noqa: 
                        cksum, udp_checksum, arp_reply_to, icmp_reply_to)
 
 QEMU = qemu_exe()
-IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
-DISK = os.path.join(ROOT, "disk.vhd")
+IMG = image_path()
+DISK = disk_path()
 
-PORT_A = (4531, 4532, 4537)     # (QMP, serial, netdev)
-PORT_B = (4533, 4534, 4538)
-PORT_C = (4535, 4536, 4539)
-PORT_D = (4541, 4542, 4547)     # 缓存（命中/flush/TTL 过期）
-PORT_E = (4543, 4544, 4548)     # 多服务器回退
-PORT_F = (4545, 4546, 4549)     # ping 接域名
+PORT_A = alloc_port(3)  # (QMP, serial, netdev)
+PORT_B = alloc_port(3)
+PORT_C = alloc_port(3)
+PORT_D = alloc_port(3)  # 缓存（命中/flush/TTL 过期）
+PORT_E = alloc_port(3)  # 多服务器回退
+PORT_F = alloc_port(3)  # ping 接域名
 BOOT_WAIT = 150
 
 WORK = {

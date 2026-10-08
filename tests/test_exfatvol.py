@@ -18,6 +18,10 @@ ceil(cluster_count/8) 字节。512B/簇时一簇只覆盖 4096 个簇 = 2MB，�
 
 端口 4631(QMP) / 4632(serial)。
 """
+import os as _os_ez
+import sys as _sys_ez
+_sys_ez.path.insert(0, _os_ez.path.dirname(_os_ez.path.abspath(__file__)))
+from ezos_qemu import alloc_port, image_path, disk_path, log_path
 import math
 import os
 import re
@@ -36,9 +40,9 @@ _sys_ezos.path.append(_os_ezos.path.dirname(
 from ezos_env import qemu_exe  # noqa: E402
 
 QEMU = qemu_exe()
-IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
+IMG = image_path()
 WORK = os.path.join(HERE, "exfatvol_disk.img").replace("\\", "/")
-QMP_PORT, SER_PORT = 4631, 4632
+QMP_PORT, SER_PORT = alloc_port(2)
 
 # 16MB：约 32000 个 512B 簇 -> 位图 4000 字节 = 8 簇（跨簇路径必然被走到）。
 # 再小（比如 2MB 以下）位图只有一簇，这个测试就退化成普通的读写测试了。

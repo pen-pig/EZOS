@@ -12,6 +12,10 @@ ext4_group_first_block_no 的定义），含 1KB 块时的 +1 偏移。按 g*bpg
 
 端口 4601(QMP) / 4602(serial)。
 """
+import os as _os_ez
+import sys as _sys_ez
+_sys_ez.path.insert(0, _os_ez.path.dirname(_os_ez.path.abspath(__file__)))
+from ezos_qemu import alloc_port, image_path, disk_path, log_path
 import os
 import shutil
 import subprocess
@@ -29,9 +33,9 @@ _sys_ezos.path.append(_os_ezos.path.dirname(
 from ezos_env import qemu_exe  # noqa: E402
 
 QEMU = qemu_exe()
-IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
+IMG = image_path()
 WORK = os.path.join(HERE, "ext4vol_disk.img").replace("\\", "/")
-QMP_PORT, SER_PORT = 4601, 4602
+QMP_PORT, SER_PORT = alloc_port(2)
 
 # 16MB 默认：正好跨 2 个块组（1KB 块 x 8192 块/组 = 8MB/组）。
 # 传更大的值（如 320）可以压到 GDT 跨块（>32 组）这条路径。

@@ -12,6 +12,10 @@
 
 用法：python tests/test_refsvol.py [MB]     默认 64MB
 """
+import os as _os_ez
+import sys as _sys_ez
+_sys_ez.path.insert(0, _os_ez.path.dirname(_os_ez.path.abspath(__file__)))
+from ezos_qemu import alloc_port, image_path, disk_path, log_path
 import os
 import subprocess
 import sys
@@ -28,9 +32,9 @@ _sys_ezos.path.append(_os_ezos.path.dirname(
 from ezos_env import qemu_exe  # noqa: E402
 
 QEMU = qemu_exe()
-IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
+IMG = image_path()
 WORK = os.path.join(HERE, "refsvol_disk.img").replace("\\", "/")
-QMP_PORT, SER_PORT = 4641, 4642
+QMP_PORT, SER_PORT = alloc_port(2)
 
 MB = int(sys.argv[1]) if len(sys.argv) > 1 else 64
 VOL_BYTES = MB * 1024 * 1024

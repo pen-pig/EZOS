@@ -18,6 +18,10 @@ Zig: rust/ezos_zig）和两份文件名 hash（Rust / Zig），`rstest` 命令�
 端口 4563(serial) / 4564(QMP)。
 用法：python tests/test_multilang.py   （退出码 0 = 通过）
 """
+import os as _os_ez
+import sys as _sys_ez
+_sys_ez.path.insert(0, _os_ez.path.dirname(_os_ez.path.abspath(__file__)))
+from ezos_qemu import alloc_port, image_path, disk_path, log_path
 import os as _os_ezos
 import sys as _sys_ezos
 _sys_ezos.path.append(_os_ezos.path.dirname(
@@ -34,10 +38,10 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
 QEMU = qemu_exe()
-QMP_PORT = 4564
-SERIAL_PORT = 4563
-IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
-DISK = os.path.join(ROOT, "disk.vhd")
+QMP_PORT = alloc_port()
+SERIAL_PORT = alloc_port()
+IMG = image_path()
+DISK = disk_path()
 # 用**副本**而不是 disk.vhd 本体：宿主机上随时可能有别的进程（索引服务、
 # 杀软扫描、Explorer 缩略图）拿着它的句柄，QEMU 会直接
 # "Could not open ... 另一个程序正在使用此文件" 退出，测试看起来像

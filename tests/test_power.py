@@ -11,6 +11,11 @@ shutdown 在真机上必须走 ACPI PM1a_CNT（QEMU 的 0x604 硬编码无效）
 用法：python tests/test_power.py   （退出码 0 = 全通过）
 端口 4486（端口必须每脚本唯一，见 tests/README.md）。
 """
+import os as _os_ez
+import sys as _sys_ez
+_sys_ez.path.insert(0, _os_ez.path.dirname(_os_ez.path.abspath(__file__)))
+from ezos_qemu import (alloc_port, image_path,
+                       disk_path, log_path, kill_stale_qemu)
 import os
 import subprocess
 import sys
@@ -21,7 +26,7 @@ sys.path.insert(0, HERE)
 import test_rmdir as T
 from test_rmdir import Qmp, ROOT, QEMU
 
-PORT = 4486
+PORT = alloc_port()
 SERIAL_LOG = os.path.join(ROOT, "temp", "serial_power.log").replace("\\", "/")
 
 
@@ -34,13 +39,12 @@ def boot_and_wait(qmp, proc):
 def main():
     os.makedirs(os.path.dirname(SERIAL_LOG), exist_ok=True)
     if T.port_in_use(PORT):
-        subprocess.call(["taskkill", "//F", "//IM", "qemu-system-x86_64.exe"],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        kill_stale_qemu("qemu-system-x86_64.exe")
         T.wait_port_free(PORT, 15)
     if os.path.exists(SERIAL_LOG):
         os.remove(SERIAL_LOG)
 
-    img = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
+    img = image_path()
     disk = os.path.join(ROOT, "disk.vhd").replace("\\", "/")
 
     proc = subprocess.Popen([

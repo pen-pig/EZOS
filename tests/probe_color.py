@@ -9,6 +9,10 @@ E2E 那套 OCR 只认文本，加没加颜色它看不出来——但这个交�
 
 用法：python tests/probe_color.py
 """
+import os as _os_ez
+import sys as _sys_ez
+_sys_ez.path.insert(0, _os_ez.path.dirname(_os_ez.path.abspath(__file__)))
+from ezos_qemu import kill_stale_qemu
 import os
 import shutil
 import subprocess
@@ -63,8 +67,7 @@ def main():
     shot = os.path.join(HERE, "color_shot.ppm").replace("\\", "/")
 
     if T.port_in_use(T.PORT):
-        subprocess.call(["taskkill", "//F", "//IM", "qemu-system-x86_64.exe"],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        kill_stale_qemu("qemu-system-x86_64.exe")
         T.wait_port_free(T.PORT, 15)
 
     proc = subprocess.Popen([

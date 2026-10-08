@@ -23,6 +23,10 @@ checksum 都必须被判 FAIL。
 
 用法：python tests/test_vhd.py   （退出码 0 = 全通过）
 """
+import os as _os_ez
+import sys as _sys_ez
+_sys_ez.path.insert(0, _os_ez.path.dirname(_os_ez.path.abspath(__file__)))
+from ezos_qemu import alloc_port, image_path, disk_path, log_path
 import os
 import shutil
 import struct
@@ -31,7 +35,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-VHD = os.path.join(ROOT, "disk.vhd")
+VHD = disk_path()
 GEN = os.path.join(ROOT, "temp", "gen_diskimg.py")
 MAKE_VHD = os.path.join(ROOT, "tools", "make_vhd.py")
 TMP_BAD = os.path.join(HERE, "_vhd_bad.vhd")

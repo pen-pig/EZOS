@@ -11,6 +11,11 @@
 用法：python tests/test_vi_color.py   （退出码 0 = 全通过）
 端口 4483（端口每脚本唯一，见 tests/README.md）。
 """
+import os as _os_ez
+import sys as _sys_ez
+_sys_ez.path.insert(0, _os_ez.path.dirname(_os_ez.path.abspath(__file__)))
+from ezos_qemu import (alloc_port, image_path,
+                       disk_path, log_path, kill_stale_qemu)
 import os
 import shutil
 import subprocess
@@ -22,7 +27,7 @@ sys.path.insert(0, HERE)
 import test_rmdir as T
 from test_rmdir import Qmp, ROOT, QEMU  # noqa: E402
 
-PORT = 4483
+PORT = alloc_port()
 SHOT_CPP = os.path.join(HERE, "vicolor_cpp.ppm").replace("\\", "/")
 SHOT_PY = os.path.join(HERE, "vicolor_py.ppm").replace("\\", "/")
 
@@ -142,11 +147,10 @@ def dump_vi(qmp, name, shot):
 def main():
     disk = os.path.join(HERE, "disk_vicolor.vhd").replace("\\", "/")
     shutil.copyfile(os.path.join(ROOT, "disk.vhd"), disk)
-    img = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
+    img = image_path()
 
     if T.port_in_use(PORT):
-        subprocess.call(["taskkill", "//F", "//IM", "qemu-system-x86_64.exe"],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        kill_stale_qemu("qemu-system-x86_64.exe")
         T.wait_port_free(PORT, 15)
 
     proc = subprocess.Popen([

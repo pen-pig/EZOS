@@ -16,6 +16,10 @@ tools/make_usb_image.py 产出的 usb-image.bin 是为真机准备的：LBA0 是
 端口 4519(QMP/legacy) / 4520(serial/legacy)、4521(QMP/UEFI) / 4522(serial/UEFI)。
 UEFI 用例用 -nographic + 串口文件，串口走 TCP 更实时，所以两边都用 TCP。
 """
+import os as _os_ez
+import sys as _sys_ez
+_sys_ez.path.insert(0, _os_ez.path.dirname(_os_ez.path.abspath(__file__)))
+from ezos_qemu import alloc_port, image_path, disk_path, log_path
 import os as _os_ezos
 import sys as _sys_ezos
 _sys_ezos.path.append(_os_ezos.path.dirname(

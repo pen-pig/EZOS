@@ -20,6 +20,10 @@
 
 所有期望值都由宿主机侧现算，不写死。
 """
+import os as _os_ez
+import sys as _sys_ez
+_sys_ez.path.insert(0, _os_ez.path.dirname(_os_ez.path.abspath(__file__)))
+from ezos_qemu import alloc_port, image_path, disk_path, log_path
 import os as _os_ezos
 import sys as _sys_ezos
 _sys_ezos.path.append(_os_ezos.path.dirname(
@@ -38,8 +42,8 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 
 QEMU = qemu_exe()
-IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
-DISK = os.path.join(ROOT, "disk.vhd")
+IMG = image_path()
+DISK = disk_path()
 WORK_A = os.path.join(HERE, "hostfs_a.vhd").replace("\\", "/")
 WORK_B = os.path.join(HERE, "hostfs_b.vhd").replace("\\", "/")
 WORK_C = os.path.join(HERE, "hostfs_c.vhd").replace("\\", "/")

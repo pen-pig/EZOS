@@ -15,6 +15,10 @@
 
 端口 4585(QMP) / 4586(serial)。
 """
+import os as _os_ez
+import sys as _sys_ez
+_sys_ez.path.insert(0, _os_ez.path.dirname(_os_ez.path.abspath(__file__)))
+from ezos_qemu import alloc_port, image_path, disk_path, log_path
 import os as _os_ezos
 import sys as _sys_ezos
 _sys_ezos.path.append(_os_ezos.path.dirname(
@@ -34,10 +38,10 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 
 QEMU = qemu_exe()
-IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
-DISK = os.path.join(ROOT, "disk.vhd")
+IMG = image_path()
+DISK = disk_path()
 WORK = os.path.join(HERE, "mouse_work.vhd").replace("\\", "/")
-QMP_PORT, SER_PORT = 4585, 4586
+QMP_PORT, SER_PORT = alloc_port(2)
 
 from test_nvme import SerialReader, Qmp, wait_for, wait_port_free, kill_all_qemu  # noqa
 

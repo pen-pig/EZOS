@@ -26,6 +26,10 @@ EZOS 这里把系统卷编进内核镜像（.rodata），挂成 /system 与 /bin
 
 用法：python tests/test_sysvol.py   （退出码 0 = 全通过）
 """
+import os as _os_ez
+import sys as _sys_ez
+_sys_ez.path.insert(0, _os_ez.path.dirname(_os_ez.path.abspath(__file__)))
+from ezos_qemu import alloc_port, image_path, disk_path, log_path
 import os as _os_ezos
 import sys as _sys_ezos
 _sys_ezos.path.append(_os_ezos.path.dirname(
@@ -47,11 +51,11 @@ from test_nvme import (SerialReader, Qmp, flat, wait_for, wait_port_free,  # noq
                        kill_all_qemu, run_cmd)
 
 QEMU = qemu_exe()
-IMG = os.path.join(ROOT, "os-image.bin").replace("\\", "/")
-DISK = os.path.join(ROOT, "disk.vhd")
+IMG = image_path()
+DISK = disk_path()
 
-PORT_A = (4511, 4512)      # (QMP, serial)
-PORT_B = (4513, 4514)
+PORT_A = alloc_port(2)  # (QMP, serial)
+PORT_B = alloc_port(2)
 BOOT_WAIT = 150
 
 # 写测试会改盘内容，绝不拿 disk.vhd 本体开刀——每次跑复制一份。

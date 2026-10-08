@@ -20,6 +20,10 @@ fs_init 探测时先撞见 exFAT 就挂回 exFAT。用户看到的是"格式化�
 
 用法：python tests/test_reformat.py   （退出码 0 = 全通过）
 """
+import os as _os_ez
+import sys as _sys_ez
+_sys_ez.path.insert(0, _os_ez.path.dirname(_os_ez.path.abspath(__file__)))
+from ezos_qemu import alloc_port, image_path, disk_path, log_path
 import os
 import shutil
 import struct
@@ -33,7 +37,7 @@ from ezos_env import qemu_exe                                    # noqa: E402
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 import test_corrupt as tc                                        # noqa: E402
 
-SRC = os.path.join(ROOT, "disk.vhd")
+SRC = disk_path()
 DISK = os.path.join(HERE, "reformat_disk.img").replace("\\", "/")
 
 # 不含 fat32：disk.vhd 只有 16MB，FAT32 要求 >= 65525 簇，格式化会被正确
@@ -78,7 +82,14 @@ def fmt(fstype, start=0):
     p, qmp = tc.launch(DISK)
     try:
         done, out = tc.run_cmd(qmp, "setdrive 1")
-        if not done or "drive set to 1" not in tc.flat(out).lower():
+        low = tc.flat(out).lower()
+        # 只有"盘不存在"才是真失败。
+        # 盘上还没有文件系统时 setdrive 会报 "no filesystem found"——这是
+        # 正常的：fs_set_drive 已经把首选盘切到 1 了，接下来 format 就作用
+        # 在它上面。（以前这条用例依赖"空盘会被自动格式化成 exFAT"所以
+        # setdrive 总能成功；加了"自动格式化只对空盘动手"的门禁之后，带
+        # MBR 的盘不再算空盘，这里必须跟着改，否则 5 条分区@2048 用例全废。）
+        if not done or "not present" in low:
             return False, "setdrive 1 失败：%r" % tc.flat(out)[:120]
         done, out = tc.run_cmd(qmp, "format " + fstype, 180.0)
         if not done:

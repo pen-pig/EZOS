@@ -22,6 +22,10 @@
 
 用法：python tests/test_autofmt.py   （退出码 0 = 全通过）
 """
+import os as _os_ez
+import sys as _sys_ez
+_sys_ez.path.insert(0, _os_ez.path.dirname(_os_ez.path.abspath(__file__)))
+from ezos_qemu import alloc_port, image_path, disk_path, log_path
 import hashlib
 import os
 import sys
@@ -35,7 +39,7 @@ sys.path.insert(0, os.path.join(ROOT, "tests"))
 import test_corrupt as tc                                        # noqa: E402
 
 # 自己的端口与日志：回归是串行的，但不要和 corrupt 抢同一个文件
-tc.PORT = 4588
+tc.PORT = alloc_port()
 tc.LOG = os.path.join(ROOT, "temp", "autofmt_serial.log").replace("\\", "/")
 
 DISK = os.path.join(HERE, "autofmt_disk.img").replace("\\", "/")
