@@ -1380,11 +1380,11 @@ static void cmd_ls(const char *args) {
     while (*p && *p != ' ' && t < 63) target[t++] = *p++;
     target[t] = 0;
 
-    /* 16.9KB（64 x 264B）。**绝不能放栈上**：主栈只有约 21KB（.data 末尾
-     * ~0x8b000 到 0x90000），任务内核栈 TASK_KSIZE 只有 16KB——放栈上会让
-     * ls 一进来就越界写穿 .data（实测：ro_cwd 被目录项名字覆盖，提示符变成
-     * [A.TXT]，随后的 cat/write 全部失败）。static 落 .bss（19MB 区），
-     * ls 不重入，安全。 */
+    /* 16.9KB（64 x 264B）。**绝不能放栈上**：任务内核栈 TASK_KSIZE 只有
+     * 16KB，放栈上会让 ls 一进来就越界写穿相邻数据（实测：ro_cwd 被目录项
+     * 名字覆盖，提示符变成 [A.TXT]，随后的 cat/write 全部失败）。
+     * static 落 .bss（19MB 区），ls 不重入，安全。
+     * （主栈 2026-10 起已扩到 1MB，但任务栈仍只有 16KB，这条约束不变。） */
     static fs_dir_entry_t entries[64];
     int n;
     const char *title;
@@ -2606,11 +2606,11 @@ static void cmd_du(const char *args) {
     }
 
     /* du���г���ǰĿ¼ȫ����Ŀռ�ã�KB�����ܼ� */
-    /* 16.9KB（64 x 264B）。**绝不能放栈上**：主栈只有约 21KB（.data 末尾
-     * ~0x8b000 到 0x90000），任务内核栈 TASK_KSIZE 只有 16KB——放栈上会让
-     * ls 一进来就越界写穿 .data（实测：ro_cwd 被目录项名字覆盖，提示符变成
-     * [A.TXT]，随后的 cat/write 全部失败）。static 落 .bss（19MB 区），
-     * ls 不重入，安全。 */
+    /* 16.9KB（64 x 264B）。**绝不能放栈上**：任务内核栈 TASK_KSIZE 只有
+     * 16KB，放栈上会让 ls 一进来就越界写穿相邻数据（实测：ro_cwd 被目录项
+     * 名字覆盖，提示符变成 [A.TXT]，随后的 cat/write 全部失败）。
+     * static 落 .bss（19MB 区），ls 不重入，安全。
+     * （主栈 2026-10 起已扩到 1MB，但任务栈仍只有 16KB，这条约束不变。） */
     static fs_dir_entry_t entries[64];
     int n = fs_read_dir(entries, 64);
     if (n < 0) {

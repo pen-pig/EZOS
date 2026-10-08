@@ -4,8 +4,8 @@
 /* stack.h - 主栈水位。
  *
  * 内核栈是**没有 MMU 保护**的稀缺资源：
- *     主栈     = [__data_end, 0x90000)，实测约 21KB（linker.ld 里
- *                __data_end / __stack_top 两个符号给出边界）
+ *     主栈     = [0x100000, 0x200000) 1MB（linker.ld 里
+ *                __stack_bottom / __stack_top 两个符号给出边界）
  *     任务内核栈 = TASK_KSIZE = 16KB（kernel/task.h）
  *     ring0 IRQ 不切栈，中断还会往当前栈上再压一帧
  *

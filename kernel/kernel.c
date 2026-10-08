@@ -314,7 +314,7 @@ static void klog_cpuinfo(void) {
 
 /* ===== main stack high-water mark =====
  * The kernel stack has NO MMU protection and is tiny:
- *   main stack  = [__data_end, 0x90000)  ~19KB (symbols from linker.ld)
+ *   main stack  = [0x100000, 0x200000)  1MB (symbols from linker.ld)
  *   task stack  = TASK_KSIZE = 16KB (kernel/task.h)
  *   ring0 IRQs do not switch stacks, so they add on top of whatever is
  *   already there.
@@ -331,12 +331,13 @@ static void klog_cpuinfo(void) {
  * esp (return address, saved regs, caller arguments) is left alone.
  */
 extern uint8_t __data_end[];
+extern uint8_t __stack_bottom[];
 extern uint8_t __stack_top[];
 
 void stack_paint(void) {
     uint32_t sp;
     asm volatile("movl %%esp, %0" : "=r"(sp));
-    uint32_t lo = (uint32_t)__data_end;
+    uint32_t lo = (uint32_t)__stack_bottom;
     uint32_t hi = (uint32_t)__stack_top;
     if (sp < hi) hi = sp;              /* only below esp is free */
     if (hi <= lo) return;
@@ -344,7 +345,7 @@ void stack_paint(void) {
 }
 
 uint32_t stack_high_water(void) {
-    uint32_t lo = (uint32_t)__data_end;
+    uint32_t lo = (uint32_t)__stack_bottom;
     uint32_t top = (uint32_t)__stack_top;
     uint32_t a = lo;
     while (a < top && *(volatile uint8_t *)a == 0xA5u) a++;
@@ -352,7 +353,7 @@ uint32_t stack_high_water(void) {
 }
 
 uint32_t stack_total(void) {
-    return (uint32_t)__stack_top - (uint32_t)__data_end;
+    return (uint32_t)__stack_top - (uint32_t)__stack_bottom;
 }
 
 void kernel_main(void) {

@@ -33,7 +33,7 @@ global g_syscall_frame
 global g_user_exited
 
 _start:
-    mov esp, 0x90000
+    mov esp, 0x200000
 
     ; 清零 .bss 段（内核镜像只加载 64KB，超出部分保持 BIOS 残留，必须显式清零）
     mov edi, __bss_start

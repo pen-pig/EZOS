@@ -14,11 +14,12 @@ ZIG     = D:/MyOS/tools/zig/zig-x86_64-windows-0.15.1/zig.exe
 CARGO   = C:/Users/admin/.cargo/bin/cargo.exe
 
 # ===================== ?????? =====================
-# -Os：见 ci/build.sh 里的同一段说明。**必须和 CI 保持一致**——CI 用的是
-# Ubuntu 系统 gcc 13，同一份源码 -O2 会编出 579KB，撞穿 linker.ld 的
-# 496KB 上限（镜像 0x10000、主栈 0x90000，中间只有 512KB）。-Os 下两边都
-# 有几十 KB 余量。
-CFLAGS  = -ffreestanding -Os -Wall -Wextra -Werror -Ikernel -MMD
+# -O2：见 ci/build.sh 里的同一段说明。**必须和 CI 保持一致**——两边都是
+# -O2。窗口已扩到 672KB（镜像 0x10000..0xB8000，主栈搬到 1MB..2MB），CI 的
+# gcc 13 -O2 编出 579KB、本机 i686-elf-gcc 编出 504KB，余量充足。以前主栈
+# 占着 0x90000，窗口只有 496KB，只能靠 -Os 硬压换余量——那是拿代码质量换
+# 体积，现在不用了。
+CFLAGS  = -ffreestanding -O2 -Wall -Wextra -Werror -Ikernel -MMD
 LDFLAGS = -m elf_i386 -T linker.ld --oformat binary -e _start
 
 # ===================== ???? =====================
@@ -75,7 +76,7 @@ rule link_user
 
 rule make_image
     # 内核镜像大小是动态的：tools/make_image.py 按 kernel_raw.bin 的真实大小
-    # 算扇区数（向上取整 + 凑偶数，上限 992 扇区 = 496KB），把扇区数写进引导
+    # 算扇区数（向上取整 + 凑偶数，上限 1344 扇区 = 672KB），把扇区数写进引导
     # 扇区偏移 0x1FC 的保留字段，boot.asm 运行时从内存读它。三条契约：
     #   boot/boot.asm（读 0x1FC）、tools/make_image.py（写 0x1FC）、
     #   uefi/main.c（UEFI 无引导扇区，直接用文件真实大小）
@@ -220,7 +221,7 @@ rule lint
 
 build lint: lint tools/lint.py
 
-# 栈帧预算：内核主栈只有 ~21KB（0x8b000..0x90000）、任务内核栈 TASK_KSIZE 16KB，
+# 栈帧预算：内核主栈 1MB（0x100000..0x200000）、任务内核栈 TASK_KSIZE 16KB，
 # 栈上放大数组会**静默写穿紧邻的 .data**（历史 bug：shell.c cmd_ls 的
 # fs_dir_entry_t entries[64] = 16.9KB 覆盖了 fs.c 的 ro_cwd，症状是提示符变
 # [A.TXT]、cat/write 全挂，伪装成文件系统损坏）。同 lint 一样不进 default。

@@ -3,8 +3,8 @@
 [bits 16]
 
 KERNEL_OFFSET equ 0x10000     ; �ں˼��ص�ַ
-KERNEL_SECTORS_MAX equ 992    ; hard cap: image lives at 0x10000, main stack at 0x90000
-                              ; -> 512KB window, 16KB of it left for the stack
+KERNEL_SECTORS_MAX equ 1344   ; hard cap: image window is 0x8000..0xB8000
+                              ; (704KB); above that is the VGA text buffer
 
 start:
     xor ax, ax
@@ -276,7 +276,7 @@ protected_mode_start:
     mov fs, ax
     mov gs, ax
     mov ss, ax
-    mov esp, 0x90000
+    mov esp, 0x200000
 
     call KERNEL_OFFSET
     jmp $

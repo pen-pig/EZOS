@@ -3,7 +3,8 @@
  *
  * 当前策略：identity mapping（虚拟地址 == 物理地址），覆盖
  *   0x00000000 - 0x02000000（32MB）：低 1MB（VGA/BIOS/实模式残区）、
- *   内核镜像 0x10000-0x8C000、.bss.hi 1-2MB（堆 + dmesg）、.bss 19MB 起、
+ *   内核镜像 0x10000-0xB8000（672KB 窗口）、主栈 1-2MB、
+ *   .bss 19MB 起、.bss.hi 30MB 起、
  *   GUI 背缓冲 16MB 起（gfxwin GW_BB_ADDR）、页表自身。
  *   另按 boot.asm 探测到的 VBE LFB（通常 0xE0000000）映射 8MB 窗口。
  *
@@ -11,8 +12,8 @@
  * 用户页（PTE_US）与步骤 6 的按需换页铺路。identity mapping 让现有
  * 全部代码零改动继续运行。
  *
- * 页表物理位置：0x200000（2MB）起（低 1MB 被镜像/.bss/栈占满，
- * 2MB-16MB 是 .bss.hi 与 GUI 背缓冲之间的空闲 RAM）。
+ * 页表物理位置：0x200000（2MB）起（低 1MB 是镜像 + VGA/BIOS 残区，
+ * 1-2MB 是主栈，2MB-16MB 是到 GUI 背缓冲之间的空闲 RAM）。
  */
 #ifndef PAGING_H
 #define PAGING_H
@@ -33,11 +34,10 @@
 #define PTE_G            0x100u     /* Global（CR4.PGE 时 TLB 不刷） */
 
 /* 页结构物理位置：0x200000（2MB）起。
- * 低内存不可用：镜像可增长到 0x8C000（496KB），栈自 0x90000 向下增长，
- * 0xA0000 起是 VGA；.bss 已解耦到 19MB（linker.ld）；2-4MB 虚拟段是
- * exec 装载的 PD[1] 暂存区，不能放常驻数据。
- * 2MB 是 .bss.hi 上界（linker.ld ASSERT <= 0x200000），与 GUI 背缓冲
- * （GW_BB_ADDR 0x1000000）之间的大块 RAM 里，2-4MB 留给 exec 暂存。 */
+ * 低内存不可用：镜像占 0x8000-0xB8000，0xB8000 起是 VGA 文本缓冲；
+ * 主栈在 1-2MB（栈顶 0x200000，向下生长）；.bss 已解耦到 19MB、
+ * .bss.hi 到 30MB（linker.ld）；2-4MB 虚拟段是 exec 装载的 PD[1] 暂存区，
+ * 不能放常驻数据。故固定取 2MB（0x200000），紧跟主栈之上。 */
 #define PAGING_PD_ADDR   0x00200000u
 #define PAGING_PT_BASE   0x00201000u
 #define PAGING_PT_MAX    16u                     /* 页表池容量（64KB） */

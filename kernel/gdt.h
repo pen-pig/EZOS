@@ -36,7 +36,7 @@
 #define SEL_UDATA       (GDT_UDATA_SEG | 3u)     /* 0x23 */
 
 /* 内核栈：TSS.esp0 指向这里。与 kernel_entry.asm / boot.asm 的 esp 初值一致。 */
-#define GDT_KERNEL_STACK 0x90000u
+#define GDT_KERNEL_STACK 0x200000u
 
 /* ring3 陷入专用内核栈（16KB @ 物理 9MB，范围 0x8FC000-0x900000）。
  *
