@@ -244,16 +244,26 @@ def gold_path(name):
     return os.path.join(HERE, "corrupt_gold_%s.img" % name).replace("\\", "/")
 
 
-def corrupt(dst, gold, seed, nflips=24, span=96 * 1024):
-    """按固定种子做单 bit 翻转。只在卷头部动手，那里才是元数据。"""
+def corrupt(dst, gold, seed, nflips=6, span=96 * 1024, start=4096):
+    """按固定种子做单 bit 翻转。只在卷头部动手，那里才是元数据。
+
+    start=4096：**跳过前 4KB**。那里是引导扇区 / 超级块，翻坏了卷直接挂不
+    上，fs_init 会回退到别的 FS，于是后面所有命令都跑在一个**没被破坏**的
+    卷上——曾经 86 条"全绿"就是这么来的，一条都没碰到坏数据。
+    从 4KB 往后翻，卷还挂得上，破坏才落在真正被遍历的元数据（FAT 表、
+    GDT、inode 表、目录块）上。超级块的不可信输入由定向用例单独覆盖。
+    """
     shutil.copyfile(gold, dst)
     size = os.path.getsize(dst)
+    lo = min(start, size - 1)
     hi = min(span, size)
+    if hi <= lo:
+        hi = size
     rnd = random.Random(seed)
     hits = []
     with open(dst, "r+b") as f:
         for _ in range(nflips):
-            off = rnd.randrange(hi)
+            off = rnd.randrange(lo, hi)
             f.seek(off)
             b = f.read(1)
             if not b:
@@ -328,12 +338,138 @@ def corrupt_exfat_cycle(dst):
         return off, _u32(old, 0), root
 
 
-# 定向损坏：只有这两个 FS 的根目录是 FAT 簇链（ext4/NTFS/F2FS/ReFS 不是），
-# 自环才有意义。
+def corrupt_ext4_blkcount(dst):
+    """把 ext4 超级块的 s_blocks_count_lo 改成天文数字。
+
+    不加闸的话 e4_groups = blocks_total / blocks_per_group 会算到几十万，
+    分配/扫描遍历块组的循环就是几十万次块读，ls 直接挂死；而且
+    `blocks_total - first_data_blk` 还能 uint64 下溢。挂载时按 ata_capacity
+    定上界 + 组数卡 65536，就是为这个场景加的。"""
+    base = vol_base(dst)
+    sb_off = base + 1024
+    with open(dst, "r+b") as f:
+        f.seek(sb_off)
+        sb = f.read(1024)
+        if len(sb) < 1024 or _u16(sb, 0x38) != 0xEF53:
+            return None                      # 不是 ext4 超级块
+        off = sb_off + 0x4                   # s_blocks_count_lo
+        f.seek(off)
+        old = f.read(4)
+        if len(old) != 4:
+            return None
+        f.seek(off)
+        f.write(struct.pack("<I", 0xFFFFFFFF))
+        return off, _u32(old, 0), 0xFFFFFFFF
+
+
+def corrupt_ext4_depth(dst):
+    """把块组 0 的 inode 表里每个 inode 的 extent 头写成 entries/depth=0xFFFF。
+
+    depth 是递归层数：不加闸会递归 65535 层，16KB 内核栈一帧也撑不住。
+    entries 是循环上界：不加闸时 hdr+12+i*12 读到缓冲外几百 KB。
+    inode 表块号从块组描述符的 bg_inode_table_lo（GDT 项偏移 0x8）取，
+    不猜位置——ext4 的元数据布局随 blksize/特性变，猜必错。"""
+    base = vol_base(dst)
+    sb_off = base + 1024
+    with open(dst, "r+b") as f:
+        f.seek(sb_off)
+        sb = f.read(1024)
+        if len(sb) < 1024 or _u16(sb, 0x38) != 0xEF53:
+            return None
+        logb = _u32(sb, 0x18)
+        if logb > 2:
+            return None
+        blksize = 1024 << logb          # s_log_block_size
+        ino_size = _u16(sb, 0x58) or 128  # s_inode_size
+        # GDT 起始块：1KB 块时 superblock 独占块 0，GDT 从块 2 起；否则块 1
+        gdt_blk = 2 if blksize == 1024 else 1
+        f.seek(base + gdt_blk * blksize)
+        gd = f.read(32)
+        if len(gd) < 32:
+            return None
+        ino_tbl = _u32(gd, 0x8)         # bg_inode_table_lo
+        if ino_tbl == 0:
+            return None
+        off = base + ino_tbl * blksize
+        f.seek(off)
+        blk = bytearray(f.read(blksize))
+        if len(blk) < blksize:
+            return None
+        # 先造一个"自环"的 extent 叶子块：块 L 的 header 里唯一的 index
+        # 指向块 L 自己。这样 e4_free_extent_node 每递归一层都读同一块，
+        # depth 从 0xFFFF 一路减到底 —— 没有深度闸就是 65535 层栈帧。
+        # 用一个远离元数据的块（1KB 块号 1000，16MB 卷里是数据区）。
+        LEAF = 1000
+        if (LEAF + 1) * blksize > os.path.getsize(dst) - base:
+            return None
+        node = bytearray(blksize)
+        struct.pack_into("<HHHH", node, 0, 0xF30A, 0xFFFF, 0xFFFF, 0xFFFF)
+        struct.pack_into("<II", node, 12, 0, LEAF)   # ei_block=0, ei_leaf=LEAF
+        f.seek(base + LEAF * blksize)
+        f.write(bytes(node))
+
+        n = 0
+        # inode 表通常跨好几个块（ipg=1024 x 128B = 128KB），A.TXT 的 inode
+        # 一般不在第一块里。只改第一块的话改到的全是保留 inode，一个文件
+        # inode 都没碰到 —— 破坏"造出来了"但等于没造（n 会算成 0）。
+        ipg = _u32(sb, 0x28)
+        nblk = (ipg * ino_size + blksize - 1) // blksize
+        if nblk < 1:
+            nblk = 1
+        if nblk > 8:
+            nblk = 8                    # 前 8 块足够覆盖前几十个 inode
+        for b in range(nblk):
+            f.seek(base + (ino_tbl + b) * blksize)
+            blk = bytearray(f.read(blksize))
+            if len(blk) < blksize:
+                break
+            for i in range(blksize // ino_size):
+                # **目录 inode 必须留着**：连目录的 extent 头都改坏的话，
+                # rm 先就找不到文件，直接报 failed to delete，根本走不到
+                # 释放路径 —— 递归爆栈这条就测不到（拆了闸也绿）。
+                mode = struct.unpack_from("<H", blk, i * ino_size)[0]
+                if (mode & 0xF000) == 0x4000:      # 目录
+                    continue
+                ib = i * ino_size + 0x28    # i_block
+                if ib + 24 > blksize:
+                    break
+                # header: magic + entries=0xFFFF + max + depth=0xFFFF
+                struct.pack_into("<HHHH", blk, ib, 0xF30A, 0xFFFF, 0xFFFF,
+                                 0xFFFF)
+                # 第一个 index 指向自环叶子块
+                struct.pack_into("<II", blk, ib + 12, 0, LEAF)
+                # 强制走 extent 释放路径：小文件（A.TXT 只有一个块）默认是
+                # legacy 直接块，i_flags 里没有 EXTENTS_FL，e4_free_inode_blocks
+                # 会走 else 分支，压根不进 e4_free_extent_node —— 递归这条
+                # 就永远测不到。
+                fo = i * ino_size + 0x20            # i_flags
+                struct.pack_into("<I", blk, fo,
+                                 struct.unpack_from("<I", blk, fo)[0] |
+                                 0x00080000)        # EXT4_EXTENTS_FL
+                n += 1
+            f.seek(base + (ino_tbl + b) * blksize)
+            f.write(bytes(blk))
+        if n == 0:
+            return None
+        return base + ino_tbl * blksize, 0, n
+
+
+# 定向损坏：
+# - exfat/fat32 根目录是 FAT 簇链，自环才有意义；
+# - ext4 的两个是纯磁盘字段当循环边界用的典型（块数 / extent 头）。
 CYCLE = {"exfat": corrupt_exfat_cycle, "fat32": corrupt_fat32_cycle}
+DIRECTED = {
+    "ext4": [("超级块块数=天文数字", corrupt_ext4_blkcount),
+             ("extent 头 depth/entries=0xFFFF", corrupt_ext4_depth)],
+}
 
 FS_LIST = ["exfat", "fat32", "ext4", "ntfs", "f2fs", "refs"]
 SEEDS = [1, 2, 3]
+# 调试用：EZOS_CORRUPT_FS=ext4 只跑 ext4（全量 30 分钟，改一个 FS 的
+# 定向用例时不该等全套）。
+_only = _os_ezos.environ.get("EZOS_CORRUPT_FS")
+if _only:
+    FS_LIST = [s for s in _only.split(",") if s]
 
 
 def make_gold(name):
@@ -341,6 +477,13 @@ def make_gold(name):
     fresh_disk()
     p, qmp = launch(DISK)
     try:
+        # **必须先切到数据盘再 format**。format 作用于"当前 FS drive"，
+        # 而启动时 FS 挂在内置系统卷（drive 0）上——不切盘的话 format 格的
+        # 是系统卷，数据盘从头到尾是原始副本，后面所有"坏盘"用例都在一个
+        # 根本没被格式化的盘上跑。这个测试曾经 86 条全绿就是这么来的。
+        done, out = run_cmd(qmp, "setdrive 1")
+        if not done or "drive set to 1" not in flat(out).lower():
+            return False, "setdrive 1 失败：%r" % flat(out)[:160]
         done, out = run_cmd(qmp, "format " + name, 180.0)
         if not done:
             return False, "format 卡住（180s 无结果）"
@@ -366,8 +509,12 @@ def make_gold(name):
     return True, "ok"
 
 
-def probe(tag, where):
-    """用当前 DISK 起一台机器，断言"引导没卡住 + ls 能跑完 + 没有 panic"。"""
+def probe(tag, where, extra=()):
+    """用当前 DISK 起一台机器，断言"引导没卡住 + 命令能跑完 + 没有 panic"。
+
+    extra 用来给定向用例加命令：随机翻位那批只跑读，但有些缺陷只在写/删
+    路径上（比如 ext4 释放 extent 树的递归），不加 rm 就永远绿——
+    **不加命令的定向用例是假绿**，反向拆闸验证时才发现（拆了闸它照样绿）。"""
     out = []
     try:
         p, qmp = launch(DISK)
@@ -377,10 +524,29 @@ def probe(tag, where):
         print("  !! %s 引导未达提示符：%s（改动位置 %s）" % (tag, e, where))
         return out
     try:
+        # **必须先切到数据盘**。启动时 FS 默认挂在内置系统卷（drive 0）上，
+        # 不切的话 ls/cat/df 全跑在一个**根本没被破坏**的卷上——
+        # 曾经"86 条全绿"就是这么来的：一条都没碰到坏盘。
+        # 前置条件失败必须中止，否则后面每条都是毫无意义的绿
+        # （rmdir 那次 11 条假绿就是这么踩的）。
+        # 大小写别硬匹配：内核打印的是 "fs drive set to 1 (exfat)"。
+        done, out0 = run_cmd(qmp, "setdrive 1")
+        low = flat(out0).lower()
+        if not done or "drive set to 1" not in low:
+            out.append(("%s: 能切到数据盘 drive 1" % tag, False))
+            print("  !! %s setdrive 1 失败：%r（后续用例无意义，中止）"
+                  % (tag, flat(out0)[:160]))
+            return out
+        # 挂载失败时 fs_init 会回退到别的 FS，命令跑在回退卷上——那也是
+        # "没挂死"，但**没碰到坏数据**，所以单独标出来，别让它混进
+        # "遍历路径安全"的结论里。
+        if "(exfat)" in low and not tag.startswith("exfat"):
+            print("  ~~ %s：卷没挂上（回退到 exfat），只验证了挂载阶段不挂死"
+                  % tag)
         # ls 覆盖目录遍历，cat 覆盖读路径（簇链/extent/NAT），
         # df 覆盖全卷扫描（FAT 链 / 位图）——三条路径分属不同代码，
         # 只测 ls 会漏掉后两条。
-        for cmd in ("ls", "cat A.TXT", "df"):
+        for cmd in ["ls", "cat A.TXT", "df"] + list(extra):
             alive, _ = run_cmd(qmp, cmd)
             out.append(("%s: %s 未挂死" % (tag, cmd), alive))
             if not alive:
@@ -413,17 +579,42 @@ def main():
             print("  !! %s 黄金盘失败：%s —— 跳过该 FS 的坏盘用例" % (name, info))
             continue
 
+        # 干净盘重启：验证"格式化好的卷重新挂载"这条路径本身是通的。
+        # 没有这条的话，万一 fs_init 根本挂不上某个 FS，所有坏盘用例都会
+        # 以"回退到别的 FS"的方式通过，看起来全绿其实一条都没测到。
+        shutil.copyfile(gold_path(name), DISK)
+        results.extend(probe("%s 干净盘重启" % name, []))
+
         for seed in SEEDS:
             hits = corrupt(DISK, gold_path(name), seed)
             results.extend(probe("%s seed=%d" % (name, seed), hits))
 
+        # 定向用例一律**从黄金盘重新复制**再改。踩过：原来直接在上一轮
+        # 翻过位的盘上叠加，而那盘经常已经坏到挂载失败了，于是破坏根本
+        # 没碰到目标路径——拆掉内核里的闸它也照样绿，是彻头彻尾的假绿。
         if name in CYCLE:
+            shutil.copyfile(gold_path(name), DISK)
             info = CYCLE[name](DISK)
             if info is None:
                 results.append(("%s: 能造出根目录链自环" % name, False))
                 print("  !! %s 读不出 BPB/根簇，定向自环没造出来" % name)
             else:
                 results.extend(probe("%s 根目录链自环" % name, [info[0]]))
+
+        for label, fn in DIRECTED.get(name, []):
+            shutil.copyfile(gold_path(name), DISK)
+            info = fn(DISK)
+            if info is None:
+                results.append(("%s: 能造出%s" % (name, label), False))
+                print("  !! %s 定向损坏没造出来：%s" % (name, label))
+            else:
+                results.extend(probe("%s %s" % (name, label), [info[0]],
+                                    # rm 走释放路径（ext4 释放 extent 树是递归，
+                                    # depth 没闸就爆栈）；write 走分配路径
+                                    # （遍历块组找空闲块，组数没闸就是几十万
+                                    # 次块读）。少了这两条，定向用例拆了内核
+                                    # 的闸照样绿——那就等于没测。
+                                    extra=("rm A.TXT", "write B.TXT hello")))
 
     npass = sum(1 for _, ok in results if ok)
     for label, ok in results:

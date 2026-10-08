@@ -16,7 +16,10 @@
 set -uo pipefail
 
 LOG=${LOG:-serial.log}
-QEMU_TIMEOUT=${QEMU_TIMEOUT:-30}
+# 45s 而不是 30s：CI 机器忙的时候内核跑完 25 个子系统自检要十几秒，30s
+# 曾经差一点点没跑到，于是"全部子系统自检通过"偶发红一次（5 次里 1 次，
+# 本地连跑 5 次复现不出来）。多给 15 秒比加个会掩盖真问题的重试划算。
+QEMU_TIMEOUT=${QEMU_TIMEOUT:-45}
 IMG=${IMG:-os-image.bin}
 DISK=${DISK:-disk.img}
 # CI 上 qemu 在 PATH 里；本机（Windows）没有，用 EZOS_QEMU 指全路径。
@@ -105,7 +108,11 @@ if [ "$fails" -eq 0 ]; then
 fi
 
 echo "[smoke] FAIL: $fails assertion(s) red —— 串口日志尾部："
-tail -n 40 "$LOG" | grep -v '^[[:space:]]*$' | tail -n 10 | while IFS= read -r l; do
+# 自检行单独打一遍：红的大概率就是它，混在 tail 里容易被横幅/ASCII art 挤掉
+grep -n -e "SELFTEST" "$LOG" | tail -8 | while IFS= read -r l; do
+    ann_err "selftest: ${l:0:180}"
+done
+tail -n 40 "$LOG" | grep -v '^[[:space:]]*$' | tail -n 15 | while IFS= read -r l; do
     ann_err "serial tail: ${l:0:180}"
 done
 exit 1

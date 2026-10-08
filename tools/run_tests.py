@@ -49,7 +49,8 @@ LAYERS = {
              "usbmsc", "usbboot", "ehci"],
     "net":  ["netapp", "dhcp", "dns"],
     "gui":  ["vi", "vi_color", "uefi3"],
-    # corrupt：故意把盘改坏后断言内核不卡死（6 FS x 3 种子，约 15 分钟）
+    # corrupt：故意把盘改坏后断言内核不卡死（6 FS，黄金盘 + 随机翻位 +
+    # 定向损坏，约 45 分钟）
     "deep": ["step7_sock", "step7_tcp", "corrupt"],
     "hw":   ["ahci", "nvme", "power", "edge", "heap", "jobs", "lock"],
     "util": ["digest"],
@@ -92,7 +93,11 @@ TIMEOUT = {
     # exfatvol 要起两轮 QEMU（中间宿主机改写盘），放宽到 8 分钟。
     "ext4vol": 420, "f2fsvol": 420, "refsvol": 420, "exfatvol": 480,
     # 坏盘健壮性：6 个 FS 各起 1 台机器做黄金盘 + 3 台跑坏盘，实测 ~15 分钟
-    "corrupt": 1800,
+    # corrupt：故意把盘改坏后断言内核不卡死。每个 FS 要重新格式化黄金盘，
+    # 外加干净盘重启 + 3 个随机种子 + 定向用例，6 个 FS 约 45 分钟
+    # （早期版本用例少，1800s 够；加了定向用例和"必须先 setdrive 1"之后
+    # 每个用例多了几条命令，超时要跟着放，否则跑一半被砍成 TIMEOUT）。
+    "corrupt": 3600,
 }
 
 # 这些测试要 GUI 像素/OCR，默认不进 core/full 的常规集合（太慢且脆）

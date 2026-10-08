@@ -296,9 +296,39 @@ void fs_set_drive(uint8_t drive) {
     }
 }
 
+/* 格式化前抹掉卷头部的旧文件系统签名。
+ *
+ * 踩过：format 只写自己的元数据、不清盘，于是旧卷的魔数原样留在原地——
+ * 把一张 exFAT 盘格成 ext4，重启后 fs_init 先探测到残留的 "EXFAT" 又挂回
+ * exFAT，用户看到的是"格式化了但没生效"，而且旧文件还在。
+ * 清卷起点后 16 个扇区（8KB）足够盖住所有 FS 的签名区，又不至于把整盘
+ * 写一遍（16MB 盘 PIO 全盘写要好几秒）。MBR 本身在 LBA 0，不动它。 */
+#define FS_WIPE_SECTORS 16
+static void fs_wipe_head(uint8_t drive) {
+    static uint8_t sec[512];
+    uint32_t start = 0;
+    if (ata_read_sector(drive, 0, sec) == 0 &&
+        sec[510] == 0x55 && sec[511] == 0xAA) {
+        for (int i = 0; i < 4; i++) {
+            const uint8_t *e = sec + 446 + i * 16;
+            if (e[4] == 0) continue;
+            uint32_t s = fs_rd32(e + 8);
+            uint32_t l = fs_rd32(e + 12);
+            if (s == 0 || s >= FS_PART_LBA_LIMIT || l == 0) continue;
+            start = s;
+            break;
+        }
+    }
+    for (uint32_t i = 0; i < 512; i++) sec[i] = 0;
+    for (uint32_t i = 0; i < FS_WIPE_SECTORS; i++)
+        ata_write_sector(drive, start + i, sec);
+}
+
 int fs_format(int fs_type) {
     /* 0 号盘是引导盘：拒绝格式化，防止把启动镜像抹掉 */
     if (fs_preferred_drive == 0) return -1;
+
+    fs_wipe_head(fs_preferred_drive);   /* 旧签名不清，重启会挂回旧 FS */
 
     if (fs_type == FS_EXFAT) {
         exfat_set_drive(fs_preferred_drive);
