@@ -4,9 +4,9 @@
 镜像大小改成动态之后，契约变成三条，任何一条断了都是"黑屏且看不出为什么"：
   1) os-image.bin = 引导扇区(512) + kernel.bin，两者都是 512 的倍数
   2) 引导扇区偏移 0x1FC 的 LE16 扇区数 == (os-image 大小 - 512) / 512
-  3) 扇区数 <= 992（496KB：0x10000~0x90000 之间还要留 16KB 栈），
-     且**整个镜像**的扇区数是偶数（引导扇区 + 内核）——H1c 实测：总数为
-     奇数的镜像写 U 盘，SeaBIOS 认得出设备却报 could not read the boot disk
+  3) 扇区数 <= MAX_SECTORS，且**整个镜像**的扇区数是偶数（引导扇区 + 内核）
+     ——H1c 实测：总数为奇数的镜像写 U 盘，SeaBIOS 认得出设备却报
+     could not read the boot disk
 
 本脚本只读文件、秒级返回，适合在每次 ninja 之后当门禁跑。
 为了让断言真的"咬得住"，最后用三个故意做坏的镜像跑同一套检查，
@@ -28,8 +28,14 @@ IMAGE = os.path.join(ROOT, "os-image.bin")
 KERNEL = os.path.join(ROOT, "kernel.bin")
 TMP = os.path.join(HERE, "_image_bad.bin")
 
-SECTOR = 512
-MAX_SECTORS = 992
+# 上限从 tools/make_image.py 取，不在这里抄一份：抄过一次就漏同步——
+# 把窗口从 496KB 扩到 672KB 时，本地产物 985 扇区仍小于旧的 992，本地
+# test_image 全绿，而 CI 的 gcc13 -O2 编出 1156 扇区直接把 CI 打红。
+# 同一个数字散落多处 = 换个编译器才暴露的假绿。
+_sys_ez.path.insert(0, _os_ez.path.join(_os_ez.path.dirname(_os_ez.path.dirname(
+    _os_ez.path.abspath(__file__))), "tools"))
+from make_image import MAX_SECTORS, SECTOR  # noqa: E402
+
 FIELD = 0x1FC
 
 
@@ -50,7 +56,7 @@ def check_image(path):
     if sectors == 0:
         return False, "sector field at 0x1FC is 0 (make_image.py did not patch it)"
     if sectors > MAX_SECTORS:
-        return False, "sector count %d > %d (496KB cap)" % (sectors, MAX_SECTORS)
+        return False, "sector count %d > %d (image window cap)" % (sectors, MAX_SECTORS)
     if sectors != (size - SECTOR) // SECTOR:
         return False, "sector field %d != actual kernel sectors %d" % (
             sectors, (size - SECTOR) // SECTOR)

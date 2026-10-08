@@ -399,7 +399,7 @@ void kernel_main(void) {
 
     klog("EZOS Kernel " EZOS_VERSION " loaded at 0x10000, i686 protected mode");
     /* 扇区数不再写死：tools/make_image.py 按 kernel_raw.bin 真实大小算出后写进
-     * 引导扇区 0x1FC，boot.asm 运行时读取（0 或 >992 时兜底 992）。 */
+     * 引导扇区 0x1FC，boot.asm 运行时读取（0 或 >1344 时兜底 1344）。 */
     klog("Boot: kernel image read by BIOS INT 13h AH=42h (64-sector batches, 3 retries, sector count from boot sector 0x1FC)");
     klog("Boot: A20 gate enabled (BIOS int 15h / port 0x92 / KBC fallback)");
     klog("Boot: GDT rebuilt in kernel - 6 descriptors (null/kcode/kdata/ucode DPL3/udata DPL3/TSS), TSS esp0=0x900000");
