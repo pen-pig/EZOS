@@ -35,7 +35,7 @@ int fat_mount(uint8_t drive, uint32_t part_start);
 
 /* 将整盘格式化为 FAT12/16/32（MBR + LBA1 单分区）并挂载；
  * 成功返回 12/16/32，失败返回 -1 */
-int fat_format(uint8_t drive, int want_type);
+int fat_format(uint8_t drive, int want_type, uint32_t part_start);
 
 int fat_ready(void);
 const fat_info_t *fat_get_info(void);

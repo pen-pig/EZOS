@@ -40,6 +40,6 @@ int      ext4_mkdir(const char *name);
 int      ext4_rmdir(const char *name);
 
 /* 格式化：在 drive 上创建 ext4 卷（1024B 块，单块组）并挂载；0=成功 */
-int      ext4_format(uint8_t drive);
+int      ext4_format(uint8_t drive, uint32_t part_start);
 
 #endif

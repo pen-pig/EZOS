@@ -2034,13 +2034,13 @@ int f2fs_mkdir(const char *name) {
  *            根 inode @ HOT_NODE 段块 1；node(1)/meta(2) NAT->块1（mkfs 语义）
  *   CP ver=随机奇数（-> pack1 为 start_cp），CRC 覆盖 [0,4092)
  */
-int f2fs_format(uint8_t drive) {
+int f2fs_format(uint8_t drive, uint32_t part_start) {
     /* 卷容量由块设备实测（fail closed：测不出容量就拒绝格式化，不猜大小） */
     uint32_t cap_secs = ata_capacity(drive);
     if (cap_secs == 0) return -1;
 
     /* 卷几何（与 mkfs.f2fs 公式一致，bps=64） */
-    const uint32_t part_start = 1;
+    if (part_start == 0) part_start = 1;
     const uint32_t bps = 64;
     const uint32_t seg0 = 63;              /* zone 对齐结果（与卷大小无关） */
     uint32_t cap_blocks = (cap_secs - part_start) / F2FS_BLK_SECS;

@@ -43,6 +43,6 @@ int      ntfs_rmdir(const char *path);
 
 /* 格式化：在 drive 上创建 NTFS 卷（4KB 簇，驻留 INDEX_ROOT 小目录模型）
  * 并挂载；0=成功 */
-int      ntfs_format(uint8_t drive);
+int      ntfs_format(uint8_t drive, uint32_t part_start);
 
 #endif

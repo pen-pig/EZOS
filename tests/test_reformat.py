@@ -22,6 +22,7 @@ fs_init 探测时先撞见 exFAT 就挂回 exFAT。用户看到的是"格式化�
 """
 import os
 import shutil
+import struct
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -44,9 +45,36 @@ def fresh_disk():
     shutil.copyfile(SRC, DISK)
 
 
-def fmt(fstype):
+def fresh_disk_at(start):
+    """造一张"分区不在 LBA 1"的盘：MBR 分区表指向 start，前面全清零。
+
+    真机上的常态就是这种盘——Windows/Linux 建的第一个分区普遍从 LBA 2048
+    开始（1MB 对齐），只有虚拟机里手搓的测试盘才会在 LBA 1。以前各
+    xxx_format 把 part_start 写死成 1，而 fs_wipe_head 按 MBR 里记录的
+    起点清签名，于是"清 2048 处、写 1 处"——旧签名留在真正被探测的
+    位置，重启后挂回上一个文件系统（或干脆认不出来）。
+    """
+    shutil.copyfile(SRC, DISK)
+    size = os.path.getsize(DISK)
+    total = size // 512
+    mbr = bytearray(512)
+    mbr[446] = 0x00                                  # boot flag
+    mbr[447] = 0x00; mbr[448] = 0x02; mbr[449] = 0x00  # CHS start
+    mbr[450] = 0x07                                  # 分区类型
+    mbr[451] = 0x00; mbr[452] = 0x3F; mbr[453] = 0xFF  # CHS end
+    struct.pack_into("<I", mbr, 454, start)
+    struct.pack_into("<I", mbr, 458, total - start)
+    mbr[510] = 0x55; mbr[511] = 0xAA
+    with open(DISK, "r+b") as f:
+        f.seek(0)
+        f.write(bytes(mbr))
+        f.seek(512)
+        f.write(b"\0" * (start + 16) * 512)
+
+
+def fmt(fstype, start=0):
     """起一台机器把 DISK 格式化成 fstype，然后关机。返回 (ok, 说明)。"""
-    fresh_disk()
+    fresh_disk_at(start) if start else fresh_disk()
     p, qmp = tc.launch(DISK)
     try:
         done, out = tc.run_cmd(qmp, "setdrive 1")
@@ -59,6 +87,37 @@ def fmt(fstype):
             return False, "format 失败：%r" % tc.flat(out)[:120]
     finally:
         tc.shutdown(p)
+    return True, "ok"
+
+
+# 各 FS 的卷签名相对**分区起点**的偏移。用来在宿主机上直接验证"卷到底
+# 写在哪个 LBA"——只看 shell 输出是看不出来的：xxx_format 会把 MBR 的分
+# 区起点一并改成自己用的 part_start，于是"挪了位置 + 改了分区表"自洽了，
+# 重启照样能挂载，端到端断言是绿的。所以必须绕开内核、直接读盘看字节。
+SIG = {
+    "exfat": (3,   b"EXFAT"),
+    "ntfs":  (3,   b"NTFS"),
+    "refs":  (3,   b"ReFS"),
+    "ext4":  (1024 + 56, b"\x53\xef"),
+    "f2fs":  (1024, b"\x10\x20\xf5\xf2"),
+}
+
+
+def layout_ok(fstype, start):
+    """宿主机视角：MBR 分区起点没被挪动，且卷签名确实写在那个起点上。
+
+    返回 (ok, 说明)。这条断言是本测试里唯一能区分"尊重已有分区表"与
+    "写死 LBA 1"的判据——反向验证过：把 fs.c 的起点改回写死 1，
+    重启探测那 5 条照样全绿，只有这里会红。
+    """
+    d = open(DISK, "rb").read()
+    got = int.from_bytes(d[454:458], "little")
+    if got != start:
+        return False, "MBR 分区起点被改成了 %d（应为 %d）" % (got, start)
+    off, sig = SIG[fstype]
+    base = start * 512 + off
+    if d[base:base + len(sig)] != sig:
+        return False, "LBA%d+%d 处没有 %s 签名" % (start, off, fstype)
     return True, "ok"
 
 
@@ -122,6 +181,30 @@ def main():
         if not good:
             print("  !! 从 %s 改格成 %s，重启后认成了 %r" % (prev, fstype, got))
         prev = fstype
+
+    # 分区不在 LBA 1 的盘（真机常态：1MB 对齐 → LBA 2048）。
+    # 这里守的是"清签名"与"写元数据"用的是同一个卷起点。
+    OFF = 2048
+    for fstype in FS_LIST:
+        ok, why = fmt(fstype, OFF)
+        if not ok:
+            results.append(("分区@%d 格式化成 %s" % (OFF, fstype), False))
+            print("  !! 分区@%d %s：%s" % (OFF, fstype, why))
+            continue
+        # 先看字节落在哪：分区表有没有被挪、卷是不是写在了 LBA 2048。
+        # 这条必须在重启之前看，重启后盘上的 MBR 已经被 format 改过了。
+        ok, why = layout_ok(fstype, OFF)
+        results.append(("分区@%d 格式化成 %s 后卷确实写在 %d"
+                        % (OFF, fstype, OFF), ok))
+        if not ok:
+            print("  !! 分区@%d %s 布局不对：%s" % (OFF, fstype, why))
+        got = probe_type()
+        good = (got == fstype)
+        results.append(("分区@%d 格式化成 %s 后重启仍识别为 %s"
+                        % (OFF, fstype, fstype), good))
+        if not good:
+            print("  !! 分区@%d 格式化成 %s，重启后认成了 %r"
+                  % (OFF, fstype, got))
 
     npass = sum(1 for _, ok in results if ok)
     for label, ok in results:

@@ -44,7 +44,7 @@ PY = sys.executable
 LAYERS = {
     "core": ["image", "vhd", "regress", "fs_matrix", "multilang", "mouse"],
     "fs":   ["fsref", "hostfs", "fatpath", "path", "sysvol", "rmdir",
-             "ext4vol", "f2fsvol", "refsvol", "exfatvol"],
+             "reformat", "ext4vol", "f2fsvol", "refsvol", "exfatvol"],
     "usb":  ["usbenum", "uhci", "uhci_control", "usb", "usbkbd", "usbmouse",
              "usbmsc", "usbboot", "ehci"],
     "net":  ["netapp", "dhcp", "dns"],
@@ -92,6 +92,9 @@ TIMEOUT = {
     # 卷容量测试：QEMU -icount 下格式化慢，单项实测 ~3 分钟。
     # exfatvol 要起两轮 QEMU（中间宿主机改写盘），放宽到 8 分钟。
     "ext4vol": 420, "f2fsvol": 420, "refsvol": 420, "exfatvol": 480,
+    # reformat：10 轮 x 2 台 QEMU（格式化 + 重启探测）+ 5 轮分区@2048，
+    # 实测 ~1.5 分钟；留 4 分钟余量给慢机器。
+    "reformat": 240,
     # 坏盘健壮性：6 个 FS 各起 1 台机器做黄金盘 + 3 台跑坏盘，实测 ~15 分钟
     # corrupt：故意把盘改坏后断言内核不卡死。每个 FS 要重新格式化黄金盘，
     # 外加干净盘重启 + 3 个随机种子 + 定向用例，6 个 FS 约 45 分钟

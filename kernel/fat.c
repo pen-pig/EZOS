@@ -338,7 +338,7 @@ static void put32le(uint8_t *p, uint32_t v) {
  *   FAT32: 64MB partition, 1 sector/cluster   (~128991 clusters)
  * Layout mirrors the gen_diskimg.py reference images: MBR, BPB, 2 FATs,
  * fixed root area (FAT12/16) or root cluster 2 (FAT32, + FSInfo/backup BS). */
-int fat_format(uint8_t drive, int want_type) {
+int fat_format(uint8_t drive, int want_type, uint32_t part_start) {
     if (want_type != 12 && want_type != 16 && want_type != 32) return -1;
 
     /* 卷大小**必须由磁盘实际容量决定**（ata_capacity）。以前写死 32767 /
@@ -347,7 +347,7 @@ int fat_format(uint8_t drive, int want_type) {
      * 写越过盘尾的簇就是静默损坏。拿不到容量就拒绝格式化，不猜。 */
     uint32_t cap = ata_capacity(drive);
     if (cap == 0) return -1;
-    uint32_t part_start = 1;
+    if (part_start == 0) part_start = 1;
     if (cap <= part_start + 64) return -1;
     uint32_t avail = cap - part_start;
 

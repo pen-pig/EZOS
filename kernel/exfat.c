@@ -861,12 +861,13 @@ uint32_t exfat_checksum_c(const uint8_t *data, int len) {
     return chk;
 }
 
-int exfat_format(void) {
+int exfat_format(uint32_t part_start) {
     exfat_info.bytes_per_sector = 512;
     exfat_info.sectors_per_cluster = 1;
     exfat_info.fat_offset = 25;         // 备份启动区占 13-24，FAT 必须从 25 开始
     exfat_info.root_dir_cluster = 2;
-    exfat_partition_start = 1;
+    if (part_start == 0) part_start = 1;
+    exfat_partition_start = part_start;
 
     /* 卷几何**由磁盘实际容量决定**。
      * 早期写死：volume_length=32767 扇区、cluster_count=100、fat_length=1
@@ -924,7 +925,7 @@ int exfat_format(void) {
         mbr[451] = (uint8_t)head; mbr[452] = (uint8_t)(sect | ((cyl >> 8) << 6));
         mbr[453] = (uint8_t)(cyl & 0xFF);
     }
-    *((uint32_t*)(mbr + 454)) = 1;      // LBA start = 1
+    *((uint32_t*)(mbr + 454)) = part_start;   // LBA start
     *((uint32_t*)(mbr + 458)) = volume_length;  // 分区扇区数
     mbr[510] = 0x55;
     mbr[511] = 0xAA;

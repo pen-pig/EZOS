@@ -1965,8 +1965,8 @@ fail_free:
  * $Bitmap（记录 6）驻留 $DATA = 簇位图（bit i = LCN i）；
  * MFT 记录位图 = $MFT（记录 0）驻留 $BITMAP 属性（16 位）
  * ============================================================ */
-int ntfs_format(uint8_t drive) {
-    uint32_t part_start = 1;
+int ntfs_format(uint8_t drive, uint32_t part_start) {
+    if (part_start == 0) part_start = 1;
     uint32_t spc = 8;                       /* 4KB 簇 */
 
     /* 卷大小由磁盘实际容量决定。早期写死 4095 扇区 = 2MB，在 16MB 的数据盘

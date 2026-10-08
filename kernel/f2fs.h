@@ -43,6 +43,6 @@ int      f2fs_rmdir(const char *name);
 
 /* 格式化：在 drive 上创建 F2FS 卷（2MB，4KB 块，inline dentry 模型）
  * 并挂载；0=成功 */
-int      f2fs_format(uint8_t drive);
+int      f2fs_format(uint8_t drive, uint32_t part_start);
 
 #endif

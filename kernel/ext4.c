@@ -1681,7 +1681,7 @@ static int e4_is_backup_group(uint32_t g) {
     return 0;
 }
 
-int ext4_format(uint8_t drive) {
+int ext4_format(uint8_t drive, uint32_t part_start) {
     /* 所有结构写入都经 e4_write_secs，而它只用全局 e4_drive；必须先指向目标盘，
      * 否则会写到上一次挂载残留的 e4_drive（默认 0=引导盘），导致 mount 读不到 SB。 */
     e4_drive = drive;
@@ -1690,7 +1690,7 @@ int ext4_format(uint8_t drive) {
     uint32_t disk_secs = ata_capacity(drive);
     if (disk_secs == 0) return -1;
 
-    const uint32_t part_start = 1;
+    if (part_start == 0) part_start = 1;
     const uint32_t blksize = 1024;
     const uint32_t blk_per_sec = blksize / 512;
     const uint32_t ino_size = 128;

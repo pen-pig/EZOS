@@ -304,21 +304,33 @@ void fs_set_drive(uint8_t drive) {
  * 清卷起点后 16 个扇区（8KB）足够盖住所有 FS 的签名区，又不至于把整盘
  * 写一遍（16MB 盘 PIO 全盘写要好几秒）。MBR 本身在 LBA 0，不动它。 */
 #define FS_WIPE_SECTORS 16
-static void fs_wipe_head(uint8_t drive) {
-    static uint8_t sec[512];
-    uint32_t start = 0;
-    if (ata_read_sector(drive, 0, sec) == 0 &&
-        sec[510] == 0x55 && sec[511] == 0xAA) {
-        for (int i = 0; i < 4; i++) {
-            const uint8_t *e = sec + 446 + i * 16;
-            if (e[4] == 0) continue;
-            uint32_t s = fs_rd32(e + 8);
-            uint32_t l = fs_rd32(e + 12);
-            if (s == 0 || s >= FS_PART_LBA_LIMIT || l == 0) continue;
-            start = s;
-            break;
-        }
+
+/* 卷起点：MBR 里第一个有效分区的 LBA；裸盘（无分区表）用 1。
+ *
+ * 格式化写到这里，挂载也从这里读——两处必须一致，否则就是"清 A 处、
+ * 写 B 处"：旧签名留在真正被探测的位置，重启后挂回上一个文件系统，
+ * 而 shell 里刚刚 format 完一切正常，看起来毫无异常。
+ * 以前各 xxx_format 都写死 part_start=1，在虚拟机里测不出来（测试盘
+ * 的分区确实在 LBA 1），但真实硬盘/U 盘的分区起点普遍是 2048，上真机
+ * 就废。现在由 fs.c 统一解析一次，再作为参数传给每个 format。 */
+#define FS_PART_LBA_DEFAULT 1
+static uint32_t fs_volume_start(uint8_t drive) {
+    uint8_t sec[512];
+    if (ata_read_sector(drive, 0, sec) != 0) return FS_PART_LBA_DEFAULT;
+    if (sec[510] != 0x55 || sec[511] != 0xAA) return FS_PART_LBA_DEFAULT;
+    for (int i = 0; i < 4; i++) {
+        const uint8_t *e = sec + 446 + i * 16;
+        if (e[4] == 0) continue;
+        uint32_t s = fs_rd32(e + 8);
+        uint32_t l = fs_rd32(e + 12);
+        if (s == 0 || s >= FS_PART_LBA_LIMIT || l == 0) continue;
+        return s;
     }
+    return FS_PART_LBA_DEFAULT;
+}
+
+static void fs_wipe_head(uint8_t drive, uint32_t start) {
+    static uint8_t sec[512];
     for (uint32_t i = 0; i < 512; i++) sec[i] = 0;
     for (uint32_t i = 0; i < FS_WIPE_SECTORS; i++)
         ata_write_sector(drive, start + i, sec);
@@ -328,23 +340,25 @@ int fs_format(int fs_type) {
     /* 0 号盘是引导盘：拒绝格式化，防止把启动镜像抹掉 */
     if (fs_preferred_drive == 0) return -1;
 
-    fs_wipe_head(fs_preferred_drive);   /* 旧签名不清，重启会挂回旧 FS */
+    /* 卷起点只在这里解析一次，清签名与写元数据共用同一个值 */
+    uint32_t start = fs_volume_start(fs_preferred_drive);
+    fs_wipe_head(fs_preferred_drive, start);   /* 旧签名不清，重启会挂回旧 FS */
 
     if (fs_type == FS_EXFAT) {
         exfat_set_drive(fs_preferred_drive);
         exfat_reset_cwd();
-        if (exfat_format() != 0) return -1;
+        if (exfat_format(start) != 0) return -1;
     } else if (fs_type == FS_FAT12 || fs_type == FS_FAT16 || fs_type == FS_FAT32) {
         /* fat_format 写 MBR/BPB/FAT/根目录后立即挂载（含 cwd 重置） */
-        if (fat_format(fs_preferred_drive, fs_type) != fs_type) return -1;
+        if (fat_format(fs_preferred_drive, fs_type, start) != fs_type) return -1;
     } else if (fs_type == FS_EXT4) {
-        if (ext4_format(fs_preferred_drive) != 0) return -1;
+        if (ext4_format(fs_preferred_drive, start) != 0) return -1;
     } else if (fs_type == FS_NTFS) {
-        if (ntfs_format(fs_preferred_drive) != 0) return -1;
+        if (ntfs_format(fs_preferred_drive, start) != 0) return -1;
     } else if (fs_type == FS_F2FS) {
-        if (f2fs_format(fs_preferred_drive) != 0) return -1;
+        if (f2fs_format(fs_preferred_drive, start) != 0) return -1;
     } else if (fs_type == FS_REFS) {
-        if (refs_format(fs_preferred_drive) != 0) return -1;
+        if (refs_format(fs_preferred_drive, start) != 0) return -1;
     } else {
         /* EROFS 为只读 ROM 文件系统，不支持格式化 */
         return -1;

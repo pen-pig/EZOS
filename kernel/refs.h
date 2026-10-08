@@ -52,6 +52,6 @@ int      refs_rmdir(const char *name);   /* 仅删目录；目标是文件或非
 
 /* 格式化：在 drive 上创建 ReFS 卷（2MB，4KB 簇，位图 + 128 目录项模型）
  * 并挂载；0=成功 */
-int      refs_format(uint8_t drive);
+int      refs_format(uint8_t drive, uint32_t part_start);
 
 #endif

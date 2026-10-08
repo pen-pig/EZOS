@@ -1409,11 +1409,11 @@ int refs_delete_file(const char *path) {
 }
 
 /* ---------- 格式化 ---------- */
-int refs_format(uint8_t drive) {
+int refs_format(uint8_t drive, uint32_t part_start) {
     /* 卷容量由块设备实测（fail closed：测不出容量就拒绝格式化） */
     uint32_t cap_secs = ata_capacity(drive);
     if (cap_secs == 0) return -1;
-    const uint32_t part_start = 1;
+    if (part_start == 0) part_start = 1;
     if (cap_secs <= part_start + 1) return -1;
     uint32_t vol_secs = cap_secs - part_start;   /* 分区可用扇区 */
     vol_secs &= ~7u;                             /* 对齐到 4KB 块 */

@@ -25,7 +25,7 @@ int exfat_init(void);
 uint32_t exfat_checksum_c(const uint8_t *data, int len);
 uint16_t exfat_name_hash_c(const uint16_t *name, int name_len);
 
-int exfat_format(void);
+int exfat_format(uint32_t part_start);
 const exfat_info_t *exfat_get_info(void);
 int exfat_list_root(void);
 int exfat_read_file(const char *name, uint8_t *buffer, uint32_t max_size);
