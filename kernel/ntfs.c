@@ -119,15 +119,39 @@ static uint64_t nt_run_read(const uint8_t *run, int nn, int sig) {
     return r;
 }
 
-/* 在 run list 中查 vcn；返回 LCN，sparse/未覆盖返回 NT_NO_LCN */
-static uint64_t nt_run_map(const uint8_t *runlist, uint32_t vcn) {
+/* run list 上界：属性长度内剩余字节，且不超过一条记录长度（双保险）。
+ * 两个来源都可能被盘上的坏数据放大，所以取两者的较小者。 */
+static uint32_t nt_attr_run_max(const uint8_t *a) {
+    uint32_t alen = rd32(a + 4);
+    uint32_t roff = rd16(a + 0x20);
+    uint32_t rem = (alen > roff) ? alen - roff : 0;
+    if (rem == 0 || rem > nt_rec_bytes) rem = nt_rec_bytes;
+    return rem;
+}
+
+/* run list 上界（调用点知道所在记录时用）：记录尾 - run 起点 */
+static uint32_t nt_run_max(const uint8_t *rec, const uint8_t *run) {
+    uint32_t off = (uint32_t)(run - rec);
+    return (nt_rec_bytes > off) ? nt_rec_bytes - off : 0;
+}
+
+/* 在 run list 中查 vcn；返回 LCN，sparse/未覆盖返回 NT_NO_LCN。
+ *
+ * max_bytes 是 run list 所在缓冲区的**硬上界**。run list 是盘上不可信数据：
+ * 结束标志（首字节低 3 位为 0）一旦被改坏，原来的 for(;;) 会一路读过记录
+ * 边界、扫过相邻内存，直到偶然碰到 0 字节才停——期间读到什么完全不可预测，
+ * 而且可能永远不停。这里按"已消费字节数"截断，越界一律 fail closed。 */
+static uint64_t nt_run_map(const uint8_t *runlist, uint32_t max_bytes, uint32_t vcn) {
     const uint8_t *run = runlist;
+    const uint8_t *end = runlist + max_bytes;
     uint64_t curr_vcn = 0, lcn = 0;
     for (;;) {
+        if (run >= end) return NT_NO_LCN;         /* 越界：不可信 */
         uint8_t c1 = (*run) & 0x7;
         uint8_t c2 = ((*run) >> 4) & 0x7;
         if (c1 == 0) return NT_NO_LCN;            /* run list 结束 */
         run++;
+        if ((uint32_t)(end - run) < (uint32_t)c1 + (uint32_t)c2) return NT_NO_LCN;
         uint64_t len = nt_run_read(run, c1, 0);
         run += c1;
         uint64_t off = nt_run_read(run, c2, 1);   /* 有符号 LCN 增量 */
@@ -153,7 +177,7 @@ static uint32_t nt_read_nres(const uint8_t *a, uint8_t *buf, uint32_t max_len) {
     while (done < max_len) {
         uint32_t vcn = done / nt_cluster_bytes;
         uint32_t in = done % nt_cluster_bytes;
-        uint64_t lcn = nt_run_map(run, vcn);
+        uint64_t lcn = nt_run_map(run, nt_attr_run_max(a), vcn);
         uint32_t chunk = 512 - in % 512;
         if (chunk > max_len - done) chunk = max_len - done;
         if (lcn == NT_NO_LCN || lcn > 0x0FFFFFFFull) {
@@ -180,6 +204,12 @@ static uint32_t nt_read_nres(const uint8_t *a, uint8_t *buf, uint32_t max_len) {
 static const uint8_t *nt_find_attr(const uint8_t *rec, uint32_t type, const char *name) {
     uint32_t off = rd16(rec + 0x14);              /* 首属性偏移 */
     uint32_t end = rd32(rec + 0x18);              /* 已用大小 */
+    /* 上界取**缓冲区**大小（NT_MAX_REC），不是记录大小 nt_rec_bytes。
+     * 踩过：一开始截到 nt_rec_bytes，结果 NTFS 整个写路径挂掉——format 写出的
+     * 记录里"已用大小"会大于标称记录长度，一截断 $Bitmap 的 $DATA 属性就找不
+     * 到了，`touch`/`mkdir` 全部 failed。这里要防的是"读到缓冲区外"，那才是
+     * 真正的越界；记录内部超长是另一回事，不该由这里顺手改语义。 */
+    if (end > NT_MAX_REC) end = NT_MAX_REC;
     while (off + 16 <= end && off + 16 <= NT_MAX_REC) {
         const uint8_t *a = rec + off;
         uint32_t t = rd32(a);
@@ -215,7 +245,8 @@ static int nt_read_record(uint32_t mftno, uint8_t *buf) {
         uint64_t b = (uint64_t)mftno * nt_rec_bytes + (uint64_t)s * 512;
         uint32_t vcn = (uint32_t)(b / nt_cluster_bytes);
         uint32_t in = (uint32_t)(b % nt_cluster_bytes);
-        uint64_t lcn = nt_run_map(nt_mmft + nt_mft_run_off, vcn);
+        uint64_t lcn = nt_run_map(nt_mmft + nt_mft_run_off,
+                                  nt_run_max(nt_mmft, nt_mmft + nt_mft_run_off), vcn);
         if (lcn == NT_NO_LCN || lcn > 0x0FFFFFFFull) return -1;
         if (ata_read_sector(nt_drive, nt_part_lba + (uint32_t)lcn * nt_spc + in / 512,
                             buf + s * 512) != 0) return -1;
@@ -255,20 +286,44 @@ static int nt_name_eq(const char *a, const char *b) {
 /* ---------- 目录遍历 ---------- */
 typedef int (*nt_dir_cb)(const char *name, uint32_t ref, int is_dir, void *ctx);
 
+/* 从 INDEX_HEADER 取条目序列起点，并校验它落在缓冲区内。
+ * rd32(ih)（entries offset）是盘上字段，可以指向记录外；直接拿来当指针会让
+ * 后面的遍历从缓冲区外开始。返回 0 = 不可信，调用方必须 fail closed。 */
+static const uint8_t *nt_index_entries(const uint8_t *end, const uint8_t *ih) {
+    if (ih >= end) return 0;
+    uint32_t left = (uint32_t)(end - ih);
+    if (left < 0x10u) return 0;                   /* 连 INDEX_HEADER 都不完整 */
+    uint32_t off = rd32(ih);
+    if (off > left - 0x10u) return 0;
+    return ih + off;
+}
+
 /* 遍历一段 INDEX entries（INDEX_ROOT 驻留内容或 INDX 块内）。
  * GRUB list_file()：entry+0x50 name_len，+0x51 命名空间，+0x48 文件属性。
  * B 树内部条目（flag bit0=带子节点 VCN）的 key 与叶子条目重复，
- * 枚举时跳过（Windows/ntfs-3g 大目录同样适用，避免重复列举）。 */
-static int nt_walk_entries(const uint8_t *pos, nt_dir_cb cb, void *ctx) {
-    while (1) {
+ * 枚举时跳过（Windows/ntfs-3g 大目录同样适用，避免重复列举）。
+ *
+ * end 是这段内存的**硬上界**，绝不能省。索引条目序列同样是盘上不可信数据：
+ * 末条目标志（flags bit1）缺失、或 e_len 被改成 0，循环就会一路走出这块
+ * 缓冲，读到的全是相邻内存——既可能永远碰不上结束标志（内核静默卡死），
+ * 也可能把别的记录内容当成文件名打印出来。所以每一步都校验"条目头 + 条目体"
+ * 完整落在 [pos, end) 内，越界一律 fail closed。 */
+static int nt_walk_entries(const uint8_t *pos, const uint8_t *end,
+                           nt_dir_cb cb, void *ctx) {
+    /* 循环条件只要求"条目头"（0x10 字节）完整：末条目标记本身只有 0x10
+     * 字节，若这里要求 0x52，正常目录的最后一项之后就会提前退出、误判成损坏。
+     * 名字等更深的字段在下面按需再校验一次。 */
+    while (pos + 0x10u <= end) {
         uint16_t e_len = rd16(pos + 8);
         uint16_t e_flags = rd16(pos + 0xC);
-        if (e_len < 0x10) return -1;
+        if (e_len < 0x10 || (uint32_t)e_len > (uint32_t)(end - pos)) return -1;
         if (e_flags & 2) return 0;                /* 最后一个条目 */
         if (e_flags & 1) { pos += e_len; continue; } /* 内部条目：跳过 */
+        if ((uint32_t)(end - pos) < 0x52u) return -1;
         uint8_t ns = pos[0x50];
         uint8_t ns_kind = pos[0x51];
         if (ns > 0 && ns_kind != 2) {             /* 跳过 DOS 命名空间 */
+            if ((uint32_t)(end - pos) < 0x52u + (uint32_t)ns * 2u) return -1;
             char name[256];
             nt_utf16_to_ascii(pos + 0x52, ns, name, sizeof(name));
             uint32_t ref = (uint32_t)(rd64(pos) & 0xFFFFFFFFFFFFull);
@@ -277,6 +332,7 @@ static int nt_walk_entries(const uint8_t *pos, nt_dir_cb cb, void *ctx) {
         }
         pos += e_len;
     }
+    return -1;                                    /* 走到上界也没见末条目：不可信 */
 }
 
 /* 读 $I30 $BITMAP（驻留或非常驻），返回字节数；失败返回 0 */
@@ -301,8 +357,11 @@ static int nt_dir_walk(const uint8_t *dirrec, nt_dir_cb cb, void *ctx) {
     if (root == 0 || root[8] != 0) return -1;     /* 必须驻留 */
     const uint8_t *ir = root + rd16(root + 0x14); /* INDEX_ROOT 内容 */
     if (rd32(ir) != NT_AT_FILENAME) return -1;    /* 非 $FILE_NAME 索引 */
+    const uint8_t *rec_end = dirrec + nt_rec_bytes;
     const uint8_t *ih = ir + 0x10;                /* INDEX_HEADER */
-    int ret = nt_walk_entries(ih + rd32(ih), cb, ctx);
+    const uint8_t *pos = nt_index_entries(rec_end, ih);
+    if (pos == 0) return -1;
+    int ret = nt_walk_entries(pos, rec_end, cb, ctx);
     if (ret != 0) return ret;
 
     /* 大目录：$INDEX_ALLOCATION + $BITMAP（GRUB grub_ntfs_iterate_dir） */
@@ -326,7 +385,7 @@ static int nt_dir_walk(const uint8_t *dirrec, nt_dir_cb cb, void *ctx) {
             uint64_t b = (uint64_t)blk * idx_clu_bytes;
             uint32_t vcn = (uint32_t)(b / nt_cluster_bytes);
             uint32_t in = (uint32_t)(b % nt_cluster_bytes);
-            uint64_t lcn = nt_run_map(run, vcn);
+            uint64_t lcn = nt_run_map(run, nt_run_max(dirrec, run), vcn);
             if (lcn == NT_NO_LCN || lcn > 0x0FFFFFFFull) return -1;
             uint32_t lba = nt_part_lba + (uint32_t)lcn * nt_spc + in / 512;
             for (uint32_t s = 0; s < idx_secs; s++) {
@@ -336,7 +395,9 @@ static int nt_dir_walk(const uint8_t *dirrec, nt_dir_cb cb, void *ctx) {
             if (nt_fixup(nt_indx, nt_idx_bytes, "INDX") != 0) return -1;
             /* INDX: magic(4)+lsn(8)+vcn(8)，INDEX_HEADER@0x18 */
             const uint8_t *ih2 = nt_indx + 0x18;
-            ret = nt_walk_entries(ih2 + rd32(ih2), cb, ctx);
+            const uint8_t *p2 = nt_index_entries(nt_indx + nt_idx_bytes, ih2);
+            if (p2 == 0) return -1;
+            ret = nt_walk_entries(p2, nt_indx + nt_idx_bytes, cb, ctx);
             if (ret != 0) return ret;
         }
     }
@@ -652,7 +713,8 @@ static int nt_write_record(uint32_t mftno, uint8_t *buf) {
         uint64_t b = (uint64_t)mftno * nt_rec_bytes + (uint64_t)s * 512;
         uint32_t vcn = (uint32_t)(b / nt_cluster_bytes);
         uint32_t in = (uint32_t)(b % nt_cluster_bytes);
-        uint64_t lcn = nt_run_map(nt_mmft + nt_mft_run_off, vcn);
+        uint64_t lcn = nt_run_map(nt_mmft + nt_mft_run_off,
+                                  nt_run_max(nt_mmft, nt_mmft + nt_mft_run_off), vcn);
         if (lcn == NT_NO_LCN || lcn > 0x0FFFFFFFull) return -1;
         if (ata_write_sector(nt_drive,
                              nt_part_lba + (uint32_t)lcn * nt_spc + in / 512,
@@ -938,16 +1000,20 @@ static uint32_t nt_find_entry(const uint8_t *dirrec, const char *name,
     if (root == 0) return 0;
     const uint8_t *ir = root + rd16(root + 0x14);
     const uint8_t *ih = ir + 0x10;
-    const uint8_t *pos = ih + rd32(ih);
-    while (1) {
+    const uint8_t *end = dirrec + nt_rec_bytes;   /* 同 nt_walk_entries：硬上界 */
+    const uint8_t *pos = nt_index_entries(end, ih);
+    if (pos == 0) return 0;
+    while (pos + 0x10u <= end) {
         uint16_t e_len = rd16(pos + 8);
         uint16_t e_flags = rd16(pos + 0xC);
-        if (e_len < 0x10) return 0;
+        if (e_len < 0x10 || (uint32_t)e_len > (uint32_t)(end - pos)) return 0;
         if (e_flags & 2) return 0;                /* 到末条目仍未找到 */
         if (e_flags & 1) { pos += e_len; continue; } /* 分隔条目：跳过 */
+        if ((uint32_t)(end - pos) < 0x52u) return 0;
         uint8_t ns = pos[0x50];
         uint8_t ns_kind = pos[0x51];
         if (ns > 0 && ns_kind != 2) {
+            if ((uint32_t)(end - pos) < 0x52u + (uint32_t)ns * 2u) return 0;
             char nb[256];
             nt_utf16_to_ascii(pos + 0x52, ns, nb, sizeof(nb));
             if (nt_name_eq(nb, name)) {
@@ -957,6 +1023,7 @@ static uint32_t nt_find_entry(const uint8_t *dirrec, const char *name,
         }
         pos += e_len;
     }
+    return 0;                                     /* 走到上界：数据不可信 */
 }
 
 /* 在 INDEX_ROOT 中插入条目（插在末条目之前）。
@@ -970,15 +1037,18 @@ static int nt_insert_entry(uint8_t *dirrec, uint32_t child_mftno,
     uint32_t root_alen = rd32(dirrec + root_off + 4);
     const uint8_t *ir = root + rd16(root + 0x14);
     const uint8_t *ih = ir + 0x10;
-    const uint8_t *entries = ih + rd32(ih);
+    const uint8_t *end = dirrec + nt_rec_bytes;
+    const uint8_t *entries = nt_index_entries(end, ih);
+    if (entries == 0) return -1;
 
-    /* 找末条目 */
+    /* 找末条目（同样必须带上界） */
     const uint8_t *pos = entries;
-    while (!(rd16(pos + 0xC) & 2)) {
+    while (pos + 0x10 <= end && !(rd16(pos + 0xC) & 2)) {
         uint16_t e_len = rd16(pos + 8);
-        if (e_len < 0x10) return -1;
+        if (e_len < 0x10 || (uint32_t)e_len > (uint32_t)(end - pos)) return -1;
         pos += e_len;
     }
+    if (pos + 0x10 > end) return -1;              /* 没碰到末条目就走出记录了 */
     uint32_t last_off = (uint32_t)(pos - dirrec);
 
     /* 新条目：头 0x10 + FILE_NAME key */
@@ -1042,19 +1112,25 @@ static int nt_remove_entry(uint8_t *dirrec, uint32_t entry_off) {
 static void nt_free_data_runs(const uint8_t *a) {
     if (a == 0 || a[8] == 0) return;
     const uint8_t *run = a + rd16(a + 0x20);
+    const uint8_t *end = run + nt_attr_run_max(a); /* 同 nt_run_map：硬上界 */
     uint64_t lcn = 0;
     for (;;) {
+        if (run >= end) return;                   /* 越界：不可信，停止回收 */
         uint8_t c1 = (*run) & 0x7;
         uint8_t c2 = ((*run) >> 4) & 0x7;
         if (c1 == 0) break;
         run++;
+        if ((uint32_t)(end - run) < (uint32_t)c1 + (uint32_t)c2) return;
         uint64_t len = nt_run_read(run, c1, 0);
         run += c1;
         uint64_t off = nt_run_read(run, c2, 1);
         run += c2;
         lcn += off;
+        /* 上界用卷的真实簇数，不是写死的 0x10000：写死会让 >65536 簇的卷上
+         * 删除大文件时后半段簇永远回收不掉（静默泄漏）。lcn 一旦因坏 run
+         * 溢出成天文数字，比较立刻为假，同样 fail closed。 */
         if (off != 0)                             /* sparse run 跳过 */
-            for (uint64_t i = 0; i < len && lcn + i < 0x10000ull; i++)
+            for (uint64_t i = 0; i < len && lcn + i < nt_total_clusters; i++)
                 nt_free_cluster((uint32_t)(lcn + i));
     }
 }
@@ -1093,7 +1169,7 @@ static int nt_read_indx(const uint8_t *dirrec, uint32_t vcn) {
     const uint8_t *alloc = nt_find_attr(dirrec, NT_AT_INDEX_ALLOC, "$I30");
     if (alloc == 0 || alloc[8] == 0) return -1;
     const uint8_t *run = alloc + rd16(alloc + 0x20);
-    uint64_t lcn = nt_run_map(run, vcn);
+    uint64_t lcn = nt_run_map(run, nt_run_max(dirrec, run), vcn);
     if (lcn == NT_NO_LCN || lcn > 0x0FFFFFFFull) return -1;
     uint32_t secs = nt_idx_bytes / 512;
     uint32_t lba = nt_part_lba + (uint32_t)lcn * nt_spc;
@@ -1108,7 +1184,7 @@ static int nt_write_indx(const uint8_t *dirrec, uint32_t vcn) {
     const uint8_t *alloc = nt_find_attr(dirrec, NT_AT_INDEX_ALLOC, "$I30");
     if (alloc == 0 || alloc[8] == 0) return -1;
     const uint8_t *run = alloc + rd16(alloc + 0x20);
-    uint64_t lcn = nt_run_map(run, vcn);
+    uint64_t lcn = nt_run_map(run, nt_run_max(dirrec, run), vcn);
     if (lcn == NT_NO_LCN || lcn > 0x0FFFFFFFull) return -1;
     nt_usn++;
     uint8_t *pu = nt_indx + rd16(nt_indx + 4);

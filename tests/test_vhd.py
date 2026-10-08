@@ -36,6 +36,7 @@ GEN = os.path.join(ROOT, "temp", "gen_diskimg.py")
 MAKE_VHD = os.path.join(ROOT, "tools", "make_vhd.py")
 TMP_BAD = os.path.join(HERE, "_vhd_bad.vhd")
 TMP_REGEN_DIR = os.path.join(HERE, "_vhd_regen")
+TMP_REGEN_DIR2 = os.path.join(HERE, "_vhd_regen2")
 TMP_RAW = os.path.join(HERE, "_vhd_roundtrip.img")
 
 SECTOR = 512
@@ -88,10 +89,28 @@ def check_boot_checksum(img):
     return True, "11 x uint32 verified, backup matches"
 
 
-def bad_case(name, mutate):
+def fresh_vhd():
+    """自己生成一份干净的 VHD 再校验。
+
+    为什么不用仓库根的 disk.vhd：那是**共享盘**，别的 E2E 用例（fs_matrix、
+    rmdir、corrupt…）会拿它去 format，跑完就脏了。本脚本再校验它就会假红，
+    看着像"生成器坏了"，其实是"盘被别人写过"。踩过好几次，所以这里每次
+    自己生成一份，既不受污染也不污染别人。"""
+    os.makedirs(TMP_REGEN_DIR, exist_ok=True)
+    p = os.path.join(TMP_REGEN_DIR, os.path.basename(VHD))
+    r = subprocess.run([sys.executable, GEN, p, "exfat"],
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if not os.path.isfile(p):
+        print("gen_diskimg.py failed to produce a VHD:\n" +
+              r.stdout.decode("utf-8", "replace"))
+        shutil.rmtree(TMP_REGEN_DIR, ignore_errors=True)
+        return None
+    return p
+
+
+def bad_case(name, mutate, blob):
     """把 VHD 改坏，检查器必须判 FAIL"""
-    with open(VHD, "rb") as f:
-        data = bytearray(f.read())
+    data = bytearray(blob)
     mutate(data)
     with open(TMP_BAD, "wb") as f:
         f.write(data)
@@ -103,24 +122,32 @@ def bad_case(name, mutate):
 
 
 def main():
-    results = []
-    if not os.path.isfile(VHD):
-        print("MISSING disk.vhd - run ninja first")
-        return 2
     if not os.path.isfile(MAKE_VHD) or not os.path.isfile(GEN):
         print("MISSING tools/make_vhd.py / temp/gen_diskimg.py")
         return 2
 
-    vhd_size = os.path.getsize(VHD)
+    src = fresh_vhd()
+    if not src:
+        return 2
+    try:
+        return run_checks(src)
+    finally:
+        shutil.rmtree(TMP_REGEN_DIR, ignore_errors=True)
+
+
+def run_checks(src):
+    results = []
+
+    vhd_size = os.path.getsize(src)
     data_size = vhd_size - FOOTER
-    with open(VHD, "rb") as f:
+    with open(src, "rb") as f:
         blob = f.read()
     data, footer = blob[:data_size], blob[data_size:]
 
     # --- A. VHD 容器 ---
-    ok, why = vhd_check(VHD)
-    results.append(("disk.vhd footer: %s" % why.splitlines()[-1] if ok
-                    else "disk.vhd footer: %s" % why, ok))
+    ok, why = vhd_check(src)
+    results.append(("fresh disk.vhd footer: %s" % why.splitlines()[-1] if ok
+                    else "fresh disk.vhd footer: %s" % why, ok))
     results.append(("disk.vhd size is 512-aligned and > footer (%d)" % vhd_size,
                     vhd_size % SECTOR == 0 and data_size > 0))
     results.append(("data area starts with a valid MBR (0x55AA)",
@@ -136,15 +163,15 @@ def main():
     results.append(("Current Size == data area size", cur == data_size))
 
     # --- B. 产物可重现（UUID 由文件名派生，所以要放到同名临时目录里重生成）---
-    os.makedirs(TMP_REGEN_DIR, exist_ok=True)
-    regen = os.path.join(TMP_REGEN_DIR, os.path.basename(VHD))
+    os.makedirs(TMP_REGEN_DIR2, exist_ok=True)
+    regen = os.path.join(TMP_REGEN_DIR2, os.path.basename(src))
     subprocess.run([sys.executable, GEN, regen],
                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     same = False
     if os.path.isfile(regen):
         with open(regen, "rb") as f:
             same = (f.read() == blob)
-    shutil.rmtree(TMP_REGEN_DIR, ignore_errors=True)
+    shutil.rmtree(TMP_REGEN_DIR2, ignore_errors=True)
     results.append(("regenerating disk.vhd is byte-reproducible", same))
 
     # --- C. make_vhd.py 的 raw -> VHD 往返仍然正确 ---
@@ -191,10 +218,10 @@ def main():
     def not_fixed(d):
         struct.pack_into('>I', d, len(d) - FOOTER + 60, 3)   # 3 = dynamic
 
-    results.append(bad_case("cookie wiped", wipe_cookie))
-    results.append(bad_case("footer checksum corrupted", break_sum))
-    results.append(bad_case("Current Size shrunk", shrink_size))
-    results.append(bad_case("disk type switched to dynamic", not_fixed))
+    results.append(bad_case("cookie wiped", wipe_cookie, blob))
+    results.append(bad_case("footer checksum corrupted", break_sum, blob))
+    results.append(bad_case("Current Size shrunk", shrink_size, blob))
+    results.append(bad_case("disk type switched to dynamic", not_fixed, blob))
 
     # boot checksum 反例：改一个被校验扇区的字节，checksum 就不该再匹配
     broken = bytearray(data)

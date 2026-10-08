@@ -550,6 +550,89 @@ static int fat_dir_block(uint32_t dir_cluster, uint32_t idx, dir_block_t *out) {
     return 1;
 }
 
+/* ---- 目录块顺序遍历：上界 + 增量步进 ----
+ *
+ * 为什么需要这两个函数
+ * --------------------
+ * 原来的写法是 `for (;;) { if (!fat_dir_block(dir, idx, &b)) break; ... idx++; }`，
+ * 两个致命问题：
+ *
+ * 1) **没有上界 → 死循环**。FAT 链是**盘上的不可信数据**，一旦出现环
+ *    （比如 FAT[c] == c），fat_dir_block 永远返回 1，循环永远不结束。内核
+ *    会一直转着读盘、不打任何输出——表现是"卡死"，比 panic 难查得多。
+ * 2) **fat_dir_block 是 O(idx)**。它每次都从链头重走 idx 步，叠加外层就是
+ *    O(簇数^2) 次 FAT 读：16MB 卷就是几亿次，即使不环也等同挂死。
+ *
+ * 所以：一次只走一步（O(1)），并且给步数上界。合法目录链不可能比簇总数还长，
+ * 超过就说明链坏了，fail closed 停下。 */
+static uint32_t fat_dir_max_blocks(uint32_t dir_cluster) {
+    if (dir_cluster == 0 && fat_type != 32) {          /* FAT12/16 根目录区 */
+        return fi.root_dir_sectors ? fi.root_dir_sectors : 1;
+    }
+    if (fi.cluster_count == 0) return 1;
+    return fi.cluster_count + 2;
+}
+
+/* 顺序走一步。返回 0 = 链结束或数据不可信，调用方必须停。 */
+static int fat_dir_step(const dir_block_t *cur, dir_block_t *out) {
+    if (!fat_type) return 0;
+    if (cur->cluster == 0) {                            /* FAT12/16 根目录区 */
+        uint32_t next = cur->sector + 1;
+        if (next >= fi.root_dir_sector + fi.root_dir_sectors) return 0;
+        out->cluster = 0;
+        out->sector = next;
+        out->bytes = fi.bytes_per_sector;
+        return 1;
+    }
+    uint32_t nxt = fat_entry_get(cur->cluster);
+    if (nxt < 2 || nxt >= fi.cluster_count + 2 ||
+        fat_is_eoc(nxt) || fat_is_bad(nxt)) return 0;
+    out->cluster = nxt;
+    out->sector = fi.first_data_sector + (nxt - 2) * fi.sectors_per_cluster;
+    out->bytes = (uint32_t)fi.bytes_per_sector * fi.sectors_per_cluster;
+    return 1;
+}
+
+/* 目录链遍历状态。fast 每次走一步，slow 两步走一步 —— Floyd 判环。
+ *
+ * 为什么光有"步数上界"还不够：FAT[c] == c 这种**自环**，上界要到簇总数才停
+ * （16MB 卷 3 万多次），而每一步都会把同一个目录块重新扫一遍，`ls` 会打出
+ * 几万倍的重复条目。那不是"慢一点"，是输出洪水，用户看到的一样是机器死了。
+ * 合法 FAT 簇链是单向分配的，绝不可能回到走过的位置，所以 fast 追上 slow
+ * 就一定是盘坏了 —— 立刻停。
+ *
+ * 根目录区（cluster == 0）扇区单调递增，不会成环，判环只对簇链生效。 */
+typedef struct {
+    dir_block_t fast;      /* 当前块 */
+    dir_block_t slow;
+    uint32_t    steps;
+    uint32_t    max;
+} fat_dir_walk_t;
+
+static int fat_dir_walk_start(uint32_t dir_cluster, fat_dir_walk_t *w) {
+    w->max = fat_dir_max_blocks(dir_cluster);
+    w->steps = 0;
+    if (!fat_dir_block(dir_cluster, 0, &w->fast)) return 0;
+    w->slow = w->fast;
+    return 1;
+}
+
+/* 走一步。返回 1 = w->fast 已经是下一块，可以继续扫；0 = 结束 / 链坏 / 成环。 */
+static int fat_dir_walk_next(fat_dir_walk_t *w) {
+    dir_block_t nb;
+    if (!fat_dir_step(&w->fast, &nb)) return 0;
+    w->fast = nb;
+    w->steps++;
+    if (w->steps >= w->max) return 0;
+    if ((w->steps & 1u) == 0u) {
+        dir_block_t ns;
+        if (!fat_dir_step(&w->slow, &ns)) return 0;
+        w->slow = ns;
+        if (w->fast.cluster != 0 && w->fast.cluster == w->slow.cluster) return 0;
+    }
+    return 1;
+}
+
 static int fat_read_block(const dir_block_t *b, uint8_t *buf) {
     for (uint32_t i = 0; i < b->bytes / 512; i++) {
         if (ata_read_sector(fat_drive, fat_part_start + b->sector + i, buf + i * 512) != 0)
@@ -693,15 +776,14 @@ static int dirent_from_short(const uint8_t *e, lfn_state_t *st,
 /* 枚举目录；cb 返回 1 停止（命中）；返回枚举到的条目总数或 -1（读错误） */
 static int fat_dir_foreach(uint32_t dir_cluster, dirent_cb cb, void *ctx) {
     lfn_state_t st;
-    uint32_t idx = 0;
     int count = 0;
+    fat_dir_walk_t w;
+    if (!fat_dir_walk_start(dir_cluster, &w)) return count;
     for (;;) {
-        dir_block_t b;
-        if (!fat_dir_block(dir_cluster, idx, &b)) break;
-        if (fat_read_block(&b, io_scratch) != 0) return -1;
+        if (fat_read_block(&w.fast, io_scratch) != 0) return -1;
         int stop = 0;
         lfn_reset(&st);
-        for (uint32_t off = 0; off + 32 <= b.bytes; off += 32) {
+        for (uint32_t off = 0; off + 32 <= w.fast.bytes; off += 32) {
             const uint8_t *e = io_scratch + off;
             if (e[0] == 0x00) { stop = 1; break; }   /* 目录结束 */
             if (e[0] == DELETED_ENTRY) { lfn_reset(&st); continue; }
@@ -711,14 +793,14 @@ static int fat_dir_foreach(uint32_t dir_cluster, dirent_cb cb, void *ctx) {
                 continue;
             }
             fat_dirent_t de;
-            if (dirent_from_short(e, &st, &b, off, &de)) {
+            if (dirent_from_short(e, &st, &w.fast, off, &de)) {
                 count++;
                 if (cb && cb(&de, ctx)) { stop = 1; break; }
             }
             lfn_reset(&st);
         }
         if (stop) break;
-        idx++;
+        if (!fat_dir_walk_next(&w)) break;
     }
     return count;
 }
@@ -1255,27 +1337,27 @@ static int fat_write_dirent_at(const fat_dirent_t *ref, uint32_t off, const uint
 
 /* 在目录中找一段同块连续空闲项（need 个）；找不到且目录为簇链时扩展新簇 */
 static int fat_find_free_slots(uint32_t dir_cluster, int need, fat_dirent_t *ref) {
-    uint32_t idx = 0;
-    for (;;) {
-        dir_block_t b;
-        if (!fat_dir_block(dir_cluster, idx, &b)) break;
-        if (fat_read_block(&b, io_scratch) != 0) return -1;
-        int run = 0;
-        for (uint32_t off = 0; off + 32 <= b.bytes; off += 32) {
-            if (io_scratch[off] == 0x00 || io_scratch[off] == DELETED_ENTRY) {
-                run++;
-                if (run == need) {
-                    ref->block_cluster = b.cluster;
-                    ref->block_sector = b.sector;
-                    ref->block_bytes = b.bytes;
-                    ref->entry_off = off + 32 - (uint32_t)need * 32;
-                    return 0;
+    fat_dir_walk_t w;
+    if (fat_dir_walk_start(dir_cluster, &w)) {
+        for (;;) {
+            if (fat_read_block(&w.fast, io_scratch) != 0) return -1;
+            int run = 0;
+            for (uint32_t off = 0; off + 32 <= w.fast.bytes; off += 32) {
+                if (io_scratch[off] == 0x00 || io_scratch[off] == DELETED_ENTRY) {
+                    run++;
+                    if (run == need) {
+                        ref->block_cluster = w.fast.cluster;
+                        ref->block_sector = w.fast.sector;
+                        ref->block_bytes = w.fast.bytes;
+                        ref->entry_off = off + 32 - (uint32_t)need * 32;
+                        return 0;
+                    }
+                } else {
+                    run = 0;
                 }
-            } else {
-                run = 0;
             }
+            if (!fat_dir_walk_next(&w)) break;
         }
-        idx++;
     }
     /* 未找到：簇链目录尝试扩展一个新簇 */
     if (dir_cluster >= 2) {

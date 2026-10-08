@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """run_tests.py - 串行跑 E2E 回归（长程任务的验证回路）。
 
-为什么需要：仓库里有 35 个测试脚本，每个要 1-10 分钟，手动一个个敲既慢
+为什么需要：仓库里有 43 个测试脚本，每个要 1-15 分钟，手动一个个敲既慢
 又容易漏。串行是硬要求——测试之间共享 os-image.bin 与 QEMU 端口，并行会
 互相抢锁（症状是莫名其妙的 ConnectionRefused）。
 
@@ -11,6 +11,7 @@
     usb     USB/输入栈
     net     网络栈
     static  静态检查：内核栈帧预算（tools/check_stack.py，不跑 QEMU）
+    deep    慢但能抓到"只在坏盘上暴露"的缺陷：坏盘健壮性 + socket/TCP
     full    全部
     changed 按 git 改动自动选（长程任务里最常用）
     <名字>  直接跑指定测试（可多个）
@@ -48,7 +49,8 @@ LAYERS = {
              "usbmsc", "usbboot", "ehci"],
     "net":  ["netapp", "dhcp", "dns"],
     "gui":  ["vi", "vi_color", "uefi3"],
-    "deep": ["step7_sock", "step7_tcp"],
+    # corrupt：故意把盘改坏后断言内核不卡死（6 FS x 3 种子，约 15 分钟）
+    "deep": ["step7_sock", "step7_tcp", "corrupt"],
     "hw":   ["ahci", "nvme", "power", "edge", "heap", "jobs", "lock"],
     "util": ["digest"],
     # 静态检查（不是 tests/test_*.py，而是 tools/*.py）
@@ -66,6 +68,8 @@ WATCH = [
     # 静态检查不跑 QEMU，10~30s 就完事，所以 kernel/ 下任何 .c 改动都带上
     ("kernel/", "static"), ("shell", "core"),
     ("fs.c", "core fs"), ("ext4", "fs"), ("f2fs", "fs"), ("refs", "fs"),
+    # 遍历循环的上界改动只有"坏盘"能验出来，好盘测不出来（见 test_corrupt.py）
+    ("ntfs", "fs deep"),
     ("kmalloc", "core hw"), ("pmm", "core hw"), ("lockselftest", "core hw"),
     ("fd.c", "core"), ("elf", "core"), ("exec", "core"),
     ("syscall", "core"), ("kernel.c", "core"), ("build.ninja", "core"),
@@ -87,6 +91,8 @@ TIMEOUT = {
     # 卷容量测试：QEMU -icount 下格式化慢，单项实测 ~3 分钟。
     # exfatvol 要起两轮 QEMU（中间宿主机改写盘），放宽到 8 分钟。
     "ext4vol": 420, "f2fsvol": 420, "refsvol": 420, "exfatvol": 480,
+    # 坏盘健壮性：6 个 FS 各起 1 台机器做黄金盘 + 3 台跑坏盘，实测 ~15 分钟
+    "corrupt": 1800,
 }
 
 # 这些测试要 GUI 像素/OCR，默认不进 core/full 的常规集合（太慢且脆）

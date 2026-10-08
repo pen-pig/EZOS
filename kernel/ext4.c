@@ -104,6 +104,11 @@ static uint32_t rd32(const uint8_t *p) {
 #define EXT4_MAX_BLOCKSIZE   4096
 #define EXT4_MAX_INODESIZE   256
 
+/* extent 节点头 / index / extent 项都是 12 字节；inode 的 i_block 共 60 字节，
+ * 所以 extent 根节点最多放 4 项。这两个常量给"磁盘上的 entries 上界"用。 */
+#define EXT4_EXT_HDR_SIZE    12
+#define EXT4_IBLOCK_SIZE     60
+
 /* ---------- 挂载状态 ---------- */
 static uint8_t  e4_drive;
 static uint8_t  e4_mounted;
@@ -177,15 +182,30 @@ int ext4_mount(uint8_t drive, uint32_t part_start) {
         e4_blocks_free |= (uint64_t)rd32(sb + SB_OFF_FREE_BLKS_HI) << 32;
     }
 
+    /* 卷不能比分区还大。blocks_total 是磁盘上的字段（64bit 特性下还是高低
+     * 32 位拼出来的），坏盘可以写个天文数字，于是 e4_groups 变成上亿，
+     * 遍历块组的循环（分配/扫描）一跑就是几亿次块读 —— 挂死。
+     * 拿磁盘真实容量做闸（format 路径 1675 行也是这么取的）。 */
+    uint32_t cap_secs = ata_capacity(e4_drive);
+    uint64_t cap_blk = (cap_secs > part_start)
+                       ? (uint64_t)(cap_secs - part_start) / e4_blk_per_sec
+                       : 0;
+    if (cap_blk == 0) cap_blk = 1u << 28;   /* 拿不到容量时的绝对上限 */
+    if (e4_blocks_total > cap_blk) e4_blocks_total = cap_blk;
+
     e4_first_data_blk = rd32(sb + SB_OFF_FIRST_DATA);
     /* 组边界必须是 first_data_block + g*bpg（Linux ext4_group_first_block_no
      * 的定义）。早期版本按 g*bpg 算，两组之间差 1 个块——1KB 块时 group 1 的
      * 起始是 8193 而不是 8192。差一个块自己完全看不出来（读写都自洽），但
      * e2fsck / 宿主机按规范算组归属时会把块 8192 当成 group 0 的最后一块，
      * 位图与空闲计数立刻对不上。 */
+    /* 下溢要挡在减法之前：blocks_total 小于 first_data_blk 时 uint64 一减就
+     * 翻成天文数字，e4_groups 跟着爆。 */
+    if (e4_blocks_total <= e4_first_data_blk) return -1;
     e4_groups = (uint32_t)((e4_blocks_total - e4_first_data_blk + e4_bpg - 1) /
                            e4_bpg);
     if (e4_groups == 0) return -1;               /* 0 块的卷：不可信，拒绝挂载 */
+    if (e4_groups > 65536) return -1;            /* 同上：不可信，拒绝挂载 */
     e4_vol_sectors = (uint32_t)(e4_blocks_total * e4_blk_per_sec);
     /* GDT：superblock 所在块（1K 块时 SB 在第 1 块，否则第 0 块）的下一块 */
     e4_gdt_blk = (e4_blksize == 1024) ? 2 : 1;
@@ -253,10 +273,19 @@ static int e4_ino_is_dir(const uint8_t *ino) {
 static uint32_t e4_map_extent(const uint8_t *ino, uint32_t lblk) {
     /* 根节点（depth 最大）在 inode i_block 前 60 字节 */
     const uint8_t *hdr = ino + INO_OFF_IBLOCK;
+    /* 当前节点可用的字节数：根节点在 inode 的 i_block（60 字节），
+     * 下潜后换成整块。用来给 entries 定上界。 */
+    uint32_t room = EXT4_IBLOCK_SIZE;
     for (int depth_iter = 0; depth_iter < 6; depth_iter++) {
         if (rd16(hdr) != EXT4_EXT_MAGIC) return 0;
         uint32_t entries = rd16(hdr + EH_OFF_ENTRIES);
         uint32_t depth = rd16(hdr + EH_OFF_DEPTH);
+        /* entries 是磁盘上随便写的 uint16：不设闸的话 hdr+12+i*12 能跑到
+         * 缓冲外七百多 KB —— 那是**真**越界读（不是读到残留，是读别人的
+         * 内存）。按节点实际容量截断。 */
+        if (room <= EXT4_EXT_HDR_SIZE) return 0;
+        uint32_t cap = (room - EXT4_EXT_HDR_SIZE) / 12;
+        if (entries > cap) entries = cap;
         if (entries == 0) return 0;
 
         if (depth == 0) {
@@ -284,6 +313,7 @@ static uint32_t e4_map_extent(const uint8_t *ino, uint32_t lblk) {
         if (child == 0 || child > 0xFFFFFFFFu) return 0;
         e4_read_blk((uint32_t)child, e4_blk);
         hdr = e4_blk;
+        room = e4_blksize;
     }
     return 0;
 }
@@ -350,12 +380,24 @@ static int e4_dx_collect(uint32_t root_blk, uint32_t *out, int *n, int max) {
     stk[0].blk = root_blk;
     stk[0].idx = 0;
 
+    /* 步数闸：每走一步要读一个块。cnt 是磁盘上随便写的 uint16（最大 65535），
+     * 不设闸的话 6 层 x 65535 ≈ 39 万次 PIO 读 —— ls 会挂好几分钟，看着像死机。
+     * 真实 htree 目录的内部节点项数是个位数到几十，1024 步绰绰有余。 */
+    uint32_t steps = 0;
+    const uint32_t step_max = 1024;
+
     while (sp >= 0) {
+        if (++steps > step_max) return -1;
         e4_read_blk(stk[sp].blk, e4_dxbuf);
         int is_root = (sp == 0);
         /* 根块：'.','..' 24 字节 + info@24 + entries@32；节点块：12 字节头 + entries@12 */
         uint32_t cnt = rd16(e4_dxbuf + (is_root ? DX_ROOT_CNT_OFF : DX_NODE_CNT_OFF));
         uint32_t base = is_root ? 36 : 16;
+        /* entries 必须整个落在块内。越界的那一半不会段错误（缓冲是 4KB），
+         * 但会读到上一块留下的残数据，凭空长出子节点。按块大小截断。 */
+        if (base >= e4_blksize) return -1;
+        uint32_t room = (e4_blksize - base) / 8;
+        if (cnt > room) cnt = room;
 
         if ((uint32_t)sp == levels) {
             /* 叶子层：全部收下 */
@@ -403,8 +445,11 @@ static int e4_dir_walk(uint32_t dir_ino, e4_dir_cb cb, void *ctx) {
             e4_read_blk(blk0, e4_dblk);
             /* dx 根特征：'..' 的 rec_len == blocksize - 12 */
             if (rd16(e4_dblk + 12 + DE_OFF_RECLEN) == e4_blksize - 12) {
+                /* 树坏了（坏盘/越界）就退回线性扫描：htree 目录的每个块本身
+                 * 仍是合法 dirent 块，线性扫能列出全部条目，只是顺序不同。
+                 * 比直接放弃整个目录好——坏盘至少还能 ls 出东西。 */
                 if (e4_dx_collect(blk0, leaves, &nleaf, DX_MAX_LEAVES) != 0)
-                    return -1;
+                    indexed = 0;
             } else {
                 indexed = 0;
             }
@@ -871,6 +916,11 @@ static int e4_extent_append(uint8_t *dino, uint32_t lblk, uint32_t pb) {
     if (rd16(hdr) != EXT4_EXT_MAGIC) return -1;
     uint32_t entries = rd16(hdr + EH_OFF_ENTRIES);
     uint32_t depth = rd16(hdr + EH_OFF_DEPTH);
+    /* 同 e4_map_extent：entries/depth 都来自磁盘。不设闸的话
+     * hdr+12+(entries-1)*12 会读到 inode 缓冲外几百 KB。
+     * 写路径直接拒绝（不能截断——截断会让我们改坏别处的数据）。 */
+    if (depth > 5) return -1;
+    if (entries > (EXT4_IBLOCK_SIZE - EXT4_EXT_HDR_SIZE) / 12) return -1;
 
     if (depth == 0) {
         if (entries > 0) {
@@ -927,6 +977,7 @@ static int e4_extent_append(uint8_t *dino, uint32_t lblk, uint32_t pb) {
         if (lb == 0) return -1;
         e4_read_blk(lb, e4_leaf);
         uint32_t lents = rd16(e4_leaf + EH_OFF_ENTRIES);
+        if (lents > (e4_blksize - EXT4_EXT_HDR_SIZE) / 12) return -1;
         if (lents > 0) {
             uint8_t *ex = e4_leaf + 12 + (lents - 1) * 12;
             uint32_t old_len = EXT4_EXT_LEN(rd16(ex + EE_OFF_LEN));
@@ -1216,9 +1267,16 @@ static int e4_split_path(const char *path, uint32_t *parent_ino,
 
 /* 回收 extent 节点：depth=0 释放全部数据块；depth>0 逐 index 读
  * 叶子块递归释放数据块，并释放叶子块本身 */
-static void e4_free_extent_node(const uint8_t *hdr, uint32_t depth) {
-    uint32_t entries = rd16(hdr + EH_OFF_ENTRIES);
+static void e4_free_extent_node(const uint8_t *hdr, uint32_t depth,
+                                uint32_t room) {
     if (rd16(hdr) != EXT4_EXT_MAGIC) return;
+    /* depth 也是磁盘上的 uint16。不加闸的话递归 65535 层 —— 每层一个栈帧，
+     * 任务内核栈才 16KB，rm 一个坏文件就能把它写穿。ext4 规范上限 5。 */
+    if (depth > 5) return;
+    uint32_t entries = rd16(hdr + EH_OFF_ENTRIES);
+    if (room <= EXT4_EXT_HDR_SIZE) return;
+    uint32_t cap = (room - EXT4_EXT_HDR_SIZE) / 12;
+    if (entries > cap) entries = cap;
     if (depth == 0) {
         for (uint32_t i = 0; i < entries; i++) {
             const uint8_t *ex = hdr + 12 + i * 12;
@@ -1234,7 +1292,7 @@ static void e4_free_extent_node(const uint8_t *hdr, uint32_t depth) {
             uint32_t leaf = rd32(ix + EI_OFF_LEAF_LO);
             if (leaf == 0) continue;
             e4_read_blk(leaf, e4_leaf);
-            e4_free_extent_node(e4_leaf, depth - 1);
+            e4_free_extent_node(e4_leaf, depth - 1, e4_blksize);
             e4_free_block(leaf);
         }
     }
@@ -1251,7 +1309,8 @@ static void e4_free_inode_blocks(uint8_t *ino) {
 
     if (rd32(ino + INO_OFF_FLAGS) & EXT4_EXTENTS_FL) {
         uint8_t *hdr = ino + INO_OFF_IBLOCK;
-        e4_free_extent_node(hdr, rd16(hdr + EH_OFF_DEPTH));
+        e4_free_extent_node(hdr, rd16(hdr + EH_OFF_DEPTH),
+                            EXT4_IBLOCK_SIZE);
     } else {
         /* 旧式直接块 */
         for (uint32_t b = 0; b < nblk && b < 12; b++) {

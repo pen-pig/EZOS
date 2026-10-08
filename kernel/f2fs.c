@@ -473,6 +473,10 @@ static int f2_check_dentries(const uint8_t *bitmap, const uint8_t *dentry,
         }
         char name[256];
         uint32_t slots = (name_len + F2FS_SLOT_LEN - 1) / F2FS_SLOT_LEN;
+        /* 名字槽必须整个落在这段 dentry 区内。坏盘能把 name_len 编到 255，
+         * 末尾一项就会读到 filename 区之外（缓冲内不崩，但名字是别处的
+         * 字节，ls 会显示乱码）。这里 fail closed：跳过该项。 */
+        if ((uint32_t)i + slots > (uint32_t)max) { i++; continue; }
         for (uint32_t k = 0; k < name_len; k++)
             name[k] = (char)filename[(uint32_t)i * F2FS_SLOT_LEN + k];
         name[name_len] = 0;
@@ -1169,6 +1173,9 @@ static int f2_dent_find(uint8_t *bitmap, uint8_t *dentry, uint8_t *filename,
         uint8_t *de = dentry + (uint32_t)i * SIZE_OF_DIR_ENTRY;
         uint16_t name_len = rd16(de + 8);
         if (name_len == 0 || name_len > F2FS_MAX_NAME) { i++; continue; }
+        /* 同上（f2_check_dentries）：槽位必须整个落在 filename 区内 */
+        int slots = (name_len + F2FS_SLOT_LEN - 1) / F2FS_SLOT_LEN;
+        if ((uint32_t)i + (uint32_t)slots > (uint32_t)max) { i++; continue; }
         char dn[256];
         for (uint16_t k = 0; k < name_len; k++)
             dn[k] = (char)filename[(uint32_t)i * F2FS_SLOT_LEN + k];
@@ -1408,6 +1415,8 @@ static int f2_dir_convert_inline(uint8_t *node, uint32_t dir_nid) {
         uint16_t name_len = rd16(de + 8);
         if (name_len == 0 || name_len > F2FS_MAX_NAME) { i++; continue; }
         uint32_t slots = (name_len + F2FS_SLOT_LEN - 1) / F2FS_SLOT_LEN;
+        /* 同上：槽位必须整个落在 inline filename 区内 */
+        if ((uint32_t)i + slots > (uint32_t)NR_INLINE_DENTRY) { i++; continue; }
         char name[256];
         for (uint32_t k = 0; k < name_len; k++)
             name[k] = (char)ifilename[(uint32_t)i * F2FS_SLOT_LEN + k];

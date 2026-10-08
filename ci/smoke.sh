@@ -19,6 +19,8 @@ LOG=${LOG:-serial.log}
 QEMU_TIMEOUT=${QEMU_TIMEOUT:-30}
 IMG=${IMG:-os-image.bin}
 DISK=${DISK:-disk.img}
+# CI 上 qemu 在 PATH 里；本机（Windows）没有，用 EZOS_QEMU 指全路径。
+QEMU=${EZOS_QEMU:-qemu-system-x86_64}
 
 ann_err()  { echo "::error::$1" >&2; }
 ann_note() { echo "::notice::$1" >&2; }
@@ -57,7 +59,7 @@ anti() {
 echo "[smoke] booting $IMG + $DISK for ${QEMU_TIMEOUT}s, serial -> $LOG"
 rm -f "$LOG"
 set +e
-timeout "$QEMU_TIMEOUT" qemu-system-x86_64 -machine pc -vga std -m 128 \
+timeout "$QEMU_TIMEOUT" "$QEMU" -machine pc -vga std -m 128 \
     -drive format=raw,file="$IMG" \
     -drive format=raw,file="$DISK" \
     -display none -no-reboot -serial "file:$LOG"
