@@ -32,6 +32,7 @@ ZIG="${ZIG:-zig}"
 
 ann_err()  { echo "::error::$1"  >&2; }
 ann_note() { echo "::notice::$1" >&2; }
+ann_warn() { echo "::warning::$1" >&2; }
 
 # 把失败日志的尾部原样发到 ::error:: 注解。别只 grep 关键字——第一次就是靠
 # "undefined reference" 去 grep 的，结果 CI 上是别的原因，一条注解都没捞到。
@@ -63,6 +64,12 @@ if [ -n "$sysroot" ] && [ -f "$sysroot/lib/rustlib/src/rust/Cargo.toml" ]; then
     ann_note "rust-src=OK ($sysroot/lib/rustlib/src/rust)"
 else
     ann_note "rust-src=MISSING (sysroot=${sysroot:-none})"
+    # 这条 notice 曾经是**误报**：cargo 是强制步骤（失败就 exit 1），CI 全绿
+    # 说明 rust-src 其实在，只是这个探测路径没命中。所以别只打印 MISSING，
+    # 把真实布局和已装组件一并打出来，省得下次对着一行 MISSING 瞎猜。
+    ann_note "rustlib layout: $(ls "$sysroot/lib/rustlib" 2>/dev/null | tr '\n' ' ')"
+    ann_note "installed src components: $(rustup component list --installed \
+              2>/dev/null | grep -i src | tr '\n' ' ')"
 fi
 
 # ---- 编译内核 C 源（自动收集，主/dev 分支通用） ----
@@ -165,4 +172,11 @@ echo "[ci] ASSEMBLE kernel.bin + os-image.bin (dynamic size)"
 SZ=$(stat -c%s os-image.bin)
 echo "[ci] BUILD OK: os-image.bin ($SZ bytes)"
 # 0x7C000 = 507904 是 linker.ld 的硬上限；离顶越近，换个 gcc 就越容易翻车
-ann_note "kernel_raw=$(stat -c%s kernel_raw.bin) / 507904 bytes limit"
+# 余量预警：贴着上限跑时换个编译器/加个功能就翻车（历史上 -O2 撞穿
+# 496KB 上限，CI 连红十几次）。剩不到 64KB 就提前喊，别等撞穿了才发现。
+RAW=$(stat -c%s kernel_raw.bin)
+ann_note "kernel_raw=$RAW / 507904 bytes limit"
+if [ "$RAW" -gt 443904 ]; then     # 507904 - 64KB
+    # warning 而不是 error：还在限内就不该红，但得让人看见余量在缩水
+    ann_warn "kernel_raw=$RAW：距 507904 上限只剩 $((507904 - RAW)) 字节"
+fi
