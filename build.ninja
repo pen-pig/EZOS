@@ -15,11 +15,13 @@ CARGO   = C:/Users/admin/.cargo/bin/cargo.exe
 
 # ===================== ?????? =====================
 # -O2：见 ci/build.sh 里的同一段说明。**必须和 CI 保持一致**——两边都是
-# -O2。窗口已扩到 672KB（镜像 0x10000..0xB8000，主栈搬到 1MB..2MB），CI 的
-# gcc 13 -O2 编出 579KB、本机 i686-elf-gcc 编出 504KB，余量充足。以前主栈
-# 占着 0x90000，窗口只有 496KB，只能靠 -Os 硬压换余量——那是拿代码质量换
-# 体积，现在不用了。
-CFLAGS  = -ffreestanding -O2 -Wall -Wextra -Werror -Ikernel -MMD
+# -O2。窗口已扩到 576KB（镜像 0x10000..0xA0000；0xA0000 是 VGA aperture；
+# 主栈搬到 1MB..2MB）。以前主栈占着 0x90000，窗口只有 496KB，只能靠 -Os 硬
+# 压换余量——那是拿代码质量换体积，现在不用了。
+#
+# -fno-align-*：只删掉函数/循环/跳转的 16 字节对齐填充（本机实测 -22.7KB），
+# **不动优化档位**——和 -Os 的区别是 -Os 改优化策略，这只是不凑边界。
+CFLAGS  = -ffreestanding -O2 -Wall -Wextra -Werror -Ikernel -MMD -fno-align-functions -fno-align-loops -fno-align-jumps
 LDFLAGS = -m elf_i386 -T linker.ld --oformat binary -e _start
 
 # ===================== ???? =====================
@@ -76,7 +78,7 @@ rule link_user
 
 rule make_image
     # 内核镜像大小是动态的：tools/make_image.py 按 kernel_raw.bin 的真实大小
-    # 算扇区数（向上取整 + 凑偶数，上限 1344 扇区 = 672KB），把扇区数写进引导
+    # 算扇区数（向上取整 + 凑偶数，上限 1152 扇区 = 576KB），把扇区数写进引导
     # 扇区偏移 0x1FC 的保留字段，boot.asm 运行时从内存读它。三条契约：
     #   boot/boot.asm（读 0x1FC）、tools/make_image.py（写 0x1FC）、
     #   uefi/main.c（UEFI 无引导扇区，直接用文件真实大小）

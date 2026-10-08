@@ -6,11 +6,10 @@ static const EFI_GUID gEfiGraphicsOutputProtocolGuid = {
 };
 
 /* Kernel image size is dynamic (tools/make_image.py sizes it from kernel_raw.bin).
- * KERNEL_SIZE_MAX only bounds it: the image window is 0x10000..0xB8000
- * (672KB); above that is the VGA text buffer. Must match linker.ld's ASSERT.
- * Do NOT lower the load base to 0x8000: OVMF occupies that area and the
- * UEFI boot path dies (tests/test_usbboot.py uefi case guards this). */
-#define KERNEL_SIZE_MAX  688128u   /* fail-closed cap; real size read from the file */
+ * KERNEL_SIZE_MAX only bounds it: the image window is 0x10000..0xA0000
+ * (576KB); 0xA0000 is the VGA aperture, NOT usable RAM - an image reaching
+ * into it page-faults on boot. Must match linker.ld's ASSERT. */
+#define KERNEL_SIZE_MAX  589824u   /* fail-closed cap; real size read from the file */
 #define KERNEL_LOAD  0x10000u   /* boot/boot.asm: KERNEL_OFFSET equ 0x10000 */
 
 /* ---- ‰∏≤Âè£ÔºàQEMU ‰∏? 0x3F8 Âç≥Á??‰∏?‰∏? ISA UARTÔºåÊé•Âà? -serialÔº? ---- */

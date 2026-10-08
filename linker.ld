@@ -10,11 +10,15 @@ SECTIONS
      * 入口字段（--oformat binary 已经把 ELF 头丢掉了）。因此 0x8000 处
      * 必须是 _start，而"0x8000 处是什么"完全由这里 .text 的收集顺序决定。
      *
-     * 窗口上界是 VGA 文本缓冲 0xB8000：BIOS 的 INT13h 只能写 seg:off
-     * （20 位），镜像必须落在低 1MB，且不能压到文本缓冲。
-     * 起点仍是 0x10000：试过下移到 0x8000 能把窗口再扩 32KB，但 OVMF 在
-     * 那一带有占用，UEFI 启动会直接跑飞（test_usbboot 的 uefi 用例守着）。
-     * 真正的扩容来自主栈搬家——它原来占着 0x90000，和镜像抢同一块内存。
+     * 窗口 = 0x8000..0xA0000 = 608KB。两个端点都是硬件给的，不是随手选的：
+     *   上界 0xA0000 —— VGA aperture 起点。0xA0000-0xBFFFF 是显卡的窗口，
+     *   文本模式下**不是**线性 flat RAM（0xB8000 只是其中的文本缓冲页）。
+     *   曾经把上界写成 0xB8000（以为中间那 96KB 也是普通内存），本地 504KB
+     *   的产物够不着所以一直没暴露；CI 的 gcc13 编出 591KB，镜像尾部一伸进
+     *   0xA0000 就 #PF 跑飞（串口刷了 6533 次 page fault）。
+     *   下界 0x10000 —— 不能再低。不是空间问题（0x8000 就能多 32KB），
+     *   而是 BOOTIA32.EFI 是仓库外预编译的二进制，里面写死了往 0x10000
+     *   搬内核；改 linker.ld 不跟着改它，UEFI 启动必然跑飞。
      *
      * 曾经只写 `*(.text)`：那么 _start 只有在 kernel_entry.o 恰好是链接
      * 列表第一个时才位于 0x8000。build.ninja 的列表确实是这么排的，所以
@@ -35,7 +39,7 @@ SECTIONS
     }
 
     /* 主栈搬到 1MB..2MB：以前它占着 0x90000，和镜像抢同一块低 1MB，把
-     * 窗口压到 496KB。搬走之后窗口 = 0x10000..0xB8000 = 672KB。
+     * 窗口压到 496KB。搬走之后镜像独占 0x10000..0xA0000 = 576KB。
      * 1-2MB 原本是 .bss.hi，已挪到 30MB（见下方）。
      * 栈从 0x200000 向下生长，1MB 空间（原来只有 ~21KB）。
      * 见 boot.asm / kernel_entry.asm 的 `mov esp, 0x200000`。
@@ -50,13 +54,14 @@ SECTIONS
     __stack_bottom = 0x100000;
     __stack_top = 0x200000;
 
-    /* 镜像（text+data）窗口 672KB：0x10000(内核) ~ 0xB8000(VGA 文本缓冲)。
+    /* 镜像（text+data）窗口 576KB：0x10000(内核) ~ 0xA0000(VGA aperture)。
      * 以前主栈占着 0x90000、和镜像抢同一块 512KB，只能靠 -Os 硬压，换个
      * gcc 就撞线（Ubuntu gcc13 -O2 编出 579KB > 496KB 上限）。现在主栈搬去
-     * 1MB，窗口 672KB；实测 -O2 产物 504KB，余量 179KB。
-     * 同一上限在 tools/make_image.py 里校验一次（MAX_SECTORS=1344）——
+     * 1MB，窗口 576KB，比原来多 80KB（代价是 -O2 产物要靠 -fno-align-* 压
+     * 掉代码对齐填充，见 build.ninja）。
+     * 同一上限在 tools/make_image.py 里校验一次（MAX_SECTORS=1152）——
      * 镜像大小本身是动态的，扇区数写进引导扇区 0x1FC。 */
-    ASSERT(. - 0x10000 <= 0xA8000, "kernel image exceeds 672KB window")
+    ASSERT(. - 0x10000 <= 0x90000, "kernel image exceeds 576KB window")
 
     /* .bss 与镜像解耦：放到 19MB（16MB GUI 背缓冲 ~18.6MB 结束之后、
      * 32MB identity 上界之前）。原因：低内存 0x10000-0x90000 被镜像+栈

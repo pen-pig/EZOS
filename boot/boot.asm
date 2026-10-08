@@ -3,7 +3,7 @@
 [bits 16]
 
 KERNEL_OFFSET equ 0x10000     ; �ں˼��ص�ַ
-KERNEL_SECTORS_MAX equ 1344   ; hard cap: image window is 0x8000..0xB8000
+KERNEL_SECTORS_MAX equ 1152   ; hard cap: image window is 0x8000..0xB8000
                               ; (704KB); above that is the VGA text buffer
 
 start:

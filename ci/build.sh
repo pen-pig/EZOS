@@ -75,10 +75,13 @@ fi
 # ---- 编译内核 C 源（自动收集，主/dev 分支通用） ----
 # **-O2**：以前用 -Os 是被窗口逼的——镜像 0x10000 和主栈 0x90000 抢同一块
 # 512KB，Ubuntu gcc 13 的 -O2 产物 579KB 直接撞穿 496KB 上限，只能降档硬压。
-# 现在主栈搬到 1MB..2MB，不再和镜像抢低 1MB，窗口扩到 672KB（镜像
-# 0x10000..0xB8000，上界是 VGA 文本缓冲），579KB 有余量了，于是回到 -O2。
-# 真要再瘦身，先考虑砍功能，别再降优化档位。
+# 现在主栈搬到 1MB..2MB，不再和镜像抢低 1MB，窗口扩到 576KB（镜像
+# 0x10000..0xA0000；0xA0000 是 VGA aperture，不是可用 RAM），于是回到 -O2。
+# -fno-align-* 只删掉函数/循环/跳转的对齐填充（本机实测 -22.7KB），不动优化
+# 档位——它和 -Os 的区别：-Os 改的是优化策略，这只是不凑 16 字节边界。
+# 不加的话 CI 的 gcc13 产物 591KB 会超出 576KB 窗口约 1.4KB。
 CFLAGS="-m32 -ffreestanding -O2 -Wall -Wextra \
+        -fno-align-functions -fno-align-loops -fno-align-jumps \
         -fno-pie -fno-pic -fno-stack-protector \
         -fno-asynchronous-unwind-tables \
         -Ikernel -MMD"
@@ -153,7 +156,7 @@ if ! "$LD" $LDFLAGS -o kernel_raw.bin boot/kernel_entry.o boot/task_switch.o \
     echo "[ci] FATAL: link failed, tail:" >&2
     tail -40 ci-ld.log >&2
     ann_log ci-ld.log ld
-    # 镜像上限是 linker.ld 的 ASSERT(<=0xA8000)。CI 用的 gcc 版本跟开发机不
+    # 镜像上限是 linker.ld 的 ASSERT(<=0x90000)。CI 用的 gcc 版本跟开发机不
     # 一样时，产物大小会漂移几个 KB——把 .o 体积打出来，一眼就能看出是"超
     # 容量"还是"缺符号"。
     tot=0
@@ -161,7 +164,7 @@ if ! "$LD" $LDFLAGS -o kernel_raw.bin boot/kernel_entry.o boot/task_switch.o \
         s=$(stat -c%s "$o" 2>/dev/null || echo 0)
         tot=$((tot + s))
     done
-    ann_note "sum of kernel .o bytes = $tot (limit 688128 for the linked image)"
+    ann_note "sum of kernel .o bytes = $tot (limit 589824 for the linked image)"
     exit 1
 fi
 echo "[ci] ASSEMBLE kernel.bin + os-image.bin (dynamic size)"
@@ -169,12 +172,12 @@ echo "[ci] ASSEMBLE kernel.bin + os-image.bin (dynamic size)"
 
 SZ=$(stat -c%s os-image.bin)
 echo "[ci] BUILD OK: os-image.bin ($SZ bytes)"
-# 0xA8000 = 688128 (672KB) 是 linker.ld 的硬上限；离顶越近，换个 gcc 就越
+# 0x90000 = 589824 (576KB) 是 linker.ld 的硬上限；离顶越近，换个 gcc 就越
 # 容易翻车。余量预警：贴着上限跑时换个编译器/加个功能就翻车（历史上 -O2
 # 撞穿 496KB 上限，CI 连红十几次）。剩不到 64KB 就提前喊，别等撞穿了才发现。
 RAW=$(stat -c%s kernel_raw.bin)
-ann_note "kernel_raw=$RAW / 688128 bytes limit"
-if [ "$RAW" -gt 622592 ]; then     # 688128 - 64KB
+ann_note "kernel_raw=$RAW / 589824 bytes limit"
+if [ "$RAW" -gt 524288 ]; then     # 589824 - 64KB
     # warning 而不是 error：还在限内就不该红，但得让人看见余量在缩水
-    ann_warn "kernel_raw=$RAW：距 688128 上限只剩 $((688128 - RAW)) 字节"
+    ann_warn "kernel_raw=$RAW：距 589824 上限只剩 $((589824 - RAW)) 字节"
 fi

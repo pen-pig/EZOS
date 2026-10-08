@@ -29,7 +29,7 @@ import os
 import sys
 
 SECTOR = 512
-MAX_SECTORS = 1344         # 704KB 窗口（0x8000..0xB8000）；同 linker.ld 的 ASSERT
+MAX_SECTORS = 1152         # 704KB 窗口（0x8000..0xB8000）；同 linker.ld 的 ASSERT
 SECTOR_FIELD = 0x1FC       # 引导扇区内保留字段（= 0x7DFC，boot.asm 的 kernel_sectors）
 BOOT_SIG = 0xAA55
 
