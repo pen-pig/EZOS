@@ -2103,12 +2103,19 @@ int f2fs_format(uint8_t drive) {
     f2_drive = drive;
     f2_part_lba = part_start;
 
-    /* MBR：分区 0x83 @LBA1（与 ext4_format 一致） */
+    /* MBR：分区 0x83 @LBA1（与 ext4_format 一致）
+     * 分区项布局：+0 boot flag、+1..+3 CHS start、+4 类型、+5..+7 CHS end、
+     * +8 LBA start、+12 扇区数。类型字节必须在 +4（mbr[450]）——
+     * 以前 0x83 被写到 mbr[449]（CHS 里），类型字节留成 0，结果所有
+     * MBR 扫描器（exfat_init / fat_try_mount / fs_scan_ro 都以 entry[4]
+     * 判空）都当空项跳过，退化成按 LBA0 的 superfloppy 探测，而 f2fs 的
+     * 超级块在 part_start+2 → 永远挂载不上，重启后卷就"消失"了。 */
     static uint8_t mbr[512];
     for (int i = 0; i < 512; i++) mbr[i] = 0;
-    mbr[446] = 0x00; mbr[447] = 0x02; mbr[448] = 0x00;
-    mbr[449] = 0x83;
-    mbr[450] = 0x00; mbr[451] = 0x3F; mbr[452] = 0xFF;
+    mbr[446] = 0x00;                            /* boot flag */
+    mbr[447] = 0x00; mbr[448] = 0x02; mbr[449] = 0x00;   /* CHS start */
+    mbr[450] = 0x83;                            /* 分区类型 */
+    mbr[451] = 0x00; mbr[452] = 0x3F; mbr[453] = 0xFF;   /* CHS end */
     f2_wr32(mbr + 454, part_start);
     f2_wr32(mbr + 458, vol_blocks * F2FS_BLK_SECS);
     mbr[510] = 0x55; mbr[511] = 0xAA;
