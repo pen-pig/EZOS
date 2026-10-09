@@ -61,7 +61,7 @@ LAYERS = {
     "usb":  ["usbenum", "uhci", "uhci_control", "usb", "usbkbd", "usbmouse",
              "usbmsc", "usbboot", "ehci"],
     "net":  ["netapp", "dhcp", "dns"],
-    "gui":  ["vi", "vi_color", "uefi3"],
+    "gui":  ["vi", "vi_color", "uefi3", "exitmode"],
     # corrupt：故意把盘改坏后断言内核不卡死（6 FS，黄金盘 + 随机翻位 +
     # 定向损坏，约 45 分钟）
     "deep": ["step7_sock", "step7_tcp", "corrupt"],
@@ -97,6 +97,9 @@ WATCH = [
     ("vhd", "core"), ("boot", "core"), ("uefi", "core"),
     ("ahci", "hw"), ("nvme", "hw"), ("acpi", "hw"), ("ata", "hw"),
     ("gfx", "gui"), ("gui", "gui"), ("desktop", "gui"), ("games", "gui"),
+    # exitmode 守的是"进桌面只有 desktop 一条路"：shell.c 的 cmd_exit /
+    # kernel.c 的主循环一改就可能把隐式通道放回来
+    ("exitmode", "gui"),
 ]
 
 # 单项超时（秒）。慢的（网络真对拍、GUI 像素）单独放宽。

@@ -4035,9 +4035,6 @@ void gw_demo(void)
      * 行列状态与屏幕脱节，表现为"显示不完整 + 按键出竖线 + clear 无效"。 */
     terminal_set_gfx_hook(NULL);
     gfx_restore_text();
-    /* Terminal 里敲过 exit 会置 shell_exit_flag：清除残留，
-     * 否则回文本模式后下一次 shell_run 立即返回又弹回桌面 */
-    shell_exit_clear();
     gw_gui_active = 0;
 }
 

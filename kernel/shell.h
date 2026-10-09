@@ -4,7 +4,6 @@
 #include "types.h"
 
 void shell_run(void);
-void shell_exit_clear(void);     // 清除 exit 标志（GUI 退出回 shell 前调用，防残留立即退出）
 void system_reboot(void);        // 触发整机重启（8042 复位）
 void system_shutdown(void);      // 触发整机关机（ACPI/QEMU）
 void cmd_hex(const char *args);

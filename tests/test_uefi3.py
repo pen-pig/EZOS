@@ -284,7 +284,7 @@ def main():
         check("selftest: 0 failed", "0 failed" in t)
 
         # ---- shell -> desktop (32bpp GUI) ----
-        qmp.type_line("exit")
+        qmp.type_line("desktop")
         settled = False
         prev = shot(SHOT2)
         deadline = time.time() + BOOT_WAIT

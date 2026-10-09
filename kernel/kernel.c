@@ -691,13 +691,11 @@ void kernel_main(void) {
     terminal_writestring("\n");
 //	klog_ok("EZOS Kernel Shell - type 'help' for commands, 'exit' to continue boot.");
 
-    /* ===== ��ѭ����shell -> exit -> ͼ������ -> �˳������ shell ===== */
+    /* shell 是系统控制台，它不会因 'exit' 返回；进入图形桌面只有一条路：
+     * 'desktop' 命令（cmd_desktop -> gw_start）。下面的循环只是兜底：
+     * 万一 shell_run 返回，重新拉起 shell，绝不自动跳进桌面。 */
     for (;;) {
         shell_run();
-
-        /* exit ֱ�ӽ���ͼ�����棨���پ��� User Shell�� */
-        terminal_writestring("\n");
-        klog("entering graphical desktop - quit from start menu to return to shell");
-        gw_start();
+        terminal_writestring("\nShell session ended, restarting shell.\n");
     }
 }

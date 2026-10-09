@@ -39,7 +39,6 @@ static size_t current_row = 0;
  * 以前只清 current_row 一行：输入一折行，第二行的内容就再也擦不掉，
  * 越输越乱（旧字残留在下面，光标还停在第一行）。 */
 static int input_rows_used = 1;      // ��ǰ��ʾ�������к�
-static int shell_exit_flag = 0;     // exit ������λ��shell_run �ݴ˷���
 /* ��ϣ�shell ѭ��ÿ�ֲ��� EFLAGS��data ��ȫ�֣��� QEMU monitor ���ڴ���֤�� */
 volatile uint32_t dbg_shell_eflags = 0;
 
@@ -580,9 +579,6 @@ static int is_exe_name(const char *name) {
 static void shell_execute_raw(char *cmd, int bg);
 
 /* shell ģʽ��1=�û� shell��GUI Terminal / User Shell����0=�ں� shell */
-/* 清除 exit 请求标志：GUI Terminal 里敲�?exit 后退出桌面时调用�?
- * 防止残留标志让下一�?shell_run 立即返回 */
-void shell_exit_clear(void) { shell_exit_flag = 0; }
 
 /* ִ�д��ض���/�ܵ������� */
 static void shell_execute(char *cmd) {
@@ -852,7 +848,7 @@ static void shell_redraw_line(void) {
 }
 
 void shell_run(void) {
-    terminal_writestring("EZOS Shell - Type 'help' for commands, 'exit' to launch desktop.\n");
+    terminal_writestring("EZOS Shell - Type 'help' for commands, 'desktop' for the graphical desktop.\n");
     shell_prompt();
 
     cmd_pos = 0;
@@ -863,10 +859,6 @@ void shell_run(void) {
     while (1) {
         asm volatile("sti; nop; nop; nop; nop; nop");   /* ȷ���жϿ��������?STI ���ƴ��ڣ� */
         { uint32_t fl; asm volatile("pushfl; popl %0" : "=r"(fl)); dbg_shell_eflags = fl; }
-        if (shell_exit_flag) {
-            shell_exit_flag = 0;
-            return;
-        }
         int c = keyboard_getchar();
         if (c == 0) continue;
 
@@ -1051,7 +1043,7 @@ static void cmd_help(const char *args) {
     help_line("  pwd        - print working directory\n");
     help_line("  desktop    - launch graphical desktop\n");
     help_line("  gui        - launch text-mode GUI\n");
-    help_line("  exit       - launch graphical desktop\n");
+    help_line("  exit       - leave the shell (disabled: console cannot be left)\n");
     help_line("  theme [n]  - list/switch GUI theme\n");
     help_line("  uname      - print system information\n");
     help_line("  vi <file>  - edit a text file\n");
@@ -1096,7 +1088,11 @@ static void cmd_clear(const char *args) {
 
 static void cmd_exit(const char *args) {
     (void)args;
-    shell_exit_flag = 1;
+    /* exit 不再切到图形桌面：桌面只能由 'desktop' 命令显式启动
+     * （cmd_desktop -> gw_start）。shell 是系统控制台，退出它就没有
+     * 任何人机界面了，所以这里只打印提示，不做任何切换。 */
+    terminal_writestring("exit: this shell is the system console, it cannot be left.\n");
+    terminal_writestring("      use 'desktop' for the graphical desktop, 'shutdown' to power off.\n");
 }
 
 static void cmd_echo(const char *args) {
@@ -1988,7 +1984,7 @@ static void cmd_gui(const char *args) {
     terminal_initialize();
 }
 
-/* desktop command: launch graphical desktop (same as 'exit') */
+/* desktop command: the ONLY way to enter the graphical desktop */
 static void cmd_desktop(const char *args) {
     (void)args;
     terminal_initialize();
