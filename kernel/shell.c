@@ -802,20 +802,13 @@ static int shell_prompt_width(void) {
     return 1 + (int)my_strlen(fs_cwd_path()) + 4;
 }
 
-/* 当前还能再输入几个字符：**屏幕放得下**才是上限。
+/* 还能再输入几个字符 = 缓冲区还剩多少。
  *
- * CMD_BUFFER_SIZE 是 1024，比一屏能显示的多一个数量级。照它放行的结果是
- * 输入一路折行折到屏幕底部、触发滚屏，current_row 当场失效——重绘清错行、
- * 光标乱跳，就是"输入太长一折行显示就乱了"。
- * 所以上限按"从 current_row 到屏底还剩几列"算，宁可拒绝输入也不滚屏。 */
-static int shell_input_capacity(void) {
-    int rows_left = TERM_HEIGHT - (int)current_row;
-    if (rows_left < 1) rows_left = 1;
-    int cap = rows_left * TERM_WIDTH - shell_prompt_width() - 1;
-    if (cap < 0) cap = 0;
-    if (cap > CMD_BUFFER_SIZE - 1) cap = CMD_BUFFER_SIZE - 1;
-    return cap;
-}
+ * 曾经把这改成"屏幕放得下"（到屏底还剩几列），想避免滚屏打乱 current_row。
+ * 结果是**超长的按键被静默丢弃**——在屏幕底部敲一条长命令，敲到行尾之后
+ * 字符就不再出现，看着就是"明明超长了却不换行"。假省事比真麻烦糟糕：
+ * 折行+滚屏才是终端该有的行为，现在由 shell_redraw_line 负责滚屏。 */
+static int shell_input_capacity(void) { return CMD_BUFFER_SIZE - 1; }
 
 static void shell_redraw_line(void) {
     int cap = shell_input_capacity();
@@ -827,11 +820,22 @@ static void shell_redraw_line(void) {
     int plen = shell_prompt_width();
     int total = plen + cmd_pos;
     int rows = total / TERM_WIDTH + 1;
-    int rows_max = TERM_HEIGHT - (int)current_row;
-    if (rows_max < 1) rows_max = 1;
-    if (rows > rows_max) rows = rows_max;
+    if (rows < 1) rows = 1;
+    if (rows > TERM_HEIGHT) rows = TERM_HEIGHT;
+
     /* 清"上次占的行"与"这次要占的行"的并集，否则输入变短会留下残字 */
     int clear_n = (input_rows_used > rows) ? input_rows_used : rows;
+
+    /* 输入折行折到屏幕底部：像真实终端那样把屏幕上滚，而不是拒绝输入。
+     * 滚完必须把 current_row 和 tty 的内部行游标一起上移——只搬显存不动
+     * terminal_row 的话，接下来 putchar 会画到已经被滚走的行号上。 */
+    if ((int)current_row + clear_n > TERM_HEIGHT) {
+        int sc = (int)current_row + clear_n - TERM_HEIGHT;
+        if (sc > TERM_HEIGHT) sc = TERM_HEIGHT;
+        terminal_scroll_n((uint32_t)sc);
+        current_row = (size_t)((int)current_row - sc);
+    }
+    terminal_set_row(current_row);
     for (int i = 0; i < clear_n; i++)
         terminal_clear_line((size_t)((int)current_row + i));
     terminal_set_cursor(current_row, 0);

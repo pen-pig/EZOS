@@ -233,6 +233,16 @@ size_t terminal_get_column(void) {
     return terminal_column;
 }
 
+void terminal_set_row(size_t row) {
+    if (row >= VGA_HEIGHT) row = VGA_HEIGHT - 1;
+    terminal_row = row;
+    terminal_column = 0;
+}
+
+void terminal_scroll_n(uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) terminal_scroll();
+}
+
 // �� scrollback �С����Ϲ��� k �С����һ��������Ⱦ����Ļ
 static void render_scrollback(int k) {
     for (int y = 0; y < VGA_HEIGHT; y++) {

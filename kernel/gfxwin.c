@@ -21,6 +21,13 @@
 #define TERM_ROWS 24
 #define TERM_COLS 80
 
+/* 输入行上限。以前是"一行放得下"（term_cols-3 ≈ 77），超出的按键**直接丢
+ * 弃**——在 GUI 终端里敲 `write BIG <长内容>` 这种命令，敲到行尾之后字符就
+ * 不再出现，看着像"明明超长了却不换行"。
+ * 现在按终端该有的行为来：输入可以折行，折到屏底就整体上滚。term_buf 是
+ * 线性 24x80，绘制按 term_cols 切行，所以连续写字符天然就是折行的。 */
+#define TERM_INPUT_MAX 512
+
 extern void system_shutdown(void);
 extern void system_reboot(void);
 extern int shell_exec_line(const char *line);
@@ -3117,12 +3124,15 @@ void term_dbg_dump(char *hx, int maxb)
 }
 int term_dbg_nrows(void) { return term_nrows; }
 int term_dbg_caret(void) { return term_caret; }
-static char term_input[TERM_COLS + 1];   /* 独立输入行缓冲（避免滚动/参数空格导致命令错乱） */
+static char term_input[TERM_INPUT_MAX + 1];   /* 独立输入行缓冲（避免滚动/参数空格导致命令错乱） */
 static int  term_input_len = 0;
+/* 当前输入在 term_buf 里的起始下标。退格不能越过它——否则会把提示符 "> "
+ * 也擦掉。以前用"光标不在行首"来判断，输入一折行这个判据就失效了。 */
+static int  term_input_base = 0;
 
 /* 命令历史（GUI 终端）：回车提交入栈，Up/Down 翻阅 */
 #define TERM_HIST_MAX 16
-static char term_hist[TERM_HIST_MAX][TERM_COLS + 1];
+static char term_hist[TERM_HIST_MAX][TERM_INPUT_MAX + 1];
 static int  term_hist_count = 0;
 static int  term_hist_idx = -1;          /* -1 = 正在编辑新输入 */
 
@@ -3152,32 +3162,31 @@ static void term_hist_push(const char *line)
         term_hist_count++;
     } else {
         for (int i = 0; i < TERM_HIST_MAX - 1; i++) {
-            for (int j = 0; j <= TERM_COLS; j++) term_hist[i][j] = term_hist[i + 1][j];
+            for (int j = 0; j <= TERM_INPUT_MAX; j++) term_hist[i][j] = term_hist[i + 1][j];
         }
     }
     char *dst = term_hist[term_hist_count - 1];
-    for (int i = 0; i < len && i < TERM_COLS; i++) dst[i] = line[i];
-    dst[len > TERM_COLS ? TERM_COLS : len] = 0;
+    for (int i = 0; i < len && i < TERM_INPUT_MAX; i++) dst[i] = line[i];
+    dst[len > TERM_INPUT_MAX ? TERM_INPUT_MAX : len] = 0;
 }
 
-/* 擦除当前输入行字符（输入限长保证不换行），光标回到提示符后 */
+/* 擦除当前输入（可能跨了好几行），光标回到提示符后 */
 static void term_input_erase(void)
 {
-    while (term_input_len > 0) {
+    while (term_input_len > 0 && term_caret > term_input_base) {
         term_input_len--;
         term_caret--;
         term_buf[term_caret] = ' ';
     }
     term_input[0] = 0;
+    term_nrows = term_caret / term_cols + 1;
 }
 
 /* 用历史行替换当前输入（重绘进终端缓冲） */
 static void term_input_set(const char *s)
 {
     term_input_erase();
-    int in_max = (term_cols > TERM_COLS ? TERM_COLS : term_cols) - 3;
-    if (in_max < 8) in_max = 8;
-    while (*s && term_input_len < in_max) {
+    while (*s && term_input_len < TERM_INPUT_MAX) {
         term_scroll_if_full();
         term_input[term_input_len++] = *s;
         term_buf[term_caret++] = *s;
@@ -3192,6 +3201,7 @@ static void term_prompt(void)
 {
     term_print("> ");
     term_input_reset();
+    term_input_base = term_caret;      /* 退格擦到这里为止，不能再往前 */
 }
 
 /* 一行有多少格 / 缓冲里第 n 行从哪开始：全部走 term_cols，不再直接写
@@ -3283,9 +3293,9 @@ static void term_key(gw_window_t *w, int key)
     (void)w;    /* 单终端实例，无需区分窗口 */
     if (key == '\n' || key == '\r') {
         /* 执行输入缓冲中的完整命令（保留空格参数） */
-        char line[TERM_COLS + 1];
+        char line[TERM_INPUT_MAX + 1];
         int len = term_input_len;
-        if (len > TERM_COLS) len = TERM_COLS;
+        if (len > TERM_INPUT_MAX) len = TERM_INPUT_MAX;
         for (int i = 0; i < len; i++) line[i] = term_input[i];
         line[len] = 0;
         term_newline();
@@ -3300,7 +3310,7 @@ static void term_key(gw_window_t *w, int key)
         term_prompt();
         term_hist_idx = -1;
     } else if (key == 0x08) {  /* Backspace */
-        if (term_input_len > 0 && term_caret > 0 && term_caret % term_cols != 0) {
+        if (term_input_len > 0 && term_caret > term_input_base) {
             term_input_len--;
             term_input[term_input_len] = 0;
             term_caret--;
@@ -3326,14 +3336,14 @@ static void term_key(gw_window_t *w, int key)
                 if (term_input[i] == ' ') { has_space = 1; break; }
             }
             if (!has_space) {
-                char full[TERM_COLS + 1];
+                char full[TERM_INPUT_MAX + 1];
                 const char *matches[12];
                 int r = shell_complete_command(term_input, full, sizeof(full), matches, 12);
                 if (r == 1) {
                     term_input_set(full);
                 } else if (r >= 2) {
                     /* 先保存当前输入（term_input_set 会清空源缓冲） */
-                    char keep[TERM_COLS + 1];
+                    char keep[TERM_INPUT_MAX + 1];
                     for (int i = 0; i <= term_input_len; i++) keep[i] = term_input[i];
                     term_newline();
                     term_print("  ");
@@ -3348,12 +3358,9 @@ static void term_key(gw_window_t *w, int key)
             }
         }
     } else if (key >= 0x20 && key < 0x7F) {
-        /* 限长"一行放得下"：提示符 "> " 2 格 + 余量，保证输入行不折行
-         * （历史回填/退格擦除均按单行处理）。窗口窄于 80 列时按实际列宽算，
-         * 否则输入会折到下一行、退格却只擦当前行。 */
-        int in_max = (term_cols > TERM_COLS ? TERM_COLS : term_cols) - 3;
-        if (in_max < 8) in_max = 8;
-        if (term_input_len < in_max) {
+        /* 上限就是输入缓冲的大小。折行由 term_buf 的线性布局天然支持
+         * （绘制按 term_cols 切行），写到底部由 term_scroll_if_full 上滚。 */
+        if (term_input_len < TERM_INPUT_MAX) {
             term_input[term_input_len++] = (char)key;
             term_input[term_input_len] = 0;
             term_scroll_if_full();   /* scroll before write: prevent overflow */

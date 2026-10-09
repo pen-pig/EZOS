@@ -192,6 +192,19 @@ def main():
         rec(results, "klog timestamps never go backwards",
             not back, "| %d regression(s) e.g. %r" % (len(back), back[:2]))
 
+        # --- 开机提示符在屏幕**底部**：超长输入必须折行+滚屏，不能被截断 ---
+        # 曾经把输入上限改成"到屏底还剩几列"，结果超长按键被静默丢弃——在屏
+        # 幕底部敲长命令，敲到行尾之后字符就不再出现，看着像"不换行"。
+        qmp.keys("echo " + "b" * 300)
+        scr = grab_vga(qmp)
+        nb = sum(r.count("b") for r in scr)
+        rec(results, "long input at bottom prompt is not truncated",
+            nb >= 150, "| %d 'b' visible on screen" % nb)
+        rec(results, "wrapped input fills whole rows (no early cut)",
+            max(r.count("b") for r in scr) >= 60,
+            "| widest run=%d" % max(r.count("b") for r in scr))
+        qmp.backspace(320)
+
         # --- baseline：clear 之后提示符回到第 0 行，屏上只有它 ---
         qmp.keys("clear")
         qmp.hmc("sendkey ret")
