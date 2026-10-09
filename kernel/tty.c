@@ -124,6 +124,8 @@ void terminal_putchar(char c) {
         if (c == '\n') {
             terminal_column = 0;
             if (terminal_row < VGA_HEIGHT - 1) terminal_row++;
+        } else if (c == '\r') {
+            terminal_column = 0;
         } else if (c == '\t') {
             terminal_column = (terminal_column + 4) & ~3;
             if (terminal_column >= VGA_WIDTH) { terminal_column = 0; if (terminal_row < VGA_HEIGHT - 1) terminal_row++; }
@@ -142,6 +144,14 @@ void terminal_putchar(char c) {
             terminal_scroll();
             terminal_row = VGA_HEIGHT - 1;
         }
+        terminal_set_cursor(terminal_row, terminal_column);
+        return;
+    }
+    /* 回车（'\r'）= 回到行首。不处理的话 0x0D 会被当普通字符
+     * 画进文本缓冲（VGA 字体里是个奇怪的符号）：串口日志看着正常，
+     * 屏幕上却一行行乱码。 */
+    if (c == '\r') {
+        terminal_column = 0;
         terminal_set_cursor(terminal_row, terminal_column);
         return;
     }
@@ -206,6 +216,9 @@ void terminal_set_cursor(size_t row, size_t col) {
 }
 
 void terminal_clear_line(size_t row) {
+    /* row 越界会写穿 VGA 缓冲。shell 折行重绘按"当前行 + 偏移"算行数，
+     * 算错就直接越界写——宁可什么都不做也不能写出去。 */
+    if (row >= VGA_HEIGHT) return;
     for (size_t col = 0; col < VGA_WIDTH; col++) {
         terminal_putentryat(' ', terminal_color, col, row);
     }
@@ -214,6 +227,10 @@ void terminal_clear_line(size_t row) {
 
 size_t terminal_get_row(void) {
     return terminal_row;
+}
+
+size_t terminal_get_column(void) {
+    return terminal_column;
 }
 
 // �� scrollback �С����Ϲ��� k �С����һ��������Ⱦ����Ļ

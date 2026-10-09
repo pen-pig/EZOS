@@ -53,9 +53,11 @@ PY = sys.executable
 
 # 层级定义。key 是层级名，value 是测试模块名（不含 test_ 前缀与 .py）。
 LAYERS = {
-    "core": ["image", "vhd", "regress", "fs_matrix", "multilang", "mouse"],
+    "core": ["image", "vhd", "regress", "fs_matrix", "multilang", "mouse",
+             "termwrap"],
     "fs":   ["fsref", "hostfs", "fatpath", "path", "sysvol", "rmdir",
-             "reformat", "autofmt", "ext4vol", "f2fsvol", "refsvol", "exfatvol"],
+             "reformat", "autofmt", "ext4vol", "f2fsvol", "refsvol", "exfatvol",
+             "fsck"],
     "usb":  ["usbenum", "uhci", "uhci_control", "usb", "usbkbd", "usbmouse",
              "usbmsc", "usbboot", "ehci"],
     "net":  ["netapp", "dhcp", "dns"],
@@ -72,6 +74,12 @@ LAYERS = {
 # 改动文件 -> 必跑层级。键是路径子串。
 WATCH = [
     ("exfat", "core fs"), ("fat.c", "core fs"), ("fs.c", "core fs"),
+    # fsck 的破坏用例是定向改字节，改动任一端（内核扫描 / 宿主机参考实现）
+    # 都可能让"好盘也报问题"这种假阳性溜过去
+    ("fsck", "core fs"), ("ref_fat", "core fs"),
+    # termwrap 直读 VGA 文本缓冲，判定的是"屏幕上看到什么"：tty.c / shell.c /
+    # kernel.c 的开机输出一改就可能红。
+    ("termwrap", "core fs"),
     ("sysvol", "core fs"), ("ref_exfat", "core fs"),
     ("mouse", "core usb"), ("usbmouse", "core usb"), ("usbkbd", "usb"),
     ("keyboard", "usb"), ("uhci", "usb"), ("ehci", "usb"), ("usbc", "usb"),

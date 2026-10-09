@@ -11,6 +11,12 @@ void terminal_setcolor(uint8_t color);
 void terminal_set_cursor(size_t row, size_t col);
 void terminal_clear_line(size_t row);
 size_t terminal_get_row(void);
+size_t terminal_get_column(void);
+
+/* 终端尺寸：shell 需要它算"输入行会折到第几行"。写死在 shell.c 里的话，
+ * 改终端尺寸就会静默错位——这里是唯一事实来源。 */
+#define TERM_WIDTH   80
+#define TERM_HEIGHT  25
 void terminal_scroll_up(void);
 void terminal_scroll_down(void);
 void terminal_scroll_reset(void);

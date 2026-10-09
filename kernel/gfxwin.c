@@ -3092,6 +3092,17 @@ static char term_buf[TERM_ROWS * TERM_COLS];
 static int term_nrows = 0;
 static int term_caret = 0;
 
+/* 终端**实际**列宽。
+ *
+ * 缓冲是 24x80，但窗口常常放不下 80 列（默认 420px 宽的窗口只能画 ~50 列）。
+ * 如果换行按 80 列算、绘制按 50 列画，每行后 30 个字符就被切掉，下一条日志
+ * 接上来显示——开机自检那种一行 60+ 字符的输出看起来就是"整片炸了"。
+ *
+ * 所以换行与绘制必须用**同一个**列宽：打开终端时按窗口内宽算出来，之后
+ * term_newline / term_print / term_draw / 光标定位全部用它。
+ * 上限仍是 TERM_COLS（窗口比 80 列还宽时不跟着变宽，80 是缓冲的行宽）。 */
+static int term_cols = TERM_COLS;
+
 /* [DEBUG-TERMBUF] 临时访问函数：供任务栏调试打印 term_buf/游标状态 */
 void term_dbg_dump(char *hx, int maxb)
 {
@@ -3164,14 +3175,16 @@ static void term_input_erase(void)
 static void term_input_set(const char *s)
 {
     term_input_erase();
-    while (*s && term_input_len < TERM_COLS - 3) {
+    int in_max = (term_cols > TERM_COLS ? TERM_COLS : term_cols) - 3;
+    if (in_max < 8) in_max = 8;
+    while (*s && term_input_len < in_max) {
         term_scroll_if_full();
         term_input[term_input_len++] = *s;
         term_buf[term_caret++] = *s;
         s++;
     }
     term_input[term_input_len] = 0;
-    term_nrows = term_caret / TERM_COLS + 1;
+    term_nrows = term_caret / term_cols + 1;
 }
 
 /* 打印 shell 提示符并清空输入缓冲 */
@@ -3181,34 +3194,44 @@ static void term_prompt(void)
     term_input_reset();
 }
 
+/* 一行有多少格 / 缓冲里第 n 行从哪开始：全部走 term_cols，不再直接写
+ * TERM_COLS——窗口窄于 80 列时按 80 换行、按实际列数画，每行后半截就被
+ * 切掉（自检那种 60+ 字符的行看着就是整片乱掉）。 */
+static int term_row_begin(int row) { return row * term_cols; }
+
+static void term_scroll_up_one(void)
+{
+    for (int _ti = 0; _ti < (TERM_ROWS - 1) * term_cols; _ti++)
+        term_buf[_ti] = term_buf[_ti + term_cols];
+    term_caret -= term_cols;
+    /* 上移之后最后一行还是"它自己的旧内容"（只搬了前 ROWS-1 行），
+     * 不清就是一行擦不掉的残影，看着像换行错了一行。 */
+    for (int _ti = (TERM_ROWS - 1) * term_cols; _ti < TERM_ROWS * term_cols; _ti++)
+        term_buf[_ti] = ' ';
+}
+
 static void term_newline(void)
 {
-    while (term_caret % TERM_COLS != 0) term_buf[term_caret++] = ' ';
-    if (term_caret >= TERM_ROWS * TERM_COLS) {
-        for (int _ti = 0; _ti < (TERM_ROWS - 1) * TERM_COLS; _ti++)
-            term_buf[_ti] = term_buf[_ti + TERM_COLS];
-        term_caret -= TERM_COLS;
-    }
-    term_nrows = term_caret / TERM_COLS + 1;
+    while (term_caret % term_cols != 0) term_buf[term_caret++] = ' ';
+    if (term_caret >= TERM_ROWS * term_cols) term_scroll_up_one();
+    term_nrows = term_caret / term_cols + 1;
 }
 
 static void term_scroll_if_full(void)
 {
-    if (term_caret >= TERM_ROWS * TERM_COLS) {
-        for (int _ti = 0; _ti < (TERM_ROWS - 1) * TERM_COLS; _ti++)
-            term_buf[_ti] = term_buf[_ti + TERM_COLS];
-        term_caret -= TERM_COLS;
-    }
+    if (term_caret >= TERM_ROWS * term_cols) term_scroll_up_one();
 }
 
 static void term_print(const char *s)
 {
     while (*s) {
+        /* 回车 = 回到行首。不认它的话 0x0D 会被当成普通字符画出来。 */
+        if (*s == '\r') { term_caret -= term_caret % term_cols; s++; continue; }
         if (*s == '\n') { term_newline(); s++; continue; }
-        term_scroll_if_full();   /* 写入前滚动，防止 term_buf[1920] 越界写 */
+        term_scroll_if_full();   /* 写入前滚动，防止 term_buf 越界写 */
         term_buf[term_caret++] = *s++;
     }
-    term_nrows = term_caret / TERM_COLS + 1;
+    term_nrows = term_caret / term_cols + 1;
 }
 
 /* GUI 模式输出重定向：shell 命令输出进入终端窗口缓冲 */
@@ -3224,11 +3247,12 @@ static void term_draw(gw_window_t *w)
      * （白底从内容区起、字形从+3起），看起来就是"乱码"。 */
     int x = w->x + 1, y = w->y + GW_TITLE_H + 1;
     int cw = 8, ch = 16;
-    int cols = (w->inner_w - 8) / cw;
+    /* 绘制列宽必须与换行用的 term_cols 一致，否则每行后半截被切掉。
+     * 窗口比 80 列宽时按 80 画（缓冲的行宽就是 80）。 */
+    int cols = term_cols;
     int rows = (w->inner_h - 8) / ch;
     if (cols < 0) cols = 0;
     if (rows < 0) rows = 0;
-    if (cols > TERM_COLS) cols = TERM_COLS;
     if (rows > TERM_ROWS) rows = TERM_ROWS;
     int start = 0;
     if (term_nrows > rows) start = term_nrows - rows;
@@ -3239,7 +3263,7 @@ static void term_draw(gw_window_t *w)
         if (src_row >= term_nrows) break;
         for (int c = 0; c < cols; c++) {
             char ch2[2];
-            ch2[0] = term_buf[src_row * TERM_COLS + c];
+            ch2[0] = term_buf[term_row_begin(src_row) + c];
             if (ch2[0] == 0) ch2[0] = ' ';
             ch2[1] = 0;   /* NUL-terminate: gfx_draw_text_scaled stops at NUL */
             /* Win10 palette: white bg + black fg (transparent bg draw) */
@@ -3247,8 +3271,8 @@ static void term_draw(gw_window_t *w)
         }
     }
     /* 光标 */
-    int cx = (term_caret % TERM_COLS);
-    int cy = (term_caret / TERM_COLS) - start;
+    int cx = (term_caret % term_cols);
+    int cy = (term_caret / term_cols) - start;
     if (cy < 0) cy = 0;
     if (cy >= rows) cy = rows - 1;
     gfx_draw_text_scaled(x + cx * cw, y + cy * ch, "_", 0x00, -1, 1);
@@ -3269,11 +3293,14 @@ static void term_key(gw_window_t *w, int key)
             term_hist_push(line);
             shell_exec_line(line);
         }
-        term_newline();
+        /* 输出不以换行结尾时补一个——不补的话提示符会接在输出尾巴上。
+         * 但输出已经换行了还补，就是每条命令后平白多一个空行（原来这里
+         * 是无条件 term_newline()）。所以看光标是不是已经在行首。 */
+        if (term_caret % term_cols != 0) term_newline();
         term_prompt();
         term_hist_idx = -1;
     } else if (key == 0x08) {  /* Backspace */
-        if (term_input_len > 0 && term_caret > 0 && term_caret % TERM_COLS != 0) {
+        if (term_input_len > 0 && term_caret > 0 && term_caret % term_cols != 0) {
             term_input_len--;
             term_input[term_input_len] = 0;
             term_caret--;
@@ -3321,14 +3348,17 @@ static void term_key(gw_window_t *w, int key)
             }
         }
     } else if (key >= 0x20 && key < 0x7F) {
-        /* 限长 TERM_COLS-3：提示符 "> " 2 格 + 余量，保证输入行不折行
-         * （历史回填/退格擦除均按单行处理） */
-        if (term_input_len < TERM_COLS - 3) {
+        /* 限长"一行放得下"：提示符 "> " 2 格 + 余量，保证输入行不折行
+         * （历史回填/退格擦除均按单行处理）。窗口窄于 80 列时按实际列宽算，
+         * 否则输入会折到下一行、退格却只擦当前行。 */
+        int in_max = (term_cols > TERM_COLS ? TERM_COLS : term_cols) - 3;
+        if (in_max < 8) in_max = 8;
+        if (term_input_len < in_max) {
             term_input[term_input_len++] = (char)key;
             term_input[term_input_len] = 0;
-            term_scroll_if_full();   /* scroll before write: prevent term_buf[1920] overflow */
+            term_scroll_if_full();   /* scroll before write: prevent overflow */
             term_buf[term_caret++] = (char)key;
-            term_nrows = term_caret / TERM_COLS + 1;
+            term_nrows = term_caret / term_cols + 1;
         }
     }
 }

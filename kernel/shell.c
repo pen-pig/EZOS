@@ -34,7 +34,11 @@ static int history_count = 0;
 
 static int history_index = -1;      // ��ǰ�������ʷλ�ã�?1 ��ʾ��������
 static size_t cursor = 0;           // ����ڵ�ǰ�����е�λ��?
-static size_t current_row = 0;      // ��ǰ��ʾ�������к�
+static size_t current_row = 0;
+/* 输入行折行后实际占了几行（重绘时决定要清几行）。
+ * 以前只清 current_row 一行：输入一折行，第二行的内容就再也擦不掉，
+ * 越输越乱（旧字残留在下面，光标还停在第一行）。 */
+static int input_rows_used = 1;      // ��ǰ��ʾ�������к�
 static int shell_exit_flag = 0;     // exit ������λ��shell_run �ݴ˷���
 /* ��ϣ�shell ѭ��ÿ�ֲ��� EFLAGS��data ��ȫ�֣��� QEMU monitor ���ڴ���֤�� */
 volatile uint32_t dbg_shell_eflags = 0;
@@ -455,6 +459,7 @@ static const command_t commands[] = {
     {"crc16",    cmd_crc16},
     {"crc32c",   cmd_crc32c},
     {"dmesg",    cmd_dmesg},
+    {"fsck",     cmd_fsck},
     {"kmtest",   cmd_kmtest},
     {"rstest",   cmd_rstest},
     {"pagetest", cmd_pagetest},
@@ -791,14 +796,55 @@ static int shell_prompt(void) {
     return n;
 }
 
+/* 提示符宽度（只算不打）。折行重绘必须先知道"提示符 + 内容一共多宽"才能
+ * 算出占几行；靠"打印完再看光标在哪"会晚一步——那时清屏已经做完了。 */
+static int shell_prompt_width(void) {
+    return 1 + (int)my_strlen(fs_cwd_path()) + 4;
+}
+
+/* 当前还能再输入几个字符：**屏幕放得下**才是上限。
+ *
+ * CMD_BUFFER_SIZE 是 1024，比一屏能显示的多一个数量级。照它放行的结果是
+ * 输入一路折行折到屏幕底部、触发滚屏，current_row 当场失效——重绘清错行、
+ * 光标乱跳，就是"输入太长一折行显示就乱了"。
+ * 所以上限按"从 current_row 到屏底还剩几列"算，宁可拒绝输入也不滚屏。 */
+static int shell_input_capacity(void) {
+    int rows_left = TERM_HEIGHT - (int)current_row;
+    if (rows_left < 1) rows_left = 1;
+    int cap = rows_left * TERM_WIDTH - shell_prompt_width() - 1;
+    if (cap < 0) cap = 0;
+    if (cap > CMD_BUFFER_SIZE - 1) cap = CMD_BUFFER_SIZE - 1;
+    return cap;
+}
+
 static void shell_redraw_line(void) {
-    terminal_clear_line(current_row);
-    int plen = shell_prompt();
+    int cap = shell_input_capacity();
+    if (cmd_pos > cap) {                 /* 历史回填 / 补全可能超长：截断 */
+        cmd_pos = cap;
+        cmd_buffer[cmd_pos] = '\0';
+        if ((int)cursor > cmd_pos) cursor = (size_t)cmd_pos;
+    }
+    int plen = shell_prompt_width();
+    int total = plen + cmd_pos;
+    int rows = total / TERM_WIDTH + 1;
+    int rows_max = TERM_HEIGHT - (int)current_row;
+    if (rows_max < 1) rows_max = 1;
+    if (rows > rows_max) rows = rows_max;
+    /* 清"上次占的行"与"这次要占的行"的并集，否则输入变短会留下残字 */
+    int clear_n = (input_rows_used > rows) ? input_rows_used : rows;
+    for (int i = 0; i < clear_n; i++)
+        terminal_clear_line((size_t)((int)current_row + i));
+    terminal_set_cursor(current_row, 0);
+    shell_prompt();
     for (int i = 0; i < cmd_pos; i++) {
         terminal_putchar(cmd_buffer[i]);
     }
-    size_t col = (size_t)plen + (size_t)cursor;
-    terminal_set_cursor(current_row, col);
+    int abs = plen + (int)cursor;
+    size_t row = (size_t)((int)current_row + abs / TERM_WIDTH);
+    size_t col = (size_t)(abs % TERM_WIDTH);
+    if (row >= TERM_HEIGHT) { row = TERM_HEIGHT - 1; col = TERM_WIDTH - 1; }
+    terminal_set_cursor(row, col);
+    input_rows_used = rows;
 }
 
 void shell_run(void) {
@@ -847,6 +893,9 @@ void shell_run(void) {
                 if (r == 1) {
                     for (int i = 0; full[i]; i++) cmd_buffer[i] = full[i];
                     cmd_pos = (int)my_strlen(full);
+                    if (cmd_pos > shell_input_capacity())
+                        cmd_pos = shell_input_capacity();
+                    cmd_buffer[cmd_pos] = '\0';
                     cursor = cmd_pos;
                     shell_redraw_line();
                 } else if (r >= 2) {
@@ -870,8 +919,12 @@ void shell_run(void) {
             cursor = 0;
             history_index = -1;
             shell_reap_bg();              /* 回提示符前非阻塞收割已退出的后台任务 */
+            /* 命令输出不以换行结尾时（被截断的输出、printf 类），提示符会
+             * 接在同一行的尾巴上。补一个换行，提示符才总在行首。 */
+            if (terminal_get_column() != 0) terminal_putchar('\n');
             shell_prompt();
             current_row = terminal_get_row();
+            input_rows_used = 1;
         } else if (c == '\b') {
             if (cursor > 0) {
                 // ɾ�����ǰ�ַ�?
@@ -901,6 +954,10 @@ void shell_run(void) {
                     if (cmd_buffer[i] == '\0') break;
                 }
                 cmd_pos = my_strlen(cmd_buffer);
+                if (cmd_pos > shell_input_capacity()) {
+                    cmd_pos = shell_input_capacity();
+                    cmd_buffer[cmd_pos] = '\0';
+                }
                 cursor = cmd_pos;
                 shell_redraw_line();
             }
@@ -913,6 +970,10 @@ void shell_run(void) {
                     if (cmd_buffer[i] == '\0') break;
                 }
                 cmd_pos = my_strlen(cmd_buffer);
+                if (cmd_pos > shell_input_capacity()) {
+                    cmd_pos = shell_input_capacity();
+                    cmd_buffer[cmd_pos] = '\0';
+                }
                 cursor = cmd_pos;
                 shell_redraw_line();
             } else if (history_index == 0) {
@@ -922,7 +983,7 @@ void shell_run(void) {
                 shell_redraw_line();
             }
         } else if (c >= 32 && c <= 126) {
-            if (cmd_pos < CMD_BUFFER_SIZE - 1) {
+            if (cmd_pos < CMD_BUFFER_SIZE - 1 && cmd_pos < shell_input_capacity()) {
                 // �� cursor λ�ò����ַ�
                 for (int i = cmd_pos; i > (int)cursor; i--) {
                     cmd_buffer[i] = cmd_buffer[i - 1];
