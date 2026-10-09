@@ -43,7 +43,7 @@
  * 常量抄在别处必然和 linker 走偏 —— 0.9.0 的版本号就曾抄在 7 处。 */
 extern char __image_start[];
 
-// �򵥳��Ⱥ��������Զ���ʽ��ʾ��ʹ��
+// 自己的 strlen：内核里没有 libc 可用
 static size_t my_strlen(const char *s) {
     size_t len = 0;
     while (s[len]) len++;
@@ -53,11 +53,11 @@ static size_t my_strlen(const char *s) {
 static void klog(const char *msg);
 static void dm_mirror(const char *body, const char *tail);
 
-/* ���������ֵ���־�и�ʽ����h1/h2 Ϊ 1 ʱʮ���������������ʮ���ƣ�?*/
+/* 拼多段文本并格式化数值：h1/h2 为 1 时按十六进制输出，否则十进制。 */
 static void klogf(const char *s1, uint32_t v1, int h1,
                   const char *s2, uint32_t v2, int h2, const char *s3) {
-    /* line 缓冲 96 字节；所有写入（含数字）统一�?sizeof(line)-1 为上界，
-     * 避免数字部分无界写入越过末尾，也保证最后一位留�?'\0'�?*/
+    /* line 缓冲 96 字节；所有写入（含数字）统一以 sizeof(line)-1 为上界，
+     * 免得数字部分无界写入越过末尾，也保证最后一位留给 '\0'。 */
     char line[96];
     int n = 0;
     const int lim = (int)sizeof(line) - 1;
@@ -85,7 +85,7 @@ static void klogf(const char *s1, uint32_t v1, int h1,
     klog(line);
 }
 
-/* ����ʮ������������־�� */
+/* 十六进制数值日志 */
 static void klog_hex32(const char *prefix, uint32_t val, const char *suffix) {
     char line[80];
     int n = 0;
@@ -103,9 +103,9 @@ static void klog_hex32(const char *prefix, uint32_t val, const char *suffix) {
     klog(line);
 }
 
-/* ͨ�� RTC CMOS �Ĵ�����ʵ̽���ڴ��С��?
- * reg 0x15/0x16 �����ڴ� KB����/���ֽڣ���reg 0x17/0x18 ��չ�ڴ� KB��
- * ��չ�ڴ�Ϊ 16 λ�ֶΣ����� 65535K��Լ 64MB������ʱ���� NMI�� */
+/* 通过 RTC CMOS 寄存器探测内存大小：
+ * reg 0x15/0x16 是常规内存 KB（低/高字节），reg 0x17/0x18 是扩展内存 KB。
+ * 扩展内存是 16 位字段，上限 65535K（约 64MB）；读取时要关掉 NMI。 */
 static uint16_t cmos_read16(uint8_t reg) {
     outb(0x70, reg | 0x80);
     uint16_t lo = inb(0x71);
@@ -124,7 +124,7 @@ static void kput_uint(uint32_t v, int width) {
     while (i) terminal_putchar(buf[--i]);
 }
 
-/* ������?PIT channel 0 ��ǰ��������Ƶ 1193�������� 1193..0�� */
+/* 读 PIT channel 0 的当前计数值（初值 1193，从 1193 递减到 0） */
 static uint16_t pit_read_counter(void) {
     outb(0x43, 0x00);            /* latch channel 0 */
     uint8_t lo = inb(0x40);
@@ -132,8 +132,8 @@ static uint16_t pit_read_counter(void) {
     return (uint16_t)(lo | (hi << 8));
 }
 
-/* ��ʵ΢��ʱ�ӣ�Linux dmesg ��񣩣�?
- * �벿�� = PIT 1000Hz tick��΢�벿�� = PIT �������м�����ÿ���� 1/1193182s �� 0.838us�� */
+/* 真实微秒时钟（Linux dmesg 那种）：
+ * 毫秒部分 = PIT 1000Hz tick；微秒部分 = PIT 计数器里剩下的值，每格 1/1193182s ≈ 0.838us。 */
 /* 上一次返回的微秒数，用来钉住单调性（见 pit_usec）。 */
 static uint32_t g_pit_last_us = 0;
 
@@ -156,9 +156,9 @@ static uint32_t pit_usec(void) {
     return us;
 }
 
-/* dmesg ���ʱ�����[    0.000000] �����?�Ҷ��� + 6 λ��ʵ΢�룩 */
+/* dmesg 时间戳前缀，形如 [    0.000000]（秒 + 6 位小数微秒） */
 static void klog_prefix(void) {
-    uint32_t us = pit_usec();              /* ��ʵ����΢�� */
+    uint32_t us = pit_usec();              /* 真实启动微秒 */
     uint32_t sec = us / 1000000u;
     uint32_t usec = us % 1000000u;
     terminal_putchar('[');
@@ -221,7 +221,7 @@ static void klog_fail(const char *msg) {
     dm_mirror(msg, " [FAIL]");
 }
 
-/* ʮ���Ƶ�ֵ��־�� */
+/* 十进制数值日志 */
 static void klog_dec32(const char *prefix, uint32_t val, const char *suffix) {
     char line[80];
     int n = 0;
@@ -236,8 +236,8 @@ static void klog_dec32(const char *prefix, uint32_t val, const char *suffix) {
     klog(line);
 }
 
-/* RTC CMOS ��ȡ��NMI ���ã���BCD ���롣�Ĵ�����0x00 �� 0x02 �� 0x04 ʱ
- * 0x07 �� 0x08 �� 0x09 �꣨����λ������ gfxwin ������ʱ��һ�¡� */
+/* RTC CMOS 读取（关 NMI，别被 BCD 编码绕进去）：寄存器 0x00 秒、0x02 分、0x04 时，
+ * 0x07 日、0x08 月、0x09 年（两位，与 gfxwin 显示的时间一致）。 */
 static uint8_t rtc_read(uint8_t reg) {
     outb(0x70, reg | 0x80);
     return inb(0x71);
@@ -246,7 +246,7 @@ static uint8_t rtc_bcd(uint8_t v) {
     return (uint8_t)((v & 0x0F) + ((v >> 4) * 10));
 }
 
-/* ���?RTC ��ʵ����ʱ�䣨UTC+8���� gfxwin ������ʱ��һ�£���prefix �Դ����� */
+/* 从 RTC 读真实启动时间（UTC+8，与 gfxwin 显示一致），prefix 由调用方给 */
 static void klog_rtc_time(const char *prefix) {
     uint8_t sec  = rtc_bcd(rtc_read(0x00));
     uint8_t min  = rtc_bcd(rtc_read(0x02));
@@ -273,7 +273,7 @@ static void klog_rtc_time(const char *prefix) {
     klog(buf);
 }
 
-/* CPUID ̽�⣨��ʵ���������ַ��������Ҷ�ӡ������?*/
+/* CPUID 探测（真实处理器与厂商字符串等），逐项打印 */
 static void klog_cpuinfo(void) {
     uint32_t eax, ebx, ecx, edx;
     uint32_t efl;
@@ -377,9 +377,9 @@ uint32_t stack_total(void) {
 
 void kernel_main(void) {
     stack_paint();          /* 必须最先：之后的所有栈使用才可能有水印 */
-    /* ���ñ��� APIC��EZOS ʹ�ô�ͳ 8259 PIC �ж�·�ɡ�
-     * QEMU Ĭ�� LAPIC enabled �� LVT0(ExtINT) masked�����̵� PIC ��
-     * ����/����ж����󣻹ر�?LAPIC �� LINT0 �ָ�Ϊ INTR ����ֱͨ PIC�� */
+    /* 关掉本地 APIC：EZOS 走的是传统 8259 PIC 中断路由。
+     * QEMU 默认 LAPIC enabled 且 LVT0(ExtINT) masked，键盘/鼠标的 PIC 中断
+     * 就全没了；关掉 LAPIC 后 LINT0 恢复成 INTR，直通 PIC。 */
     {
         uint32_t lo, hi;
         asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0x1B));
@@ -437,10 +437,10 @@ void kernel_main(void) {
     isr_install();
     irq_install();
     syscall_init();           /* int 0x80 DPL=3 门：用户态唯一合法陷入入口 */
-    pit_init();               /* 1000Hz ϵͳʱ�ӣ��˺���־ʱ���Ϊ��ʵ����ʱ��?*/
+    pit_init();               /* 1000Hz 系统时钟：此后的日志时间戳才是真实时间 */
     asm volatile("sti");
     klog_ok("PIT: system timer 1000Hz (channel 0 rate generator)");
-    klog_rtc_time("RTC: boot time 20");   /* ��ʵ����ʱ�䣨CMOS BCD, UTC+8�� */
+    klog_rtc_time("RTC: boot time 20");   /* 真实开机时间（CMOS BCD, UTC+8） */
     klog_ok("IDT: 256 gates installed");
     klog_ok("PIC: IRQ0-15 remapped to INT 0x20-0x2f, IRQ0/1/12 enabled");
     klog_ok("ISR: 32 exception gates installed (panic screen on fault)");
@@ -449,10 +449,10 @@ void kernel_main(void) {
     klog_ok("SYSCALL: int 0x80 gate (DPL=3), READ/WRITE/EXIT");
     klogf("Kmalloc: ", 384, 0, "KB heap at .bss.hi, 16B align, magic guard", 0, 0, "");
 
-    /* CPU����ʵ CPUID ̽�� */
+    /* CPU：真实 CPUID 探测 */
     klog_cpuinfo();
 
-    /* �ڴ�̽�⣺RTC CMOS ��ʵ���������鹹 */
+    /* 内存探测：RTC CMOS 报上来的真实内存容量 */
     if (*(volatile uint32_t*)0x5010 == 0x55454649u) {
         /* U3: UEFI boot - loader handed off GetMemoryMap (0x5020/0x5100).
          * The CMOS 16-bit extended field overflows above 64MB anyway. */
@@ -468,7 +468,7 @@ void kernel_main(void) {
         klog_dec32("Memory: total ", (uint32_t)conv + ext, "K");
     }
 
-    /* ATA ���̣���ʵ̽�������� LBA0 */
+    /* ATA 磁盘：真实探测，读 LBA0 */
     uint8_t mbr[512];
     klog("ATA: PIO mode, probing 4 drives (0x1F0 / 0x170)");
     for (uint8_t d = 0; d < 4; d++) {
@@ -658,8 +658,8 @@ void kernel_main(void) {
         }
     }
 
-    /* VBE ͼ��ģʽ����ȡ boot.asm ʵģʽ̽������0x5000 �ṹ����
-     * �û�̬ gw_start() ���������� LFB���˴���������ʵ̽��״̬�� */
+    /* VBE 图形模式参数来自 boot.asm 实模式探测的结果（写进 0x5000 的结构），
+     * 用户态 gw_start() 会去用这个 LFB；这里只报告实模式探测到的状态。 */
     {
         uint32_t lfb  = *(volatile uint32_t*)0x5000;
         uint16_t vxr  = *(volatile uint16_t*)0x5004;
@@ -679,7 +679,7 @@ void kernel_main(void) {
             klog("VBE: no LFB mode probed, will fallback to VGA 0x13 320x200x256");
         }
     }
-    /* ����������־��������banner ֱ�Ӹ��� verbose boot log ֮�� */
+    /* 启动日志到此打完，banner 直接跟在 verbose boot log 之后 */
     //ascii art
 	terminal_writestring("\n");
     terminal_writestring("  _____   ______  _____   _____\n");

@@ -19,7 +19,7 @@ int GFX_W = 320;
 int GFX_H = 200;
 uint8_t *gfx_fb = (uint8_t*)0xA0000;
 int gfx_bpp = 1;                      /* 1=VGA 0x13, 2=VBE 16bpp */
-uint16_t gfx_palette16[256];          /* ��ɫ���� -> RGB565��VBE 16bpp �ã� */
+uint16_t gfx_palette16[256];          /* 调色板索引 -> RGB565（VBE 16bpp 用） */
 
 static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
     return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
@@ -29,12 +29,12 @@ static inline void io_wait(void) {
     outb(0x80, 0);
 }
 
-/* VGA 8x16 �ı�����ı���/�ָ���plane 2������� GUI���ı�ģʽ�л������屻�ƻ� */
+/* VGA 8x16 文本字体放在 plane 2，切进 GUI 图形模式后会被覆盖，所以必须先存起来 */
 static void gfx_save_font(void);
 static void gfx_restore_font(void);
 
 static uint8_t font8x8[256][8];
-// ���� 8x8 ���壨�������ո����֡���д��ĸ�����÷��ţ�
+// 内置 8x8 字体（空格、大小写字母、数字和常用符号）
 static const uint8_t builtin_font[][8] = {
     [0x20] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // space
     [0x21] = {0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00}, // !
@@ -131,17 +131,17 @@ static const uint8_t builtin_font[][8] = {
     [0x7C] = {0x18,0x18,0x18,0x00,0x18,0x18,0x18,0x00}, // |
     [0x7D] = {0x07,0x0C,0x0C,0x38,0x0C,0x0C,0x07,0x00}, // }
     [0x7E] = {0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00}, // ~
-};// 切换�?? 320x200x256 图形模式（VGA 模式 0x13�??
+};// 切换到 320x200x256 图形模式（VGA 模式 0x13）
 void gfx_init(void) {
-    gfx_save_font();   /* VBE �л�ǰ�����ı�ģʽ 8x16 ���壨plane2������ gfx_restore_text ��ԭ */
-    /* boot.asm ����ʵģʽ���? VBE ��ֱ���̽�Ⲣд��? 0x5000 �ṹ��
-     *   0x5000: dword LFB ������ַ��0 = �޿���ģʽ������ VGA 0x13��
+    gfx_save_font();   /* 切 VBE 之前先存下文本模式的 8x16 字体（plane 2），由 gfx_restore_text 还原 */
+    /* boot.asm 在实模式下做完 VBE 线性帧缓冲探测，结果写进 0x5000 的结构：
+     *   0x5000: dword LFB 物理地址（0 = 没有可用图形模式，回退 VGA 0x13）
      *   0x5004: word  XRES
      *   0x5006: word  YRES
-     *   0x5008: byte  BPP��16 = 16bpp RGB565��
-     * �˴����ٰ� hypervisor ǿ�����㣺QEMU TCG/Microsoft Hv �Ȼ�����
-     * -vga std ʵ��֧�� Bochs VBE������ boot.asm ��̽�������ɡ�
-     * ��ʵ����������·�? VBE_DISPI ID ̽��е���ID �� 0xB0C0 �Ż��� VGA 0x13���� */
+     *   0x5008: byte  BPP（16 = 16bpp RGB565）
+     * 这里不再按 hypervisor 猜：QEMU TCG、Microsoft Hv 等环境下
+     * -vga std 实际都支持 Bochs VBE，boot.asm 的探测结果可信。
+     * 兜底路径：读 VBE_DISPI ID，ID 不是 0xB0C0 就回退 VGA 0x13。 */
     uint32_t lfb  = *(volatile uint32_t*)0x5000;
     uint16_t vxr  = *(volatile uint16_t*)0x5004;
     uint16_t vyr  = *(volatile uint16_t*)0x5006;
@@ -287,7 +287,7 @@ void gfx_init(void) {
     outb(0x3C0, 0x3F); outb(0x3C0, 0x00);
     outb(0x3C0, 0x20);
     outb(0x3C4, 0x00); outb(0x3C5, 0x03);  // resume sequencer (clear sync reset)
-    /* 重置 VGA 调色板为默�?�文�?色，防�?�图形模式调色板污染文本显示 */
+    /* 把 VGA 调色板重置为文本模式默认的 16 色，免得图形模式的调色板污染文本显示 */
     outb(0x3C8, 0x00);
     for (int _i = 0; _i < 16; _i++) {
         static const uint8_t _pr[16] = {0,0,170,170,0,0,170,170,85,85,255,255,85,85,255,255};
@@ -295,15 +295,15 @@ void gfx_init(void) {
         static const uint8_t _pb[16] = {0,0,0,0,170,170,170,170,85,85,85,85,255,255,255,255};
         outb(0x3C9, _pr[_i]); outb(0x3C9, _pg[_i]); outb(0x3C9, _pb[_i]);
     }
-    /* 光标形状恢�?�为文本模式 */
+    /* 光标形状恢复成文本模式 */
     outb(0x3D4, 0x0A); outb(0x3D5, 0x0E);
     outb(0x3D4, 0x0B); outb(0x3D5, 0x0F);
 
 }
 
 
-/* ����ͼ��ģʽǰ���ã��� VGA 8x16 �ı����壨plane 2��SeaBIOS �Ѽ��أ������ڴ档
- * GUI �ڼ� 0xA0000 ƽ�汻 LFB/bank ӳ�串�ǣ�������֮���ƻ��������ı�ģʽ�뻹ԭ�� */
+/* 进图形模式之前先备份 VGA 8x16 文本字体（plane 2，SeaBIOS 已经把它加载进显存）。
+ * GUI 期间 0xA0000 平面被 LFB/bank 映射覆盖，不备份的话退出图形模式就还原不出文本了。 */
 static uint8_t g_vga_font[256 * 16];
 static int g_vga_font_saved = 0;
 
@@ -318,13 +318,13 @@ static void gfx_save_font(void) {
     g_vga_font_saved = 1;
 }
 
-/* �ı�ģʽ�ָ�ʱ���ã��ѱ���� 8x16 ����д�� plane 2�����ͼ�ν׶�д��Ĳ������Ρ� */
+/* 文本模式恢复时调用：把备份的 8x16 字体写回 plane 2（写入的参数与图形阶段相反）。 */
 static void gfx_restore_font(void) {
     if (!g_vga_font_saved) return;
     outb(0x3C4, 0x04); outb(0x3C5, 0x06);  /* SC4: odd/even off + extended memory */
     outb(0x3C4, 0x02); outb(0x3C5, 0x04);  /* SC2: map mask plane 2 */
     outb(0x3CE, 0x05); outb(0x3CF, 0x00);  /* GC5: write mode 0 */
-    outb(0x3CE, 0x06); outb(0x3CF, 0x04);  /* GC6: ͼ��ƽ��дģʽ */
+    outb(0x3CE, 0x06); outb(0x3CF, 0x04);  /* GC6: 图形模式平面写 */
     {
         volatile uint8_t *fp = (volatile uint8_t*)0xA0000;
         int n, j;
@@ -334,9 +334,9 @@ static void gfx_restore_font(void) {
     }
     outb(0x3CE, 0x04); outb(0x3CF, 0x00);  /* GC4: read map plane 0 */
     outb(0x3CE, 0x05); outb(0x3CF, 0x10);  /* GC5: read mode 1 */
-    outb(0x3CE, 0x06); outb(0x3CF, 0x0E);  /* GC6: �ı�ģʽ */
+    outb(0x3CE, 0x06); outb(0x3CF, 0x0E);  /* GC6: 文本模式 */
     outb(0x3C4, 0x02); outb(0x3C5, 0x03);  /* SC2: mask plane 0/1 only - protect font plane 2 */
-    outb(0x3C4, 0x04); outb(0x3C5, 0x03);  /* SC4: odd/even���ı�ģʽ�� */
+    outb(0x3C4, 0x04); outb(0x3C5, 0x03);  /* SC4: odd/even（文本模式） */
 }
 
 /* Load the built-in 8x16 font into VGA plane 2 at boot, before any text
@@ -379,25 +379,25 @@ void gfx_restore_text(void) {
     outb(0x3D4, 0x03); outb(0x3D5, 0x82);
     outb(0x3D4, 0x04); outb(0x3D5, 0x55);
     outb(0x3D4, 0x05); outb(0x3D5, 0x81);
-    outb(0x3D4, 0x06); outb(0x3D5, 0xBF);   /* V Total = 191 (400 ���ı�) */
-    outb(0x3D4, 0x07); outb(0x3D5, 0x1F);   /* Overflow (�ı�ģʽ) */
+    outb(0x3D4, 0x06); outb(0x3D5, 0xBF);   /* V Total = 191（400 行文本） */
+    outb(0x3D4, 0x07); outb(0x3D5, 0x1F);   /* Overflow（文本模式） */
     outb(0x3D4, 0x08); outb(0x3D5, 0x00);
     outb(0x3D4, 0x09); outb(0x3D5, 0x4F);
     outb(0x3D4, 0x0A); outb(0x3D5, 0x0D);
     outb(0x3D4, 0x0B); outb(0x3D5, 0x0E);
-    outb(0x3D4, 0x0C); outb(0x3D5, 0x00);   /* start_addr = 0x0000���ı�ģʽ�Դ�� 0xB8000 �� */
-    outb(0x3D4, 0x0D); outb(0x3D5, 0x00);   /* �ɵ� 0xC000 ���� 32KB ҳ(0x8000)���൱�ڰ���ʾ���
-                                               ָ���¾� VRAM/ͼ�β����ϣ������ı�ģʽ��������ɫ�� */
+    outb(0x3D4, 0x0C); outb(0x3D5, 0x00);   /* start_addr = 0x0000：文本模式显存从 0xB8000 起 */
+    outb(0x3D4, 0x0D); outb(0x3D5, 0x00);   /* 以 0xC000 为界分 32KB 页（0x8000），相当于把显示
+                                               指针挪到 VRAM/图形缓冲区之外，免得文本模式读到花屏 */
     outb(0x3D4, 0x0E); outb(0x3D5, 0x00);
     outb(0x3D4, 0x0F); outb(0x3D5, 0x00);
     outb(0x3D4, 0x10); outb(0x3D5, 0x9C);
-    outb(0x3D4, 0x11); outb(0x3D5, 0x8E);   /* V Retrace End (�ı�ģʽ) */
+    outb(0x3D4, 0x11); outb(0x3D5, 0x8E);   /* V Retrace End（文本模式） */
     outb(0x3D4, 0x12); outb(0x3D5, 0x8F);
     outb(0x3D4, 0x13); outb(0x3D5, 0x28);
     outb(0x3D4, 0x14); outb(0x3D5, 0x1F);  /* CR14: underline location (mode 3 value) */
     outb(0x3D4, 0x15); outb(0x3D5, 0x96);
     outb(0x3D4, 0x16); outb(0x3D5, 0xB9);
-    outb(0x3D4, 0x17); outb(0x3D5, 0xA3);   /* Mode Control (�ı�ģʽ) */
+    outb(0x3D4, 0x17); outb(0x3D5, 0xA3);   /* Mode Control（文本模式） */
 
     // Graphics Controller (mode 03h)
     outb(0x3CE, 0x00); outb(0x3CF, 0x00);
@@ -493,13 +493,13 @@ void gfx_set_palette(void) {
         return;
     }
     if (gfx_bpp == 2) {
-        /* VBE 16bpp: �� RGB565 ���ұ�����ɫ���� -> ���? */
+        /* VBE 16bpp：调色板索引按 RGB565 展开成 16 位色 */
         for (int i = 0; i < 256; i++) {
             uint8_t r, g, b;
             if (i < 16) {
                 r = std_r[i]; g = std_g[i]; b = std_b[i];
             } else if (i >= 0xF0 && i <= 0xF7) {
-                /* Win10 palette (gfxwin Լ��) */
+                /* Win10 palette（gfxwin 约定） */
                 static const uint8_t wr[8]  = {0x00,0x00,0x3C,0xF3,0xE1,0xCD,0x99,0xE8};
                 static const uint8_t wg[8]  = {0x78,0x5A,0x9B,0xF3,0xE1,0xCD,0x99,0x11};
                 static const uint8_t wb[8]  = {0xD7,0x9E,0xE8,0xF3,0xE1,0xCD,0x99,0x23};
@@ -521,7 +521,7 @@ void gfx_set_palette(void) {
         if (i < 16) {
             r = std_r[i]; g = std_g[i]; b = std_b[i];
         } else if (i >= 0xF0 && i <= 0xF7) {
-            /* Win10 palette (gfxwin Լ��) */
+            /* Win10 palette（gfxwin 约定） */
             static const uint8_t wr[8]  = {0x00,0x00,0x3C,0xF3,0xE1,0xCD,0x99,0xE8};
             static const uint8_t wg[8]  = {0x78,0x5A,0x9B,0xF3,0xE1,0xCD,0x99,0x11};
             static const uint8_t wb[8]  = {0xD7,0x9E,0xE8,0xF3,0xE1,0xCD,0x99,0x23};
@@ -537,7 +537,7 @@ void gfx_set_palette(void) {
     }
 }
 
-//// �?? VGA 字体 ROM 读取 8x8 字体
+// ---- 从 VGA 字体 ROM 读 8x8 字体（旧实现，先留着） ----
 //void gfx_load_font(void) {
 //    outb(0x3CE, 0x04); outb(0x3CF, 0x02);
 //    outb(0x3CE, 0x05); outb(0x3CF, 0x00);
@@ -558,7 +558,7 @@ void gfx_load_font(void) {
             font8x8[i][j] = builtin_font[i][j];
         }
     }
-    // �����ַ�����?��
+    // 128..255 用内置表补齐
     for (int i = 128; i < 256; i++) {
         for (int j = 0; j < 8; j++) {
             font8x8[i][j] = 0;
@@ -614,8 +614,8 @@ void gfx_draw_text(int x, int y, const char *s, uint8_t fg, uint8_t bg) {
     }
 }
 
-/* �������Ŵ����֣�ÿ�� 8x8 �������ػ��� scale x scale ���ؿ飨scale>=1����
- * ���ڵͷֱ��ʣ�320x200���µĴ����?/ͼ�����ƣ�2x �� 16px �ߡ� */
+/* 按字符画点阵：每个 8x8 字形按 scale 倍放大画出（scale>=1）。
+ * 低分辨率（320x200）下用它放大文本/图形，2x 就是 16px 高。 */
 void gfx_draw_text_scaled(int x, int y, const char *s, uint8_t fg, int bg, int scale) {
     if (scale < 1) scale = 1;
     while (*s) {
@@ -624,14 +624,14 @@ void gfx_draw_text_scaled(int x, int y, const char *s, uint8_t fg, int bg, int s
             uint8_t line = font8x8[ch][row];
             for (int col = 0; col < 8; col++) {
                 if (line & (0x01 << col)) {
-                    /* ǰ������ */
+                    /* 前景色 */
                     for (int dy = 0; dy < scale; dy++) {
                         for (int dx = 0; dx < scale; dx++) {
                             gfx_putpixel(x + col * scale + dx, y + row * scale + dy, fg);
                         }
                     }
                 } else if (bg >= 0) {
-                    /* �������أ�bg < 0 ��ʾ͸��������ǰ������������?/��������ɫ��һ�²����ӱ� */
+                    /* 填充背景色：bg < 0 表示透明（保留原有像素） */
                     for (int dy = 0; dy < scale; dy++) {
                         for (int dx = 0; dx < scale; dx++) {
                             gfx_putpixel(x + col * scale + dx, y + row * scale + dy, (uint8_t)bg);
@@ -648,9 +648,9 @@ void gfx_draw_text_scaled(int x, int y, const char *s, uint8_t fg, int bg, int s
 void gfx_clear(uint8_t color) {
     gfx_fill_rect(0, 0, GFX_W, GFX_H, color);
 }
-// ---- ��ͼ�� UI��VGA 320x200x256��----
+// ---- 图形 UI（VGA 320x200x256）----
 
-// ����ʽ��ֵ����������֧�� + - * / % �����ţ�
+// 简易表达式求值：支持 + - * / % 与括号
 static int gfx_expr_pos;
 static int gfx_expr_err;
 static const char *gfx_expr_str;
@@ -881,6 +881,6 @@ void gfx_menu(void) {
     }
 
     gfx_restore_text();
-    terminal_initialize();   // �޸����˳�ͼ��ģʽ������ؽ��ı��նˣ���ǰ��? TEMP-DBG ע�͵��º�����
+    terminal_initialize();   // 退出图形模式后重建文本终端
 }
 

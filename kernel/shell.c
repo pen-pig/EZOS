@@ -32,24 +32,24 @@ static int cmd_pos = 0;
 static char history[HISTORY_SIZE][CMD_BUFFER_SIZE];
 static int history_count = 0;
 
-static int history_index = -1;      // ��ǰ�������ʷλ�ã�?1 ��ʾ��������
-static size_t cursor = 0;           // ����ڵ�ǰ�����е�λ��?
+static int history_index = -1;      // 当前浏览的历史位置（-1 表示正在编辑新行）
+static size_t cursor = 0;           // 光标在当前输入行里的位置
 static size_t current_row = 0;
 /* 输入行折行后实际占了几行（重绘时决定要清几行）。
  * 以前只清 current_row 一行：输入一折行，第二行的内容就再也擦不掉，
  * 越输越乱（旧字残留在下面，光标还停在第一行）。 */
-static int input_rows_used = 1;      // ��ǰ��ʾ�������к�
-/* ��ϣ�shell ѭ��ÿ�ֲ��� EFLAGS��data ��ȫ�֣��� QEMU monitor ���ڴ���֤�� */
+static int input_rows_used = 1;      // 当前显示的输入行占了几行
+/* 调试用：shell 循环每轮采样一次 EFLAGS 放全局，便于 QEMU monitor 直接查内存验证 */
 volatile uint32_t dbg_shell_eflags = 0;
 
-// �ַ�������
+// 字符串工具
 static size_t my_strlen(const char *s) {
     size_t len = 0;
     while (s[len]) len++;
     return len;
 }
 
-// ���Դ�Сд�Ƚ�
+// 不区分大小写比较
 static int my_tolower(char c) {
     if (c >= 'A' && c <= 'Z') return c + ('a' - 'A');
     return c;
@@ -66,7 +66,7 @@ static int my_strcasecmp(const char *a, const char *b) {
     return *a - *b;
 }
 
-// �� atoi
+// 简易 atoi
 static int my_atoi(const char *s) {
     int result = 0;
     while (*s >= '0' && *s <= '9') {
@@ -78,7 +78,7 @@ static int my_atoi(const char *s) {
     return result;
 }
 
-// ʮ�������ַ�תֵ
+// 十六进制字符转数值
 static int hex_char_val(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -86,7 +86,7 @@ static int hex_char_val(char c) {
     return -1;
 }
 
-// ����ʮ�������ַ���Ϊ����
+// 十六进制字符串转数值
 static uint32_t my_htoi(const char *s) {
     uint32_t result = 0;
     if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
@@ -99,11 +99,11 @@ static uint32_t my_htoi(const char *s) {
     return result;
 }
 
-// 64 λ / 32 λ�޷��ų������������� libgcc �� __udivdi3��
-// ���?hi:lo ���?64 λ��������d Ϊ������������
+// 64 位 / 32 位无符号除法：内核里没有 libgcc 的 __udivdi3
+// 把 hi:lo 拼成的 64 位数除以 d（d 必须是非零除数）
 static uint32_t udiv64_32(uint32_t hi, uint32_t lo, uint32_t d) {
     if (d == 0) return 0;
-    if (hi >= d) return 0xFFFFFFFF;   // ���������?
+    if (hi >= d) return 0xFFFFFFFF;   // 商溢出
     uint64_t rem = hi;
     uint32_t q = 0;
     for (int i = 31; i >= 0; i--) {
@@ -116,7 +116,7 @@ static uint32_t udiv64_32(uint32_t hi, uint32_t lo, uint32_t d) {
     return q;
 }
 
-// ��ӡʮ����
+// 打印十进制
 static void print_dec(uint32_t num) {
     char buf[16];
     int len = 0;
@@ -131,14 +131,14 @@ static void print_dec(uint32_t num) {
     while (len > 0) terminal_putchar(buf[--len]);
 }
 
-// ��ӡʮ�������ֽ�
+// 打印十六进制字节
 static void print_hex_byte(uint8_t val) {
     char hex[] = "0123456789ABCDEF";
     terminal_putchar(hex[val >> 4]);
     terminal_putchar(hex[val & 0x0F]);
 }
 
-// ��ӡʮ������32λ
+// 打印 32 位十六进制
 static void print_hex32(uint32_t val) {
     print_hex_byte((val >> 24) & 0xFF);
     print_hex_byte((val >> 16) & 0xFF);
@@ -146,13 +146,13 @@ static void print_hex32(uint32_t val) {
     print_hex_byte(val & 0xFF);
 }
 
-// CMOS ��һ���ֽ�
+// CMOS 读一个字节
 static uint8_t cmos_read(uint8_t reg) {
     outb(0x70, reg);
     return inb(0x71);
 }
 
-/* ����ʵ�� */
+/* 命令实现 */
 static void cmd_help(const char *args);
 static void cmd_clear(const char *args);
 static void cmd_exit(const char *args);
@@ -442,7 +442,7 @@ static const command_t commands[] = {
     {"tictactoe",cmd_tictactoe},
     {"snake",    cmd_snake},
     {"games",    cmd_games},
-    /* ������shell_extra.c ��ǿ������?MikanOS �������������壩 */
+    /* 以下是 shell_extra.c 实现的命令（MikanOS 那批扩展命令） */
     {"ver",      cmd_ver},
     {"sysinfo",  cmd_sysinfo},
     {"type",     cmd_type},
@@ -482,12 +482,12 @@ static const command_t commands[] = {
     {0, 0}
 };
 
-/* ===== �ܵ����ض���֧�� ===== */
+/* ===== 管道与重定向支持 ===== */
 #define PIPE_BUF_SIZE 4096
 static char pipe_buffer[PIPE_BUF_SIZE];
 static int pipe_len = 0;
 
-/* ===== �ն���ɫ������tty �� vga_color ö���� tty.c �� static��shell.c ֱ�ӵ� terminal_setcolor��===== */
+/* ===== 终端颜色：直接复用 tty 的 vga_color 枚举值（tty.c 里是 static，shell.c 自己调 terminal_setcolor）===== */
 #define CLR_WHITE     15
 #define CLR_LIGHT_GREY  7
 #define CLR_DARK_GREY   8
@@ -566,7 +566,7 @@ static void help_line(const char *s) {
     shell_color_default();
 }
 
-/* �����չ���Ƿ�Ϊ��ִ��?*/
+/* 判断扩展名是不是可执行文件 */
 static int is_exe_name(const char *name) {
     int len = 0; while (name[len]) len++;
     if (len < 4) return 0;
@@ -575,12 +575,12 @@ static int is_exe_name(const char *name) {
         || (name[len-4]=='.' && (name[len-3]=='b'||name[len-3]=='B') && (name[len-2]=='i'||name[len-2]=='I') && (name[len-1]=='n'||name[len-1]=='N'));
 }
 
-/* ִ��ԭʼ��������ض���/�ܵ�Ԥ������ */
+/* 执行原始命令（重定向/管道已经预处理过） */
 static void shell_execute_raw(char *cmd, int bg);
 
-/* shell ģʽ��1=�û� shell��GUI Terminal / User Shell����0=�ں� shell */
+/* shell 模式：1=用户 shell（GUI Terminal / User Shell），0=内核 shell */
 
-/* ִ�д��ض���/�ܵ������� */
+/* 执行带重定向/管道的命令 */
 static void shell_execute(char *cmd) {
     if (history_count < HISTORY_SIZE) {
         for (int i = 0; i < CMD_BUFFER_SIZE; i++) {
@@ -596,7 +596,7 @@ static void shell_execute(char *cmd) {
     int bg = shell_strip_bg(cmd);
     if (*cmd == '\0') return;
 
-    /* �����ض��� >��>> �͹ܵ� |�����ַ���������ţ����������ڣ�?*/
+    /* 扫描重定向 > >> 与管道 |：出现在引号里的这些符号不算 */
     int in_quote = 0;
     char *gt = NULL, *pipe = NULL;
     for (char *p = cmd; *p; p++) {
@@ -607,13 +607,13 @@ static void shell_execute(char *cmd) {
     }
 
     if (gt) {
-        /* cmd > file �� cmd >> file */
+        /* cmd > file 或 cmd >> file */
         int append = (gt[0] != '\0' && gt[1] == '>');
         *gt = '\0';
         char *fname = gt + 1 + (append ? 1 : 0);
         while (*fname == ' ') fname++;
         if (append) {
-            /* >> ׷�ӣ��ȶ����ļ��ٺϲ� */
+            /* >> 追加：先读回原文件再合并 */
             static uint8_t old[4096];
             static uint8_t merged[8192];
             int mn = 0;
@@ -682,7 +682,7 @@ static void shell_execute_raw(char *cmd, int bg) {
         }
     }
 
-    /* ����չ�������?POSIX shell ���壩��alias name=cmd ����ı����ڴ����?*/
+    /* 别名展开（POSIX shell 那种）：alias name=cmd 的替换在这里做 */
     const char *alias_exp = shell_extra_lookup_alias(cmd);
     if (alias_exp) {
         static int alias_depth = 0;
@@ -693,7 +693,7 @@ static void shell_execute_raw(char *cmd, int bg) {
                 expanded[n] = alias_exp[n];
                 n++;
             }
-            /* 保留原命令后接的参数：alias ll=ls �?ll subdir 应执�?ls subdir */
+            /* 保留原命令后面带的参数：alias ll=ls 时，ll subdir 应该执行 ls subdir */
             if (*space && n < CMD_BUFFER_SIZE - 1) {
                 expanded[n++] = ' ';
                 while (*space && n < CMD_BUFFER_SIZE - 1) {
@@ -724,7 +724,7 @@ static void shell_execute_raw(char *cmd, int bg) {
     terminal_writestring("\n");
 }
 
-/* �� shell_extra.c �� type/which ��ѯ�����Ƿ�Ϊ�ڽ����� */
+/* 供 shell_extra.c 的 type/which 查询某个名字是不是内建命令 */
 int shell_is_builtin(const char *name) {
     for (int i = 0; commands[i].name != 0; i++) {
         if (my_strcasecmp(name, commands[i].name) == 0) return 1;
@@ -732,10 +732,10 @@ int shell_is_builtin(const char *name) {
     return 0;
 }
 
-/* 命令名前缀补全：prefix 不区分大小写前缀匹配内建命令表�?
- * 唯一匹配 -> 拷贝完整命令名到 out，返�?1�?
- * 多个匹配 -> 各命令名指针写入 matches[]（最�?max_matches 个），返回匹配总数�?
- * 无匹�?-> 返回 0。供内核 shell �?GUI 终端 Tab 补全共用 */
+/* 命令名前缀补全：prefix 按大小写无关前缀匹配内建命令表。
+ * 唯一匹配 -> 把完整命令名拷进 out，返回 1；
+ * 多个匹配 -> 各命令名指针写入 matches[]（最多 max_matches 个），返回匹配总数；
+ * 无匹配   -> 返回 0。内核 shell 与 GUI 终端的 Tab 补全共用。 */
 int shell_complete_command(const char *prefix, char *out, int outsz,
                            const char *matches[], int max_matches) {
     int plen = 0;
@@ -767,7 +767,7 @@ int shell_complete_command(const char *prefix, char *out, int outsz,
     return count;
 }
 
-// �ػ浱ǰ������
+// 保存当前目录（真正的 cwd 在 fs 层，见下面注释）
 /* cd /bin | cd /system 之后的当前目录**不在 shell 里**：它下沉到了 fs 层
  * （fs.c 的 g_sysvol_cwd），这样 cat / write / rm / mkdir 等所有 fs_* 入口
  * 都能把相对路径解析成 /bin/xxx、/system/xxx——只在呈现层记 cwd 的话，
@@ -857,7 +857,7 @@ void shell_run(void) {
     current_row = terminal_get_row();
 
     while (1) {
-        asm volatile("sti; nop; nop; nop; nop; nop");   /* ȷ���жϿ��������?STI ���ƴ��ڣ� */
+        asm volatile("sti; nop; nop; nop; nop; nop");   /* 确保中断开着：STI 之后要隔几条指令才生效 */
         { uint32_t fl; asm volatile("pushfl; popl %0" : "=r"(fl)); dbg_shell_eflags = fl; }
         int c = keyboard_getchar();
         if (c == 0) continue;
@@ -876,7 +876,7 @@ void shell_run(void) {
         }
 
         if (c == '\t') {
-            /* Tab 补全：仅当光标停在第一个词内（命令名）时补�?*/
+            /* Tab 补全：只有光标停在第一个词（命令名）里时才补 */
             int word_len = 0;
             while (word_len < cmd_pos && cmd_buffer[word_len] != ' ') word_len++;
             if (word_len > 0 && cmd_pos == word_len) {
@@ -895,7 +895,7 @@ void shell_run(void) {
                     cursor = cmd_pos;
                     shell_redraw_line();
                 } else if (r >= 2) {
-                    /* 多个匹配：换行列出候选，重绘提示�?*/
+                    /* 多个匹配：换行列出候选，再重绘提示符 */
                     terminal_putchar('\n');
                     for (int i = 0; i < r && i < 12; i++) {
                         terminal_writestring(matches[i]);
@@ -905,7 +905,7 @@ void shell_run(void) {
                     current_row = terminal_get_row();
                     shell_redraw_line();
                 }
-                /* r == 0 无匹配：无操�?*/
+                /* r == 0 无匹配：什么都不做 */
             }
         } else if (c == '\n') {
             terminal_putchar('\n');
@@ -923,7 +923,7 @@ void shell_run(void) {
             input_rows_used = 1;
         } else if (c == '\b') {
             if (cursor > 0) {
-                // ɾ�����ǰ�ַ�?
+                // 删除光标前的那个字符
                 for (int i = cursor - 1; i < cmd_pos - 1; i++) {
                     cmd_buffer[i] = cmd_buffer[i + 1];
                 }
@@ -980,7 +980,7 @@ void shell_run(void) {
             }
         } else if (c >= 32 && c <= 126) {
             if (cmd_pos < CMD_BUFFER_SIZE - 1 && cmd_pos < shell_input_capacity()) {
-                // �� cursor λ�ò����ַ�
+                // 在 cursor 位置插入字符
                 for (int i = cmd_pos; i > (int)cursor; i--) {
                     cmd_buffer[i] = cmd_buffer[i - 1];
                 }
@@ -993,7 +993,7 @@ void shell_run(void) {
     }
 }
 
-/* �������ʵ��?*/
+/* help 命令的实现 */
 static void cmd_help(const char *args) {
     if (*args != '\0') {
         const char *detail = shell_extra_help(args);
@@ -1336,7 +1336,7 @@ static void cmd_readdisk(const char *args) {
 static void cmd_hexdump(const char *args) {
     uint32_t addr = my_htoi(args);
     int len = 64;
-    /* ��ѡ���Ȳ�����hexdump <addr> [len]�����?1024 */
+    /* 可选的字节数参数：hexdump <addr> [len]，上限 1024 */
     const char *p = args;
     while (*p && *p != ' ') p++;
     while (*p == ' ') p++;
@@ -1368,8 +1368,8 @@ static void cmd_hexdump(const char *args) {
     if (len % 16 != 0) terminal_putchar('\n');
 }
 
-/* PC 蜂鸣器可编程接口：freq Hz 鸣响 ms 毫秒（PIT ch2 + gate 0x61，忙等精确时长）�?
- * �?shell beep 命令、GUI/游戏音效共用；freq 超出人耳范围或 ms==0 直接返回 */
+/* PC 蜂鸣器可编程接口：freq Hz 鸣响 ms 毫秒（PIT ch2 + gate 0x61，忙等精确时长）。
+ * shell 的 beep 命令、GUI/游戏音效共用；freq 超出人耳范围或 ms==0 就直接返回。 */
 void beep(uint32_t freq, uint32_t ms) {
     if (freq < 20 || freq > 20000 || ms == 0) return;
     outb(0x43, 0xB6);                       /* ch2: lobyte/hibyte, square wave */
@@ -1495,7 +1495,7 @@ static void cmd_ls(const char *args) {
     terminal_writestring(title);
     terminal_writestring(":\n");
     if (verbose) {
-        /* -l ��ϸģʽ������ + �Ҷ�����?+ ���ƣ����?MikanOS ListAllEntries�� */
+        /* -l 详细模式：类型 + 权限位 + 大小（类似 MikanOS 的 ListAllEntries） */
         for (int i = 0; i < n; i++) {
             if (entries[i].is_dir) shell_fg(CLR_LIGHT_BLUE);
             else if (is_exe_name(entries[i].name)) shell_fg(CLR_LIGHT_GREEN);
@@ -1520,7 +1520,7 @@ static void cmd_ls(const char *args) {
             terminal_putchar('\n');
         }
     } else {
-        /* eza ����ɫ���� */
+        /* eza 风格的彩色输出 */
         int maxlen = 4;
         for (int i = 0; i < n; i++) {
             int l = 0; while (entries[i].name[l]) l++;
@@ -1543,7 +1543,7 @@ static void cmd_ls(const char *args) {
                 for (int k = 0; k < l; k++) terminal_putchar(namebuf[k]);
                 if (entries[idx].is_dir) terminal_putchar('/');
                 shell_color_default();
-                /* ��䵽�п�?*/
+                /* 补空格到列宽 */
                 int pad = l + (entries[idx].is_dir ? 1 : 0);
                 for (int fill = pad; fill < maxlen + 3; fill++) terminal_putchar(' ');
             }
@@ -1695,9 +1695,9 @@ static void cmd_setdrive(const char *args) {
     }
 }
 
-/* ============ ���� Linux ��������ʵ�֣�?============ */
+/* ============ 仿 Linux 风格的命令（真实实现） ============ */
 
-// ������һ���ո�ָ���?token��д�� out������ʣ�����ָ��?
+// 从 args 里取下一个以空格分隔的记号（token）写进 out，返回剩余字符串的指针
 static const char *parse_token(const char *args, char *out, int max) {
     int i = 0;
     while (*args == ' ') args++;
@@ -1717,7 +1717,7 @@ static void cmd_grep(const char *args) {
         return;
     }
     if (filename[0] == '\0' && pipe_len > 0) {
-        /* �ӹܵ��������� */
+        /* 从管道里读输入 */
         int plen = my_strlen(pattern);
         int line_start = 0, line_end = 0;
         while (line_end < pipe_len) {
@@ -2043,24 +2043,24 @@ static int vi_modified = 0;
 static int vi_mode = 0;
 static const char *vi_msg = NULL;
 
-// �����校ɫ����static����.bss����100*96 ɫ����ջ����ö�.bss.hi
-static uint8_t vi_colbuf[VI_MAX_LINE];     // ��ǰ�пɼ��е�逐����ɫ(ÿ���ظ���)
-static uint8_t vi_block_comment[VI_MAX_LINES]; // ÿ��进�뿪����ע��״̬(0/1)
+// 语法高亮配色（用 static 放 .bss：100*96 的配色数组会撑爆栈，得放 .bss.hi）
+static uint8_t vi_colbuf[VI_MAX_LINE];     // 当前行可见区的逐字符颜色（每次重算）
+static uint8_t vi_block_comment[VI_MAX_LINES]; // 每行进入块注释时的状态(0/1)
 
-// ===== vi �������룺��������ѡ�󷨹������� =====
+// ===== vi 的语法高亮：按语言选规则 =====
 static int vi_is_digit(char c) { return c >= '0' && c <= '9'; }
 static int vi_is_ident_start(char c) {
     return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
 }
 static int vi_is_ident(char c) { return vi_is_ident_start(c) || vi_is_digit(c); }
 
-// Сдַ����Ƚϣ��ֱ����β '\0'����strcmp
+// 小写字符串比较：一直比到结尾的 '\0'（就是 strcmp）
 static int vi_streq(const char *a, const char *b) {
     while (*a && *a == *b) { a++; b++; }
     return (*a == '\0' && *b == '\0');
 }
 
-// C �ؼ�/asm ���������бȽϣ�s �� len �ֽڣ����ǰβ
+// C 关键字 / asm 助记符表比较：s 有 len 字节，不以结尾为准
 static int vi_match_list(const char *s, int len, const char *const *list, int n) {
     for (int k = 0; k < n; k++) {
         const char *kw = list[k];
@@ -2069,7 +2069,7 @@ static int vi_match_list(const char *s, int len, const char *const *list, int n)
             if (kw[j] != s[j]) { match = 0; break; }
             j++;
         }
-        if (match && kw[j] == '\0') return 1; // s ����ȷ���� kw
+        if (match && kw[j] == '\0') return 1; // s 确实等于 kw
     }
     return 0;
 }
@@ -2104,10 +2104,10 @@ static int vi_get_lang(void) {
         vi_streq(ext, "cxx") || vi_streq(ext, "hpp") ||
         vi_streq(ext, "hh")) return 4;
     if (vi_streq(ext, "py")) return 5;
-    return 0; // δ֪����ΪĬ�Ϻ�ɫ
+    return 0; // 未知类型按默认配色
 }
 
-// һ�δ�量ɨ�����и�进�뿪 /* */ ״̬����O(总行*列) ����כ����и�
+// 一次扫完全部行的 /* */ 块注释状态（O(总行*列)，避免逐行回溯）
 static void vi_compute_block_states(int lang) {
     int in_block = 0;
     char trip = 0; /* python triple-quote char while in_block */
@@ -2139,7 +2139,7 @@ static void vi_compute_block_states(int lang) {
                 if (i + 1 < L && c == '*' && vi_lines[line][i + 1] == '/') { in_block = 0; i += 2; }
                 else i++;
             } else {
-                if (c == '/' && i + 1 < L && vi_lines[line][i + 1] == '/') break; // �к�ע��
+                if (c == '/' && i + 1 < L && vi_lines[line][i + 1] == '/') break; // 行注释
                 else if (c == '/' && i + 1 < L && vi_lines[line][i + 1] == '*') { in_block = 1; i += 2; }
                 else i++;
             }
@@ -2147,7 +2147,7 @@ static void vi_compute_block_states(int lang) {
     }
 }
 
-// ΢һ�п�逐����ɫ��vi_colbuf[0..L-1]����ʹ in_block 进����ע��״̬
+// 给一行做逐字符配色：写满 vi_colbuf[0..L-1]，in_block 表示进入时已在块注释里
 static void vi_color_line(int line, int lang, int in_block) {
     int L = vi_len[line];
     if (L < 0) L = 0;
@@ -2155,22 +2155,22 @@ static void vi_color_line(int line, int lang, int in_block) {
      * vi_len 理论上由插入逻辑保证 <= VI_MAX_LINE-1，但这里是最后一道防线：
      * 一旦越界就是向相邻 static 数据写颜色值，属于极难排查的静默破坏。 */
     if (L > VI_MAX_LINE) L = VI_MAX_LINE;
-    for (int i = 0; i < VI_MAX_LINE; i++) vi_colbuf[i] = CLR_LIGHT_GREY; // Ĭ����ɫ 0x07
+    for (int i = 0; i < VI_MAX_LINE; i++) vi_colbuf[i] = CLR_LIGHT_GREY; // 默认配色 0x07
     if (lang == 0 || L == 0) return;
 
     if (lang == 3) { // ===== Markdown =====
         int k = 0; while (k < L && vi_lines[line][k] == ' ') k++;
-        if (k < L && vi_lines[line][k] == '#') { // ����
+        if (k < L && vi_lines[line][k] == '#') { // 标题
             for (int j = 0; j < L; j++) vi_colbuf[j] = CLR_LIGHT_BLUE;
             return;
         }
         int i = 0;
         if (k < L && (vi_lines[line][k] == '-' || vi_lines[line][k] == '*') &&
             (k + 1 >= L || vi_lines[line][k + 1] == ' ' || vi_lines[line][k + 1] == '\t')) {
-            vi_colbuf[k] = CLR_LIGHT_RED; // �б���ǣ�
+            vi_colbuf[k] = CLR_LIGHT_RED; // 列表标记
             i = k + 1;
         }
-        while (i < L) { // �����д�����`
+        while (i < L) { // 行内代码 `...`
             char c = vi_lines[line][i];
             if (c == '`') {
                 vi_colbuf[i] = CLR_LIGHT_GREEN; i++;
@@ -2183,7 +2183,7 @@ static void vi_color_line(int line, int lang, int in_block) {
         return;
     }
 
-    if (lang == 2) { // ===== ���� =====
+    if (lang == 2) { // ===== 汇编 =====
         static const char *mnem[] = {
             "mov","add","sub","mul","div","and","or","xor","not","shl","shr","jmp",
             "je","jne","jz","jnz","call","ret","push","pop","int","cmp","lea","inc",
@@ -2197,12 +2197,12 @@ static void vi_color_line(int line, int lang, int in_block) {
                 for (int j = i; j < L; j++) vi_colbuf[j] = CLR_DARK_GREY;
                 break;
             }
-            if (c == '.') { // ���� .text .globl
+            if (c == '.') { // 伪指令 .text .globl
                 int s = i; i++; while (i < L && vi_is_ident(vi_lines[line][i])) i++;
                 for (int j = s; j < i; j++) vi_colbuf[j] = CLR_LIGHT_CYAN;
                 continue;
             }
-            if (c == '%') { // ����%eax
+            if (c == '%') { // 寄存器 %eax
                 int s = i; i++; while (i < L && vi_is_ident(vi_lines[line][i])) i++;
                 for (int j = s; j < i; j++) vi_colbuf[j] = CLR_LIGHT_BLUE;
                 continue;
@@ -2335,7 +2335,7 @@ static void vi_color_line(int line, int lang, int in_block) {
         kwt = kwcpp;
         n = (int)(sizeof(kwcpp) / sizeof(kwcpp[0]));
     }
-    // Ԥ����: �����հ�'#' -> # ������������ɫ
+    // 预处理指令：行首空白之后的 '#' -> # 开始整行同色
     int i = 0;
     int p = 0; while (p < L && vi_lines[line][p] == ' ') p++;
     if (p < L && vi_lines[line][p] == '#') {
@@ -2360,7 +2360,7 @@ static void vi_color_line(int line, int lang, int in_block) {
             vi_colbuf[i] = CLR_DARK_GREY; vi_colbuf[i + 1] = CLR_DARK_GREY;
             in_block = 1; i += 2; continue;
         }
-        if (c == '"') { // �ַ�����
+        if (c == '"') { // 字符串
             vi_colbuf[i] = CLR_LIGHT_GREEN; i++;
             while (i < L) {
                 char d = vi_lines[line][i]; vi_colbuf[i] = CLR_LIGHT_GREEN;
@@ -2370,7 +2370,7 @@ static void vi_color_line(int line, int lang, int in_block) {
             }
             continue;
         }
-        if (c == '\'') { // �ַ�����
+        if (c == '\'') { // 字符常量
             vi_colbuf[i] = CLR_LIGHT_GREEN; i++;
             while (i < L) {
                 char d = vi_lines[line][i]; vi_colbuf[i] = CLR_LIGHT_GREEN;
@@ -2400,7 +2400,7 @@ static void vi_color_line(int line, int lang, int in_block) {
     }
 }
 
-// ȷ������ںϷ����?
+// 确认光标位置合法
 static void vi_clamp_cursor(void) {
     if (vi_count == 0) { vi_row = 0; vi_col = 0; return; }
     if (vi_row < 0) vi_row = 0;
@@ -2409,7 +2409,7 @@ static void vi_clamp_cursor(void) {
     if (vi_col > vi_len[vi_row]) vi_col = vi_len[vi_row];
 }
 
-// ��������ƫ�ƣ�ȷ�����ɼ�
+// 滚动到光标所在偏移，确保它可见
 static void vi_scroll_into_view(void) {
     if (vi_row < vi_top) vi_top = vi_row;
     if (vi_row >= vi_top + VI_SCREEN_ROWS) vi_top = vi_row - VI_SCREEN_ROWS + 1;
@@ -2419,11 +2419,11 @@ static void vi_scroll_into_view(void) {
     if (vi_top < 0) vi_top = 0;
 }
 
-// ��Ⱦ����(���������뷨��ɫ)
+// 渲染整屏（带行号与语法高亮）
 static void vi_render(void) {
     terminal_initialize();
     int lang = vi_get_lang();
-    if (lang == 1 || lang == 4 || lang == 5) vi_compute_block_states(lang); // �С��ע��跨��״̬
+    if (lang == 1 || lang == 4 || lang == 5) vi_compute_block_states(lang); // 多行注释的跨行状态
     for (int i = 0; i < VI_SCREEN_ROWS; i++) {
         int line = vi_top + i;
         if (line < vi_count) {
@@ -2432,7 +2432,7 @@ static void vi_render(void) {
             if (L < 0) L = 0;
             int in_block = ((lang == 1 || lang == 4 || lang == 5) && line >= 0 && line < VI_MAX_LINES) ? vi_block_comment[line] : 0;
             vi_color_line(line, lang, in_block);
-            int cur_color = -1; // ����ɫʱ�ŵ� terminal_setcolor
+            int cur_color = -1; // 换色时才调 terminal_setcolor
             for (int x = 0; x < VI_SCREEN_COLS - 1; x++) {
                 int src = vi_left + x;
                 char ch = (src < L) ? vi_lines[line][src] : ' ';
@@ -2462,7 +2462,7 @@ static void vi_render(void) {
     terminal_set_cursor((size_t)(vi_row - vi_top), (size_t)(vi_col - vi_left));
 }
 
-// �ڹ�괦�����ַ�?
+// 在光标处插入字符
 static void vi_insert_char(char c) {
     if (vi_len[vi_row] >= VI_MAX_LINE - 1) return;
     for (int i = vi_len[vi_row]; i > vi_col; i--) {
@@ -2474,7 +2474,7 @@ static void vi_insert_char(char c) {
     vi_modified = 1;
 }
 
-// ɾ����괦�ַ�?
+// 删除光标处的字符
 static void vi_delete_char(void) {
     if (vi_col >= vi_len[vi_row]) return;
     for (int i = vi_col; i < vi_len[vi_row] - 1; i++) {
@@ -2484,7 +2484,7 @@ static void vi_delete_char(void) {
     vi_modified = 1;
 }
 
-// ɾ�����ǰ�ַ���������ϲ�����һ�У�
+// 删除光标前的字符（退格，必要时并到上一行）
 static void vi_backspace(void) {
     if (vi_col > 0) {
         vi_col--;
@@ -2508,7 +2508,7 @@ static void vi_backspace(void) {
     }
 }
 
-// �ڹ�괦����?
+// 在光标处插入换行
 static void vi_insert_newline(void) {
     if (vi_count >= VI_MAX_LINES) return;
     int tail = vi_len[vi_row] - vi_col;
@@ -2528,7 +2528,7 @@ static void vi_insert_newline(void) {
     vi_modified = 1;
 }
 
-// ɾ����ǰ��
+// 删除当前行
 static void vi_delete_line(void) {
     if (vi_count == 0) return;
     for (int r = vi_row; r < vi_count - 1; r++) {
@@ -2548,7 +2548,7 @@ static void vi_delete_line(void) {
     vi_modified = 1;
 }
 
-// ���浽�ļ�
+// 保存到文件
 static void vi_save(void) {
     static uint8_t out_buf[4096];
     int o = 0;
@@ -2565,7 +2565,7 @@ static void vi_save(void) {
     }
 }
 
-// ��״̬����ȡ����
+// 从底部状态栏读一条命令
 static int vi_read_command(char *buf, int max) {
     terminal_set_cursor(VI_SCREEN_ROWS, 0);
     terminal_setcolor(0x70);
@@ -2613,7 +2613,7 @@ static void cmd_df(const char *args) {
     }
     uint32_t cluster_size = (uint32_t)info->bytes_per_sector * info->sectors_per_cluster;
     uint32_t used_clusters = fs_count_used_clusters();
-    /* �� 64 λ�˷� + ���ƻ��� KB������ libgcc �� 64 λ�������� */
+    /* 用 64 位乘法 + 移位换算 KB，绕开 libgcc 的 64 位除法 */
     uint64_t total_b = (uint64_t)info->cluster_count * cluster_size;
     uint64_t used_b = (uint64_t)used_clusters * cluster_size;
     uint32_t total_kb = (uint32_t)(total_b >> 10);
@@ -2655,7 +2655,7 @@ static void cmd_du(const char *args) {
     }
     uint32_t cluster_size = (uint32_t)info->bytes_per_sector * info->sectors_per_cluster;
 
-    /* du <file>����ʾָ���ļ�/Ŀ¼�Ĵ�ռ�ã�KB�� */
+    /* du <file>：显示指定文件/目录的占用（KB） */
     if (name[0] != '\0') {
         uint32_t clusters = fs_get_file_clusters(name);
         uint32_t kb = (uint32_t)(((uint64_t)clusters * cluster_size) >> 10);
@@ -2666,7 +2666,7 @@ static void cmd_du(const char *args) {
         return;
     }
 
-    /* du���г���ǰĿ¼ȫ����Ŀռ�ã�KB�����ܼ� */
+    /* du：列出当前目录所有项的占用（KB）与合计 */
     /* 16.9KB（64 x 264B）。**绝不能放栈上**：任务内核栈 TASK_KSIZE 只有
      * 16KB，放栈上会让 ls 一进来就越界写穿相邻数据（实测：ro_cwd 被目录项
      * 名字覆盖，提示符变成 [A.TXT]，随后的 cat/write 全部失败）。
@@ -2831,21 +2831,21 @@ static void cmd_vi(const char *args) {
 
 
 
-/* ================= ʵ�ù��� ================= */
+/* ================= 实用工具 ================= */
 
-// ��ӡ�з�������
+// 打印整数
 static void print_int(int num) {
     uint32_t mag;
     if (num < 0) {
         terminal_putchar('-');
-        mag = (uint32_t)(-(num + 1)) + 1u;   /* 避免 INT_MIN 取负�?UB */
+        mag = (uint32_t)(-(num + 1)) + 1u;   /* 避免 INT_MIN 取负的未定义行为 */
     } else {
         mag = (uint32_t)num;
     }
     print_dec(mag);
 }
 
-// calc: ����ʽ������������ gfx_eval��
+// calc: 表达式求值（与 gfx_eval 同源）
 static void cmd_icalc(const char *args) {
     if (*args == '\0') {
         terminal_writestring("Usage: icalc <expr>   e.g. calc 1+2*3\n");
@@ -2862,7 +2862,7 @@ static void cmd_icalc(const char *args) {
     terminal_writestring("\n");
 }
 
-// hex: ʮ����/ʮ�����ƻ�ת
+// hex: 十六进制 / 十进制互转
 void cmd_hex(const char *args) {
     if (*args == '\0') {
         terminal_writestring("Usage: hex <num>   dec->hex, or 0x<hex> -> dec\n");
@@ -2881,7 +2881,7 @@ void cmd_hex(const char *args) {
     }
 }
 
-// rand: α�������LCG��
+// rand: 伪随机数（LCG）
 static uint32_t rand_state = 0x9E3779B9u;
 static uint32_t my_rand(void) {
     rand_state = rand_state * 1664525u + 1013904223u;
@@ -2896,9 +2896,9 @@ void cmd_rand(const char *args) {
     terminal_writestring("\n");
 }
 
-/* ================= ��Ϸ ================= */
+/* ================= 游戏 ================= */
 
-// ��ȡһ�����루���ԣ������س��ȣ�Esc ���� -1
+// 读一行输入（回显，支持退格，Esc 返回 -1）
 static int read_line(char *buf, int maxlen) {
     int n = 0;
     while (1) {
@@ -2926,10 +2926,10 @@ static int read_line(char *buf, int maxlen) {
     }
 }
 
-// guess: ��������Ϸ
+// guess: 猜数字游戏
 void cmd_guess(const char *args) {
     (void)args;
-    if (games_gui_launch(1)) return;   /* ͼ�����棺ֱ��ͼ������ */
+    if (games_gui_launch(1)) return;   /* 图形模式：直接进图形版 */
     int target = (int)(my_rand() % 100) + 1;
     terminal_writestring("I picked a number 1-100. Guess it! (0 to quit)\n");
     char line[16];
@@ -2955,7 +2955,7 @@ void cmd_guess(const char *args) {
     }
 }
 
-// tictactoe: �����壨���?X vs AI O��
+// tictactoe: 井字棋（玩家 X vs AI O）
 static int tt_win(char b[9], char p) {
     static const int lines[8][3] = {
         {0,1,2},{3,4,5},{6,7,8},
@@ -2991,7 +2991,7 @@ static void tt_draw(char b[9]) {
 
 void cmd_tictactoe(const char *args) {
     (void)args;
-    if (games_gui_launch(2)) return;   /* ͼ�����棺ֱ��ͼ������ */
+    if (games_gui_launch(2)) return;   /* 图形模式：直接进图形版 */
     char b[9] = {0};
     terminal_writestring("Tic-Tac-Toe: you are X, AI is O. Enter 1-9.\n");
     while (1) {
@@ -3009,30 +3009,30 @@ void cmd_tictactoe(const char *args) {
         b[mv-1] = 'X';
         if (tt_win(b, 'X')) { tt_draw(b); terminal_writestring("You win!\n"); return; }
         if (tt_full(b)) { tt_draw(b); terminal_writestring("Draw.\n"); return; }
-        // AI ����
+        // AI 落子
         int best = -1;
-        for (int i = 0; i < 9 && best < 0; i++) {   // 1) ��Ӯ��Ӯ
+        for (int i = 0; i < 9 && best < 0; i++) {   // 1) 能赢就赢
             if (b[i] == 0) {
                 b[i] = 'O';
                 if (tt_win(b, 'O')) best = i;
                 b[i] = 0;
             }
         }
-        for (int i = 0; i < 9 && best < 0; i++) {   // 2) �����?
+        for (int i = 0; i < 9 && best < 0; i++) {   // 2) 该堵就堵
             if (b[i] == 0) {
                 b[i] = 'X';
                 if (tt_win(b, 'X')) best = i;
                 b[i] = 0;
             }
         }
-        if (best < 0 && b[4] == 0) best = 4;        // 3) ����
-        if (best < 0) {                             // 4) ����
+        if (best < 0 && b[4] == 0) best = 4;        // 3) 占中心
+        if (best < 0) {                             // 4) 占角
             static const int corners[4] = {0,2,6,8};
             for (int i = 0; i < 4; i++) {
                 if (b[corners[i]] == 0) { best = corners[i]; break; }
             }
         }
-        if (best < 0) {                             // 5) ���?
+        if (best < 0) {                             // 5) 随便下
             int n = (int)(my_rand() % 9);
             for (int i = 0; i < 9; i++) {
                 int idx = (n + i) % 9;
@@ -3048,12 +3048,12 @@ void cmd_tictactoe(const char *args) {
     }
 }
 
-// snake: �ı�̰����
+// snake: 文本贪吃蛇
 #define SNAKE_W 40
 #define SNAKE_H 20
 #define SNAKE_MAX (SNAKE_W * SNAKE_H)
 
-// RDTSC æ����ʱ��Լ ticks �� TSC ���ڣ�
+// RDTSC 忙等延时：把 ticks 换算成 TSC 周期数
 static void delay_ticks(uint32_t ticks) {
     uint32_t start;
     __asm__ __volatile__("rdtsc" : "=a"(start) : : "edx");
@@ -3066,7 +3066,7 @@ static void delay_ticks(uint32_t ticks) {
 
 void cmd_snake(const char *args) {
     (void)args;
-    if (games_gui_launch(3)) return;   /* ͼ�����棺ֱ��ͼ������ */
+    if (games_gui_launch(3)) return;   /* 图形模式：直接进图形版 */
     int sx[SNAKE_MAX], sy[SNAKE_MAX];
     int len = 3;
     int dir = KEY_RIGHT;
@@ -3164,7 +3164,7 @@ void cmd_snake(const char *args) {
 }
 
 
-/* GUI �ն˵��ⲿģ��ע��һ������ */
+/* 给 GUI 终端等外部模块用的单行命令入口 */
 int shell_exec_line(const char *line) {
     char buf[CMD_BUFFER_SIZE];
     int i = 0;

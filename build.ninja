@@ -243,6 +243,15 @@ rule stack_check
 
 build stack: stack_check tools/check_stack.py
 
+# 编码闸门：源文件必须是合法 UTF-8、不能有 U+FFFD 或"拷"字乱码。历史上有
+# 9 个文件的注释被 GBK/UTF-8 来回转码碾过（4001 处），重写完必须守住——
+# 这个检查纯扫字节、几秒就完事。用法：ninja enc
+rule enc_check
+    command = cmd /c python tools/check_encoding.py
+    description = ENCODING utf-8 clean
+
+build enc: enc_check tools/check_encoding.py
+
 # VMware 侧验证：QEMU 的 SeaBIOS 太干净，VMware 的 PhoenixBIOS + 更接近真机的
 # 芯片组是介于 QEMU 与真机之间的第二道关。同样不进 default。用法：ninja vmware
 rule make_vmware

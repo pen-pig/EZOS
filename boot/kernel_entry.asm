@@ -35,7 +35,7 @@ global g_user_exited
 _start:
     mov esp, 0x200000
 
-    ; ÇåÁã .bss ¶Î£¨ÄÚºË¾µÏñÖ»¼ÓÔØ 64KB£¬³¬³ö²¿·Ö±£³Ö BIOS ²ĞÁô£¬±ØĞëÏÔÊ½ÇåÁã£©
+    ; æ¸…é›¶ .bss æ®µï¼šC çš„é™æ€å˜é‡éƒ½åœ¨é‡Œé¢ï¼Œå¿…é¡»æ˜¾å¼æ¸…é›¶ï¼Œä¸èƒ½æŒ‡æœ› BIOS ç•™ä¸‹çš„æ˜¯ 0
     mov edi, __bss_start
     mov ecx, __bss_end
     sub ecx, edi
@@ -53,7 +53,7 @@ _start:
     cli
     hlt
 
-; IRQ0 ÖĞ¶ÏÈë¿Ú£¨PIT ¶¨Ê±Æ÷£©
+; IRQ0 ä¸­æ–­å…¥å£ï¼ˆPIT å®šæ—¶å™¨ï¼‰
 irq0:
     cli
     pusha
@@ -62,7 +62,7 @@ irq0:
     sti
     iret
 
-; IRQ1 ÖĞ¶ÏÈë¿Ú
+; IRQ1 ä¸­æ–­å…¥å£ï¼ˆé”®ç›˜ï¼‰
 irq1:
     cli
     pusha
@@ -71,7 +71,7 @@ irq1:
     sti
     iret
 
-; IRQ12 ÖĞ¶ÏÈë¿Ú£¨Êó±ê£©
+; IRQ12 ä¸­æ–­å…¥å£ï¼ˆé¼ æ ‡ï¼‰
 irq12:
     cli
     pusha
@@ -106,59 +106,59 @@ irq15s:
     popa
     iret
 
-; ¼ÓÔØ IDT µÄº¯Êı
-; ²ÎÊı£ºuint32_t idt_ptr£¨Ö¸Ïò idt_ptr ½á¹¹µÄÖ¸Õë£©
+; åŠ è½½ IDT çš„å‡½æ•°
+; å‚æ•°ï¼šuint32_t idt_ptrï¼ˆæŒ‡å‘ idt_ptr ç»“æ„çš„æŒ‡é’ˆï¼‰
 idt_flush:
-    mov eax, [esp + 4]    ; »ñÈ¡²ÎÊı£¨idt_ptr µØÖ·£©
-    lidt [eax]            ; ¼ÓÔØ IDT
+    mov eax, [esp + 4]    ; å–å‚æ•°ï¼ˆidt_ptr åœ°å€ï¼‰
+    lidt [eax]            ; åŠ è½½ IDT
     ret
 
-; ==================== CPU Òì³£×®£¨ÏòÁ¿ 0-31£©====================
-; Õ»²¼¾Ö£¨isr_common ÖĞ£¬´Ó esp ÏòÉÏ£©£º
-;   [esp..esp+31]  pusha Çø£¨edi esi ebp espÕ¼Î» ebx edx ecx eax£©
-;   [esp+32]=ÏòÁ¿ºÅ  [esp+36]=´íÎóÂë(ÎŞÂëÏòÁ¿µæ 0)
+; ==================== CPU å¼‚å¸¸æ¡©ï¼ˆå‘é‡ 0-31ï¼‰====================
+; æ ˆå¸ƒå±€ï¼ˆisr_common é‡Œï¼Œä» esp å¾€ä¸Šï¼‰ï¼š
+;   [esp..esp+31]  pusha åŒºï¼ˆedi esi ebp espå ä½ ebx edx ecx eaxï¼‰
+;   [esp+32]=å‘é‡å·  [esp+36]=é”™è¯¯ç ï¼ˆæ— ç å‘é‡å« 0ï¼‰
 ;   [esp+40]=EIP  [esp+44]=CS  [esp+48]=EFLAGS
-; ring0 Í¬¼¶´¥·¢£¬ÎŞ ESP/SS Ñ¹Õ»£»C ²à isr_regs_t Óë´Ë²¼¾ÖÒ»ÖÂ¡£
+; ring0 åŒçº§è§¦å‘ï¼Œä¸å‹ ESP/SSï¼›C ä¾§ isr_regs_t çš„å¸ƒå±€å¿…é¡»ä¸æ­¤ä¸€è‡´ã€‚
 %macro ISR_STUB_ERR 1
 isr_stub_%1:
     cli
-    push dword %1            ; ÏòÁ¿ºÅ£¨´íÎóÂë CPU ÒÑÑ¹£©
+    push dword %1            ; å‘é‡å·ï¼ˆé”™è¯¯ç å·²ç”± CPU å‹å…¥ï¼‰
     jmp isr_common
 %endmacro
 
 %macro ISR_STUB_NOERR 1
 isr_stub_%1:
     cli
-    push dword 0            ; µæ 0 ´íÎóÂë£¬Óë´øÂëÏòÁ¿²¼¾Ö¶ÔÆë
+    push dword 0            ; å« 0 å ä½ï¼Œå¥½å’Œæœ‰ç å‘é‡å…±ç”¨åŒä¸€æ ˆå¸§
     push dword %1
     jmp isr_common
 %endmacro
 
-; ´íÎóÂë¹æÔò£¨Intel SDM Vol.3 6.13£©£º½öÏòÁ¿ 8/10/11/12/13/14/17/30 ÓÉ CPU Ñ¹Èë
-; ´íÎóÂë£¬ÆäÓà±ØĞëµæ 0 ²ÅÄÜÓë´øÂëÏòÁ¿¹²ÓÃÍ¬Ò»Õ»²¼¾Ö¡£
+; é”™è¯¯ç è§„åˆ™ï¼ˆIntel SDM Vol.3 6.13ï¼‰ï¼šåªæœ‰å‘é‡ 8/10/11/12/13/14/17/30 ç”± CPU å‹å…¥
+; é”™è¯¯ç ï¼Œå…¶ä½™å¿…é¡»å« 0 æ‰èƒ½å’Œå¸¦ç å‘é‡å…±ç”¨åŒä¸€ä¸ªæ ˆå¸§ã€‚
 ;   #DE #DB NMI #BP #OF #BR #UD #NM | #DF | #TS #NP #SS #GP #PF | #MF #AC #MC #XM
 ;   0   1   2   3   4   5   6   7   | 8   | 10  11  12  13  14   | 16  17  18  19
-ISR_STUB_NOERR 0            ; #DE ³ıÁã
-ISR_STUB_NOERR 1            ; #DB µ÷ÊÔ
+ISR_STUB_NOERR 0            ; #DE é™¤é›¶
+ISR_STUB_NOERR 1            ; #DB è°ƒè¯•
 ISR_STUB_NOERR 2            ; NMI
-ISR_STUB_NOERR 3            ; #BP ¶Ïµã£¨ÏİÚå£¬ÎŞ´íÎóÂë£©
-ISR_STUB_NOERR 4            ; #OF into Òç³ö
-ISR_STUB_NOERR 5            ; #BR bnd Ô½½ç
-ISR_STUB_NOERR 6            ; #UD ·Ç·¨Ö¸Áî
-ISR_STUB_NOERR 7            ; #NM Éè±¸²»¿ÉÓÃ
-ISR_STUB_ERR   8            ; #DF Ë«ÖØ¹ÊÕÏ£¨´íÎóÂëºã 0£©
-ISR_STUB_NOERR 9            ; Ğ­´¦ÀíÆ÷¶ÎÒç³ö£¨±£Áô£©
-ISR_STUB_ERR   10           ; #TS ÎŞĞ§ TSS
-ISR_STUB_ERR   11           ; #NP ¶Î²»´æÔÚ
-ISR_STUB_ERR   12           ; #SS Õ»¶Î¹ÊÕÏ
-ISR_STUB_ERR   13           ; #GP Í¨ÓÃ±£»¤
-ISR_STUB_ERR   14           ; #PF È±Ò³£¨CR2=¹ÊÕÏµØÖ·£©
-ISR_STUB_NOERR 15           ; ±£Áô
-ISR_STUB_NOERR 16           ; #MF x87 ¸¡µã
-ISR_STUB_ERR   17           ; #AC ¶ÔÆë¼ì²é£¨´íÎóÂëºã 0£©
-ISR_STUB_NOERR 18           ; #MC »úÆ÷¼ì²é
-ISR_STUB_NOERR 19           ; #XM SIMD ¸¡µã
-ISR_STUB_NOERR 20           ; #VE ĞéÄâ»¯
+ISR_STUB_NOERR 3            ; #BP æ–­ç‚¹ï¼ˆint3ï¼Œè°ƒè¯•ç”¨ï¼‰
+ISR_STUB_NOERR 4            ; #OF into æº¢å‡º
+ISR_STUB_NOERR 5            ; #BR bnd è¶Šç•Œ
+ISR_STUB_NOERR 6            ; #UD éæ³•æŒ‡ä»¤
+ISR_STUB_NOERR 7            ; #NM è®¾å¤‡ä¸å¯ç”¨ï¼ˆFPUï¼‰
+ISR_STUB_ERR   8            ; #DF åŒé‡æ•…éšœï¼ˆé”™è¯¯ç æ’ 0ï¼‰
+ISR_STUB_NOERR 9            ; åå¤„ç†å™¨æ®µæº¢å‡ºï¼ˆä¿ç•™ï¼‰
+ISR_STUB_ERR   10           ; #TS æ— æ•ˆ TSS
+ISR_STUB_ERR   11           ; #NP æ®µä¸å­˜åœ¨
+ISR_STUB_ERR   12           ; #SS æ ˆæ®µæ•…éšœ
+ISR_STUB_ERR   13           ; #GP é€šç”¨ä¿æŠ¤
+ISR_STUB_ERR   14           ; #PF ç¼ºé¡µï¼ˆCR2=å‡ºé”™çš„çº¿æ€§åœ°å€ï¼‰
+ISR_STUB_NOERR 15           ; ä¿ç•™
+ISR_STUB_NOERR 16           ; #MF x87 æµ®ç‚¹å¼‚å¸¸
+ISR_STUB_ERR   17           ; #AC å¯¹é½æ£€æŸ¥ï¼ˆé”™è¯¯ç æ’ 0ï¼‰
+ISR_STUB_NOERR 18           ; #MC æœºå™¨æ£€æŸ¥
+ISR_STUB_NOERR 19           ; #XM SIMD æµ®ç‚¹å¼‚å¸¸
+ISR_STUB_NOERR 20           ; #VE è™šæ‹ŸåŒ–å¼‚å¸¸
 ISR_STUB_NOERR 21
 ISR_STUB_NOERR 22
 ISR_STUB_NOERR 23
@@ -168,28 +168,28 @@ ISR_STUB_NOERR 26
 ISR_STUB_NOERR 27
 ISR_STUB_NOERR 28
 ISR_STUB_NOERR 29
-ISR_STUB_ERR   30           ; #SX °²È«Òì³£
+ISR_STUB_ERR   30           ; #SX å®‰å…¨å¼‚å¸¸
 ISR_STUB_NOERR 31
 
 isr_common:
-    pusha                    ; [esp]=pusha Çø 32B
-    mov eax, esp             ; eax -> isr_regs_t »ùÖ·£¨º¬ÏòÁ¿/´íÎóÂë/EIP/CS/EFLAGS£©
+    pusha                    ; [esp]=pusha åŒº 32B
+    mov eax, esp             ; eax -> isr_regs_t åŸºå€ï¼ˆå«å‘é‡å·/é”™è¯¯ç /EIP/CS/EFLAGSï¼‰
     push eax
     call isr_dispatch
     add esp, 4
     popa
-    add esp, 8               ; µ¯ÏòÁ¿ºÅ + ´íÎóÂë/µæÎ»
+    add esp, 8               ; å¼¹æ‰å‘é‡å· + é”™è¯¯ç /å«ä½
     iret
 
-; C ¿É¼ûµÄ×®µØÖ·±í£¨panic.c ±éÀú×¢²á IDT 0-31£©
+; C å¯è§çš„æ¡©åœ°å€è¡¨ï¼ˆpanic.c éå†å®ƒæ³¨å†Œ IDT 0-31ï¼‰
 ;
-; ±ØĞëÖğÏîÏÔÊ½ÁĞ³ö£¬²»ÄÜĞ´³É
+; å¿…é¡»é€é¡¹æ˜¾å¼åˆ—å‡ºï¼Œä¸èƒ½å†™æˆ
 ;     %assign i 0 / %rep 32 / dd isr_stub_%+i / %assign i i+1 / %endrep
-; ¡ª¡ªNASM µÄ %+ Æ´½Ó·¢ÉúÔÚ %assign ±äÁ¿Õ¹¿ªÖ®Ç°£¬»á°Ñ 32 ¸ö±íÏîÈ«²¿½âÎö³É
-; Í¬Ò»¸ö·ûºÅ£¨Êµ²âÈ«Ö¸Ïò isr_stub_0£©£¬ÓÚÊÇÈÎºÎÒì³£¶¼ÉÏ±¨ "#DE vector 00"£¬
-; ÇÒ isr_regs_t ÕûÌå´íÎ» 4 ×Ö½Ú£¨EIP ¶Áµ½´íÎóÂë¡¢CS ¶Áµ½Õæ EIP¡¢EFLAGS ¶Áµ½
-; Õæ CS=0x8£©¡£¸ÃÈ±ÏİÓÉ test_step3.py µÄÕæ×Ö¿â OCR ¶ÏÑÔÊ×´Î±©Â¶¡ª¡ª
-; ²½Öè 1 µÄ"À¶ÆÁÅäÉ«/ÏñËØÍ³¼Æ"Àà´Ö¼ìÍêÈ«·¢ÏÖ²»ÁË¡£
+; â€”â€”NASM çš„ %+ æ‹¼æ¥å‘ç”Ÿåœ¨ %assign å˜é‡å±•å¼€ä¹‹å‰ï¼Œä¼šæŠŠ 32 ä¸ªè¡¨é¡¹å…¨éƒ¨è§£ææˆ
+; åŒä¸€ä¸ªç¬¦å·ï¼Œå®æµ‹å…¨éƒ½æŒ‡å‘ isr_stub_0ï¼šä»»ä½•å¼‚å¸¸ä¸ŠæŠ¥éƒ½æ˜¯ "#DE vector 00"ï¼Œ
+; ä¸” isr_regs_t æ•´ä½“é”™ä½ 4 å­—èŠ‚ï¼ˆEIP è¯»æˆäº†é”™è¯¯ç ã€CS è¯»åˆ°çœŸ EIPã€
+; EFLAGS è¯»åˆ°çœŸ CS=0x8ï¼‰ã€‚è¿™ä¸ªç¼ºé™·æ˜¯ test_step3.py çš„å¼€æœº OCR é¦–æ¬¡æš´éœ²çš„â€”â€”
+; æ­¥éª¤ 1 é‚£ç±»â€œè“å±é…è‰²/åƒç´ ç»Ÿè®¡â€æ–­è¨€ä¼šå…¨éƒ¨ä¸æˆç«‹ã€‚
 isr_stub_table:
     dd isr_stub_0
     dd isr_stub_1
@@ -224,32 +224,32 @@ isr_stub_table:
     dd isr_stub_30
     dd isr_stub_31
 
-; ==================== GDT / TSS / ç³»ç»Ÿè°ƒç”¨ / ring3ï¼ˆæ­¥éª? 4ï¼?====================
+; ==================== GDT / TSS / ç³»ç»Ÿè°ƒç”¨ / ring3 ====================
 
 [section .bss]
-; enter_usermode è¿›å…¥æ—¶ä¿å­˜çš„å†…æ ¸ espï¼ˆæŒ‡å‘è¿”å›åœ°å€ï¼‰ï¼ŒSYS_EXIT æ—¶æ®æ­¤å›åˆ°è°ƒç”¨è€?
+; enter_usermode è¿›å…¥æ—¶ä¿å­˜çš„å†…æ ¸ espï¼ˆæŒ‡å‘è¿”å›åœ°å€ï¼‰ï¼ŒSYS_EXIT æ—¶æ®æ­¤å›åˆ°è°ƒç”¨è€…
 g_kernel_esp_save:  resd 1
-; SYS_EXIT ç½? 1ï¼›syscall_entry æ£€æŸ¥æ­¤æ ‡å¿—èµ?"è¿”å›å†…æ ¸"è·¯å¾„è€Œé iret å›ç”¨æˆ·æ€?
+; SYS_EXIT ç½® 1ï¼›syscall_entry æ£€æŸ¥æ­¤æ ‡å¿—èµ°â€œè¿”å›å†…æ ¸â€è·¯å¾„è€Œä¸æ˜¯ iret å›ç”¨æˆ·æ€
 g_user_exited:      resd 1
-; enter_usermode ½øÈëÊ±µÄÄÚºË EFLAGS£ºSYS_EXIT ·µ»ØÂ·¾¶¾İ´Ë¾«È·»Ö¸´ IF
-; £¨²»ÄÜÎŞÌõ¼ş sti¡ª¡ªÄÇÑù»á°Ñ"µ÷ÓÃÕß±¾¾Í¹Ø×ÅÖĞ¶Ï"µÄÉÏÏÂÎÄ´íÎó´ò¿ª£©
+; enter_usermode è¿›å…¥æ—¶ä¿å­˜çš„å†…æ ¸ EFLAGSï¼šSYS_EXIT è¿”å›æ—¶æ®æ­¤ç²¾ç¡®æ¢å¤ IF
+; ï¼ˆä¸èƒ½æ— æ¡ä»¶ stiâ€”â€”é‚£ä¼šæŠŠâ€œè°ƒç”¨è€…æœ¬æ¥å…³ç€ä¸­æ–­â€çš„æƒ…å†µç»™æ‰“å¼€ï¼‰
 g_kernel_eflags:    resd 1
-; ÏµÍ³µ÷ÓÃÏİÈëÊ±Ñ¹ºÃµÄÍêÕû¼Ä´æÆ÷Ö¡µØÖ·£¨syscall_entry ÔÚ call Ö®Ç°´æºÃ£©¡£
-; fork ÒªÓÃËü¸´ÖÆ¸¸½ø³ÌÏÖ³¡¡£±ØĞëÓÉ**»ã±à**¸ø³ö£ºÒÔÇ°ÊÇÔÚ syscall_handler µÄ
-; µÚÒ»ÌõÓï¾ä¶Á esp ÔÙ°´¹Ì¶¨ÏÂ±êË÷Òı£¬ÄÇ¸öÏÂ±êÒÀÀµ±àÒëÆ÷¸ø¸Ã C º¯ÊıÉú³ÉµÄ
-; prologue£¨push ÁË¼¸¸ö callee-saved¡¢sub ÁË¶àÉÙ¾Ö²¿¿Õ¼ä£©£¬
-; º¯ÊıÒ»¸Ä¾Í¾²Ä¬´íÎ»¡ª¡ªÊÇµäĞÍµÄ´àÈõÔ¼¶¨¡£
+; ç³»ç»Ÿè°ƒç”¨é™·å…¥æ—¶å‹å‡ºæ¥çš„å¯„å­˜å™¨å¸§åœ°å€ï¼ˆsyscall_entry åœ¨ call ä¹‹å‰ä¿å­˜ï¼‰ï¼š
+; fork è¦é å®ƒå¤åˆ¶å­è¿›ç¨‹çš„å¯„å­˜å™¨ï¼Œè€Œè¿™ä¸ªåœ°å€**åªèƒ½ç”±æ±‡ç¼–**ç»™å‡ºï¼šä»¥å‰æ˜¯åœ¨
+; syscall_handler çš„ç¬¬ä¸€æ¡è¯­å¥è¯» espã€å†æŒ‰å›ºå®šä¸‹æ ‡ç®—ï¼Œå¯é‚£ä¸ªä¸‹æ ‡ä¼šéš C ç¼–è¯‘å™¨
+; ç”Ÿæˆçš„ prologue å˜åŒ–ï¼ˆpush äº†å‡ ä¸ª callee-savedã€sub äº†å¤šå°‘å±€éƒ¨ç©ºé—´ï¼‰ï¼Œ
+; å‡½æ•°ä¸€æ”¹å°±é»˜è®¤é”™ä½â€”â€”è¿™å°±æ˜¯é çº¦å®šåŠäº‹çš„ä»£ä»·ã€‚
 g_syscall_frame:    resd 1
 
 [section .text]
 
 ; void gdt_flush(uint32_t gdt_ptr_addr)
-; è£…è½½æ–? GDT åå¿…é¡»ç”¨è¿œè·³è½¬é‡è½? CSâ€”â€”åªæ”? ds/es/ss ä¸åŠ¨ CS çš„è¯ï¼?
-; åç»­å–æŒ‡ä»ç”¨æ—§çš„æè¿°ç¬¦ç¼“å­˜å€¼ã€?
+; è£…è½½æ–° GDT åå¿…é¡»ç”¨è¿œè·³è½¬é‡è½½ CSâ€”â€”åªæ”¹ ds/es/ss ä¸åŠ¨ CS çš„è¯ï¼Œ
+; åç»­å–æŒ‡ç”¨çš„è¿˜æ˜¯æ—§çš„æè¿°ç¬¦ç¼“å­˜å€¼ã€‚
 gdt_flush:
     mov eax, [esp + 4]
     lgdt [eax]
-    mov ax, 0x10                 ; å†…æ ¸æ•°æ®æ®?
+    mov ax, 0x10                 ; å†…æ ¸æ•°æ®æ®µ
     mov ds, ax
     mov es, ax
     mov fs, ax
@@ -260,17 +260,17 @@ gdt_flush:
     ret
 
 ; void tss_flush(void)
-; ltr çš„é€‰æ‹©å­? RPL å¿…é¡»ä¸? 0ï¼Œå¦åˆ? #GPã€?
+; ltr çš„é€‰æ‹©å­ RPL å¿…é¡»ä¸º 0ï¼Œå¦åˆ™ #GPã€‚
 tss_flush:
     mov ax, 0x28
     ltr ax
     ret
 
-; ---- int 0x80 ç³»ç»Ÿè°ƒç”¨å…¥å£ï¼ˆIDT é—? DPL=3ï¼Œç”¨æˆ·æ€å”¯ä¸€åˆæ³•é™·å…¥æ–¹å¼ï¼?----
-; è¿›å…¥æ—? CPU å·²æŒ‰ TSS.esp0/ss0 åˆ‡åˆ°å†…æ ¸æ ˆï¼Œå¹¶å‹å…? SS/ESP/EFLAGS/CS/EIPã€?
-; å‚æ•°çº¦å®šï¼šeax=è°ƒç”¨å·ï¼Œebx/ecx/edx=å‚æ•°ï¼›è¿”å›å€¼ç» eax ä¼ å›ç”¨æˆ·æ€ã€?
+; ---- int 0x80 ç³»ç»Ÿè°ƒç”¨å…¥å£ï¼ˆIDT é—¨ DPL=3ï¼Œç”¨æˆ·æ€å”¯ä¸€åˆæ³•é™·å…¥æ–¹å¼ï¼‰----
+; è¿›å…¥æ—¶ CPU å·²æŒ‰ TSS.esp0/ss0 åˆ‡åˆ°å†…æ ¸æ ˆï¼Œå¹¶å‹å…¥ SS/ESP/EFLAGS/CS/EIPã€‚
+; å‚æ•°çº¦å®šï¼šeax=è°ƒç”¨å·ï¼Œebx/ecx/edx=å‚æ•°ï¼›è¿”å›å€¼ç» eax ä¼ å›ç”¨æˆ·æ€ã€‚
 ;
-; æ ˆå¸ƒå±€ï¼ˆpusha ä¹‹åï¼Œä» esp èµ·ï¼‰ï¼?
+; æ ˆå¸ƒå±€ï¼ˆpusha ä¹‹åï¼Œä» esp èµ·ï¼‰ï¼š
 ;   +0 edi +4 esi +8 ebp +12 esp +16 ebx +20 edx +24 ecx +28 eax
 ;   +32 gs +36 fs +40 es +44 ds
 syscall_entry:
@@ -288,7 +288,7 @@ syscall_entry:
     ; Must come from ASM: indexing from a C function's esp depends on the
     ; compiler-generated prologue and silently shifts when the function changes.
     mov [g_syscall_frame], esp
-    mov ax, 0x10                 ; åˆ‡åˆ°å†…æ ¸æ•°æ®æ®µï¼šç”¨æˆ·æ®µé€‰æ‹©å­ä¸èƒ½ç”¨äºå†…æ ¸å­˜å?
+    mov ax, 0x10                 ; åˆ‡åˆ°å†…æ ¸æ•°æ®æ®µï¼šç”¨æˆ·æ®µé€‰æ‹©å­ä¸èƒ½ç”¨äºå†…æ ¸å­˜å–
     mov ds, ax
     mov es, ax
     mov fs, ax
@@ -297,7 +297,7 @@ syscall_entry:
     call syscall_handler         ; int syscall_handler(num, a1, a2, a3)
     add esp, 16
 
-    ; SYS_EXIT æœ‰ç‹¬ç«‹è¿”å›è·¯å¾„ï¼šä¸¢å¼ƒç”¨æˆ·æ€ä¸Šä¸‹æ–‡ï¼Œç›´æ¥å›åˆ? enter_usermode çš„è°ƒç”¨è€?
+    ; SYS_EXIT æœ‰ç‹¬ç«‹è¿”å›è·¯å¾„ï¼šä¸¢å¼ƒç”¨æˆ·æ€ä¸Šä¸‹æ–‡ï¼Œç›´æ¥å›åˆ° enter_usermode çš„è°ƒç”¨è€…
     cmp dword [g_user_exited], 0
     jne .return_to_kernel
 
@@ -328,11 +328,11 @@ syscall_entry:
     mov dword [g_user_exited], 0
     push dword [g_kernel_eflags]  ; exact restore of caller EFLAGS
     popfd
-    ret                          ; å›åˆ° enter_usermode() çš„è°ƒç”¨è€?
+    ret                          ; å›åˆ° enter_usermode() çš„è°ƒç”¨è€…
 
 ; ---- void enter_usermode(uint32_t entry, uint32_t user_esp) ----
-; æ„é€? iret å¸§é™æƒåˆ° ring3ã€‚CS/SS å¿…é¡»å¸? RPL=3ï¼?0x1B/0x23ï¼‰ï¼Œ
-; å¦åˆ™ CPL ä¸? RPL ä¸åŒ¹é…ä¼š #GPã€?
+; æ„é€  iret å¸§é™æƒåˆ° ring3ã€‚CS/SS å¿…é¡»å¸¦ RPL=3ï¼ˆ0x1B/0x23ï¼‰ï¼Œ
+; å¦åˆ™ CPL ä¸ RPL ä¸åŒ¹é…ä¼š #GPã€‚
 enter_usermode:
     mov eax, [esp + 4]           ; entry
     mov edx, [esp + 8]           ; user_esp
@@ -344,9 +344,9 @@ enter_usermode:
     pushfd
     pop ecx                      ; NOT ebx: ebx is callee-saved (cdecl)
     mov [g_kernel_eflags], ecx   ; save for exact restore on exit path
-    or ecx, 0x200                ; ç½? IFï¼šç”¨æˆ·æ€éœ€è¦èƒ½æ”¶åˆ°ä¸­æ–­
+    or ecx, 0x200                ; ç½® IFï¼šç”¨æˆ·æ€éœ€è¦èƒ½æ”¶åˆ°ä¸­æ–­
     push ecx                     ; EFLAGS
-    push dword 0x1B              ; CS: ç”¨æˆ·ä»£ç æ®? | RPL3
+    push dword 0x1B              ; CS: ç”¨æˆ·ä»£ç æ®µ | RPL3
     push dword [esp + 20]        ; EIP = entry arg: 4 pushes => esp-16, so
                                  ; entry sits at [esp+20]. Reload from stack
                                  ; because "mov ax,imm16" clobbers eax low half
@@ -354,7 +354,7 @@ enter_usermode:
     cli                          ; "half-user" window: ring0 running with DPL3
                                  ; data segments - an IRQ here would let C code
                                  ; touch kernel data through them
-    mov ax, 0x23                 ; ç”¨æˆ·æ•°æ®æ®? | RPL3
+    mov ax, 0x23                 ; ç”¨æˆ·æ•°æ®æ®µ | RPL3
     mov ds, ax
     mov es, ax
     mov fs, ax

@@ -21,19 +21,19 @@ static int left_shift = 0;
 static int right_shift = 0;
 static int alt_down = 0;      /* 左/右 Alt 按下状态（Alt+Tab 窗口切换用） */
 
-/* �ȴ� 8042 ���뻺���д��IBF ��գ� */
+/* 等 8042 输入缓冲空（IBF 清零）后再写命令 */
 static void kb_wait_write(void) {
     int timeout = 100000;
     while (--timeout > 0 && (inb(0x64) & 0x02)) ;
 }
 
-/* �ȴ� 8042 �������ɶ���OBF ��λ�� */
+/* 等 8042 输出缓冲满（OBF 置位）后读数据 */
 static void kb_wait_read(void) {
     int timeout = 100000;
     while (--timeout > 0 && !(inb(0x64) & 0x01)) ;
 }
 
-/* ���� 8042 ���� IRQ�������ֽ� bit0=1������������� scancode */
+/* 配置 8042 命令字节并打开键盘 IRQ（bit0=1），之后开始收 scancode */
 void keyboard_init(void) {
     uint8_t status;
 
@@ -72,17 +72,17 @@ void keyboard_init(void) {
     kb_wait_write();
     outb(0x60, status);
 
-    /* ������� scancode����ֹ��ʼ���ڼ��ѹ�İ�����Ⱦ�������� */
+    /* 清空残留 scancode，防止初始化期间积压的按键污染后续输入 */
     while ((inb(0x64) & 0x01)) {
         inb(0x60);
     }
 
-    /* ȷ�����̽ӿ����� */
+    /* 确保键盘接口处于开启状态 */
     kb_wait_write();
     outb(0x64, 0xAE);
 }
 
-/* ��ϣ������жϵ��ü�����data ��ȫ�֣��� QEMU monitor ���ڴ���֤�� */
+/* 调试计数：中断次数与最后的 scancode 放全局，便于 QEMU monitor 查内存验证 */
 volatile uint32_t kb_irq_count = 0;
 volatile uint32_t kb_last_scancode = 0;
 
@@ -122,27 +122,27 @@ void keyboard_handler(void) {
     uint8_t scancode = inb(0x60);
     kb_last_scancode = scancode;
 
-    if (scancode == 0x2A || scancode == 0x36) {       // Shift ����
+    if (scancode == 0x2A || scancode == 0x36) {       // Shift 按下
         left_shift = (scancode == 0x2A) ? 1 : left_shift;
         right_shift = (scancode == 0x36) ? 1 : right_shift;
         outb(0x20, 0x20);
         return;
-    } else if (scancode == 0xAA || scancode == 0xB6) { // Shift �ͷ�
+    } else if (scancode == 0xAA || scancode == 0xB6) { // Shift 松开
         left_shift = (scancode == 0xAA) ? 0 : left_shift;
         right_shift = (scancode == 0xB6) ? 0 : right_shift;
         outb(0x20, 0x20);
         return;
-    } else if (scancode == 0x38) {   // Alt ����
+    } else if (scancode == 0x38) {   // Alt 按下
         alt_down = 1;
         outb(0x20, 0x20);
         return;
-    } else if (scancode == 0xB8) {   // Alt �ͷ�
+    } else if (scancode == 0xB8) {   // Alt 松开
         alt_down = 0;
         outb(0x20, 0x20);
         return;
     }
 
-    if (!(scancode & 0x80)) { // �����¼�
+    if (!(scancode & 0x80)) { // 通码（按下事件）；断码最高位为 1
         int key = 0;
         int shifted = (left_shift || right_shift);
         switch (scancode) {

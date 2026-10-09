@@ -68,7 +68,9 @@ LAYERS = {
     "hw":   ["ahci", "nvme", "power", "edge", "heap", "jobs", "lock"],
     "util": ["digest"],
     # 静态检查（不是 tests/test_*.py，而是 tools/*.py）
-    "static": ["check_stack", "stack"],
+    # encoding：编码闸门（无 U+FFFD / 无 GBK 残留字节），几秒跑完，守住
+    # 2026-10-09 重写过的那批注释不再被转码碾坏
+    "static": ["check_stack", "stack", "encoding"],
 }
 
 # 改动文件 -> 必跑层级。键是路径子串。
@@ -186,6 +188,9 @@ def pick_changed():
                 layers.update(lay.split())
     if not layers:
         layers = {"core"}
+    # 静态检查（编码闸门 + 栈预算）看的是整个仓库，几秒就跑完，不管改了
+    # 哪个文件都一起过一遍，免得"改 docs 顺手带进一串乱码"这种事溜过去
+    layers.add("static")
     return sorted({n for lay in layers for n in LAYERS[lay]}), out
 
 

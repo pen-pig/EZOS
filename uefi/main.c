@@ -1,6 +1,6 @@
 #include "efi.h"
 
-/* GOP 协�?? GUID: {9042a9de-23dc-4a38-96fb-7aded080516a} */
+/* GOP 协议 GUID: {9042a9de-23dc-4a38-96fb-7aded080516a} */
 static const EFI_GUID gEfiGraphicsOutputProtocolGuid = {
   0x9042a9de, 0x23dc, 0x4a38, {0x96,0xfb,0x7a,0xde,0xd0,0x80,0x51,0x6a}
 };
@@ -15,7 +15,7 @@ static const EFI_GUID gEfiGraphicsOutputProtocolGuid = {
 #define KERNEL_SIZE_MAX  0x300000u  /* fail-closed cap; real size read from the file */
 #define KERNEL_LOAD  0x1300000u  /* linker.ld / boot/layout.inc: KERNEL_DST */
 
-/* ---- 串口（QEMU �? 0x3F8 即�??�?�? ISA UART，接�? -serial�? ---- */
+/* ---- 串口（QEMU 里的 0x3F8 就是标准 ISA UART，接 -serial 输出） ---- */
 static inline uint8_t inb(uint16_t port) {
   uint8_t v;
   __asm__ __volatile__("inb %1, %0" : "=a"(v) : "Nd"(port));
@@ -43,7 +43,7 @@ static void serial_hex(uint32_t v) {
   for (int s = 28; s >= 0; s -= 4) serial_putc(h[(v >> s) & 0xF]);
 }
 
-/* 屏幕用的 UTF-16 字面量（不用 L""，避�? wchar_t 宽度歧义�? */
+/* 屏幕用的 UTF-16 字面量（不用 L""，避免 wchar_t 宽度歧义） */
 static const UINT16 msg16[] = {
   'E', 'Z', 'E', 'F', 'I', ':', ' ', 'h', 'e', 'l', 'l', 'o', '\r', '\n', 0
 };
@@ -51,12 +51,12 @@ static const UINT16 kernel_path[] = {
   'k','e','r','n','e','l','.','b','i','n',0
 };
 
-/* 内核图形层（kernel/gfx.c:139-142）约定的帧缓冲参数区物理布局�?
- *   0x5000  uint32  LFB 物理地址�?0=�? LFB，回�? VGA 0x13�?
+/* 内核图形层（kernel/gfx.c）约定的帧缓冲参数区物理布局：
+ *   0x5000  uint32  LFB 物理地址（0 = 没有 LFB，回退 VGA 0x13）
  *   0x5004  uint16  XRES / 0x5006  uint16  YRES / 0x5008  uint8  BPP
  * 扩展（供 U3）：0x5009 uint8 PixelFormat / 0x500A uint16 保留 / 0x500C uint32 stride
- * 0x5010  uint32  UEFI �?动魔�? 0x55454649（U3 �?其判定跳�? VBE 探测�?
- * UEFI IA32 �?动阶段为 1:1 映射，可直接按物理地�?写入�? */
+ * 0x5010  uint32  UEFI 启动魔数 0x55454649（U3 用它判定跳过 VBE 探测）
+ * UEFI IA32 启动阶段是 1:1 映射，可以直接按物理地址写入。 */
 #define GFX_INFO_PHYS 0x5000u
 #define UEFI_MAGIC_PHYS 0x5010u
 /* U3: memory map handoff (kernel/pmm.c pmm_apply_uefi_map reads it)
@@ -66,7 +66,7 @@ static const UINT16 kernel_path[] = {
 #define UEFI_MMAP_PHYS     0x5100u
 #define UEFI_MMAP_MAX      (0x6000u - 0x5100u)
 
-/* �?易内存拷贝（�? libc�? */
+/* 简易内存拷贝（这里没有 libc） */
 static void my_memcpy(volatile void *dst, const void *src, UINTN n) {
   volatile uint8_t *d = (volatile uint8_t *)dst;
   const uint8_t *s = (const uint8_t *)src;
@@ -81,7 +81,7 @@ EFI_STATUS EFIAPI EfiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *ST) {
 
   EFI_BOOT_SERVICES *BS = ST->BootServices;
 
-  /* ===== GOP 帧缓冲信�?（U2b/U2b-ext�? ===== */
+  /* ===== GOP 帧缓冲信息（U2b/U2b-ext） ===== */
   EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = 0;
   EFI_STATUS st = BS->LocateProtocol(
       (EFI_GUID *)&gEfiGraphicsOutputProtocolGuid, 0, (void **)&gop);
@@ -145,7 +145,7 @@ EFI_STATUS EFIAPI EfiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *ST) {
 
   /* ===== U2c：加载内核并跳转 ===== */
 
-  /* 1) 找到�?动�?��?�的文件系统 */
+  /* 1) 找到启动盘上的文件系统 */
   EFI_LOADED_IMAGE_PROTOCOL *li = 0;
   st = ((EFI_OPEN_PROTOCOL)BS->OpenProtocol)(ImageHandle,
       (EFI_GUID *)&gEfiLoadedImageProtocolGuid, (void **)&li,
@@ -227,11 +227,11 @@ EFI_STATUS EFIAPI EfiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *ST) {
   serial_hex((uint32_t)KERNEL_LOAD);
   serial_puts(" ok\r\n");
 
-  /* 3) UEFI �?动魔数（�? U3 内核判定�? */
+  /* 3) 写入 UEFI 启动魔数（供 U3 内核判定启动路径） */
   *(volatile uint32_t *)UEFI_MAGIC_PHYS = UEFI_MAGIC;
   serial_puts("EZEFI:uefi magic@0x5010 ok\r\n");
 
-  /* 4) 取内存映射（�?步只打印，不传�?�给内核�? */
+  /* 4) 取内存映射（下面 5b 会拷一份交给内核） */
   UINTN map_size = 0, map_key = 0, desc_size = 0;
   UINT32 desc_ver = 0;
   void *mmap = 0;
@@ -270,14 +270,14 @@ EFI_STATUS EFIAPI EfiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *ST) {
   serial_puts(" descsize="); serial_dec((uint32_t)desc_size);
   serial_puts("\r\n");
 
-  /* 5) ExitBootServices（失败用�? MapKey 重试，最�? 3 次） */
+  /* 5) ExitBootServices（失败就用新的 MapKey 重试，最多 3 次） */
   int ebs_ok = 0;
   for (int attempt = 0; attempt < 3 && !ebs_ok; ++attempt) {
     st = ((EFI_EXIT_BOOT_SERVICES)BS->ExitBootServices)(ImageHandle, map_key);
     if (st == EFI_SUCCESS) {
       ebs_ok = 1;
     } else {
-      /* MapKey �?能已变，重新取一�? */
+      /* MapKey 可能已经变了，重新取一次 */
       /* U3: MapKey may have changed - re-fetch the FULL map into the buffer
        * so the copy handed to the kernel matches the post-EBS state */
       UINTN cap_in = mmap_cap;
@@ -316,7 +316,7 @@ EFI_STATUS EFIAPI EfiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *ST) {
   serial_hex((uint32_t)KERNEL_LOAD);
   serial_puts("\r\n");
 
-  /* 6) 关中�?�?7) 跳转到内核入�? 0x10000（内核自己�?�栈/�? bss/建页�?�? */
+  /* 6) 关中断 → 7) 跳到内核入口（设栈/清 bss/建页表都是内核自己的事） */
   __asm__ __volatile__("cli");
   typedef void (*entry_t)(void);
   ((entry_t)KERNEL_LOAD)();

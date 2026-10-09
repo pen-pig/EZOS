@@ -1,5 +1,5 @@
 #include "tty.h"
-#include "port.h"        // ����������ṩ outb/inb
+#include "port.h"        // outb/inb：光标寄存器要用端口 I/O 设置
 #include "serial.h"     // H1a：串口是真机诊断主通道，控制台输出同步镜像 COM1
 
 #define VGA_WIDTH  80
@@ -83,7 +83,7 @@ void terminal_initialize(void) {
             terminal_buffer[index] = vga_entry(' ', terminal_color);
         }
     }
-    // ��ʼ�����λ��
+    // 光标复位到左上角
     terminal_set_cursor(0, 0);
 }
 
@@ -97,7 +97,7 @@ void terminal_putentryat(char c, uint8_t color, size_t x, size_t y) {
 }
 
 void terminal_scroll(void) {
-    // ��������Ļ�Ķ��б��浽 scrollback
+    // 滚屏前先把被顶掉的那一行存进 scrollback
     for (size_t x = 0; x < VGA_WIDTH; x++) {
         scrollback[sb_start][x] = terminal_buffer[x];
     }
@@ -115,12 +115,12 @@ void terminal_scroll(void) {
 }
 
 void terminal_putchar(char c) {
-    /* ����ģʽ�����д�뻺�壬��д��Ļ */
+    /* 捕获模式：只写缓冲区，不写屏幕 */
     if (g_capture_buf) {
         if (g_capture_len < g_capture_max - 1) {
             g_capture_buf[g_capture_len++] = c;
         }
-        /* ����ģʽ���Ը�������״̬����֤����ִ�к���λ����ȷ */
+        /* 捕获模式下也要更新行列状态，保证执行位置与光标一致 */
         if (c == '\n') {
             terminal_column = 0;
             if (terminal_row < VGA_HEIGHT - 1) terminal_row++;
@@ -210,7 +210,7 @@ void terminal_set_cursor(size_t row, size_t col) {
     outb(0x3D5, (uint8_t)(pos & 0xFF));
     outb(0x3D4, 0x0E);
     outb(0x3D5, (uint8_t)((pos >> 8) & 0xFF));
-    // �����ڲ�����
+    // 同步内部的行列状态
     terminal_row = row;
     terminal_column = col;
 }
@@ -243,7 +243,7 @@ void terminal_scroll_n(uint32_t n) {
     for (uint32_t i = 0; i < n; i++) terminal_scroll();
 }
 
-// �� scrollback �С����Ϲ��� k �С����һ��������Ⱦ����Ļ
+// 从 scrollback 里取倒数第 k 行开始的整屏内容，重新渲染到屏幕
 static void render_scrollback(int k) {
     for (int y = 0; y < VGA_HEIGHT; y++) {
         int seq = sb_count - k + y;

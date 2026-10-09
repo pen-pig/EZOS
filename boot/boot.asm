@@ -68,16 +68,16 @@ disk_load:
     ret
 
 dap:
-    db 0x10                  ; DAP �ṹ��С
-    db 0x00                  ; ����
+    db 0x10                  ; DAP 结构大小
+    db 0x00                  ; 保留，必须为 0
 dap_sectors:
-    dw 0                     ; ����������
+    dw 0                     ; 要读的扇区数
 dap_offset:
-    dw 0                     ; ƫ��
+    dw 0                     ; 目标偏移
 dap_segment:
-    dw 0                     ; �Σ����� = segment<<4 + offset��
+    dw 0                     ; 目标段（线性地址 = segment<<4 + offset）
 dap_lba:
-    dq 0                     ; ��ʼ LBA����̬���㣬���� boot ������
+    dq 0                     ; 起始 LBA（运行时填，不是 boot 期常量）
 
 disk_error:
     mov si, MSG_DISK_ERROR
@@ -85,20 +85,21 @@ disk_error:
     jmp $
 
 ; ------------------------------------------------------------------
-; set_vbe: VBE ��ֱ�������Ӧ̽��?6bpp LFB��
-;   1) 0x4F00 ���?VBE BIOS ���� + 'VESA' ǩ��
-;   2) 0x4F01 ���ֱ��ʴӴ�С����̽����?16bpp VBE ģʽ��
-;      1280x1024(0x11A) -> 1024x768(0x117) -> 800x600(0x115)
-;      -> 640x480(0x110)��ÿ��ģʽҪ��
-;      attributes bit7 (LFB) ��λ��XRES/YRES ���㡢BPP==16��
-;      PhysBasePtr ���㣻���е�һ����Ϊ�����÷ֱ��ʡ�
-;   success: 0x5000 д���?{ dword LFB; word XRES; word YRES; byte BPP }
-;   failure: 0x5000 д�� 0���ں˻��� VGA 0x13 320x200��
-;   NOTE: ���ⲻ���� 0x4F02 ����ģʽ�������ı�ģʽ���ں� shell ʹ�ã�
-;         ���������ı������?LFB ƽ���ϲ��ɼ���gfx_init �ڱ���ģʽ
-;         ͨ�� VBE_DISPI �Ĵ�����̽��ֱ��ʼ���?
-;   buffers: VBEInfoBlock / mode info ����ʵģʽ 0x6000
-;            ��mode info ��д��Ḳ��?VBEInfoBlock���ް���
+; ------------------------------------------------------------------
+; set_vbe: 探测 VBE 的线性帧缓冲（LFB），只认 16bpp：
+;   1) 0x4F00 取 VBE BIOS 信息，并校验 'VESA' 签名；
+;   2) 0x4F01 按分辨率从大到小逐个探测 16bpp 模式：
+;      1280x1024(0x11A) -> 1024x768(0x117) -> 800x600(0x114)
+;      -> 640x480(0x111)，每个模式都要求
+;      attributes bit7（LFB）置位、XRES/YRES 非零、BPP==16、
+;      PhysBasePtr 非零；命中第一个就作为选定分辨率。
+;   成功：0x5000 写入 { dword LFB; word XRES; word YRES; byte BPP }
+;   失败：0x5000 写 0，内核回退到 VGA 0x13 320x200。
+;   注意：这里**不**调 0x4F02 切模式——文本模式还要留给内核 shell，
+;        真正的切模式在用户态 gfx_init 里通过 VBE_DISPI 寄存器完成。
+;   缓冲：VBEInfoBlock 与 mode info 都放在实模式 0x6000
+;        （读 mode info 会覆盖 VBEInfoBlock，那时它已经用完了）。
+; ------------------------------------------------------------------
 ; ------------------------------------------------------------------
 set_vbe:
     pusha
@@ -167,7 +168,7 @@ set_vbe:
     popa
     ret
 
-; ��׼ VBE 16bpp ģʽ�������ֱ��ʴӴ�С���У�0 ��β
+; 标准 VESA 16bpp 模式号，按分辨率从大到小排，0 结尾
 ; standard VESA 16bpp modes, largest first, 0 terminated
 ; (0x115 is 24bpp and 0x110 is 15bpp - both rejected by BPP==16 check)
 vbe_modes:
