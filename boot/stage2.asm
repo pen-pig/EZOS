@@ -129,6 +129,10 @@ start:
     jmp .read_loop
 
 .done:
+    ; 打一行证据：冒烟测试靠它确认"镜像确实是 stage2 用 INT13h 读进来、
+    ; 又在保护模式下搬到 KERNEL_DST 的"，而不是引导扇区直接读的旧路径。
+    mov si, MSG_DONE
+    call serial_puts
     cli
     lgdt [gdt_descriptor]
     mov eax, cr0
@@ -236,6 +240,16 @@ serial_putc:
     pop dx
     ret
 
+; si -> 0 结尾字符串（ds:si）。al 由 serial_putc 自己还原，si 不被破坏。
+serial_puts:
+    lodsb
+    or al, al
+    jz .sdone
+    call serial_putc
+    jmp serial_puts
+.sdone:
+    ret
+
 disk_error:
     mov al, 'E'
     call serial_putc
@@ -269,6 +283,7 @@ bios_gdtr    dw 0
              dw 0                ; sgdt 写 6 字节：limit(2) + base(4)
              dw 0
 MSG_DISK_ERROR db 'stage2: disk read error', 13, 10, 0
+MSG_DONE       db 'stage2: kernel image read by BIOS INT 13h and relocated to 0x1300000', 13, 10, 0
 
 dap:
     db 0x10                     ; DAP 结构大小

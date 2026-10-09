@@ -84,8 +84,10 @@ fi
 echo "[smoke] ---- assertions ----"
 # 1) 真的进了内核（不是卡在 BIOS/引导扇区）
 check "内核横幅" "EZOS Kernel .* loaded at 0x1300000"
-# 2) 引导扇区把镜像读进来了（这条是 INT13h 路径打出来的）
-check "BIOS INT13h 读入内核镜像" "kernel image read by BIOS INT 13h"
+# 2) stage2 真的跑了：用 INT13h 把镜像读进 bounce 缓冲，又在保护模式下搬到
+#    19MB。旧断言只认"引导扇区直接读内核"，stage2 上马后必须换成这一条
+#    ——否则 CI 会绿在一条永远打不出来的日志上（679f9c3 就红在这里）。
+check "stage2 读盘并搬到高地址" "kernel image read by BIOS INT 13h and relocated to 0x1300000"
 # 3) 全子系统自检通过（内核启动时跑 25 个 selftest，最后一个汇总行）
 check "全部子系统自检通过" "SELFTEST: all subsystem checks passed"
 # 4) shell 起来了 —— 旧版冒烟最致命的盲区就在这里
