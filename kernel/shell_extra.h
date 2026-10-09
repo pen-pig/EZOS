@@ -35,6 +35,8 @@ void cmd_crc(const char *args);
 void cmd_crc16(const char *args);
 void cmd_crc32c(const char *args);
 void cmd_dmesg(const char *args);
+/* fsck：卷一致性只读检查（实现在 kernel/fsck.c + fat.c/exfat.c 的 *_fsck） */
+void cmd_fsck(const char *args);
 void cmd_kmtest(const char *args);
 void cmd_rstest(const char *args);
 void cmd_pagetest(const char *args);

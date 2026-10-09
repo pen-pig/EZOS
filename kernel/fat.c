@@ -14,6 +14,8 @@
 #include "ata.h"
 #include "tty.h"
 #include "port.h"
+#include "fsck.h"
+#include "kmalloc.h"
 
 #define ATTR_READONLY  0x01
 #define ATTR_HIDDEN    0x02
@@ -1683,4 +1685,132 @@ int fat_rmdir(const char *name) {
     /* 非空与否交给 fat_delete_file 判定（它用 empty_check_cb 拒绝非空目录）。
      * 不再在这里重复扫一遍：避免释放逻辑出现第二份副本并保持行为一致。 */
     return fat_delete_file(name);
+}
+
+/* ==================== fsck：FAT12/16/32 只读一致性检查 ====================
+ *
+ * 扫三件事（详见 fsck.h 头部的说明）：链本身走不走得通、有没有簇被两条链
+ * 同时引用、分配表里"已占用"的簇是不是都有目录项指着。
+ *
+ * 两条硬约束（踩过的坑都写在这儿，别再试）：
+ *   - reachable 位图走 kmalloc，不放栈（主栈/任务栈只有 16KB 级），也不放
+ *     .bss.hi（那里只剩十几 KB，大卷塞不下）。
+ *   - 目录树用**显式队列**而不是递归：递归深度 = 目录深度，盘上数据不可信，
+ *     一条自引用的目录链就能把栈打穿。队列满就 fail closed 返回 -3，
+ *     绝不能"跳过剩下的目录继续报告"——漏掉一个目录，它下面所有文件的簇
+ *     都会被算成孤儿簇，那是最难查的假阳性。
+ * ------------------------------------------------------------------ */
+#define FAT_FSCK_MAX_DIRS 1024
+
+typedef struct {
+    fsck_report_t *r;
+    uint8_t       *bm;       /* reachable 位图，下标 = 簇号 - 2 */
+    uint32_t      *queue;    /* 待枚举的目录簇（BFS） */
+    int            head;
+    int            tail;
+    int            cap;
+    uint32_t       csize;    /* 每簇字节数 */
+    int            overflow; /* 队列溢出：必须让整个扫描失败，不能带病出报告 */
+} fat_fsck_ctx_t;
+
+/* 沿 FAT 链走一遍：把经过的簇标成 reachable，顺带记下链上的损伤。
+ * need = 这条链至少该有几个簇（按 size 算；目录和空文件传 0 = 不校验长度）。 */
+static void fat_fsck_chain(fat_fsck_ctx_t *x, uint32_t first, uint32_t need) {
+    if (first < 2) return;                 /* 空文件 / FAT12-16 根目录区 */
+    uint32_t limit = fi.cluster_count + 2;
+    uint32_t c = first, steps = 0;
+    for (;;) {
+        if (c < 2 || c >= limit) { x->r->bad_chain++; fsck_record_bad(x->r, c); return; }
+        if (fsck_bit_get(x->bm, c - 2)) { x->r->crosslink++; fsck_record_bad(x->r, c); }
+        else fsck_bit_set(x->bm, c - 2);
+        steps++;
+        /* 合法链不可能比簇总数还长；超了就是环，停（否则会一直转着读盘） */
+        if (steps > fi.cluster_count) { x->r->loop++; fsck_record_bad(x->r, c); return; }
+        uint32_t nxt = fat_entry_get(c);
+        if (fat_is_eoc(nxt)) break;
+        if (fat_is_bad(nxt)) { x->r->bad_chain++; fsck_record_bad(x->r, c); break; }
+        if (nxt < 2 || nxt >= limit) { x->r->bad_chain++; fsck_record_bad(x->r, c); return; }
+        c = nxt;
+    }
+    if (need && steps < need) x->r->truncated++;
+}
+
+static int fat_fsck_dirent_cb(const fat_dirent_t *e, void *ctx) {
+    fat_fsck_ctx_t *x = (fat_fsck_ctx_t *)ctx;
+
+    /* "." / ".." 指向自身与父目录，不是新链。跟着走会把子目录自己的链标
+     * 两次，直接报一堆 crosslink——那是假的。 */
+    if (e->name[0] == '.' && (e->name[1] == '\0' ||
+        (e->name[1] == '.' && e->name[2] == '\0'))) return 0;
+
+    uint32_t need = 0;
+    if (!e->is_dir && e->size > 0 && x->csize > 0)
+        need = (uint32_t)((e->size + x->csize - 1) / x->csize);
+    fat_fsck_chain(x, e->first_cluster, need);
+
+    if (e->is_dir && e->first_cluster >= 2) {
+        /* 队列满 = 这个卷的目录数超出这一版 fsck 的处理能力。宁可报"扫不动"
+         * 也不报一份缺了目录的假报告。 */
+        if (x->tail - x->head >= x->cap) { x->overflow = 1; return 1; }
+        x->queue[x->tail % x->cap] = e->first_cluster;
+        x->tail++;
+    }
+    return 0;
+}
+
+int fat_fsck(fsck_report_t *r) {
+    if (!fat_type) return -1;
+    uint32_t total = fi.cluster_count;
+    r->clusters_total = total;
+    if (total == 0) return -1;
+
+    uint32_t bm_bytes = (total + 7) / 8;
+    uint8_t *bm = (uint8_t *)kmalloc(bm_bytes);
+    if (!bm) return -2;
+    for (uint32_t i = 0; i < bm_bytes; i++) bm[i] = 0;
+
+    uint32_t *queue = (uint32_t *)kmalloc((uint32_t)FAT_FSCK_MAX_DIRS * 4u);
+    if (!queue) { kfree(bm); return -2; }
+
+    fat_fsck_ctx_t x;
+    x.r = r;
+    x.bm = bm;
+    x.queue = queue;
+    x.head = 0;
+    x.tail = 0;
+    x.cap = FAT_FSCK_MAX_DIRS;
+    x.csize = (uint32_t)fi.bytes_per_sector * fi.sectors_per_cluster;
+    x.overflow = 0;
+
+    uint32_t root = root_dir_cluster_value();
+    /* FAT32 的根目录自身就是一条簇链，不被任何目录项指着，必须自己标记，
+     * 否则整条根链会被当成孤儿。FAT12/16 的根在保留区（cluster==0），
+     * 不在数据簇里，没有可标记的。 */
+    if (root >= 2) fat_fsck_chain(&x, root, 0);
+    queue[x.tail++] = root;
+
+    while (x.head < x.tail) {
+        uint32_t d = queue[x.head % x.cap];
+        x.head++;
+        if (fat_dir_foreach(d, fat_fsck_dirent_cb, &x) < 0 || x.overflow) {
+            /* 读盘失败 / 目录数超上限：两种都不许出半份报告——漏扫一个目录
+             * 就是一堆假孤儿簇，那比"扫不动"难查得多。 */
+            kfree(queue);
+            kfree(bm);
+            return -3;
+        }
+    }
+
+    /* 分配表 vs reachable：两边对不上的都记下来 */
+    for (uint32_t c = 2; c < total + 2; c++) {
+        uint32_t e = fat_entry_get(c);
+        int used = (e != 0);           /* 0 = 空闲；EOC / 坏簇标记都算占用 */
+        int reach = fsck_bit_get(bm, c - 2);
+        if (used && !reach)        { r->orphan++;        fsck_record_bad(r, c); }
+        else if (!used && reach)   { r->free_but_used++; fsck_record_bad(r, c); }
+    }
+
+    kfree(queue);
+    kfree(bm);
+    return 0;
 }

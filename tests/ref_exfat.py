@@ -149,6 +149,39 @@ class Exfat(object):
                 slots.append(data[off:off + 32])
         return slots
 
+    def meta(self, tag):
+        """根目录里的元数据条目（0x81 位图 / 0x82 大写表）-> (首簇, 数据长度)。
+
+        **唯一事实来源**：所有工具（test_exfatvol / host_probe / fsck 测试）
+        都必须走这里，不许自己 ``_u32(slot, 20)``。
+
+        原因：规范里主条目**没有** FirstCluster / DataLength，这两个字段在
+        紧跟的 ``0xC0`` Stream Extension 的 +0x14 / +0x18；主条目 +0x14 是
+        保留字段（全 0）。EZOS 早先把它们写在主条目里，于是任何按规范写的
+        卷（Windows 建的）在这里都读到 0 —— 位图校验会整片静默失效。
+        现在 format 已按规范写，读也必须按规范读。
+        """
+        slots = self.dir_slots(self.root)
+        for i, s in enumerate(slots):
+            if s[0] != tag:
+                continue
+            st = slots[i + 1] if i + 1 < len(slots) and slots[i + 1][0] == 0xC0 else s
+            return _u32(st, 20), _u64(st, 24)
+        return None
+
+    def flags_of(self, tag):
+        """元数据条目紧跟的 0xC0 的 GeneralSecondaryFlags（bit0=AllocationPossible）。
+
+        没有 0xC0 时返回 None——那是"非规范卷"，调用方自行判定是否接受。"""
+        slots = self.dir_slots(self.root)
+        for i, s in enumerate(slots):
+            if s[0] != tag:
+                continue
+            if i + 1 < len(slots) and slots[i + 1][0] == 0xC0:
+                return slots[i + 1][1]
+            return None
+        return None
+
     def parse_dir(self, dir_cluster):
         """扫描目录，返回条目列表（跳过空闲/已删除槽，遇到 0x00 终结符停止）。"""
         slots = self.dir_slots(dir_cluster)
@@ -259,15 +292,23 @@ class Exfat(object):
         return self.read(e)
 
     # ---------- 体检 ----------
-    def audit_root_meta(self):
-        """根目录三个特殊次级条目——**Windows 挂载必查**，错一项就弹"需要格式化"：
+    def audit_root_meta(self, strict=False):
+        """根目录三个特殊条目——**Windows 挂载必查**，错一项就弹"需要格式化"。
 
-          * ``0x83`` Volume Label：``SecondaryCount`` 必须是 1，且紧跟一个 ``0xC0``
-            流扩展项（写成 2、后面直接放 0x81，Windows 按卷标读流扩展项读到
-            0x81 当场判卷损坏）；
-          * ``0x81`` Allocation Bitmap：``GeneralSecondaryFlags`` bit0
-            （AllocationPossible）必须为 1，否则 Windows 认为没有可用位图；
-          * ``0x82`` Up-case Table：AllocationPossible 必须为 0。
+        规范（exFAT spec）的布局是：每个 critical 主条目后面紧跟一个 ``0xC0``
+        Stream Extension，``FirstCluster`` / ``DataLength`` / ``AllocationPossible``
+        **都在 0xC0 里**——主条目自身没有这几个字段。EZOS 早先把它们直接写
+        在主条目里、不写 0xC0，于是别人（Windows / 别的工具）建的规范卷，
+        内核按主条目 +0x14 取位图簇号只取到保留字段 0，位图同步全落到簇 0：
+        内核不看位图所以毫无察觉，宿主一挂载就看到 FAT 与位图互相矛盾。
+
+          * ``0x83`` Volume Label：SecondaryCount=1，紧跟 0xC0；
+          * ``0x81`` Allocation Bitmap：其 0xC0 的 flags bit0
+            （AllocationPossible）必须为 1，bit1（NoFatChain）位图跨簇故为 0；
+          * ``0x82`` Up-case Table：其 0xC0 的 flags bit0 必须为 0。
+
+        ``strict=True`` 时额外要求 0x81/0x82 **必须**带 0xC0（新写出的盘该满足）。
+        默认不要求，因为仓库里还有历史盘是 inline 形态，读它们不该报红。
 
         内核只把 ``0x85`` 当文件条目解析，绕过了这一段——所以这类错误内核
         自己永远发现不了，只能靠这里或者真的挂一次盘。"""
@@ -287,14 +328,42 @@ class Exfat(object):
         if nxt != 0xC0:
             problems.append("0x83 not followed by 0xC0 stream entry (found 0x%02X)"
                             % nxt)
-        if 0x81 not in idx:
-            problems.append("root: no 0x81 allocation bitmap entry")
-        elif not (idx[0x81][1][1] & 0x01):
-            problems.append("0x81 bitmap AllocationPossible=0 (spec requires 1)")
-        if 0x82 not in idx:
-            problems.append("root: no 0x82 up-case table entry")
-        elif idx[0x82][1][1] & 0x01:
-            problems.append("0x82 up-case claims AllocationPossible=1")
+
+        def _check(t, alloc_possible):
+            """t=0x81/0x82；alloc_possible 是该条目应有的 AllocationPossible"""
+            if t not in idx:
+                problems.append("root: no 0x%02X entry" % t)
+                return
+            i, s = idx[t]
+            nx = slots[i + 1][0] if i + 1 < len(slots) else -1
+            if nx == 0xC0:
+                st = slots[i + 1]
+                ap = st[1] & 0x01
+                fc = _u32(st, 0x14)
+                if not ap and alloc_possible:
+                    problems.append("0x%02X stream: AllocationPossible=0 "
+                                    "(spec requires 1)" % t)
+                if ap and not alloc_possible:
+                    problems.append("0x%02X stream: AllocationPossible=1 "
+                                    "(spec requires 0)" % t)
+            else:
+                if strict:
+                    problems.append(
+                        "0x%02X not followed by 0xC0 stream entry (found 0x%02X)"
+                        % (t, nx))
+                ap = s[1] & 0x01
+                fc = _u32(s, 0x14)
+                if not ap and alloc_possible:
+                    problems.append("0x%02X AllocationPossible=0 "
+                                    "(spec requires 1)" % t)
+                if ap and not alloc_possible:
+                    problems.append("0x%02X AllocationPossible=1 "
+                                    "(spec requires 0)" % t)
+            if not (2 <= fc < self.cluster_count + 2):
+                problems.append("0x%02X FirstCluster=%d out of range" % (t, fc))
+
+        _check(0x81, True)
+        _check(0x82, False)
         return problems
 
     def audit(self, dir_cluster=None):
@@ -341,14 +410,10 @@ class ExfatRW(Exfat):
         self.path = path
         self.footer = orig[-512:] if orig[-512:-504] == b'conectix' else b''
         self.raw = bytearray(self.raw)
-        self.bmp_cluster = None
-        for s in self.dir_slots(self.root):
-            if s[0] == 0x81:
-                self.bmp_cluster = _u32(s, 20)
-                self.bmp_len = _u64(s, 24)
-                break
-        if self.bmp_cluster is None:
+        m = self.meta(0x81)
+        if m is None:
             raise ExfatError('no 0x81 allocation bitmap - refusing to write')
+        self.bmp_cluster, self.bmp_len = m
 
     # ---------- 原始写 ----------
     def _cl_off(self, c):

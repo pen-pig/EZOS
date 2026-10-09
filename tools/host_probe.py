@@ -74,14 +74,11 @@ def main():
             ok = False
 
     print("== allocation bitmap (0x81) vs FAT ==")
-    raw_slots = fs.dir_slots(fs.root)
-    bmp_cluster = None
-    upcase_cluster = None
-    for i, s in enumerate(raw_slots):
-        if s[0] == 0x81 and bmp_cluster is None:
-            bmp_cluster = _u32(s, 20)
-        if s[0] == 0x82 and upcase_cluster is None:
-            upcase_cluster = _u32(s, 20)
+    # 走 ref_exfat.Exfat.meta()：规范里这两个字段在紧跟的 0xC0 里
+    m81 = fs.meta(0x81)
+    m82 = fs.meta(0x82)
+    bmp_cluster = None if m81 is None else m81[0]
+    upcase_cluster = None if m82 is None else m82[0]
     if bmp_cluster is None:
         print("  NO 0x81 bitmap entry  <-- Windows requires it")
         ok = False

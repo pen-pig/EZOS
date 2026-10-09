@@ -3,6 +3,8 @@
 #include "ata.h"
 #include "tty.h"
 #include "port.h"
+#include "fsck.h"
+#include "kmalloc.h"
 
 static exfat_info_t exfat_info;
 static int exfat_ready = 0;
@@ -1036,15 +1038,35 @@ int exfat_format(uint32_t part_start) {
     // 0xC0 Stream Extension（卷标流：NoFatChain，0 簇 0 长度）
     root_cluster[32] = 0xC0;
     root_cluster[33] = 0x02;  // NoFatChain = 1
-    // 0x81 Allocation Bitmap（FirstCluster@+0x14, DataLength@+0x18）
+    // 0x81 Allocation Bitmap + **它的 0xC0 Stream Extension**
+    //
+    // 规范（exFAT spec）里主条目**没有** FirstCluster / DataLength 这两个
+    // 字段，它们连同 AllocationPossible 一起放在紧跟的 0xC0 Stream
+    // Extension 里：
+    //     0x81 的 byte[1] 是 SecondaryCount（=1，后面跟 1 个次级条目），
+    //     不是 AllocationPossible；
+    //     0xC0 的 byte[1] bit0 = AllocationPossible（位图必须为 1），
+    //                    bit1 = NoFatChain（位图要跨簇，必须走 FAT 链 = 0）；
+    //     FirstCluster @0xC0+0x14，DataLength @0xC0+0x18。
+    //
+    // 早先 EZOS 把 FirstCluster/DataLength 直接写在 0x81 主条目里、且不写
+    // 0xC0。后果不是"Windows 挑刺"——**内核读不了别人建的卷**：exfat_init
+    // 按主条目 +0x14 取位图簇号，而规范卷的那个位置是保留字段（全 0），
+    // 于是 bmp_cluster=0，位图同步全落到簇 0，Windows 一挂就报卷损坏。
+    // 所以这里是照规范写，读取侧（exfat_init）也改成优先读 0xC0。
     root_cluster[64] = 0x81;
-    root_cluster[65] = 0x01;  // AllocationPossible = 1
-    *((uint32_t*)(root_cluster + 64 + 0x14)) = bmp_first;   // FirstCluster
-    *((uint64_t*)(root_cluster + 64 + 0x18)) = bmp_bytes;   // DataLength
-    // 0x82 Up-case Table（FirstCluster@+0x14, DataLength@+0x18）
-    root_cluster[96] = 0x82;
-    *((uint32_t*)(root_cluster + 96 + 0x14)) = upcase_first;   // FirstCluster
-    *((uint64_t*)(root_cluster + 96 + 0x18)) = 124; // DataLength（压缩 upcase 表：4 校验和 + 12 保留 + 26*4 映射 + 4 终止符）
+    root_cluster[65] = 0x01;  // SecondaryCount = 1（一个 0xC0）
+    root_cluster[96] = 0xC0;
+    root_cluster[97] = 0x01;  // AllocationPossible = 1, NoFatChain = 0
+    *((uint32_t*)(root_cluster + 96 + 0x14)) = bmp_first;   // FirstCluster
+    *((uint64_t*)(root_cluster + 96 + 0x18)) = bmp_bytes;   // DataLength
+    // 0x82 Up-case Table + 它的 0xC0（AllocationPossible 必须为 0）
+    root_cluster[128] = 0x82;
+    root_cluster[129] = 0x01; // SecondaryCount = 1
+    root_cluster[160] = 0xC0;
+    root_cluster[161] = 0x00; // AllocationPossible = 0, NoFatChain = 0
+    *((uint32_t*)(root_cluster + 160 + 0x14)) = upcase_first;
+    *((uint64_t*)(root_cluster + 160 + 0x18)) = 124; // DataLength（压缩 upcase 表：4 校验和 + 12 保留 + 26*4 映射 + 4 终止符）
     // 卷标 entry set 的 SetChecksum（覆盖 0x83 + 0xC0 共 64 字节，跳过 0x83 的字节 2-3）
     uint16_t esc = exfat_set_checksum(root_cluster, 64);
     root_cluster[2] = (uint8_t)(esc & 0xFF);
@@ -1168,10 +1190,22 @@ int exfat_init(void) {
             uint8_t *e = root_dir_buf + off;
             if (e[0] == 0x00) break;
             if (e[0] == 0x81) {
-                uint32_t bmp_cluster = *((uint32_t*)(e + 0x14));
+                /* FirstCluster / DataLength 的位置：优先取紧跟的 0xC0 Stream
+                 * Extension（规范，也是 exfat_format 现在写的形态）。取不到
+                 * 才退回主条目 —— 那是历史盘（EZOS 早先把这两个字段直接写
+                 * 在 0x81 主条目里、且不写 0xC0）的遗留格式，仓库里还有这
+                 * 种盘，必须继续能读。
+                 *
+                 * 只认主条目这一条路时，规范卷（Windows / 别的工具建的）在
+                 * 这个位置是保留字段全 0，于是 bmp_cluster=0，位图同步全
+                 * 落到簇 0：内核自己不看位图所以毫无察觉，Windows 一挂载
+                 * 就看到 FAT 与位图互相矛盾。 */
+                const uint8_t *p = e;
+                if (off + 64 <= n * cluster_size && e[32] == 0xC0) p = e + 32;
+                uint32_t bmp_cluster = *((uint32_t *)(p + 0x14));
                 if (bmp_cluster >= 2 && bmp_cluster < exfat_info.cluster_count + 2)
                     exfat_bitmap_cluster = bmp_cluster;
-                uint64_t dl = *((uint64_t*)(e + 0x18));   /* DataLength */
+                uint64_t dl = *((uint64_t *)(p + 0x18));   /* DataLength */
                 exfat_bitmap_bytes = (dl <= 0xFFFFFFFFull) ? (uint32_t)dl : 0;
                 break;
             }
@@ -1615,4 +1649,203 @@ int exfat_delete_file(const char *name) {
         }
     }
     return -1;
+}
+
+/* ==================== fsck：exFAT 只读一致性检查 ====================
+ *
+ * 与 fat_fsck 同一套思路（reachable 位图 vs 分配表对拍），但 exFAT 有三处
+ * 不一样，写错了就会出**假阳性**，每一条都是实测出来的：
+ *
+ *  1) 分配表是 Allocation Bitmap（0x81 条目指向的那个），不是 FAT。exFAT
+ *     允许 NoFatChain——单簇文件/小目录在 FAT 里根本没有条目，只有位图标了
+ *     占用。只查 FAT 会把整卷的 NoFatChain 文件全报成孤儿。
+ *     所以：位图是权威分配表，FAT 只用来走链。
+ *  2) 位图本身是一条普通的簇链（可以跨簇），必须沿链读，不能只读第一簇。
+ *  3) 根目录里有 0x81（位图）/ 0x82（大写表）/ 0x83（卷标）这些**元数据
+ *     entry set**，它们同样占簇但没有被任何"文件"指着。只认 0x85 的话，
+ *     位图和大写表的簇会被当成孤儿簇——而它们恰恰是分配表本身。
+ *     所以：凡是 critical 主条目（0x81/0x82/0x83/0x85/0xA0/0xA1/0xA2，
+ *     后面紧跟 0xC0 stream extension）都要把它的簇链标成 reachable。
+ *
+ * 目录树用显式队列、不放递归（盘上数据不可信，自引用链会打穿栈）；
+ * 队列满或读盘失败一律返回错误码，绝不出半份报告。
+ * ------------------------------------------------------------------ */
+#define EXFAT_FSCK_MAX_DIRS 1024
+#define EXFAT_FSCK_DIRBUF   (512 * 16)   /* exfat_read_dir_chain 内部硬上限 8KB */
+
+/* 沿链走一遍：标 reachable + 记损伤。
+ *   nofat=1：连续簇（NoFatChain），need 个簇后停（need 至少 1）
+ *   nofat=0：跟 FAT 走到 EOC；check_len 时再比对 need（只对文件开，
+ *            目录的 DataLength 可能小于分配到的簇数，比了就是假阳性） */
+static void exfat_fsck_chain(uint32_t first, uint32_t need, int nofat,
+                             int check_len, uint8_t *reach, fsck_report_t *r) {
+    if (first < 2) return;
+    uint32_t total = exfat_info.cluster_count;
+    uint32_t limit = total + 2;
+    uint32_t c = first, steps = 0;
+    for (;;) {
+        if (c < 2 || c >= limit) { r->bad_chain++; fsck_record_bad(r, c); return; }
+        if (fsck_bit_get(reach, c - 2)) { r->crosslink++; fsck_record_bad(r, c); }
+        else fsck_bit_set(reach, c - 2);
+        steps++;
+        if (steps > total) { r->loop++; fsck_record_bad(r, c); return; }
+        if (nofat) {
+            if (steps >= need) break;
+            c++;
+        } else {
+            uint32_t nxt = exfat_read_fat_entry(c);
+            if (nxt >= 0xFFFFFFF8) break;      /* EOC（读错也是这个值，fail closed 停） */
+            if (nxt == 0) { r->free_but_used++; fsck_record_bad(r, c); return; }
+            if (nxt < 2 || nxt >= limit) { r->bad_chain++; fsck_record_bad(r, c); return; }
+            c = nxt;
+        }
+    }
+    if (check_len && need && steps < need) r->truncated++;
+}
+
+int exfat_fsck(fsck_report_t *r) {
+    if (!exfat_ready) return -1;
+    uint32_t total = exfat_info.cluster_count;
+    r->clusters_total = total;
+    if (total == 0) return -1;
+    uint32_t csize = (uint32_t)exfat_info.bytes_per_sector *
+                     exfat_info.sectors_per_cluster;
+    if (csize == 0 || csize > EXFAT_FSCK_DIRBUF) return -1;
+
+    uint32_t bm_bytes = (total + 7) / 8;
+    uint8_t *reach = (uint8_t *)kmalloc(bm_bytes);
+    uint8_t *alloc = (uint8_t *)kmalloc(bm_bytes);
+    uint8_t *dirbuf = (uint8_t *)kmalloc((uint32_t)EXFAT_FSCK_DIRBUF);
+    uint32_t *queue = (uint32_t *)kmalloc((uint32_t)EXFAT_FSCK_MAX_DIRS * 4u);
+    if (!reach || !alloc || !dirbuf || !queue) goto oom;
+    for (uint32_t i = 0; i < bm_bytes; i++) { reach[i] = 0; alloc[i] = 0; }
+
+    /* ---- 1) 把 Allocation Bitmap 整条链读进 alloc（权威分配表） ---- */
+    {
+        uint32_t off = 0, cur = exfat_bitmap_cluster, guard = 0;
+        while (off < bm_bytes && cur >= 2 && cur < total + 2 && guard++ <= total + 2) {
+            if (exfat_read_cluster(cur, dirbuf) != 0) goto io_err;
+            uint32_t n = bm_bytes - off;
+            if (n > csize) n = csize;
+            for (uint32_t i = 0; i < n; i++) alloc[off + i] = dirbuf[i];
+            off += n;
+            uint32_t nxt = exfat_read_fat_entry(cur);
+            if (nxt >= 0xFFFFFFF8) break;
+            cur = nxt;
+        }
+        /* 位图比卷短（元数据被截）：缺的那部分按"未分配"处理，别猜 */
+        for (; off < bm_bytes; off++) alloc[off] = 0;
+    }
+
+    /* ---- 2) 目录树 BFS：把所有 entry set 的簇链标成 reachable ---- */
+    {
+        int head = 0, tail = 0, cap = EXFAT_FSCK_MAX_DIRS;
+        uint32_t root = exfat_info.root_dir_cluster;
+        exfat_fsck_chain(root, 0, 0, 0, reach, r);   /* 根链不被任何条目指着 */
+        queue[tail++] = root;
+
+        while (head < tail) {
+            if (tail - head > cap) goto oom;
+            uint32_t d = queue[head % cap];
+            head++;
+            uint32_t n = exfat_read_dir_chain(d, dirbuf, 16);
+            if (n == 0) continue;
+            uint32_t total_bytes = n * csize;
+
+            for (uint32_t off = 0; off + 32 <= total_bytes;) {
+                uint8_t *e = dirbuf + off;
+                uint8_t et = e[0];
+                if (et == 0x00) break;                       /* 目录结束 */
+                /* 只处理带 0xC0 stream extension 的 critical 主条目。
+                 * 0xC0/0xC1 是次级条目，正常不会单独出现在这里。 */
+                if (et != 0x81 && et != 0x82 && et != 0x83 &&
+                    et != 0x85 && et != 0xA0 && et != 0xA1 && et != 0xA2) {
+                    off += 32;
+                    continue;
+                }
+                uint32_t sec = e[1];
+                int adv_slots;                    /* 本 entry set 占几个 32B 槽 */
+                uint32_t first;
+                uint64_t dlen;
+                int nofat;
+                int is_dir = 0;
+
+                uint8_t *ec0 = (off + 32 <= total_bytes) ? e + 32 : 0;
+                int have_ec0 = (ec0 && ec0[0] == 0xC0);
+
+                if (et == 0x85) {
+                    /* 文件/目录：一定是 1 个 0xC0 + (sec-1) 个 0xC1 */
+                    if (!have_ec0 || sec < 2 || sec > 20 ||
+                        off + (sec + 1) * 32u > total_bytes) {
+                        r->bad_entry++;
+                        break;                /* entry set 越界：后面没法定位了 */
+                    }
+                    first = *((uint32_t *)(ec0 + 0x14));
+                    dlen  = *((uint64_t *)(ec0 + 0x18));
+                    nofat = (ec0[1] & 0x02) ? 1 : 0;
+                    is_dir = (e[4] & EXFAT_ATTR_DIRECTORY) ? 1 : 0;
+                    adv_slots = (int)sec + 1;
+                } else if (have_ec0) {
+                    /* 标准形态：0x81/0x82/0x83/0xA0.. 后面紧跟 0xC0 */
+                    first = *((uint32_t *)(ec0 + 0x14));
+                    dlen  = *((uint64_t *)(ec0 + 0x18));
+                    nofat = (ec0[1] & 0x02) ? 1 : 0;
+                    adv_slots = 2;
+                } else {
+                    /* **历史盘遗留**：EZOS 早先写的 0x81（位图）/ 0x82（大写表）
+                     * 后面没有 0xC0，FirstCluster/DataLength 直接放在主条目
+                     * 里。format 已经改成写标准形态了（见 exfat_format 的
+                     * 注释），但仓库里还有那种盘，读的时候必须认。
+                     * 没有 flag 字节可看，按 FAT 链走（位图/大写表本来就是
+                     * FAT 链，format 也是这么建链的）。 */
+                    first = *((uint32_t *)(e + 0x14));
+                    dlen  = *((uint64_t *)(e + 0x18));
+                    nofat = 0;
+                    adv_slots = 1;
+                }
+
+                uint32_t need = 0;
+                if (dlen > 0 && csize > 0) {
+                    uint64_t nn = (dlen + csize - 1) / csize;
+                    need = (nn > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)nn;
+                }
+                if (nofat && need == 0) need = 1;
+                exfat_fsck_chain(first, need, nofat, !is_dir, reach, r);
+
+                if (is_dir && first >= 2 && first < total + 2) {
+                    if (tail - head >= cap) goto oom;
+                    queue[tail % cap] = first;
+                    tail++;
+                }
+                off += (uint32_t)adv_slots * 32u;
+            }
+        }
+    }
+
+    /* ---- 3) 分配表 vs reachable 对拍 ---- */
+    for (uint32_t c = 2; c < total + 2; c++) {
+        int used = fsck_bit_get(alloc, c - 2);
+        int reach_flag = fsck_bit_get(reach, c - 2);
+        if (used && !reach_flag)       { r->orphan++;        fsck_record_bad(r, c); }
+        else if (!used && reach_flag)  { r->free_but_used++; fsck_record_bad(r, c); }
+    }
+
+    kfree(queue);
+    kfree(dirbuf);
+    kfree(alloc);
+    kfree(reach);
+    return 0;
+
+oom:
+    if (queue) kfree(queue);
+    if (dirbuf) kfree(dirbuf);
+    if (alloc) kfree(alloc);
+    if (reach) kfree(reach);
+    return -2;
+io_err:
+    kfree(queue);
+    kfree(dirbuf);
+    kfree(alloc);
+    kfree(reach);
+    return -3;
 }

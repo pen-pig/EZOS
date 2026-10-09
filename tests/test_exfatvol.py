@@ -129,11 +129,12 @@ class Guest(object):
 
 
 def meta(fs, tag):
-    """找根目录里的特殊次级条目 0x81/0x82，返回 (首簇, 数据长度)。"""
-    for s in fs.dir_slots(fs.root):
-        if s[0] == tag:
-            return _u32(s, 20), _u64(s, 24)
-    return None
+    """找根目录里的特殊条目 0x81/0x82，返回 (首簇, 数据长度)。
+
+    解析规则在 ref_exfat.Exfat.meta() 里（唯一事实来源）——主条目没有这两个
+    字段，它们在紧跟的 0xC0 Stream Extension 中。
+    """
+    return fs.meta(tag)
 
 
 def bmp_blob(fs, first, length):
@@ -273,8 +274,11 @@ def main():
             not problems,
             "| %s" % ("; ".join(problems[:3]) if problems else "0 problems"))
 
-        rec(results, "ref_exfat.audit_root_meta() clean",
-            not fs.audit_root_meta())
+        # strict=True：这是内核刚 format 出来的盘，0x81/0x82 必须带规范的
+        # 0xC0 stream extension（历史盘那种 inline 形态在这里算问题）。
+        rec(results, "ref_exfat.audit_root_meta(strict) clean",
+            not fs.audit_root_meta(strict=True),
+            "| %s" % ("; ".join(fs.audit_root_meta(strict=True)[:3]) or "0 problems"))
         probs = fs.audit()
         rec(results, "ref_exfat.audit() clean", not probs,
             "| %s" % ("; ".join(probs[:3]) if probs else "0 problems"))
