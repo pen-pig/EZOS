@@ -258,6 +258,17 @@ int fs_init(void) {
         if (fs_try_drive(d)) return 0;
     }
 
+    /* 2b) USB 大容量存储（drive 12..15）。
+     *    从 U 盘启动的机器上 ATA 是空的，不扫这一段就永远挂不上文件系统 ——
+     *    开机一行 "FS: no disk [FAIL]"，然后 shell 里什么文件都看不到。USB
+     *    启动盘是 H1c 的目标形态，这条回退让它真的可用。
+     *    没插 U 盘时 usbmsc_read_sector 立刻返回 -1（msc_get 拿不到设备就
+     *    返回 NULL），不会卡住引导。 */
+    for (uint8_t d = USBMSC_DRIVE_BASE; d < USBMSC_DRIVE_BASE + 4; d++) {
+        if (d == fs_preferred_drive) continue;
+        if (fs_try_drive(d)) return 0;
+    }
+
     /* 3) 全部失败：区分"有盘无文件系统"与"无介质" */
     if (!ata_drive_present(fs_preferred_drive)) return -1;
     uint8_t sec[512];

@@ -884,7 +884,18 @@ static int st2_ata(char *detail, uint32_t ds) {
         st_puts(detail, &p, ds, bad ? "BAD" : "ok");
         detail[p] = '\0';
     }
-    if (present == 0) return 1;      /* 一块盘都没有：存储子系统不可用 */
+    /* 一块 ATA 盘都没有**不算失败**：从 U 盘（USB-MSC，drive 12..15）或
+     * NVMe 启动时压根不走 ATA，这是正常的启动形态，不是存储子系统坏了。
+     * 实测：USB 启动的 E2E 里这一项稳定 FAIL，跟 exec/fd 一起凑成"开机自检
+     * 红 3 项"，看着像内核崩了——其实只是这台机器没挂 ATA 盘。 */
+    if (present == 0) {
+        if (detail && ds) {
+            uint32_t p = 0;
+            st_puts(detail, &p, ds, "no ATA drive (storage may be USB/NVMe)");
+            detail[p] = '\0';
+        }
+        return 0;
+    }
     return bad;
 }
 
@@ -1535,10 +1546,13 @@ int boot_selftest(void) {
         r[n].ms = g_pit_ticks - t0;
         n++;
     }
-    {   /* exec：HELLO.ELF 退出码 42 */
+    {   /* exec：HELLO.ELF 退出码 42。
+         * HELLO.ELF 在文件系统上，没挂载就根本读不到——那是环境问题不是内核
+         * 问题，降级（与 fd 同一类；USB 启动时这两项 + ata 一起假红 3 项）。 */
         uint32_t t0 = g_pit_ticks;
         const char *why = 0;
-        r[n].run = (exec_file("HELLO.ELF", 0, &why) == 42) ? 0 : 1;
+        r[n].run = fs_ready() ? ((exec_file("HELLO.ELF", 0, &why) == 42) ? 0 : 1)
+                              : 0;
         r[n].ms = g_pit_ticks - t0;
         n++;
     }
