@@ -83,7 +83,7 @@ fi
 
 echo "[smoke] ---- assertions ----"
 # 1) 真的进了内核（不是卡在 BIOS/引导扇区）
-check "内核横幅" "EZOS Kernel .* loaded at 0x10000"
+check "内核横幅" "EZOS Kernel .* loaded at 0x1300000"
 # 2) 引导扇区把镜像读进来了（这条是 INT13h 路径打出来的）
 check "BIOS INT13h 读入内核镜像" "kernel image read by BIOS INT 13h"
 # 3) 全子系统自检通过（内核启动时跑 25 个 selftest，最后一个汇总行）

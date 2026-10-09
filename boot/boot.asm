@@ -2,9 +2,9 @@
 [org 0x7c00]
 [bits 16]
 
-KERNEL_OFFSET equ 0x10000     ; �ں˼��ص�ַ
-KERNEL_SECTORS_MAX equ 1152   ; hard cap: image window is 0x8000..0xB8000
-                              ; (704KB); above that is the VGA text buffer
+%include "boot/layout.inc"
+; 布局常量（STAGE2_LBA / STAGE2_SECTORS / STAGE2_LOAD / KERNEL_DST ...）
+; 都来自 layout.inc，Python 侧也解析同一份，不再各写各的。
 
 start:
     xor ax, ax
@@ -25,14 +25,10 @@ start:
 
     call enable_a20
 
-    cli
-    lgdt [gdt_descriptor]
-
-    mov eax, cr0
-    or eax, 0x1
-    mov cr0, eax
-
-    jmp CODE_SEG:protected_mode_start
+    ; 跳 stage2：CS:IP = 0x1000:0000 = 线性 STAGE2_LOAD。stage2 仍在实模式
+    ; （它要调用 INT13h），进保护模式是它搬完内核之后的事。
+    mov dl, [BOOT_DRIVE]
+    jmp 0x1000:0x0000
 
 [bits 16]
 print_string_16:
@@ -46,56 +42,29 @@ print_string_16:
     ret
 
 disk_load:
-    ; ��չ��ѭ����AH=42h�����ܶ� KERNEL_SECTORS ������ÿ�����?64 ������
-    ; ���ⵥ�� DAP ���� BIOS ���ơ�
-    ; ��ڣ�DL = ��������
-    mov bx, [kernel_sectors]  ; real count, patched in by tools/make_image.py
-    cmp bx, KERNEL_SECTORS_MAX
-    jb  .ks_ok                ; 0 (bare boot.bin) or >MAX -> fall back to MAX
-    mov bx, KERNEL_SECTORS_MAX
-.ks_ok:
-    xor ecx, ecx                  ; �Ѷ�������
-.load_loop:
-    test bx, bx
-    jz .done
-    ; ���ζ�ȡ�� = min(bx, 64)
-    mov ax, bx
-    cmp ax, 64
-    jle .batch_ok
-    mov ax, 64
-.batch_ok:
-    mov word [dap_sectors], ax
-    ; LBA = 1 + cx������ boot ������
-    mov eax, ecx
-    inc eax
-    mov dword [dap_lba], eax
-    ; �ε�ַ = (0x10000 + cx*512) >> 4��ƫ�� = 0
-    mov eax, ecx
-    shl eax, 9
-    add eax, 0x10000
-    shr eax, 4
-    mov word [dap_segment], ax
+    ; 只读 stage2（固定 STAGE2_SECTORS 个扇区，从 STAGE2_LBA 到 STAGE2_LOAD）。
+    ; 内核交给 stage2 接着读：BIOS INT13h 的目的地址撑死只能落在低 1MB，而
+    ; 0xA0000 起是 VGA aperture，于是"引导扇区直接读内核"的上限只有 576KB。
+    ; stage2 进保护模式把内核分批搬到 KERNEL_DST（19MB），上限由窗口决定、
+    ; 不再是 BIOS 的 20 位地址。见 boot/stage2.asm。
+    mov word [dap_sectors], STAGE2_SECTORS
+    mov dword [dap_lba], STAGE2_LBA
+    mov dword [dap_lba + 4], 0
     mov word [dap_offset], 0
-    ; ���� BIOS
-    mov bp, 3                   ; 3 attempts per batch
+    mov word [dap_segment], (STAGE2_LOAD >> 4)
+    mov byte [retry_left], 3
 .retry:
     mov si, dap
     mov ah, 0x42
     mov dl, [BOOT_DRIVE]
     int 0x13
-    jnc .batch_done
-    dec bp
+    jnc .ok
+    dec byte [retry_left]
     jz disk_error
-    xor ah, ah                  ; reset disk system (DL kept), retry batch
+    xor ah, ah                  ; 复位磁盘系统后重试
     int 0x13
     jmp .retry
-.batch_done:
-    ; �����Ѷ�/ʣ��
-    mov ax, word [dap_sectors]
-    add cx, ax
-    sub bx, ax
-    jmp .load_loop
-.done:
+.ok:
     ret
 
 dap:
@@ -234,52 +203,13 @@ enable_a20:
     ret
 
 BOOT_DRIVE db 0
+retry_left db 0
 MSG_LOADING db 'Loading kernel...', 13, 10, 0
 MSG_DISK_ERROR db 'Disk read error!', 13, 10, 0
 
-gdt_start:
+; GDT 与保护模式入口都在 boot/stage2.asm：引导扇区自己已经不进保护模式了
+; （省下的字节正好够放跳转 stage2 的远跳）。
 
-gdt_null:
-    dd 0x0
-    dd 0x0
-
-gdt_code:
-    dw 0xffff
-    dw 0x0
-    db 0x0
-    db 10011010b
-    db 11001111b
-    db 0x0
-
-gdt_data:
-    dw 0xffff
-    dw 0x0
-    db 0x0
-    db 10010010b
-    db 11001111b
-    db 0x0
-
-gdt_end:
-
-gdt_descriptor:
-    dw gdt_end - gdt_start - 1
-    dd gdt_start
-
-CODE_SEG equ gdt_code - gdt_start
-DATA_SEG equ gdt_data - gdt_start
-
-[bits 32]
-protected_mode_start:
-    mov ax, DATA_SEG
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
-    mov ss, ax
-    mov esp, 0x200000
-
-    call KERNEL_OFFSET
-    jmp $
 
 times 508-($-$$) db 0
 kernel_sectors: dw 0          ; LE16 sector count, written by tools/make_image.py

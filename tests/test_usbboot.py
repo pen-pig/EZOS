@@ -2,13 +2,14 @@
 """test_usbboot.py - U 盘混合镜像（legacy BIOS + UEFI）双通道启动验证
 
 tools/make_usb_image.py 产出的 usb-image.bin 是为真机准备的：LBA0 是带 BPB 和
-活动 EFI 分区表项的 MBR，LBA1024 是真正的引导扇区，LBA2048 起是 FAT32 的 EFI
+活动 EFI 分区表项的 MBR，LBA1 起是 stage2+内核，引导扇区副本与 ESP 的位置
+由 make_usb_image.py 按内核上限动态算出，LBA2048 起是 FAT32 的 EFI
 系统分区。这里在 QEMU 上把两条路都跑一遍：
 
-  A. legacy：SeaBIOS 读 LBA0 -> MBR 代码加载 LBA1024 的引导扇区 -> 引导扇区
+  A. legacy：SeaBIOS 读 LBA0 -> MBR 代码加载引导扇区副本 -> 引导扇区
      从 LBA1 读内核（boot/boot.asm 没被改过，走的还是老路径）；
   B. UEFI：OVMF(i386) 扫分区表 -> 找到 ESP -> \\EFI\\BOOT\\BOOTIA32.EFI ->
-     uefi/main.c 把 KERNEL.BIN 载入 0x10000 并跳转。
+     uefi/main.c 把 KERNEL.BIN 载入 0x1300000（KERNEL_DST）并跳转。
 
 两条都只要"内核真的跑起来了"这一种断言：串口出现内核的启动标记。至于 UEFI
 那条，额外断言 EZEFI 的 kernel size 行（证明它读的是镜像里那份内核）。

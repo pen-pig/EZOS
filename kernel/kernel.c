@@ -39,6 +39,10 @@
 #include "usbmsc.h"
 #include "usbmouse.h"
 
+/* 镜像加载地址（linker.ld 的 __image_start = KERNEL_DST）。用符号而不是常量：
+ * 常量抄在别处必然和 linker 走偏 —— 0.9.0 的版本号就曾抄在 7 处。 */
+extern char __image_start[];
+
 // �򵥳��Ⱥ��������Զ���ʽ��ʾ��ʹ��
 static size_t my_strlen(const char *s) {
     size_t len = 0;
@@ -397,10 +401,14 @@ void kernel_main(void) {
      * 必须在 paging_init 之后——池本身要能正常访问。 */
     pmm_init();
 
-    klog("EZOS Kernel " EZOS_VERSION " loaded at 0x10000, i686 protected mode");
+    /* 加载地址不再写死：镜像由 boot/stage2.asm 搬到 linker.ld 的
+     * __image_start（现在是 19MB）。抄成常量必然和 linker 走偏（0.9.0 时代的
+     * 教训），所以直接打印符号值。 */
+    klog_hex32("EZOS Kernel " EZOS_VERSION " loaded at 0x",
+               (uint32_t)(unsigned long)__image_start, ", i686 protected mode");
     /* 扇区数不再写死：tools/make_image.py 按 kernel_raw.bin 真实大小算出后写进
-     * 引导扇区 0x1FC，boot.asm 运行时读取（0 或 >1344 时兜底 1344）。 */
-    klog("Boot: kernel image read by BIOS INT 13h AH=42h (64-sector batches, 3 retries, sector count from boot sector 0x1FC)");
+     * 引导扇区 0x1FC，boot/stage2.asm 运行时读取（0 或超上限时兜底成上限）。 */
+    klog("Boot: kernel image relocated above 1MB (BIOS: boot/stage2.asm in protected mode, 64-sector batches into a low bounce buffer; UEFI: uefi/main.c)");
     klog("Boot: A20 gate enabled (BIOS int 15h / port 0x92 / KBC fallback)");
     klog("Boot: GDT rebuilt in kernel - 6 descriptors (null/kcode/kdata/ucode DPL3/udata DPL3/TSS), TSS esp0=0x900000");
     klog("VGA text mode: 80x25 active");

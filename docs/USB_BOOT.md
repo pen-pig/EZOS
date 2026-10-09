@@ -33,31 +33,29 @@ python tools\make_usb_boot.py --write --disk 2     :: 真的写盘（要手打�
 `os-image.bin` 是两段拼起来的裸镜像：
 
 ```
-os-image.bin = boot/boot.bin (512 字节，引导扇区)
-             + kernel.bin     (动态大小，kernel_raw.bin 向上取整到扇区并凑偶数)
-             + pad            (零填充，写 U 盘时凑整到 1024 扇区 = 512KB)
+os-image.bin = boot/boot.bin   (512 字节，引导扇区)
+             + boot/stage2.bin (2KB，二级加载器，见下)
+             + kernel.bin      (动态大小，kernel_raw.bin 向上取整到扇区并凑偶数)
 ```
 
 - 内核扇区数**不再写死**：`tools/make_image.py` 按 `kernel_raw.bin` 的真实
-  大小算出扇区数，写进引导扇区偏移 `0x1FC` 的保留字段，`boot/boot.asm`
-  运行时从内存读它（`KERNEL_SECTORS_MAX equ 992` 只在读到 0 或超限时兜底）。
-  上限 992 扇区 = 496KB 不能突破：内核链接在 `0x10000`、主栈 `esp=0x90000`，
-  中间只有 512KB，得留 16KB 给栈。
+  大小算出扇区数，写进引导扇区偏移 `0x1FC` 的保留字段，`boot/stage2.asm`
+  运行时从内存读它（`KERNEL_MAX_SECTORS` 只在读到 0 或超限时兜底）。
+- **上限不再是 496KB**：内核链接在 19MB（`boot/layout.inc` 的 `KERNEL_DST`），由 `boot/stage2.asm` 分批搬上去 —— BIOS 的 `INT 13h` 只能写低 1MB，而`0xA0000` 起是 VGA aperture，所以"引导扇区直接读内核"的窗口只有`0x10000..0xA0000` = 576KB；多一层 stage2 之后窗口变成 3MB（19MB..22MB）。所有布局常量集中在 `boot/layout.inc` 一处，Python 侧从那里解析。
 - 引导扇区以 `0x55 0xAA` 结尾（BIOS 据此判定"这是可引导设备"）。
 - `tools/make_usb_boot.py` 写盘时自动补零到 1024 扇区，无需手工处理。
 
-引导流程（`boot/boot.asm`）：
+引导流程（`boot/boot.asm` → `boot/stage2.asm`）：
 
 1. BIOS 把 LBA0 的一个扇区（512B）加载到 `0x7C00` 并执行。
-2. 引导代码**只用 BIOS `INT 13h AH=42h`（扩展读）**，按 DAP 把后续
-   **992 个扇区**读到 `0x10000`，每批 64 扇区、每批重试 3 次。
-3. 依次做：VBE 探测（找 16bpp LFB 模式）→ A20 开启（三重回退）→
-   建 GDT → 切入 32 位保护模式 → `jmp 0x10000` 进内核。
+2. 引导扇区用 BIOS `INT 13h AH=42h`（扩展读）把 **stage2**（固定 4 扇区）读到 `0x10000` 并跳过去 —— 引导扇区只有 512 字节，塞不下搬内核的代码。
+3. stage2 分批：每批 64 扇区用 `INT 13h` 读到低地址 bounce 缓冲，然后**进保护模式**用 `rep movsd` 搬到 19MB，退回实模式再读下一批。之所以每批都要"进 PM 再退回"，是因为跟 BIOS 打交道必须给它干净的实模式状态（用 unreal mode省掉这些切换反而会让 BIOS 在若干批之后跑飞，详见 `boot/stage2.asm` 文件头）。
+4. 搬完进保护模式、设栈、`jmp KERNEL_DST` 进内核；A20 由引导扇区开启。
 
 ### 为什么"不能把 os-image.bin 拷进一个 FAT32 分区当文件"
 
 引导阶段**完全不认识任何文件系统**。BIOS 只负责从 LBA0 找引导扇区并跳进去；
-剩下的 992 扇区内核，是引导代码用 `INT 13h` 按**绝对扇区号（LBA）**整块读上来的，
+后面的 stage2 与内核，是引导代码用 `INT 13h` 按**绝对扇区号（LBA）**整块读上来的，
 不是从某个分区里的文件读出来的。
 
 - 如果你把 `os-image.bin` 当普通文件丢进一个格式化的 U 盘，BIOS 看到的 LBA0

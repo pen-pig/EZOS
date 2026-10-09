@@ -2,23 +2,25 @@ ENTRY(_start)
 
 SECTIONS
 {
-    . = 0x10000;
-
-    /* 入口桩必须永远排在最前。
+    /* 内核镜像加载地址 = 19MB（同 boot/layout.inc 的 KERNEL_DST）。
      *
-     * boot.asm 把内核加载到固定的 0x8000 并直接跳过去，它不读任何 ELF
-     * 入口字段（--oformat binary 已经把 ELF 头丢掉了）。因此 0x8000 处
-     * 必须是 _start，而"0x8000 处是什么"完全由这里 .text 的收集顺序决定。
+     * 为什么搬出低 1MB：BIOS 的 INT13h AH=42h 用 seg:off 寻址（20 位），
+     * 目的地址只能落在低 1MB，而 0xA0000 起是 VGA aperture —— 0xA0000-0xBFFFF
+     * 是显卡的窗口，文本模式下**不是**线性 flat RAM（0xB8000 只是其中的
+     * 文本缓冲页）。于是"引导扇区直接读内核"的上限被硬件钉死在
+     * 0x10000..0xA0000 = 576KB。曾经把上界写成 0xB8000（以为中间那 96KB
+     * 也是普通内存），本地 504KB 的产物够不着所以一直没暴露；CI 的 gcc13
+     * 编出 591KB，镜像尾部一伸进 0xA0000 就 #PF 跑飞（串口刷了 6533 次
+     * page fault）。修完上界只剩 28KB 余量，再加功能必然撞线。
      *
-     * 窗口 = 0x8000..0xA0000 = 608KB。两个端点都是硬件给的，不是随手选的：
-     *   上界 0xA0000 —— VGA aperture 起点。0xA0000-0xBFFFF 是显卡的窗口，
-     *   文本模式下**不是**线性 flat RAM（0xB8000 只是其中的文本缓冲页）。
-     *   曾经把上界写成 0xB8000（以为中间那 96KB 也是普通内存），本地 504KB
-     *   的产物够不着所以一直没暴露；CI 的 gcc13 编出 591KB，镜像尾部一伸进
-     *   0xA0000 就 #PF 跑飞（串口刷了 6533 次 page fault）。
-     *   下界 0x10000 —— 不能再低。不是空间问题（0x8000 就能多 32KB），
-     *   而是 BOOTIA32.EFI 是仓库外预编译的二进制，里面写死了往 0x10000
-     *   搬内核；改 linker.ld 不跟着改它，UEFI 启动必然跑飞。
+     * 现在由 boot/stage2.asm 进保护模式把内核分批搬到 19MB：BIOS 只写
+     * 低地址的 bounce 缓冲，高地址由 32 位地址前缀写入。窗口 3MB
+     * （19MB..22MB，22MB 起是 .bss），上限不再由 BIOS 的 20 位地址决定。
+     *
+     * 入口桩必须永远排在最前。
+     * stage2 把内核搬到固定的 KERNEL_DST 并直接跳过去，它不读任何 ELF
+     * 入口字段（--oformat binary 已经把 ELF 头丢掉了）。因此 KERNEL_DST 处
+     * 必须是 _start，而"KERNEL_DST 处是什么"完全由这里 .text 的收集顺序决定。
      *
      * 曾经只写 `*(.text)`：那么 _start 只有在 kernel_entry.o 恰好是链接
      * 列表第一个时才位于 0x8000。build.ninja 的列表确实是这么排的，所以
@@ -28,6 +30,10 @@ SECTIONS
      *
      * 显式点名就不必再依赖链接顺序了；ld 先匹配先消费，下面的 *(.text)
      * 不会再把它收一遍。 */
+    . = 0x1300000;
+    /* 镜像起点：kernel.c 直接打印这个符号（不再抄常量，抄就会和这里走偏）。 */
+    __image_start = .;
+
     .text : {
         *kernel_entry.o(.text)
         *(.text)
@@ -38,10 +44,11 @@ SECTIONS
         *(.data)
     }
 
-    /* 主栈搬到 1MB..2MB：以前它占着 0x90000，和镜像抢同一块低 1MB，把
-     * 窗口压到 496KB。搬走之后镜像独占 0x10000..0xA0000 = 576KB。
+    /* 主栈 1MB..2MB（栈顶 0x200000，向下生长）。
+     * 2026-10-08 从 0x90000 搬上来：当时它和镜像抢同一块低 1MB，把镜像窗口
+     * 压到 496KB，只能靠 -Os 硬压代码。现在镜像已经整个搬到 19MB，主栈留在
+     * 1-2MB 纯属惯性 —— 它夹在页表池(2MB)之下，两边都不冲突。
      * 1-2MB 原本是 .bss.hi，已挪到 30MB（见下方）。
-     * 栈从 0x200000 向下生长，1MB 空间（原来只有 ~21KB）。
      * 见 boot.asm / kernel_entry.asm 的 `mov esp, 0x200000`。
      *
      * 栈水位扫描（kernel.c stack_paint / stack_high_water）的两端：启动时把
@@ -54,29 +61,28 @@ SECTIONS
     __stack_bottom = 0x100000;
     __stack_top = 0x200000;
 
-    /* 镜像（text+data）窗口 576KB：0x10000(内核) ~ 0xA0000(VGA aperture)。
-     * 以前主栈占着 0x90000、和镜像抢同一块 512KB，只能靠 -Os 硬压，换个
-     * gcc 就撞线（Ubuntu gcc13 -O2 编出 579KB > 496KB 上限）。现在主栈搬去
-     * 1MB，窗口 576KB，比原来多 80KB（代价是 -O2 产物要靠 -fno-align-* 压
-     * 掉代码对齐填充，见 build.ninja）。
-     * 同一上限在 tools/make_image.py 里校验一次（MAX_SECTORS=1152）——
-     * 镜像大小本身是动态的，扇区数写进引导扇区 0x1FC。 */
-    ASSERT(. - 0x10000 <= 0x90000, "kernel image exceeds 576KB window")
+    /* 镜像（text+data）窗口 3MB：KERNEL_DST(19MB) ~ 22MB(.bss 起点)。
+     * 上限不再是 BIOS 的 20 位地址，而是"这一段空档有多大"——16-19MB 是 GUI
+     * 背缓冲、22MB 起是 .bss，中间正好 3MB。要再扩就得挪 .bss（现在占
+     * 22-24MB，30MB 之前还有余量）或挪 GUI 背缓冲，不是改一个常量就完事。
+     *
+     * 同一上限在 tools/make_image.py 里校验一次（MAX_SECTORS，从
+     * boot/layout.inc 解析）。镜像大小本身是动态的，扇区数写进引导扇区
+     * 0x1FC，由 boot/stage2.asm 读。 */
+    ASSERT(. - 0x1300000 <= 0x300000, "kernel image exceeds 3MB window (19MB..22MB)")
 
-    /* .bss 与镜像解耦：放到 19MB（16MB GUI 背缓冲 ~18.6MB 结束之后、
-     * 32MB identity 上界之前）。原因：低内存 0x10000-0x90000 被镜像+栈
-     * 挤满（file+bss 合计只有 ~501KB），bss 跟着镜像会把文件预算吃光；
-     * 而 2-4MB 虚拟段是 exec 装载的 PD[1] 暂存区、1-2MB 是 .bss.hi，
-     * 都不能碰。19MB 处 identity 映射覆盖、启动早期（尚未开分页、PM
-     * 平坦段）可直接访问，kernel_entry.asm 的清零循环走符号无需改动。
-     * NOBITS 不进镜像文件。 */
-    .bss 0x01300000 (NOLOAD) : {
+    /* .bss 与镜像解耦：放到 22MB（镜像窗口 19-22MB 之后、32MB identity
+     * 上界之前）。原因：bss 跟着镜像会把文件预算吃光（低 1MB 时代
+     * file+bss 合计只有 ~501KB）。
+     * 22MB 处 identity 映射覆盖、启动早期（尚未开分页、PM 平坦段）可直接
+     * 访问，kernel_entry.asm 的清零循环走符号无需改动。NOBITS 不进镜像文件。 */
+    .bss 0x01600000 (NOLOAD) : {
         __bss_start = .;
         *(.bss)
         __bss_end = .;
     }
 
-    /* bss 上界 30MB：给 19-30MB 区间留出 11MB 余量，同时绝不触及
+    /* bss 上界 30MB：给 22-30MB 区间留出 8MB 余量，同时绝不触及
      * 32MB identity 映射上界。 */
     ASSERT(__bss_end <= 0x01E00000, "kernel bss exceeds 30MB limit")
 

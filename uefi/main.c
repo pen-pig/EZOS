@@ -6,11 +6,14 @@ static const EFI_GUID gEfiGraphicsOutputProtocolGuid = {
 };
 
 /* Kernel image size is dynamic (tools/make_image.py sizes it from kernel_raw.bin).
- * KERNEL_SIZE_MAX only bounds it: the image window is 0x10000..0xA0000
- * (576KB); 0xA0000 is the VGA aperture, NOT usable RAM - an image reaching
- * into it page-faults on boot. Must match linker.ld's ASSERT. */
-#define KERNEL_SIZE_MAX  589824u   /* fail-closed cap; real size read from the file */
-#define KERNEL_LOAD  0x10000u   /* boot/boot.asm: KERNEL_OFFSET equ 0x10000 */
+ * KERNEL_SIZE_MAX only bounds it: the image window is KERNEL_LOAD(19MB)..22MB
+ * (3MB) - 16-19MB is the GUI backbuffer and .bss starts at 22MB. The old
+ * 0x10000..0xA0000 window (576KB) was a BIOS INT13h limit, not a hardware
+ * one: legacy boot now goes through boot/stage2.asm (protected mode) and UEFI
+ * never had the limit at all. Must match linker.ld's ASSERT and
+ * boot/layout.inc's KERNEL_MAX_BYTES. */
+#define KERNEL_SIZE_MAX  0x300000u  /* fail-closed cap; real size read from the file */
+#define KERNEL_LOAD  0x1300000u  /* linker.ld / boot/layout.inc: KERNEL_DST */
 
 /* ---- 串口（QEMU �? 0x3F8 即�??�?�? ISA UART，接�? -serial�? ---- */
 static inline uint8_t inb(uint16_t port) {
@@ -171,7 +174,7 @@ EFI_STATUS EFIAPI EfiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *ST) {
     return EFI_SUCCESS;
   }
 
-  /* 2) 读内核到临时缓冲（AllocatePages 不能指定地址），�? memcpy �? 0x10000 */
+  /* 2) 先读到临时缓冲，ExitBootServices 之后再搬到 KERNEL_LOAD（原因见下）*/
   /* real size: seek to EOF, read the position back. UEFI has no boot sector,
    * so the sector-count field boot.asm reads (0x1FC) does not exist here. */
   UINT64 fsize = 0;
@@ -193,6 +196,15 @@ EFI_STATUS EFIAPI EfiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *ST) {
     return EFI_SUCCESS;
   }
 
+  /* ★ 这里**不能**用 AllocatePages(AllocateAddress, KERNEL_LOAD) 预留。
+   * OVMF 把自己的 DXE 堆放在 0x900000-0x1780000（9MB-23.6MB，type 4
+   * EfiBootServicesData），内核的 KERNEL_LOAD(19MB) 正好落在里面 —— 固件
+   * 只肯把 EfiConventionalMemory 交给你，于是 AllocateAddress 直接返回
+   * EFI_NOT_FOUND(0x8000000E)，串口就停在 reserve fail。
+   * 同理也不能在 ExitBootServices **之前** memcpy 过去：那段是固件正在用的
+   * 堆，写进去固件自己就崩了。
+   * 正确顺序：先用 AllocateAnyPages 拿一块固件给的缓冲读内核，等
+   * ExitBootServices 之后（堆归我们了）再搬到 KERNEL_LOAD。 */
   EFI_PHYSICAL_ADDRESS tmp = 0;
   st = ((EFI_ALLOCATE_PAGES)BS->AllocatePages)(AllocateAnyPages, EfiLoaderData,
       (ksize + 4095) / 4096 + 1, &tmp);
@@ -209,10 +221,11 @@ EFI_STATUS EFIAPI EfiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *ST) {
     serial_puts("\r\n");
     return EFI_SUCCESS;
   }
-  my_memcpy((void *)KERNEL_LOAD, buf, ksize);
   serial_puts("EZEFI:kernel size=");
   serial_dec((uint32_t)read_size);
-  serial_puts(" dst=0x10000 ok\r\n");
+  serial_puts(" dst=");
+  serial_hex((uint32_t)KERNEL_LOAD);
+  serial_puts(" ok\r\n");
 
   /* 3) UEFI �?动魔数（�? U3 内核判定�? */
   *(volatile uint32_t *)UEFI_MAGIC_PHYS = UEFI_MAGIC;
@@ -295,6 +308,13 @@ EFI_STATUS EFIAPI EfiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *ST) {
     serial_dec(copy);
     serial_puts("\r\n");
   }
+
+  /* 5c) ExitBootServices 之后才往 KERNEL_LOAD 搬：那片是固件刚交出来的
+   * DXE 堆（见第 2 步注释）。 */
+  my_memcpy((void *)(UINTN)KERNEL_LOAD, buf, ksize);
+  serial_puts("EZEFI:kernel copied to ");
+  serial_hex((uint32_t)KERNEL_LOAD);
+  serial_puts("\r\n");
 
   /* 6) 关中�?�?7) 跳转到内核入�? 0x10000（内核自己�?�栈/�? bss/建页�?�? */
   __asm__ __volatile__("cli");

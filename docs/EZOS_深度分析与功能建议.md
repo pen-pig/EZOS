@@ -13,7 +13,7 @@
 
 ```
 boot.asm(MBR 512B)
-  ├─ INT 13h AH=42h 扩展读：768 扇区(384KB)内核 → 0x10000，每批 64 扇区、3 次重试
+  ├─ INT 13h AH=42h 扩展读：stage2 → 0x10000，再由 stage2 把内核分批搬到 19MB
   ├─ VBE 探测 0x11A→0x117→0x114→0x111（16bpp+LFB 硬校验），结果存 0x5000
   ├─ A20 三重回退（BIOS int15h → 0x92 → KBC）
   └─ GDT(3 描述符) → 保护模式 → kernel_entry.asm
@@ -25,8 +25,8 @@ boot.asm(MBR 512B)
 
 | 区域 | 范围 | 限制 |
 |---|---|---|
-| 内核镜像 | 0x10000 起 | ≤384KB（ASSERT） |
-| BSS | 0x10000+镜像 | ≤0x90000 栈区（ASSERT） |
+| 内核镜像 | 0x1300000（19MB）起，由 boot/stage2.asm 搬上去 | ≤3MB（ASSERT） |
+| BSS | 0x1600000（22MB），与镜像解耦 | 22MB..32MB（ASSERT） |
 | 高内存 BSS | 1MB–2MB | ≤2MB，放只读 FS 大缓冲（NOLOAD） |
 | 栈 | 0x90000 向下 | 无栈溢出检测 |
 | GUI 后缓冲 | 16MB 固定地址 | 上限 1600×1200 |

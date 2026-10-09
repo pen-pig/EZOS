@@ -15,13 +15,19 @@
 所以这里产出一份混合镜像 usb-image.bin：
 
     LBA 0            mbr_usb.bin：BPB + 活动 EFI 分区表项 + 迷你引导代码
-    LBA 1 .. N       内核（与 os-image.bin 里完全相同的字节）
-    LBA 1024         真正的引导扇区（os-image.bin 的 LBA0 原样搬过来）
-    LBA 2048 ..      EFI 系统分区（FAT32，含 EFI/BOOT/BOOTIA32.EFI + kernel.bin）
+    LBA 1 .. N       与 os-image.bin 完全相同的字节：stage2 + 内核
+                     （前 STAGE2_SECTORS 个扇区是 stage2，之后才是内核）
+    LBA VBR_LBA      真正的引导扇区（os-image.bin 的 LBA0 原样搬过来）
+    LBA ESP_LBA ..   EFI 系统分区（FAT32，含 EFI/BOOT/BOOTIA32.EFI + kernel.bin）
 
-引导链：BIOS 读 LBA0 -> MBR 代码用 INT13h AH=42 把 LBA1024 那个引导扇区载入
-0000:7C00 并跳过去 -> 引导扇区照旧从 LBA1 读内核（**boot/boot.asm 一行都不用改**：
-内核在 USB 镜像里同样从 LBA1 开始）。UEFI 则直接走 EFI 分区里的加载器。
+引导链：BIOS 读 LBA0 -> MBR 代码用 INT13h AH=42 把 VBR_LBA 那个引导扇区载入
+0000:7C00 并跳过去 -> 引导扇区照旧从 LBA1 读（先 stage2 再内核，boot/boot.asm
+一行都不用改：两者在 USB 镜像里同样从 LBA1 开始）。UEFI 则直接走 EFI 分区里的
+加载器。
+
+VBR_LBA / ESP_LBA 不再写死：内核最多 KERNEL_MAX_SECTORS 个扇区（3MB），加上
+stage2 就要占满 LBA1..6149，写死 1024/2048 会被内核直接盖掉。这里按
+boot/layout.inc 的上限算出下一个 4KB 对齐位置（stage2 之后要留足空档）。
 
 用法：
     python tools/make_usb_image.py                    # 默认输入输出路径
@@ -29,17 +35,30 @@
 """
 import argparse
 import os
+import re
 import struct
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from make_image import parse_layout           # noqa: E402  镜像布局的唯一事实来源
+
 SECTOR = 512
-VBR_LBA = 1024          # 引导扇区副本所在地（内核最多 992 扇区，1024 安全）
-ESP_LBA = 2048          # EFI 系统分区起点（1MB 对齐，固件最喜欢）
-ESP_SECTORS = 69632     # 34MB：FAT32 需要 >= 65525 簇（512B/簇）才名副其实
 PART_TYPE_EFI = 0xEF
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+
+_LAYOUT = parse_layout(os.path.join(ROOT, "boot", "layout.inc"))
+KERNEL_LBA = _LAYOUT["KERNEL_LBA"]                        # 5（1 引导扇区 + 4 stage2）
+KERNEL_MAX_SECTORS = _LAYOUT["KERNEL_MAX_SECTORS"]        # 6144（3MB 窗口）
+STAGE2_SECTORS = _LAYOUT["STAGE2_SECTORS"]                # 4
+
+# 内核尾 = KERNEL_LBA + KERNEL_MAX_SECTORS；引导扇区副本要放在它之后（再向上
+# 取 4KB 对齐），ESP 再往后 4MB。写死 1024/2048 的旧值会被 3MB 的内核盖掉。
+_KERNEL_END = KERNEL_LBA + KERNEL_MAX_SECTORS             # 6149
+VBR_LBA = ((_KERNEL_END + 4095) // 4096) * 4096           # 8192
+ESP_LBA = VBR_LBA + 8192                                  # 16384
+ESP_SECTORS = 69632     # 34MB：FAT32 需要 >= 65525 簇（512B/簇）才名副其实
 
 
 def put16(b, off, v):
@@ -356,7 +375,10 @@ def main():
         return 2
 
     vbr = os_image[:SECTOR]
-    kernel_img = os_image[SECTOR:]
+    # LBA1 起是"stage2 + 内核"（与 os-image.bin 逐字节相同）——引导扇区从
+    # STAGE2_LBA 读 stage2，stage2 再从 KERNEL_LBA 读内核，所以整段照抄即可。
+    payload = os_image[SECTOR:]
+    kernel_img = payload[STAGE2_SECTORS * SECTOR:]     # 单独取内核（给 ESP 用）
     if len(kernel_img) != len(kernel):
         print("WARN: kernel.bin (%d) != os-image kernel (%d); using os-image copy"
               % (len(kernel), len(kernel_img)))
@@ -375,8 +397,9 @@ def main():
             print("   synced uefi/esp/kernel.bin (%d bytes)" % len(kernel))
 
     ksectors = struct.unpack_from('<H', vbr, 0x1FC)[0]
-    if ksectors == 0 or ksectors > 992:
-        print("kernel sector field at 0x1FC is %d - refusing to build" % ksectors)
+    if ksectors == 0 or ksectors > KERNEL_MAX_SECTORS:
+        print("kernel sector field at 0x1FC is %d (max %d) - refusing to build"
+              % (ksectors, KERNEL_MAX_SECTORS))
         return 2
 
     if os.path.isfile(args.efi):
@@ -390,7 +413,7 @@ def main():
     total = ESP_LBA + ESP_SECTORS
     img = bytearray(total * SECTOR)
     img[0:SECTOR] = patch_mbr(mbr, total, VBR_LBA, ESP_LBA, ESP_SECTORS)
-    img[SECTOR:SECTOR + len(kernel_img)] = kernel_img          # 内核从 LBA1 起
+    img[SECTOR:SECTOR + len(payload)] = payload          # stage2+内核从 LBA1 起
     img[VBR_LBA * SECTOR:(VBR_LBA + 1) * SECTOR] = vbr         # 引导扇区副本
     esp_bytes, p = build_esp(ESP_SECTORS, kernel, efi)
     img[ESP_LBA * SECTOR:(ESP_LBA + ESP_SECTORS) * SECTOR] = esp_bytes
@@ -399,8 +422,9 @@ def main():
         f.write(img)
     info = check_image(args.out)
     print("OK %s: %d bytes (%d sectors)" % (args.out, len(img), total))
-    print("   legacy: MBR(LBA0) -> boot sector(LBA%d) -> kernel(LBA1..%d)"
-          % (VBR_LBA, ksectors))
+    print("   legacy: MBR(LBA0) -> boot sector(LBA%d) -> stage2(LBA1..%d)"
+          " -> kernel(LBA%d..%d)"
+          % (VBR_LBA, STAGE2_SECTORS, KERNEL_LBA, KERNEL_LBA + ksectors - 1))
     print("   uefi  : ESP LBA%d, FAT32 %d clusters x %dB, %s"
           % (ESP_LBA, p['clusters'], p['spc'] * SECTOR,
              "EFI/BOOT/BOOTIA32.EFI + KERNEL.BIN" if efi else "no EFI loader"))
