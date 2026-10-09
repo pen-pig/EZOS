@@ -82,14 +82,22 @@ static void dm_push_line(void) {
     dm_cur_len = 0;
 }
 
-void dmesg_write(const char *line) {
+static void dmesg_push(const char *line, int echo_serial) {
     if (!line) return;
     /* 串口镜像（真机诊断通道）：serial 未 init/自检失败时内部 no-op。
      * 放在环形缓冲之前——环形缓冲裁剪不影响串口侧拿到完整行。
      * 与缓冲更新同处一个临界区：否则串口侧的两行字符会交错。 */
     uint32_t f = irq_save_disable();
-    serial_write(line);
-    serial_putc('\n');
+    if (echo_serial) {
+        serial_write(line);
+        /* 只在调用方**没带**换行时补一个。klog 的 dm_mirror 和 st_report
+         * 传进来的行都以 
+ 结尾，以前无条件再补一个 —— 串口日志里每行
+         * 后面跟一个空行，看着就像输出被打散了。 */
+        uint32_t n = 0;
+        while (line[n]) n++;
+        if (n == 0 || line[n - 1] != '\n') serial_putc('\n');
+    }
     for (uint32_t i = 0; line[i]; i++) {
         char c = line[i];
         if (c == '\n') { dm_push_line(); continue; }
@@ -97,6 +105,22 @@ void dmesg_write(const char *line) {
         /* 超长行静默截断 */
     }
     irq_restore(f);
+}
+
+void dmesg_write(const char *line) {
+    dmesg_push(line, 1);
+}
+
+/* 只进环形缓冲、**不**写串口 —— 给"已经上过屏"的调用方用。
+ *
+ * terminal_putchar 早已把控制台输出逐字符镜像到 COM1（H1a，真机无屏时的
+ * 诊断通道，也是 E2E 唯一的取结果通道）。klog / st_report 都是"先上屏、
+ * 再记 dmesg"，这里再往串口写一遍，串口日志上每一行都会出现两次
+ * （实测开机日志：24 条自检 + 每条的 klog 汇总，全是双份，两份的时间戳
+ * 还不一样，因为 dm_mirror 是**事后**重新取的时间）。
+ * dmesg 命令回看不受影响 —— 走的还是同一个环形缓冲。 */
+void dmesg_record(const char *line) {
+    dmesg_push(line, 0);
 }
 
 static char dm_char(uint32_t idx, uint32_t k) {

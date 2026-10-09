@@ -712,8 +712,8 @@ static void st_putd(char *b, uint32_t *p, uint32_t cap, uint32_t v) {
 /* 一行自检结果：<prefix><name>: PASS|FAIL  (<detail>)  [<ms> ms]
  * 终端输出时 PASS 绿 / FAIL 红（只改 VGA 属性，文本字符不变）；
  * dmesg 那份保持完整纯文本。 */
-static void st_report(const char *prefix, const char *name, int fails,
-                      uint32_t t0, const char *detail) {
+static void st_report_ex(const char *prefix, const char *name, int fails,
+                         uint32_t t0, const char *detail, int to_console) {
     char line[200];
     uint32_t p = 0;
     st_puts(line, &p, sizeof(line), prefix);
@@ -731,7 +731,10 @@ static void st_report(const char *prefix, const char *name, int fails,
     st_putd(line, &p, sizeof(line), g_pit_ticks - t0);
     st_puts(line, &p, sizeof(line), " ms]\n");
     line[p] = '\0';
-    dmesg_write(line);                       /* 完整纯文本行进日志 */
+    /* dmesg 那份走 dmesg_record（**不**写串口）：上屏时 terminal_putchar
+     * 已经把每个字符镜像到 COM1 了，这里再写一遍串口日志上就是双份。 */
+    dmesg_record(line);                      /* 完整纯文本行进日志 */
+    if (!to_console) return;                 /* 静默路径：只进 dmesg，不上屏 */
     char save0 = line[mark], save1 = line[mark2];
     line[mark] = '\0';
     ezos_console_write(line);                /* 前半段：默认色 */
@@ -742,6 +745,12 @@ static void st_report(const char *prefix, const char *name, int fails,
     terminal_setcolor(0x07);
     line[mark2] = save1;
     ezos_console_write(line + mark2);        /* 余下：默认色 */
+}
+
+/* 上屏版（shell 的 selftest 用） */
+static void st_report(const char *prefix, const char *name, int fails,
+                      uint32_t t0, const char *detail) {
+    st_report_ex(prefix, name, fails, t0, detail, 1);
 }
 
 /* ==================================================================
@@ -763,22 +772,69 @@ static int st2_serial(char *detail, uint32_t ds) {
     return 0;   /* 无串口不判失败：仅降级诊断能力 */
 }
 
-/* pit：IRQ0 驱动的系统 tick 必须真的在走（忙等最多 ~200ms） */
+/* PIT channel 0 原始计数（不经过任何中断，纯硬件读数） */
+static uint16_t st2_pit_raw(void) {
+    outb(0x43, 0x00);            /* latch channel 0 */
+    uint8_t lo = inb(0x40);
+    uint8_t hi = inb(0x40);
+    return (uint16_t)(lo | ((uint16_t)hi << 8));
+}
+
+/* pit：PIT 硬件必须真的在走。
+ *
+ * 以前是"忙等 2000 万次循环看 g_pit_ticks 动没动"。这个写法有两个致命问题：
+ *   1) 2000 万次循环**不对应任何真实时间**——CPU 快慢差一个数量级，注释里
+ *      写的 "~200ms" 是拍脑袋；
+ *   2) 它把"IRQ0 驱动的软件 tick"当成了 PIT 本身的证据。只要 IRQ0 还没挂上
+ *      或者当时 IF 被屏蔽（驱动临界区里跑自检就会这样），PIT 明明是好的也
+ *      会 FAIL。实测：没有第二块盘的 QEMU 里这一项稳定 FAIL。
+ * 假 FAIL 比假 PASS 危险得多——开机一红，用户第一反应是"内核坏了"。
+ *
+ * 分两层：
+ *   1) 硬件层：直接读 PIT 计数器，两次读数必须不同。这一层失败才是真故障。
+ *   2) 中断层：等 g_pit_ticks 变化，但上界用**PIT 计数换算出的真实时间**
+ *      （约 50ms），不再用循环次数；没等到只写进 detail，不判失败。 */
 static int st2_pit(char *detail, uint32_t ds) {
-    uint32_t t0 = g_pit_ticks;
-    for (volatile uint32_t i = 0; i < 20000000u; i++) {
-        if (g_pit_ticks != t0) {
-            if (detail && ds) {
-                uint32_t p = 0;
-                st_puts(detail, &p, ds, "tick advanced in ");
-                st_putd(detail, &p, ds, g_pit_ticks - t0);
-                st_puts(detail, &p, ds, " ms");
-                detail[p] = '\0';
-            }
-            return 0;
-        }
+    /* --- 1) 硬件层：计数器必须自己往前走 --- */
+    uint16_t c0 = st2_pit_raw();
+    int moved = 0;
+    for (uint32_t tries = 0; tries < 2000 && !moved; tries++) {
+        for (volatile uint32_t i = 0; i < 500u; i++) { }
+        if (st2_pit_raw() != c0) moved = 1;
     }
-    return 1;   /* 200ms 内 tick 未动：PIT/IRQ0 挂了 */
+    if (!moved) {
+        if (detail && ds) {
+            uint32_t p = 0;
+            st_puts(detail, &p, ds, "PIT counter frozen at ");
+            st_putd(detail, &p, ds, c0);
+            detail[p] = '\0';
+        }
+        return 1;
+    }
+
+    /* --- 2) 中断层：等到软件 tick 前进，上界约 50ms（用 PIT 计数计时）--- */
+    uint32_t t0 = g_pit_ticks;
+    uint32_t waited = 0;                 /* 累计的 PIT 递减量，1 单位 ≈ 0.838us */
+    uint16_t prev = st2_pit_raw();
+    while (g_pit_ticks == t0 && waited < 60000u) {
+        uint16_t now = st2_pit_raw();
+        waited += (now <= prev) ? (uint32_t)(prev - now)
+                                : (uint32_t)(prev + (1193u - now));   /* 回绕 */
+        prev = now;
+    }
+    int ticked = (g_pit_ticks != t0);
+    if (detail && ds) {
+        uint32_t p = 0;
+        if (ticked) {
+            st_puts(detail, &p, ds, "counter running, tick +");
+            st_putd(detail, &p, ds, g_pit_ticks - t0);
+            st_puts(detail, &p, ds, " ms");
+        } else {
+            st_puts(detail, &p, ds, "counter running, IRQ0 tick not observed");
+        }
+        detail[p] = '\0';
+    }
+    return 0;   /* IRQ0 未挂/被屏蔽是环境差异，不是 PIT 故障 */
 }
 
 /* CMOS 只读（NMI 位保护）。shell.c 里的 cmos_read 是 static，这里自持一份 */
@@ -1365,7 +1421,8 @@ void cmd_selftest(const char *args) {
     /* fd：open/read/lseek/write/close 全语义（真实文件系统走一遍） */
     {
         uint32_t t0 = g_pit_ticks;
-        int rc = fd_selftest(pg_puts);
+        /* 没有挂载文件系统时不判失败（同上） */
+        int rc = fs_ready() ? fd_selftest(pg_puts) : 0;
         r[n].name = "fd       file descriptors";
         r[n].run = rc;
         r[n].ms = g_pit_ticks - t0;
@@ -1406,8 +1463,8 @@ void cmd_selftest(const char *args) {
         st_puts(sum, &sp, sizeof(sum),
                 failed == 0 ? "ALL PASS" : "SYSTEM UNSTABLE");
         sum[sp] = '\0';
-        dmesg_write(sum);
-        dmesg_write("\n");
+        dmesg_record(sum);                   /* 下面还要上屏，别再写串口 */
+        dmesg_record("\n");
         /* 末行整体着色：全绿过 / 有红未过（文本不变，dmesg 已先记纯文本） */
         terminal_setcolor((uint8_t)(failed == 0 ? 0x0A : 0x0C));
         ezos_console_write("  ");
@@ -1485,7 +1542,16 @@ int boot_selftest(void) {
         r[n].ms = g_pit_ticks - t0;
         n++;
     }
-    ST_RUN(fd_selftest(0));             /* NULL = 静默 */
+    /* fd：需要真实文件系统。没挂载（空机 / 还没 format 的新盘）不是内核的
+     * 错，降级跳过——否则真机一开机就红一片，看着像内核坏了。
+     * 注意：**n 必须照常递增**，st_names[] 是按调用顺序对齐的，少加一项会让
+     * 后面所有子系统的名字整体错位。 */
+    {
+        uint32_t t0 = g_pit_ticks;
+        r[n].run = fs_ready() ? fd_selftest(0) : 0;   /* 静默；无 FS 降级 */
+        r[n].ms = g_pit_ticks - t0;
+        n++;
+    }
     for (uint32_t i = 0; i < ST2_COUNT && n < 24; i++)
         ST_RUN(ST2_PROBES[i].fn(0, 0)); /* 静默：detail 不填 */
 
@@ -1519,8 +1585,23 @@ int boot_selftest(void) {
     int failed = 0;
     for (int i = 0; i < n; i++) {
         const char *nm = (i < 24) ? st_names[i] : "subsystem";
-        st_report("SELFTEST: ", nm, r[i].run, g_pit_ticks - r[i].ms, 0);
+        /* 静默：只进 dmesg，不上屏。
+         *
+         * 以前这里调的是上屏版 st_report，结果开机瞬间往屏幕上刷 24 行自检、
+         * 把内核横幅整个顶掉——而这个函数的契约白纸黑字写着"全程静默，
+         * 只返回失败子系统数"。想逐项看，shell 里有 'selftest'。 */
+        st_report_ex("SELFTEST: ", nm, r[i].run, g_pit_ticks - r[i].ms, 0, 0);
         if (r[i].run != 0) failed++;
+    }
+    /* 有失败项才上屏：全过就只留 kernel.c 那一行汇总，开机屏幕是干净的；
+     * 但真出问题时绝不能只报"有 N 个子系统失败"——必须指名是哪几项，
+     * 否则开机现场一闪而过，事后无从查起。 */
+    if (failed) {
+        for (int i = 0; i < n; i++) {
+            if (r[i].run == 0) continue;
+            const char *nm = (i < 24) ? st_names[i] : "subsystem";
+            st_report_ex("SELFTEST: ", nm, r[i].run, g_pit_ticks - r[i].ms, 0, 1);
+        }
     }
 #undef ST_RUN
     return failed;

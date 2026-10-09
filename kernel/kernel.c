@@ -134,11 +134,26 @@ static uint16_t pit_read_counter(void) {
 
 /* ��ʵ΢��ʱ�ӣ�Linux dmesg ��񣩣�?
  * �벿�� = PIT 1000Hz tick��΢�벿�� = PIT �������м�����ÿ���� 1/1193182s �� 0.838us�� */
+/* 上一次返回的微秒数，用来钉住单调性（见 pit_usec）。 */
+static uint32_t g_pit_last_us = 0;
+
 static uint32_t pit_usec(void) {
+    uint32_t t = g_pit_ticks;
     uint32_t c = pit_read_counter();
     if (c > 1193) c = 1193;
-    uint32_t elapsed = 1193 - c;           /* ��ǰ tick �����߼��� */
-    return g_pit_ticks * 1000u + (elapsed * 838u) / 1000u;
+    uint32_t elapsed = 1193 - c;
+    /* g_pit_ticks 与 PIT 计数器是两个独立读数：计数器数到 0 的那一瞬间
+     * IRQ0 才把 g_pit_ticks 加一。两次读取之间只要插进一个 IRQ0，就会拼出
+     * "新 tick + 旧小数"或"旧 tick + 新小数"——算出来的时间戳会**倒退**。
+     * 实测开机日志里 0.059699 后面跟着 0.059563，就是这么来的。
+     * 两层处理：读计数器期间翻了 tick 就把小数清零（避免算出超前值），
+     * 再用"取 max"钉住单调性。宁可停一拍也不能往回走——时间戳一倒退，
+     * 所有按时间排序的诊断（耗时、先后因果）全部失效。 */
+    if (t != g_pit_ticks) elapsed = 0;
+    uint32_t us = t * 1000u + (elapsed * 838u) / 1000u;
+    if (us < g_pit_last_us) us = g_pit_last_us;
+    g_pit_last_us = us;
+    return us;
 }
 
 /* dmesg ���ʱ�����[    0.000000] �����?�Ҷ��� + 6 λ��ʵ΢�룩 */
@@ -182,7 +197,7 @@ static void dm_mirror(const char *body, const char *tail) {
     for (const char *p = tail; *p && o + 1 < sizeof(line); p++) line[o++] = *p;
     if (o + 1 < sizeof(line)) line[o++] = '\n';
     line[(o < sizeof(line)) ? o : sizeof(line) - 1] = 0;
-    dmesg_write(line);
+    dmesg_record(line);          /* 不写串口：控制台镜像已经有一份了 */
 }
 
 static void klog(const char *msg) {
@@ -408,11 +423,11 @@ void kernel_main(void) {
                (uint32_t)(unsigned long)__image_start, ", i686 protected mode");
     /* 扇区数不再写死：tools/make_image.py 按 kernel_raw.bin 真实大小算出后写进
      * 引导扇区 0x1FC，boot/stage2.asm 运行时读取（0 或超上限时兜底成上限）。 */
-    klog("Boot: kernel image relocated above 1MB (BIOS: boot/stage2.asm in protected mode, 64-sector batches into a low bounce buffer; UEFI: uefi/main.c)");
+    klog("Boot: kernel above 1MB (BIOS: boot/stage2.asm; UEFI: uefi/main.c)");
     klog("Boot: A20 gate enabled (BIOS int 15h / port 0x92 / KBC fallback)");
-    klog("Boot: GDT rebuilt in kernel - 6 descriptors (null/kcode/kdata/ucode DPL3/udata DPL3/TSS), TSS esp0=0x900000");
+    klog("Boot: GDT rebuilt in kernel (6 descriptors), TSS esp0=0x900000");
     klog("VGA text mode: 80x25 active");
-    klog("APIC: local APIC disabled via MSR 0x1B, IRQ routing via legacy 8259 PIC");
+    klog("APIC: disabled via MSR 0x1B, IRQ via legacy 8259 PIC");
 
     /* GDT 必须先于 IDT 之后的任何用户态机制建立：ring3 段与 TSS 都在这里 */
     gdt_init();
@@ -428,10 +443,10 @@ void kernel_main(void) {
     klog_rtc_time("RTC: boot time 20");   /* ��ʵ����ʱ�䣨CMOS BCD, UTC+8�� */
     klog_ok("IDT: 256 gates installed");
     klog_ok("PIC: IRQ0-15 remapped to INT 0x20-0x2f, IRQ0/1/12 enabled");
-    klog_ok("ISR: 32 CPU exception gates installed (panic screen on fault)");
+    klog_ok("ISR: 32 exception gates installed (panic screen on fault)");
     klogf("Paging: identity map 0-", PAGING_IDENTITY_END / (1024 * 1024), 0,
           "MB, 4KB pages, PD 0x", PAGING_PD_ADDR, 1, ", CR0.PG=1");
-    klog_ok("SYSCALL: int 0x80 gate (DPL=3), SYS_READ/SYS_WRITE/SYS_EXIT");
+    klog_ok("SYSCALL: int 0x80 gate (DPL=3), READ/WRITE/EXIT");
     klogf("Kmalloc: ", 384, 0, "KB heap at .bss.hi, 16B align, magic guard", 0, 0, "");
 
     /* CPU����ʵ CPUID ̽�� */
@@ -455,7 +470,7 @@ void kernel_main(void) {
 
     /* ATA ���̣���ʵ̽�������� LBA0 */
     uint8_t mbr[512];
-    klog("ATA: PIO mode, probing 4 drives (0x1F0 primary / 0x170 secondary bus)");
+    klog("ATA: PIO mode, probing 4 drives (0x1F0 / 0x170)");
     for (uint8_t d = 0; d < 4; d++) {
         if (!ata_drive_present(d)) {
             klog_dec32("ATA: drive ", d, " absent");
@@ -659,7 +674,7 @@ void kernel_main(void) {
         } else if (lfb >= 0x00100000u && lfb < 0xFFF00000u && vxr >= 320 && vyr >= 200 && vbpp == 16) {
             klog_hex32("VBE: boot probe OK, LFB 0x", lfb, " (16bpp RGB565)");
             klogf("VBE: resolution ", vxr, 0, "x", vyr, 0, ", activated at user-mode");
-            klog("VBE: probed 0x11A/0x117/0x115/0x110 in order, first LFB match wins");
+            klog("VBE: probed 4 modes, first LFB match wins");
         } else {
             klog("VBE: no LFB mode probed, will fallback to VGA 0x13 320x200x256");
         }
