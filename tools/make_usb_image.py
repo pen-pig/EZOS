@@ -283,7 +283,12 @@ def check_image(path):
     assert struct.unpack_from('<I', mbr, 0x20)[0] == total, "BPB total sectors"
     assert vbr[510] == 0x55 and vbr[511] == 0xAA, "VBR signature (LBA %d)" % VBR_LBA
     ksectors = struct.unpack_from('<H', vbr, 0x1FC)[0]
-    assert 1 <= ksectors <= 992, "kernel sector field %d" % ksectors
+    # 上限取 layout.inc 的 KERNEL_MAX_SECTORS（3MB 窗口），**不要写死数字**。
+    # 曾经这里硬编码 992（=496KB 的老窗口），窗口扩到 3MB 后没跟着改，
+    # 结果内核一旦超过 496KB 就报 "kernel sector field 1569" —— 报错信息
+    # 完全指不到真正原因（构建期检查用的是对的 6144，只有这行体检在用旧值）。
+    assert 1 <= ksectors <= KERNEL_MAX_SECTORS, \
+        "kernel sector field %d exceeds layout window %d" % (ksectors, KERNEL_MAX_SECTORS)
     assert esp[510] == 0x55 and esp[511] == 0xAA, "ESP boot sector signature"
     assert esp[82:90] == b'FAT32   ', "ESP is not FAT32"
     fat32_sz = struct.unpack_from('<I', esp, 36)[0]

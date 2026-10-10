@@ -5,6 +5,7 @@
  * 用户态运行时之后再说——在那之前不实现，也不假装实现。
  */
 #include "elf.h"
+#include "mem.h"     /* memcpy：内核唯一实现（原 e_memcpy 是第 4 份拷贝） */
 #include "paging.h"
 #include "pmm.h"
 #include "syscall.h"      /* USER_IMAGE_BASE / USER_IMAGE_END */
@@ -55,17 +56,10 @@ _Static_assert(__builtin_offsetof(elf32_phdr_t, p_memsz) == 20, "p_memsz @20");
 _Static_assert(__builtin_offsetof(elf32_phdr_t, p_flags) == 24, "p_flags @24");
 
 /* ---------- 小工具（不依赖 libc） ---------- */
+/* memcpy/memset 来自 kernel/mem.h：内核唯一一份实现。这里原来各有一份
+ * static 拷贝循环，全仓库一度有 4 份，重复到改语义时必然漏改一处。 */
 
-static void e_memset(void *dst, uint8_t v, uint32_t n) {
-    uint8_t *d = (uint8_t *)dst;
-    for (uint32_t i = 0; i < n; i++) d[i] = v;
-}
 
-static void e_memcpy(void *dst, const void *src, uint32_t n) {
-    uint8_t *d = (uint8_t *)dst;
-    const uint8_t *s = (const uint8_t *)src;
-    for (uint32_t i = 0; i < n; i++) d[i] = s[i];
-}
 
 static uint32_t align_up(uint32_t v, uint32_t a) {
     return (v + a - 1u) & ~(a - 1u);
@@ -198,11 +192,11 @@ int elf_load(const uint8_t *buf, uint32_t size, elf_image_t *img, const char **w
 
         /* 整段清零：既保证 bss 为零，也避免把上一任使用者的内核数据
          * 泄漏给用户态（页刚从 pmm 出来，内容未知）。 */
-        e_memset((void *)va_start, 0, pages * PMM_PAGE_SIZE);
+        memset((void *)va_start, 0, pages * PMM_PAGE_SIZE);
 
         /* 文件部分 */
         if (ph[i].p_filesz != 0)
-            e_memcpy((void *)ph[i].p_vaddr, buf + ph[i].p_offset, ph[i].p_filesz);
+            memcpy((void *)ph[i].p_vaddr, buf + ph[i].p_offset, ph[i].p_filesz);
 
         /* W^X：不可写段改为只读（无 NX，执行不可禁，但至少不能就地改码） */
         if ((ph[i].p_flags & PF_W) == 0u) {
@@ -265,7 +259,7 @@ int elf_selftest(elf_puts_fn out) {
 
     /* 构造一个最小合法 ELF：1 个 PT_LOAD，代码段在 0x400000 */
     static uint8_t good[sizeof(elf32_ehdr_t) + sizeof(elf32_phdr_t) + 16];
-    e_memset(good, 0, sizeof(good));
+    memset(good, 0, sizeof(good));
     elf32_ehdr_t *eh = (elf32_ehdr_t *)good;
     good[0] = 0x7F; good[1] = 'E'; good[2] = 'L'; good[3] = 'F';
     good[4] = ELFCLASS32; good[5] = ELFDATA2LSB; good[6] = EV_CURRENT;

@@ -1768,8 +1768,167 @@ void cmd_rstest(const char *args) {
     int ok_hash = (ch == rh) && (ch == zh) && (ch != 0);   /* 全 0 说明根本没算 */
     ezos_console_write(ok_hash ? " [OK]\n" : " [FAIL]\n");
 
+    /* =================================================================
+     * 第二组：文件名编解码（UTF-16LE <-> UTF-8）
+     *
+     * 三份实现在两个方向上必须逐字节一致，尤其是**失败路径**：
+     * 落单代理项要变 U+FFFD、缓冲不够要返回负数而不是半截名字。
+     * 只测成功路径的话，"装不下时静默截断"这种最坏的 bug 会溜过去，
+     * 而半截名字会匹配到错误的文件——比显示乱码严重得多。
+     * ================================================================= */
+
+    /* 探针要混：纯 ASCII / BMP 中文(3 字节 UTF-8) / 代理对(4 字节,
+     * 桌面 emoji) / 落单代理。少任何一个都会漏掉一类 bug。
+     *
+     * **落单代理必须放在串尾**（或者后面跟的不是低代理）：高代理 0xD83D
+     * 后面紧跟 0xDC00 是一个**合法**代理对 U+1F400，会被正常合并，不是
+     * 落单项。想测 U+FFFD 就得让高代理后面没有低代理——我第一版把两个落单
+     * 代理并排放，结果三份实现都算对了，是断言自己错了。 */
+    static const uint16_t u16probe[] = {
+        'R', 'e', 'a', 'd',                     /* ASCII */
+        0x4E2D, 0x6587,                         /* 中文 BMP */
+        0xD83D, 0xDE00,                         /* 合法代理对 U+1F600 */
+        0xDC00,                                 /* 落单低代理 -> U+FFFD */
+        '.', 'T', 'X', 'T',
+        0xD83D                                  /* 串尾落单高代理 -> U+FFFD */
+    };
+    const uint32_t u16n = (uint32_t)(sizeof(u16probe) / sizeof(u16probe[0]));
+
+    /* 缓冲给足（最长 4 字节 UTF-8 + NUL），另外单独做一次"故意不够"的测试 */
+    char d8c[80];
+    uint8_t d8r[80], d8z[80];
+    int32_t n8c = utf16_to_utf8_c(u16probe, u16n, d8c, sizeof(d8c));
+    int32_t n8r = utf16_to_utf8_rs(u16probe, u16n, d8r, sizeof(d8r));
+    int32_t n8z = utf16_to_utf8_zig(u16probe, u16n, d8z, sizeof(d8z));
+    int ok_u16 = (n8c == n8r) && (n8c == n8z) && (n8c > 0);
+    if (ok_u16) {
+        /* 长度一致还不够，字节也要逐个一致 */
+        for (uint32_t i = 0; i < (uint32_t)n8c; i++) {
+            if ((uint8_t)d8c[i] != d8r[i] || (uint8_t)d8c[i] != d8z[i]) {
+                ok_u16 = 0;
+                break;
+            }
+        }
+    }
+    /* 三份都必须补上 NUL，且都补在同一个位置 */
+    if (ok_u16 && (d8c[n8c] != 0 || d8r[n8r] != 0 || d8z[n8z] != 0)) ok_u16 = 0;
+    /* 落单代理必须变成 U+FFFD（EF BF BD），不能被吞掉也不能原样吐出 */
+    int seen_fffd = 0;
+    for (uint32_t i = 0; i + 2 < (uint32_t)n8c; i++)
+        if ((uint8_t)d8c[i] == 0xEF && (uint8_t)d8c[i+1] == 0xBF &&
+            (uint8_t)d8c[i+2] == 0xBD) { seen_fffd = 1; break; }
+    if (!seen_fffd) ok_u16 = 0;
+    ezos_console_write("  u16->u8   len C=");
+    ezos_console_print_dec((uint32_t)n8c);
+    ezos_console_write(" rust=");
+    ezos_console_print_dec((uint32_t)n8r);
+    ezos_console_write(" zig=");
+    ezos_console_print_dec((uint32_t)n8z);
+    ezos_console_write(ok_u16 ? " [OK]\n" : " [FAIL]\n");
+
+    /* 缓冲不足：三份都必须返回负数（fail closed），绝不能返回半截长度。
+     * 这一条是本组测试存在的最主要理由。 */
+    char tiny_c[8];
+    uint8_t tiny_r[8], tiny_z[8];
+    int32_t tc = utf16_to_utf8_c(u16probe, u16n, tiny_c, sizeof(tiny_c));
+    int32_t tr = utf16_to_utf8_rs(u16probe, u16n, tiny_r, sizeof(tiny_r));
+    int32_t tz = utf16_to_utf8_zig(u16probe, u16n, tiny_z, sizeof(tiny_z));
+    int ok_tiny = (tc < 0) && (tr < 0) && (tz < 0) && (tc == tr) && (tr == tz);
+    ezos_console_write("  u16->u8 tiny ");
+    ezos_console_print_hex32((uint32_t)tc);
+    ezos_console_write("/");
+    ezos_console_print_hex32((uint32_t)tr);
+    ezos_console_write("/");
+    ezos_console_print_hex32((uint32_t)tz);
+    ezos_console_write(ok_tiny ? " [OK]\n" : " [FAIL]\n");
+
+    /* 反方向：UTF-8 -> UTF-16LE。用刚才编出来的字节，顺带验证往返一致。
+     * 往返比"两边各自对一批固定输入"更强：任一边对代理对 / BMP / ASCII
+     * 的边界算错，round-trip 就对不上。 */
+    uint16_t w16c[80], w16r[80], w16z[80];
+    int32_t wn_c = 0, wn_r = 0, wn_z = 0;
+    int ok_rt = 0;
+    if (n8c > 0) {
+        wn_c = utf8_to_utf16_c(d8c, w16c, 80);
+        wn_r = utf8_to_utf16_rs((const uint8_t *)(const void *)d8c, w16r, 80);
+        wn_z = utf8_to_utf16_zig((const uint8_t *)(const void *)d8c, w16z, 80);
+        ok_rt = (wn_c == wn_r) && (wn_c == wn_z) && (wn_c > 0);
+        if (ok_rt) {
+            for (uint32_t i = 0; i < (uint32_t)wn_c; i++) {
+                if (w16c[i] != w16r[i] || w16c[i] != w16z[i]) {
+                    ok_rt = 0;
+                    break;
+                }
+            }
+        }
+        /* 往返一致性：探针前 4 个 ASCII 必须原样还原。后半含两个落单
+         * 代理，按 Unicode 规范 round-trip 时它们变 U+FFFD、长度变 1，
+         * 与"原样还原"不同——属预期，所以只钉住前 4 个 ASCII。它们足以
+         * 抓住"代理对被拆散""BMP 被截断""落单代理被吞"这几类漂移。 */
+        if (ok_rt && (wn_c < 4 || w16c[0] != 'R' || w16c[1] != 'e' ||
+                      w16c[2] != 'a' || w16c[3] != 'd'))
+            ok_rt = 0;
+    }
+    ezos_console_write("  u8->u16   n   C=");
+    ezos_console_print_dec((uint32_t)wn_c);
+    ezos_console_write(" rust=");
+    ezos_console_print_dec((uint32_t)wn_r);
+    ezos_console_write(" zig=");
+    ezos_console_print_dec((uint32_t)wn_z);
+    ezos_console_write(ok_rt ? " [OK]\n" : " [FAIL]\n");
+
+    /* =================================================================
+     * Levenshtein：shell 的 "did you mean"。对拍重点是**边界语义**——
+     * 超长串返回 limit+1（早退哨兵）而不是真距离，调用方靠它拒绝。
+     * ================================================================= */
+    static const char *lev_a[] = { "lst", "shel", "desk", "xyzzy", "" };
+    static const char *lev_b[] = { "ls", "shell", "desktop", "ls", "ls" };
+    int ok_lev = 1;
+    for (uint32_t i = 0; i < 5; i++) {
+        uint32_t lc = levenshtein_c(lev_a[i], lev_b[i], 24);
+        uint32_t lr = levenshtein_rs((const uint8_t *)(const void *)lev_a[i],
+                                     (const uint8_t *)(const void *)lev_b[i], 24);
+        uint32_t lz = levenshtein_zig((const uint8_t *)(const void *)lev_a[i],
+                                      (const uint8_t *)(const void *)lev_b[i], 24);
+        if (lc != lr || lc != lz) ok_lev = 0;
+    }
+    /* 超长串哨兵：limit=4 时长度 7 的串必须返回 5（= limit+1） */
+    if (levenshtein_c("abcdefg", "x", 4) != 5 ||
+        levenshtein_rs((const uint8_t *)(const void *)"abcdefg",
+                       (const uint8_t *)(const void *)"x", 4) != 5 ||
+        levenshtein_zig((const uint8_t *)(const void *)"abcdefg",
+                        (const uint8_t *)(const void *)"x", 4) != 5)
+        ok_lev = 0;
+    /* 距离真值抽查：不能"三份都返回同一个错数"就算过 */
+    if (levenshtein_c("lst", "ls", 24) != 1) ok_lev = 0;
+    if (levenshtein_c("kitten", "sitting", 24) != 3) ok_lev = 0;
+    ezos_console_write("  levenshtein    ");
+    ezos_console_write(ok_lev ? "[OK]\n" : "[FAIL]\n");
+
+    /* =================================================================
+     * RFC 1071 Internet 校验和：net.c 生产路径已迁到 Rust，这里三路对拍。
+     * 探针沿用上面那段（含奇数长度 37，钉住"末字节补到高字节位"）。
+     * ================================================================= */
+    uint32_t kr  = cksum_raw_c(probe, (uint32_t)sizeof(probe));
+    uint32_t krr = cksum_raw_rs(probe, (uint32_t)sizeof(probe));
+    uint32_t krz = cksum_raw_zig(probe, (uint32_t)sizeof(probe));
+    uint16_t kc  = cksum_c(probe, (uint32_t)sizeof(probe));
+    uint16_t kcr = cksum_rs(probe, (uint32_t)sizeof(probe));
+    uint16_t kcz = cksum_zig(probe, (uint32_t)sizeof(probe));
+    int ok_ck = (kr == krr) && (kr == krz) && (kc == kcr) && (kc == kcz) &&
+                ((uint16_t)(~kr) == kc);
+    ezos_console_write("  cksum     C=0x");
+    ezos_console_print_hex32(kc);
+    ezos_console_write(" rust=0x");
+    ezos_console_print_hex32(kcr);
+    ezos_console_write(" zig=0x");
+    ezos_console_print_hex32(kcz);
+    ezos_console_write(ok_ck ? " [OK]\n" : " [FAIL]\n");
+
+    int all_ok = ok_sum && ok_set && ok_hash && ok_u16 && ok_tiny &&
+                 ok_rt && ok_lev && ok_ck;
     ezos_console_write("  result: ");
-    ezos_console_write((ok_sum && ok_set && ok_hash) ? "PASS" : "FAIL");
+    ezos_console_write(all_ok ? "PASS" : "FAIL");
     ezos_console_write("\n");
 }
 

@@ -190,6 +190,12 @@ def main():
             ("mem 0xFFFFFFFF 4096", None,         3.0),   # 边界：曾整机 panic
             ("calc",             None,            2.5),   # 空参数
             ("ver",              ("version " + VER), 3.0),   # 末尾仍可用
+            # 拼写建议（shell_closest_command -> Levenshtein，三方对拍过的）：
+            # 手滑打错要给出最接近的内建命令，而不是干巴巴一句 Unknown。
+            ("lst",              "did you mean",  3.0),
+            ("lst",              "ls",            2.5),   # 建议的就是 ls
+            # 离得太远就不该硬凑一个建议出来——"太像噪声"也是缺陷
+            ("qwertyuiop",       "did you mean",  3.0),
         ]
         for cmd, expect, wait in cases:
             try:

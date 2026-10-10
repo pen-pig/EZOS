@@ -20,6 +20,7 @@
 #include "ntfs.h"
 #include "ata.h"
 #include "kmalloc.h"
+#include "rust_bridge.h" /* utf16_to_utf8_active / utf8_to_utf16_active */
 
 /* ---------- 小端读取助手 ---------- */
 static uint16_t rd16(const uint8_t *p) {
@@ -221,15 +222,32 @@ static const uint8_t *nt_find_attr(const uint8_t *rec, uint32_t type, const char
             if (name == 0 && name_len == 0) return a;
             if (name != 0 && name_len > 0) {
                 uint32_t noff = rd16(a + 0xA);
+                if (noff > len) return 0;          /* 名字偏移越出属性值 */
                 const uint8_t *np = a + noff;
-                const char *q = name;
-                int same = 1;
-                for (uint32_t i = 0; i < name_len; i++) {
-                    uint16_t c = rd16(np + i * 2);
-                    if ((char)c != *q) { same = 0; break; }
-                    q++;
+                /* 盘上是 UTF-16LE，name 是 UTF-8，必须先转再比。
+                 *
+                 * 以前这里是 `if ((char)c != *q)`——把 UTF-16 码元截成低
+                 * 字节去和 UTF-8 的**字节**逐个比。ASCII 时碰巧相等，任何
+                 * 非 ASCII 文件名都永远匹配不上（"中" 的码元是 0x4E2D，
+                 * (char)0x4E2D = '-'，跟 UTF-8 首字节 0xE4 根本不像）。
+                 * 而且 tmp 是 256 项缓冲，超长名字会越界写。 */
+                char tmp[512];
+                if (utf16_to_utf8_active((const uint16_t *)(const void *)np,
+                                         name_len, (uint8_t *)(void *)tmp,
+                                         sizeof(tmp)) < 0)
+                    return 0;                      /* 转换失败：不信这份记录 */
+                /* 属性名匹配要**大小写无关**（NTFS 索引按 $UpCase 排序，
+                 * 同一条目可能被写成 "STANDARD" 或 "standard"）。写个就地
+                 * 比较而不是引入依赖：exfat.c 里那个 my_strcmp 是 static，
+                 * 这里用不了，而字符串工具函数在项目里没有统一出口。 */
+                const char *x = tmp, *y = name;
+                while (*x && *y) {
+                    char cx = (*x >= 'A' && *x <= 'Z') ? (char)(*x + 32) : *x;
+                    char cy = (*y >= 'A' && *y <= 'Z') ? (char)(*y + 32) : *y;
+                    if (cx != cy) break;
+                    x++; y++;
                 }
-                if (same && *q == 0) return a;
+                if (*x == 0 && *y == 0) return a;
             }
         }
         off += len;
@@ -259,15 +277,31 @@ static int nt_rec_is_dir(const uint8_t *rec) {
     return rd16(rec + 0x16) & 2;
 }
 
-/* ---------- UTF-16 -> ASCII（截断转写） ---------- */
-static void nt_utf16_to_ascii(const uint8_t *src, uint32_t nchars, char *dst, uint32_t dstmax) {
-    uint32_t i;
-    if (nchars > dstmax - 1) nchars = dstmax - 1;
-    for (i = 0; i < nchars; i++) {
-        uint16_t c = rd16(src + i * 2);
-        dst[i] = (c < 128) ? (char)c : '?';
+/* ---------- UTF-16LE -> UTF-8 ----------
+ *
+ * 这里原来是自己写的一行循环：非 ASCII 一律变成 '?'。问题不是降级本身，
+ * 而是**三个后端各降级各的**——exfat.c 变成 '.'，refs.c 直接判定"不匹配"。
+ * 同一块盘上的同一个中文文件名，三个后端三个答案，用户看到的是随机的
+ * 乱码或"文件不存在"。现在三边统一走 rust_bridge.h 的实现（默认 Rust），
+ * 真正做 UTF-16LE -> UTF-8 转换，CJK 文件名可以原样 ls / cat / cd。
+ *
+ * 契约：装不下返回 -1。**绝不返回半截名字**——半截名字比没有名字更坏，
+ * 它会匹配到错误的文件（本项目反复吃过的亏：拿不到就 fail closed）。
+ * 调用方一律当 void 用：转换失败时宁可让这次查找失败，也不能用残缺名字
+ * 继续比下去。 */
+static void nt_utf16_to_utf8(const uint8_t *src, uint32_t nchars,
+                             char *dst, uint32_t dstmax) {
+    if (utf16_to_utf8_active((const uint16_t *)(const void *)src, nchars,
+                             (uint8_t *)(void *)dst, dstmax) < 0) {
+        dst[0] = 0;
     }
-    dst[i] = 0;
+}
+
+/* 兼容旧调用点名的别名：语义已经不是"转 ASCII"而是"转 UTF-8"，
+ * 但改名会让 6 处调用点全变，读 diff 时反而看不出改了什么。 */
+static void nt_utf16_to_ascii(const uint8_t *src, uint32_t nchars,
+                              char *dst, uint32_t dstmax) {
+    nt_utf16_to_utf8(src, nchars, dst, dstmax);
 }
 
 static char nt_lower(char c) {
@@ -275,6 +309,16 @@ static char nt_lower(char c) {
     return c;
 }
 
+/* NTFS 文件名比较：规范要求按 **UTF-16 码元** 大小写无关比较，且用的是
+ * $UpCase 表。这里没有那张表，只能对 ASCII 做 A-Z -> a-z。
+ *
+ * 局限要说清楚：**非 ASCII 不做大小写折叠**，所以 "Ä" 和 "ä" 在内核看来
+ * 是两个不同文件。这是"比不做比较强"的选择——真实语义要读 $UpCase（一个
+ * up 到 65536 项的表，通常在索引里），代价是每个目录项多一次随机读；
+ * 等哪天 NTFS 变成主要在用格式再补，现在不值得。
+ *
+ * 但**字节级比较必须走 UTF-8 视图**：目录项里是 UTF-16LE，直接拿
+ * 原始字节比会把同一个字符的两字节拆开跟别的字符比，等于乱比。 */
 static int nt_name_eq(const char *a, const char *b) {
     while (*a && *b) {
         if (nt_lower(*a) != nt_lower(*b)) return 0;
@@ -822,7 +866,20 @@ static void nt_free_cluster(uint32_t lcn) {
 }
 
 /* ---------- $FILE_NAME 值构造（key：flags@+0x38, EA@+0x3C,
- * name_len@+0x40, ns@+0x41, name@+0x42；与 nt_walk_entries 读取一致） ---------- */
+ * name_len@+0x40, ns@+0x41, name@+0x42；与 nt_walk_entries 读取一致） ----------
+ *
+ * **name_len 是 UTF-16 码元数，不是 UTF-8 字节数**。以前这两者被当成同一个
+ * 量（`while (fname[i]) i++` 数的是字节），对 ASCII 恰好相等所以一直没露馅，
+ * 一旦文件名里出现非 ASCII：写出去的是"每字节一个 Latin-1 码元"（"中" ->
+ * U+00E4 U+00B8 两个字符），而 key_len / name_len 字段仍按字节算——Windows
+ * 读到的文件名与目录项自述的长度对不上，判卷损坏。
+ *
+ * 现在三个入口（create_file / mkdir / rmdir）先调 nt_utf16_units() 把名字
+ * 转成真正的 UTF-16 码元序列，一路把**码元数**传下来；本函数拿 name 直接
+ * 做转换，不再逐字节搬运。转换失败（名字过长 / 含非法序列）返回 -1，
+ * 调用方一律当失败处理——绝不写一个半截名字进索引，那比写不进去更糟：
+ * 它会让后续所有查找匹配到错误的条目。
+ */
 static void nt_build_filename_key(uint8_t *key, uint32_t parent_mftno,
                                    const char *name, uint32_t name_len,
                                    int is_dir, uint32_t alloc_sz, uint32_t real_sz) {
@@ -833,8 +890,27 @@ static void nt_build_filename_key(uint8_t *key, uint32_t parent_mftno,
     nt_wr32(key + 0x38, is_dir ? NT_ATTR_DIRECTORY : 0);
     key[0x40] = (uint8_t)name_len;
     key[0x41] = 1;                                        /* WINDOWS 命名空间 */
-    for (uint32_t i = 0; i < name_len; i++)
-        nt_wr16(key + 0x42 + i * 2, (uint16_t)(uint8_t)name[i]);
+    /* 真正的 UTF-8 -> UTF-16LE：BMP 之外的码点写成代理对。
+     * 装不下时把名字清空（调用方会因 name_len==0 而失败），不写半截。 */
+    if (utf8_to_utf16_active((const uint8_t *)(const void *)name,
+                             (uint16_t *)(void *)(key + 0x42),
+                             name_len) != (int32_t)name_len) {
+        for (uint32_t i = 0; i < 0x42 + name_len * 2; i++) key[i] = 0;
+        key[0x40] = 0;
+    }
+}
+
+/* UTF-8 文件名 -> UTF-16 码元个数。返回 0 表示失败（名字为空 / 转换
+ * 装不下 255 码元上限）。**这是 NTFS 名字长度的唯一计算入口**——以前
+ * 三处各写一遍 `while (s[i]) i++`，数的是 UTF-8 字节数。 */
+static uint32_t nt_utf16_units(const char *name) {
+    /* 255 是 NTFS $FILE_NAME 的 name_len 上限（1 字节字段）。
+     * 留一个码元的余量给转换失败时的判定。 */
+    uint16_t tmp[256];
+    int32_t n = utf8_to_utf16_active((const uint8_t *)(const void *)name,
+                                     tmp, 256);
+    if (n <= 0 || n > 255) return 0;
+    return (uint32_t)n;
 }
 
 /* ---------- runlist 编码（ntfs-3g mkntfs 同构，变长字段） ----------
@@ -1669,8 +1745,8 @@ int ntfs_create_file(const char *name, const uint8_t *data, uint32_t size) {
     char fname[256];
     if (nt_split_path(name, parent_path, sizeof(parent_path), fname) != 0)
         return -1;
-    uint32_t name_len = 0;
-    while (fname[name_len]) name_len++;
+    uint32_t name_len = nt_utf16_units(fname);
+    if (name_len == 0) return -1;   /* 名字非法或超 255 码元上限 */
 
     /* 载入两张位图 */
     if (nt_maps_load() != 0) return -1;
@@ -1814,8 +1890,8 @@ int ntfs_mkdir(const char *name) {
     char fname[256];
     if (nt_split_path(name, parent_path, sizeof(parent_path), fname) != 0)
         return -1;
-    uint32_t name_len = 0;
-    while (fname[name_len]) name_len++;
+    uint32_t name_len = nt_utf16_units(fname);
+    if (name_len == 0) return -1;
 
     if (nt_maps_load() != 0) return -1;
     uint32_t parent = nt_resolve_dir(parent_path);
@@ -1867,10 +1943,14 @@ int ntfs_rmdir(const char *path) {
     /* 抽取父路径与叶名；根 "/" 与无叶名情形由 split 失败覆盖 */
     if (nt_split_path(path, parent_path, sizeof(parent_path), fname) != 0)
         return -1;
+    /* "." / ".." 按 UTF-8 字节判断（这两个名字必然是 ASCII） */
     while (fname[name_len]) name_len++;
     if (name_len == 1 && fname[0] == '.') return -1;   /* "." */
     if (name_len == 2 && fname[0] == '.' && fname[1] == '.') return -1; /* ".." */
-
+    /* 往下传的是 UTF-16 码元数（rmdir 也要经过 nt_dir_insert -> nt_indx_insert，
+     * 那条路用 name_len 算 key 长度；字节数在这里是错的）。 */
+    name_len = nt_utf16_units(fname);
+    if (name_len == 0) return -1;
     if (nt_maps_load() != 0) return -1;
 
     uint32_t parent = nt_resolve_dir(parent_path);

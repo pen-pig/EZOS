@@ -89,6 +89,14 @@ jobs:
           EZOS_CC: gcc
         run: python3 tools/check_stack.py
 
+      # 指令集闸门：Rust / Zig 产物里不许出现 SSE/SSE2。内核只做 fninit
+      # （x87），从不设 CR4.OSFXSR、也不保存 XMM 上下文——那些指令必然
+      # #UD。实测踩过：Zig 的 levenshtein_zig 里一个数组清零被编成
+      # movdqa，rstest 一跑就 panic（vector 06）。Zig 默认 baseline 档
+      # 允许 SSE，必须显式 -mcpu i686。
+      - name: CPU feature guard (no SSE in Rust/Zig objects)
+        run: python3 tools/check_cpu.py
+
       - name: Generate data disk
         run: python3 temp/gen_diskimg.py disk.img
 

@@ -49,6 +49,7 @@
  */
 #include "refs.h"
 #include "ata.h"
+#include "rust_bridge.h" /* utf16_to_utf8_active / utf8_to_utf16_active */
 
 /* ---------- 小端读写助手 ---------- */
 static uint16_t rd16(const uint8_t *p) {
@@ -456,61 +457,87 @@ static int rs_node_check(const uint8_t *node, uint32_t area_size, uint32_t nho) 
     return 0;
 }
 
-/* ---------- UTF-16LE 名字工具 ---------- */
+/* ---------- UTF-16LE 名字工具 ----------
+ *
+ * key 里存的是 UTF-16LE（DE_KEY_HDR 之后），而内核其余地方（shell 命令行、
+ * fs_dir_entry_t.name、sysvol 源文件）是 UTF-8。以前这里有**三处各自为政**
+ * 的有损转换：编码时每字节当 Latin-1、比较时"非 ASCII 直接判不等"、
+ * 列出时变成 '?'。结果是同一个中文文件名在 ReFS 上既列得出来又永远
+ * 匹配不上。现在统一走 rust_bridge.h 的实现（默认 Rust），三边一致。 */
 static char rs_lower(char c) {
     return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
 }
-/* 编码 entry key：0x0030 + 类型 + UTF-16LE 名。返回 key 大小 */
+
+/* 编码 entry key：0x0030 + 类型 + UTF-16LE 名。返回 key 大小，0 = 失败。
+ * 失败条件：名字超过 RS_NAME_MAX 个 **UTF-16 码元**，或含非法 UTF-8。
+ * 宁可写不进去也不写半截——entry key 的长度是自描述的，半截名字会让
+ * 后续所有遍历从错位处开始。 */
 static uint32_t rs_name_encode(uint8_t *key, const char *name, uint16_t etype) {
     wr16(key + 0, 0x0030);
     wr16(key + DE_TYPE_OFF, etype);
-    uint32_t l = 0;
-    while (name[l] && l < RS_NAME_MAX) {
-        wr16(key + DE_KEY_HDR + l * 2, (uint16_t)(uint8_t)name[l]);
-        l++;
-    }
-    return DE_KEY_HDR + l * 2;
+    int32_t n = utf8_to_utf16_active((const uint8_t *)(const void *)name,
+                                     (uint16_t *)(void *)(key + DE_KEY_HDR),
+                                     RS_NAME_MAX);
+    if (n <= 0) return 0;
+    return DE_KEY_HDR + (uint32_t)n * 2;
 }
-/* entry key 名字与 ASCII 名比较（大小写不敏感）；0=相等 */
+
+/* entry key 名字与 UTF-8 名比较（大小写不敏感）；0=相等。
+ * 先把盘上的 UTF-16LE 转成 UTF-8 再比——以前是
+ * `if (c >= 0x80) return 1`，也就是**任何非 ASCII 文件名一律判不等**：
+ * 中文文件在 ReFS 上 ls 得出来，却永远 cat / cd 不到。 */
 static int rs_key_name_eq(const uint8_t *key, uint32_t ksize, const char *name) {
-    uint32_t namesz = ksize - DE_KEY_HDR;
-    uint32_t l = 0;
-    while (name[l]) l++;
-    if (l * 2 != namesz) return 1;
-    for (uint32_t i = 0; i < l; i++) {
-        uint16_t c = rd16(key + DE_KEY_HDR + i * 2);
-        if (c >= 0x80) return 1;                    /* 非 ASCII 不匹配 */
-        if ((char)rs_lower((char)c) != rs_lower(name[i])) return 1;
+    uint32_t namesz = (ksize - DE_KEY_HDR) / 2;
+    char tmp[512];
+    if (utf16_to_utf8_active((const uint16_t *)(const void *)(key + DE_KEY_HDR),
+                             namesz, (uint8_t *)(void *)tmp,
+                             sizeof(tmp)) < 0)
+        return 1;                          /* 转不出来：不认 */
+    const char *x = tmp, *y = name;
+    while (*x && *y) {
+        if (rs_lower(*x) != rs_lower(*y)) return 1;
+        x++; y++;
     }
-    return 0;
+    return (*x == 0 && *y == 0) ? 0 : 1;
 }
-/* 名字排序比较（key1 vs key2，大小写不敏感，升序） */
+
+/* 名字排序比较（key1 vs key2，大小写不敏感，升序）。
+ * key 是目录的**索引顺序**，错序不会丢文件但会让 ls 顺序不对。
+ * 转成 UTF-8 后按字节比：非 ASCII 按 UTF-8 字节序（等价于码点序），
+ * 这与 ReFS 自己的定序不完全一致，但稳定且可复现——比旧的"一律当 0x7F"
+ * （把所有非 ASCII 名字视作相等，比较结果退化成乱序）好得多。 */
 static int rs_key_name_cmp(const uint8_t *k1, uint32_t s1,
                            const uint8_t *k2, uint32_t s2) {
-    uint32_t n1 = (s1 - DE_KEY_HDR) / 2;
-    uint32_t n2 = (s2 - DE_KEY_HDR) / 2;
-    uint32_t n = (n1 < n2) ? n1 : n2;
+    char a_buf[512], b_buf[512];
+    uint32_t n1u = (s1 - DE_KEY_HDR) / 2, n2u = (s2 - DE_KEY_HDR) / 2;
+    if (utf16_to_utf8_active((const uint16_t *)(const void *)(k1 + DE_KEY_HDR),
+                             n1u, (uint8_t *)(void *)a_buf,
+                             sizeof(a_buf)) < 0) a_buf[0] = 0;
+    if (utf16_to_utf8_active((const uint16_t *)(const void *)(k2 + DE_KEY_HDR),
+                             n2u, (uint8_t *)(void *)b_buf,
+                             sizeof(b_buf)) < 0) b_buf[0] = 0;
+    uint32_t la = 0, lb = 0;
+    while (a_buf[la]) la++;
+    while (b_buf[lb]) lb++;
+    uint32_t n = la < lb ? la : lb;
     for (uint32_t i = 0; i < n; i++) {
-        uint16_t c1 = rd16(k1 + DE_KEY_HDR + i * 2);
-        uint16_t c2 = rd16(k2 + DE_KEY_HDR + i * 2);
-        char a = (c1 < 0x80) ? rs_lower((char)c1) : (char)0x7F;
-        char b = (c2 < 0x80) ? rs_lower((char)c2) : (char)0x7F;
-        if (a != b) return (a < b) ? -1 : 1;
+        unsigned char ca = (unsigned char)rs_lower(a_buf[i]);
+        unsigned char cb = (unsigned char)rs_lower(b_buf[i]);
+        if (ca != cb) return (ca < cb) ? -1 : 1;
     }
-    if (n1 == n2) return 0;
-    return (n1 < n2) ? -1 : 1;
+    if (la == lb) return 0;
+    return (la < lb) ? -1 : 1;
 }
-/* entry key 名字 -> ASCII（有损转换，fs_dir_entry_t.name 用） */
+
+/* entry key 名字 -> UTF-8（fs_dir_entry_t.name 用）。
+ * 转换失败（名字损坏 / 装不下）时给空串：上层会当成无名条目，但绝不会
+ * 拿到一个错的名字再拿它去操作别的文件。 */
 static void rs_key_name_asc(const uint8_t *key, uint32_t ksize,
                             char *out, uint32_t cap) {
     uint32_t namesz = (ksize - DE_KEY_HDR) / 2;
-    uint32_t l = 0;
-    while (l < namesz && l + 1 < cap) {
-        uint16_t c = rd16(key + DE_KEY_HDR + l * 2);
-        out[l] = (c < 0x80) ? (char)c : '?';
-        l++;
-    }
-    out[l] = 0;
+    if (utf16_to_utf8_active((const uint16_t *)(const void *)(key + DE_KEY_HDR),
+                             namesz, (uint8_t *)(void *)out, cap) < 0)
+        out[0] = 0;
 }
 
 /* ---------- 目录 entry 解析 ---------- */
@@ -1250,6 +1277,10 @@ int refs_create_file(const char *path, const uint8_t *data, uint32_t size) {
     }
     uint8_t key[DE_KEY_HDR + RS_NAME_MAX * 2];
     uint32_t ksize = rs_name_encode(key, fname, DE_TYPE_FILE);
+    if (ksize == 0) {                 /* 名字超长或非法 UTF-8：一个字节都不写 */
+        rs_rollback_alloc(nblk, nblk);
+        return -1;
+    }
     if (rs_dir_insert_sorted(nnode, key, ksize, 0x0008,
                              rs_databuf, vsize) != 0) {
         rs_rollback_alloc(nblk, nblk);
@@ -1317,6 +1348,11 @@ int refs_mkdir(const char *path) {
     uint8_t *nnode = rs_loaded_node(rs_blk2);
     uint8_t key[DE_KEY_HDR + RS_NAME_MAX * 2];
     uint32_t ksize = rs_name_encode(key, fname, DE_TYPE_DIR);
+    if (ksize == 0) {                 /* 名字超长或非法 UTF-8 */
+        rs_rollback_alloc(1, 1);
+        rs_next_subid--;
+        return -1;
+    }
     if (rs_dir_insert_sorted(nnode, key, ksize, 0, dval, DV_SIZE) != 0) {
         rs_rollback_alloc(1, 1);        /* sub_blk：指针与 used_blocks 都已推进 */
         rs_next_subid--;

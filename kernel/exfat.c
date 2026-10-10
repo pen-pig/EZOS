@@ -217,8 +217,23 @@ static void exfat_write_timestamp(uint8_t *dst) {
 }
 
 // 计算 entry set 需要的条目数（0x85 + 0xC0 + ceil(name_len/15) 个 0xC1）
+// **name_len 必须是 UTF-16 码元数**，不是 UTF-8 字节数：0xC1 每个条目放 15 个
+// 码元，NameLength 字段也是码元数。传错的话名字条目数会算少，SetChecksum
+// 覆盖不到全部条目，Windows 判卷损坏。
 static int exfat_entry_set_count(int name_len) {
     return 2 + (name_len + 14) / 15;
+}
+
+// UTF-8 文件名 -> exFAT 目录项里的 UTF-16 码元个数。
+// 返回 <=0 表示无法表示（空名 / 非法 UTF-8 / 超过 255 码元上限）。
+// 这是 exFAT 侧**名字长度的唯一计算入口**——以前散在各处 `while (s[i]) i++`
+// 数的是字节数，对非 ASCII 会算少。
+static int exfat_name_units(const char *name) {
+    uint16_t tmp[256];
+    int32_t n = utf8_to_utf16_active((const uint8_t *)(const void *)name,
+                                     tmp, 256);
+    if (n <= 0 || n > 255) return 0;
+    return (int)n;
 }
 
 // 在目录缓冲区中找连续空闲条目区（空闲=0x00 或已删除=最高位为0）。
@@ -315,15 +330,28 @@ static uint32_t exfat_extend_dir(uint32_t dir_cluster) {
     return new_cl;
 }
 
-// 将文件/目录的 entry set 写入 dir_buf 的 free_off 处
-static void exfat_write_entry_set(uint8_t *dir_buf, int free_off,
-                                  const char *name, uint32_t first_cluster,
-                                  uint32_t size, uint8_t is_dir) {
-    int name_len = 0;
-    while (name[name_len]) name_len++;
-    /* exFAT 文件名上限 255 个 UTF-16 字符。超限就截断（fail closed）：名字
-     * 来自调用方，缓冲只有 256 项，越界写会踩到栈上别的字段。 */
-    if (name_len > 255) name_len = 255;
+// 将文件/目录的 entry set 写入 dir_buf 的 free_off 处。
+// 返回 0 = 成功；-1 = 名字无法表示（非法 UTF-8 / 超过 255 码元），
+// 此时**一个字节都不会写**。
+static int exfat_write_entry_set(uint8_t *dir_buf, int free_off,
+                                 const char *name, uint32_t first_cluster,
+                                 uint32_t size, uint8_t is_dir) {
+    /* UTF-8 -> UTF-16LE（真正转，不是每个字节当 Latin-1）。
+     *
+     * 以前是 `name_utf16[i] = (uint8_t)name[i]`：UTF-8 的每个**字节**塞进
+     * 一个 UTF-16 码元。"中" 的 UTF-8 是 E4 B8 AD，于是盘上写成三个字符
+     * U+00E4 U+00B8 U+00AD —— Windows 读出来是"ä¸­"。规范要求的是一个
+     * 码元 U+4E2D。
+     *
+     * 转换失败或超过 255 码元（exFAT 上限，NameLength 是 1 字节）就返回 0，
+     * 调用方必须把它当失败处理。**绝不截断**：截断出来的名字会指向另一个
+     * 条目，比写不进去危险得多——它能覆盖掉已有文件。 */
+    uint16_t name_utf16[256];
+    for (int i = 0; i < 256; i++) name_utf16[i] = 0;
+    int32_t n16 = utf8_to_utf16_active((const uint8_t *)(const void *)name,
+                                       name_utf16, 255);
+    if (n16 <= 0 || n16 > 255) return -1;       /* fail closed：一个字节都不写 */
+    int name_len = (int)n16;                    /* 码元数，不是字节数 */
     int name_entries = (name_len + 14) / 15;
     int secondary_count = 1 + name_entries;
 
@@ -343,12 +371,6 @@ static void exfat_write_entry_set(uint8_t *dir_buf, int free_off,
     ec0[0] = 0xC0;
     ec0[1] = (size <= exfat_info.bytes_per_sector * exfat_info.sectors_per_cluster) ? 0x02 : 0x00;   // 单簇文件 NoFatChain，多簇用 FAT 链
     ec0[3] = (uint8_t)name_len;   // NameLength
-    /* 整块清零：hash 现在由另一个编译单元算（rust_bridge.h 选中的实现），
-     * 编译器看不到 name_len 的上界，会认为读到了未初始化元素
-     * （-Werror=maybe-uninitialized）。清零本身也不贵（256 项）。 */
-    uint16_t name_utf16[256];
-    for (int i = 0; i < 256; i++) name_utf16[i] = 0;
-    for (int i = 0; i < name_len; i++) name_utf16[i] = (uint16_t)(uint8_t)name[i];
     *((uint16_t*)(ec0 + 4)) = exfat_name_hash_active(name_utf16, (uint32_t)name_len);  // NameHash
     *((uint64_t*)(ec0 + 8)) = size;    // ValidDataLength
     *((uint32_t*)(ec0 + 0x14)) = first_cluster;  // FirstCluster
@@ -362,7 +384,7 @@ static void exfat_write_entry_set(uint8_t *dir_buf, int free_off,
         for (int i = 0; i < 15; i++) {
             int idx = n * 15 + i;
             if (idx < name_len) {
-                *((uint16_t*)(ec1 + 2 + i * 2)) = (uint16_t)(uint8_t)name[idx];
+                *((uint16_t*)(ec1 + 2 + i * 2)) = name_utf16[idx];
             } else {
                 *((uint16_t*)(ec1 + 2 + i * 2)) = 0x0000;
             }
@@ -373,6 +395,7 @@ static void exfat_write_entry_set(uint8_t *dir_buf, int free_off,
     int total_bytes = (2 + name_entries) * 32;
     uint16_t chk = exfat_set_checksum(dir_buf + free_off, total_bytes);
     *((uint16_t*)(e85 + 2)) = chk;
+    return 0;
 }
 
 // 解析 entry set，将 0x85 条目合并为兼容结构输出：
@@ -439,15 +462,21 @@ static int exfat_find_entry(uint32_t dir_cluster, const char *name, uint8_t *out
             if (off + (uint32_t)(1 + sec_count) * 32 > total_size) return -1;
             uint8_t merged[1024];
             if (exfat_parse_entry_set(entry, merged) == 0) {
-                    char entry_name[256];
+                    /* merged[2] 是 UTF-16 码元数，merged+4 起是 UTF-16LE 名。
+                     * 转成 UTF-8 再比——以前这里是 `if (ch < 128) ... else '.'`，
+                     * 非 ASCII 一律变成点号，于是同一个中文文件名在 exFAT 上
+                     * 叫 "..."，在 NTFS 上叫 "???"，在 ReFS 上根本匹配不上。
+                     * 现在三边统一（见 kernel/textenc.c）。 */
+                    char entry_name[512];
                     int name_len = merged[2];
-                    int nlen = 0;
-                    for (int i = 0; i < name_len && i < 255; i++) {
-                        uint16_t ch = *((uint16_t*)(merged + 4 + i * 2));
-                        if (ch < 128) entry_name[nlen++] = (char)ch;
-                        else entry_name[nlen++] = '.';
-                    }
-                    entry_name[nlen] = '\0';
+                    if (utf16_to_utf8_active((const uint16_t *)(void *)(merged + 4),
+                                             (uint32_t)name_len,
+                                             (uint8_t *)(void *)entry_name,
+                                             sizeof(entry_name)) < 0)
+                        continue;   /* 名字转不出来：不是我们要找的那个 */
+                    /* exFAT 文件名比较按 Up-case Table 大小写无关进行；
+                     * 内核没有那张表，ASCII 段用 A-Z -> a-z。my_strcmp
+                     * 本来就是这个语义（my_upper_char），直接复用。 */
                     if (my_strcmp(entry_name, name) == 0) {
                         if (out_entry) {
                             for (int i = 0; i < 1024; i++) out_entry[i] = merged[i];
@@ -811,8 +840,8 @@ int exfat_mkdir(const char *name) {
     uint32_t dir_clusters = exfat_read_dir_chain(parent_cluster, dbuf, 16);
     if (dir_clusters == 0) goto restore;
 
-    int name_len = 0;
-    while (dir_name[name_len]) name_len++;
+    int name_len = exfat_name_units(dir_name);
+    if (name_len == 0) goto restore;    /* 名字无法用 UTF-16 表示 */
     int need = exfat_entry_set_count(name_len);
     int free_off = exfat_find_free_set(dbuf, dir_clusters * cluster_size, cluster_size, need);
     if (free_off == -1) {
@@ -824,7 +853,8 @@ int exfat_mkdir(const char *name) {
         if (free_off == -1) goto restore;
     }
 
-    exfat_write_entry_set(dbuf, free_off, dir_name, new_cluster, 0, 1);
+    if (exfat_write_entry_set(dbuf, free_off, dir_name, new_cluster, 0, 1) != 0)
+        goto restore;
     exfat_fix_dir_layout(dbuf, dir_clusters * cluster_size);
     if (exfat_write_cluster(parent_cluster, dbuf) != 0) goto restore;
     if (dir_clusters > 1) {
@@ -1305,17 +1335,25 @@ int exfat_read_dir_cluster(uint32_t cluster, exfat_dir_entry_t *entries, int max
             }
             uint8_t merged[1024];
             if (exfat_parse_entry_set(entry, merged) == 0) {
+                /* merged[2] 是 UTF-16 码元数，merged+4 起是 UTF-16LE 名。
+                 * 转成真正的 UTF-8 再交给上层（ls / cat / cd）。
+                 *
+                 * 以前这里是 `if (ch >= 32 && ch <= 126) ... else '.'`：
+                 * 中文文件名在 ls 里全变成一串点，用户根本没法复制、没法 cd，
+                 * 而 exfat_find_entry 又用另一套降级（也是 '.'）去匹配——
+                 * 两处碰巧一致才没露馅，但和 ntfs（'?'）、refs（不匹配）
+                 * 放到一起就是三套标准。 */
                 int name_len = merged[2];
-                int nlen = 0;
-                for (int i = 0; i < name_len && i < 255; i++) {
-                    uint16_t ch = *((uint16_t*)(merged + 4 + i * 2));
-                    if (ch >= 32 && ch <= 126) {
-                        entries[count].name[nlen++] = (char)ch;
-                    } else {
-                        entries[count].name[nlen++] = '.';
-                    }
+                int n = utf16_to_utf8_active(
+                    (const uint16_t *)(void *)(merged + 4), (uint32_t)name_len,
+                    (uint8_t *)(void *)entries[count].name,
+                    sizeof(entries[count].name));
+                /* 转不动（名字损坏 / 装不下）就跳过这条：宁可少列一个，
+                 * 也不要给用户看一个错的文件名再去操作它。 */
+                if (n < 0) {
+                    offset += (1 + sec_count) * 32;
+                    continue;
                 }
-                entries[count].name[nlen] = '\0';
                 entries[count].size = *((uint32_t*)(merged + EXFAT_MERGED_SIZE_OFF));
                 entries[count].is_dir = (merged[1] & EXFAT_ATTR_DIRECTORY) ? 1 : 0;
                 count++;
@@ -1452,11 +1490,11 @@ int exfat_create_file(const char *name, const uint8_t *data, uint32_t size) {
     char leaf[256];
     if (exfat_resolve_leaf(name, &dir, leaf, sizeof(leaf)) != 0) return -1;
 
-    int name_len = 0;
-    while (leaf[name_len]) name_len++;
+    /* UTF-16 码元数，不是 UTF-8 字节数（0xC1 每条目 15 个码元、NameLength
+     * 也是码元数，用字节数算会算少条目数，SetChecksum 覆盖不全 -> 判卷损坏）。
+     * 255 是 exFAT 规范的文件名长度上限，正好也是 epos[3] 一字节能表示的。 */
+    int name_len = exfat_name_units(leaf);
     if (name_len == 0) return -1;
-    /* exFAT 规范文件名最长 255 字符，防止 name_utf16 缓冲区溢出 */
-    if (name_len > 255) return -1;
 
     // 重名检查
     uint8_t exist_entry[1024];
@@ -1534,7 +1572,9 @@ int exfat_create_file(const char *name, const uint8_t *data, uint32_t size) {
     }
 
     // 写 entry set
-    exfat_write_entry_set(root_buffer, free_entry_offset, leaf, start_cluster, size, 0);
+    if (exfat_write_entry_set(root_buffer, free_entry_offset, leaf,
+                              start_cluster, size, 0) != 0)
+        return -1;
     exfat_fix_dir_layout(root_buffer, dir_clusters * cluster_size);
     if (exfat_write_cluster(root_cluster, root_buffer) != 0) {
         exfat_free_cluster_chain(start_cluster);

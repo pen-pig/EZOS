@@ -25,6 +25,7 @@
  * 轮询而非中断：与 AHCI/网络栈一致（不接 MSI-X），命令超时即 fail closed。
  */
 #include "nvme.h"
+#include "mem.h"       /* memcpy/memset：内核唯一实现 */
 #include "pci.h"
 #include "paging.h"
 #include "dmesg.h"
@@ -105,17 +106,6 @@ static uint8_t  g_ns_n;
 static int      g_ready;              /* 控制器已 enable 且队列就绪 */
 
 /* ---------- 小工具 ---------- */
-static void n_memset(void *dst, uint8_t v, uint32_t n) {
-    uint8_t *p = (uint8_t *)dst;
-    while (n--) *p++ = v;
-}
-
-static void n_memcpy(void *dst, const void *src, uint32_t n) {
-    uint8_t *d = (uint8_t *)dst;
-    const uint8_t *s = (const uint8_t *)src;
-    while (n--) *d++ = *s++;
-}
-
 static void n_str(char *b, int *n, int lim, const char *s) {
     while (*s && *n < lim) b[(*n)++] = *s++;
 }
@@ -203,7 +193,7 @@ static int n_complete(volatile uint32_t *cq, uint32_t depth, uint32_t *head,
 static int n_admin(uint8_t opc, uint32_t nsid, uint64_t prp1,
                    uint32_t cdw10, uint32_t cdw11, uint32_t *res) {
     uint32_t c[16];
-    n_memset(c, 0, sizeof(c));
+    memset(c, 0, sizeof(c));
     c[0] = (uint32_t)opc;
     c[1] = nsid;
     c[6] = (uint32_t)(prp1 & 0xFFFFFFFFu);
@@ -231,10 +221,10 @@ static uint32_t id_read32(const uint8_t *p, int off) {
 static int n_io_sector(uint8_t ns, uint32_t lba, uint8_t *buffer, int write) {
     if (!g_ready || ns >= NVME_MAX_NS || ns >= g_ns_n) return -1;
     if (g_ns_sect[ns] == 0u || lba >= g_ns_sect[ns]) return -1;   /* 越界 fail closed */
-    if (write) n_memcpy(g_data, buffer, 512);
+    if (write) memcpy(g_data, buffer, 512);
 
     uint32_t c[16];
-    n_memset(c, 0, sizeof(c));
+    memset(c, 0, sizeof(c));
     c[0] = write ? OPC_NVM_WRITE : OPC_NVM_READ;
     c[1] = g_ns_nsid[ns];
     c[6] = (uint32_t)((uint64_t)(unsigned long)g_data & 0xFFFFFFFFu);
@@ -262,7 +252,7 @@ static int n_io_sector(uint8_t ns, uint32_t lba, uint8_t *buffer, int write) {
         dmesg_write(line);
         return -1;
     }
-    if (!write) n_memcpy(buffer, g_data, 512);
+    if (!write) memcpy(buffer, g_data, 512);
     return 0;
 }
 
@@ -431,10 +421,10 @@ int nvme_init(void) {
         }
 
         /* ---------- 3. 队列属性与基址 ---------- */
-        n_memset(g_asq, 0, sizeof(g_asq));
-        n_memset(g_acq, 0, sizeof(g_acq));
-        n_memset(g_iosq, 0, sizeof(g_iosq));
-        n_memset(g_iocq, 0, sizeof(g_iocq));
+        memset(g_asq, 0, sizeof(g_asq));
+        memset(g_acq, 0, sizeof(g_acq));
+        memset(g_iosq, 0, sizeof(g_iosq));
+        memset(g_iocq, 0, sizeof(g_iocq));
         /* 深度不能超过 CAP.MQES+1（不可信字段，取小者） */
         uint32_t adepth = NV_ADMIN_DEPTH;
         if (mqes < adepth) adepth = mqes;
@@ -476,7 +466,7 @@ int nvme_init(void) {
         nw(NV_INTMS, 0xFFFFFFFFu);
 
         /* ---------- 6. Identify Controller（CNS=1） ---------- */
-        n_memset(g_ident, 0, sizeof(g_ident));
+        memset(g_ident, 0, sizeof(g_ident));
         if (n_admin(OPC_IDENTIFY, 0u, (uint64_t)(unsigned long)g_ident,
                     1u /* CNS=1 */, 0u, 0) != 0) {
             dmesg_write("NVME: IDENTIFY controller failed, skip");
@@ -530,7 +520,7 @@ int nvme_init(void) {
 
         /* ---------- 8. 逐个 Identify Namespace（CNS=0） ---------- */
         for (uint32_t nsid = 1u; nsid <= nn && g_ns_n < NVME_MAX_NS; nsid++) {
-            n_memset(g_ident, 0, sizeof(g_ident));
+            memset(g_ident, 0, sizeof(g_ident));
             if (n_admin(OPC_IDENTIFY, nsid, (uint64_t)(unsigned long)g_ident,
                         0u /* CNS=0 */, 0u, 0) != 0) {
                 continue;                                    /* 该 NSID 无效 */

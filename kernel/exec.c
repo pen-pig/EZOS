@@ -23,6 +23,7 @@
  *     用户程序传进来的指针由内核解引用前还要再过一次 user_range_ok。
  */
 #include "exec.h"
+#include "mem.h"       /* memset：内核唯一实现 */
 #include "elf.h"
 #include "fs.h"
 #include "sysvol.h"
@@ -34,11 +35,6 @@
 #include "kmalloc.h"
 
 /* ---------- 小工具（不依赖 libc） ---------- */
-static void x_memset(void *dst, uint8_t v, uint32_t n) {
-    uint8_t *d = (uint8_t *)dst;
-    for (uint32_t i = 0; i < n; i++) d[i] = v;
-}
-
 static uint32_t x_strlen(const char *s) {
     uint32_t n = 0;
     while (s[n]) n++;
@@ -155,8 +151,8 @@ static int exec_spawn(const char *name, const char *args, const char **why, int 
         FAIL(-4, "out of pages for process address space");
     }
     /* pmm 契约：返回的页内容未定义，交出去前必须自己清零 */
-    x_memset((void *)pd_phys, 0, PMM_PAGE_SIZE);
-    x_memset((void *)pt_phys, 0, PMM_PAGE_SIZE);
+    memset((void *)pd_phys, 0, PMM_PAGE_SIZE);
+    memset((void *)pt_phys, 0, PMM_PAGE_SIZE);
 
     /* 内核区在**所有**进程页目录里共享同一批页表（identity + LFB），
      * 用户区（4-8MB，PDE 索引 1）换成本进程私有页表。 */
@@ -211,7 +207,7 @@ static int exec_spawn(const char *name, const char *args, const char **why, int 
             FAIL(-5, "user stack mapping failed");
         }
     }
-    x_memset((void *)stack_base, 0, pages * PMM_PAGE_SIZE);
+    memset((void *)stack_base, 0, pages * PMM_PAGE_SIZE);
 
     /* ---- 4) argc / argv：argv[0] 是程序名，其后是命令行参数 ---- */
     uint32_t sp = USER_STACK_TOP;

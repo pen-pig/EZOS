@@ -2,6 +2,7 @@
  * task.c - 任务与抢占式调度器（步骤 6a）
  */
 #include "task.h"
+#include "mem.h"       /* memcpy：内核唯一实现 */
 #include "gdt.h"
 #include "isr.h"        /* g_pit_ticks */
 #include "panic.h"
@@ -37,12 +38,6 @@ static wait_queue_t g_wq_reap = {-1};
 extern void switch_to(uint32_t *old_esp, uint32_t new_esp);
 
 /* ---------- 无 libc 小工具（fork 复制地址空间用） ---------- */
-static void t_memcpy(void *dst, const void *src, uint32_t n) {
-    uint8_t *d = (uint8_t *)dst;
-    const uint8_t *s = (const uint8_t *)src;
-    for (uint32_t i = 0; i < n; i++) d[i] = s[i];
-}
-
 /*
  * 在子进程私有用户页表里设一个 PTE（pt_phys 是子进程页表物理页，identity
  * 映射下可直接当指针用）。flags 直接沿用父进程 PTE 的低 12 位属性位。
@@ -458,7 +453,7 @@ int task_fork(void *syscall_frame) {
             }
             /* 源：父进程虚拟地址（当前 CR3=父，可直接读）；
              * 目的：子进程新物理页（identity 映射，可直接写） */
-            t_memcpy((void *)(cphys + k * PMM_PAGE_SIZE), (const void *)p, PMM_PAGE_SIZE);
+            memcpy((void *)(cphys + k * PMM_PAGE_SIZE), (const void *)p, PMM_PAGE_SIZE);
             child_pt_set(pt_phys, p, cphys + k * PMM_PAGE_SIZE, flags);
         }
         if (fail) break;
@@ -482,7 +477,7 @@ int task_fork(void *syscall_frame) {
                     fail = 1;
                     break;
                 }
-                t_memcpy((void *)(child_stack + k * PMM_PAGE_SIZE),
+                memcpy((void *)(child_stack + k * PMM_PAGE_SIZE),
                          (const void *)p, PMM_PAGE_SIZE);
                 child_pt_set(pt_phys, p, child_stack + k * PMM_PAGE_SIZE, flags);
             }

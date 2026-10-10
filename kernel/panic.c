@@ -84,6 +84,18 @@ static void __attribute__((noreturn)) panic_halt(void) {
     for (;;) asm volatile("cli; hlt");
 }
 
+/* 非 C 语言侧的"出事了"统一出口。Rust 的 panic handler 是死循环
+ * （no_std 下没有 unwinder，panic = abort），Zig 的 __zig_probe_stack
+ * 是 noreturn——它们都桥到这里，于是三种语言共用同一块 panic 屏幕与
+ * 同一套上下文记录，不会一个静默死循环、一个画自己的屏。 */
+void __attribute__((noreturn)) panic_fatal(const char *msg) {
+    panic_set_context(msg);
+    terminal_writestring("KERNEL PANIC: ");
+    terminal_writestring(msg ? msg : "(unknown)");
+    terminal_writestring("\n");
+    panic_halt();
+}
+
 static void dump(isr_regs_t *r) {
     /* 与 pusha 顺序相反：eax 在 regs+28 */
     uint32_t cr0, cr2, cr3;

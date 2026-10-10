@@ -1,4 +1,5 @@
 #include "shell.h"
+#include "rust_bridge.h" /* levenshtein_active：命令拼写建议 */
 #include "shell_extra.h"
 #include "tty.h"
 #include "keyboard.h"
@@ -578,6 +579,11 @@ static int is_exe_name(const char *name) {
 /* 执行原始命令（重定向/管道已经预处理过） */
 static void shell_execute_raw(char *cmd, int bg);
 
+/* 命令拼写建议：找不到命令时给出最接近的内建命令。定义在下面
+ * shell_execute_raw 之后（它要用 commands[] 表），C99 隐式声明在
+ * -Werror 下直接报错，所以这里前置声明一次。 */
+static const char *shell_closest_command(const char *name);
+
 /* shell 模式：1=用户 shell（GUI Terminal / User Shell），0=内核 shell */
 
 /* 执行带重定向/管道的命令 */
@@ -721,7 +727,45 @@ static void shell_execute_raw(char *cmd, int bg) {
 
     terminal_writestring("Unknown command: ");
     terminal_writestring(cmd);
+    /* 给个最接近的内建命令。只在"足够接近"时才提示——距离太远（比如
+     * 用户输了个完全不相干的词）报出来反而是噪声。阈值取 max(2, len/3)：
+     * len=3 时容 2 个字符的错（"lst" -> "ls" 差 1、"sl" 差 1 都够），
+     * len=12 时容 4（"shel" -> "shell" 差 1、"desktop" -> "deskto" 差 1）。
+     * 纯 UX，零风险：只是多打一行字，不改变任何执行语义。 */
+    const char *guess = shell_closest_command(cmd);
+    if (guess != 0) {
+        terminal_writestring("\ndid you mean: ");
+        terminal_writestring(guess);
+    }
     terminal_writestring("\n");
+    terminal_writestring("type 'help' for the command list\n");
+}
+
+/* 在内建命令表里找与 name 编辑距离最小的那个。距离算法在 Rust 侧
+ * （rust/ezos_rs/src/lib.rs 的 levenshtein_rs，C 参考实现见 textenc.c，
+ * Zig 版见 ezos_zig.zig，三方由 rstest 对拍）。
+ *
+ * 阈值 max(2, len/3)：容得下"手滑打错一两个字母"，又不至于把明显不相干的
+ * 输入也硬凑一个建议出来。多个命令同距时取**表里靠前**的那个——
+ * commands[] 的顺序是按功能分组排的，靠前的更可能是用户想用的。 */
+static const char *shell_closest_command(const char *name) {
+    uint32_t len = 0;
+    while (name[len] && len < 64) len++;
+    if (len == 0) return 0;
+    uint32_t thresh = len / 3;
+    if (thresh < 2) thresh = 2;
+    const char *best = 0;
+    uint32_t best_d = thresh + 1;
+    for (int i = 0; commands[i].name != 0; i++) {
+        uint32_t d = levenshtein_active((const uint8_t *)name,
+                                        (const uint8_t *)commands[i].name,
+                                        24);
+        if (d < best_d) {
+            best_d = d;
+            best = commands[i].name;
+        }
+    }
+    return best;
 }
 
 /* 供 shell_extra.c 的 type/which 查询某个名字是不是内建命令 */

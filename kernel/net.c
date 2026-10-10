@@ -39,6 +39,7 @@
 #include "task.h"
 #include "isr.h"        /* g_pit_ticks：睡眠超时的 tick 源（步骤 8a） */
 #include "dmesg.h"
+#include "rust_bridge.h" /* cksum_active：RFC 1071 校验和的生产实现 */
 
 #define ETH_HDR_LEN   14u
 #define IP_HDR_MIN    20u
@@ -155,17 +156,27 @@ static void wr16le(uint8_t *p, uint16_t v) {
 
 /* Internet 校验和（RFC 1071）：16 位反码和。cksum_raw 返回不取反的和
  * （多段求和时逐段累加，最后统一取反一次——对两段分别取反再相加是
- * 错的：反码和不满足 ~a+~b == ~(a+b)，slirp 等真协议栈会丢弃坏包）。 */
-static uint32_t cksum_raw(const uint8_t *p, uint32_t n) {
+ * 错的：反码和不满足 ~a+~b == ~(a+b)，slirp 等真协议栈会丢弃坏包）。
+ *
+ * 下面这两个是 **C 参考实现**（`rstest` 对拍基线 / EZ_TEXT_IMPL=0 回退）。
+ * 生产路径走 rust_bridge.h 选中的那一份（默认 Rust）——当初网络调试时
+ * "到底是测试包算错还是实现算错"卡了很久，两边各写一份正是成因。 */
+uint32_t cksum_raw_c(const uint8_t *p, uint32_t n) {
     uint32_t s = 0;
     while (n >= 2) { s += ((uint32_t)p[0] << 8) | p[1]; p += 2; n -= 2; }
     if (n) s += (uint32_t)p[0] << 8;
     while (s >> 16) s = (s & 0xFFFFu) + (s >> 16);
     return s;
 }
-static uint16_t cksum(const uint8_t *p, uint32_t n) {
-    return (uint16_t)(~cksum_raw(p, n));
+uint16_t cksum_c(const uint8_t *p, uint32_t n) {
+    return (uint16_t)(~cksum_raw_c(p, n));
 }
+
+/* 内部一律用 active 版本：这个宏在 EZ_TEXT_IMPL=1（默认）下指向 Rust。
+ * 用宏而不是函数指针：这条路径每个包都要跑几次，函数指针会挡住内联，
+ * 而 ODR 上 C 参考实现已经编进来了，链接器会自动丢掉没人用的那份。 */
+#define cksum_raw  cksum_raw_active
+#define cksum      cksum_active
 
 static uint32_t my_ip_be(void) {
     return be32(rtl8139_ip());

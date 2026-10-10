@@ -38,4 +38,10 @@ void isr_dispatch(isr_regs_t *regs);
 /* panic 上下文记录（供异常屏显示"出事时在干什么"） */
 void panic_set_context(const char *what);
 
+/* 不可返回的致命错误：打印 msg + 上下文，停机并显示 panic 屏幕。
+ * Rust 侧 panic = 死循环、Zig 侧 stack probe = noreturn，它们都桥到这里
+ * （见 kernel/textenc.c 与 Zig 文件头的 __zig_probe_stack 注释），
+ * 这样三种语言的"出事了"是同一个出口，不会各停各的。 */
+void __attribute__((noreturn)) panic_fatal(const char *msg);
+
 #endif

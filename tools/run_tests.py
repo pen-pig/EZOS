@@ -71,7 +71,9 @@ LAYERS = {
     # encoding：编码闸门（无 U+FFFD / 无 GBK 残留字节），几秒跑完，守住
     # 2026-10-09 重写过的那批注释不再被转码碾坏
     # help：命令表与 cmd_help 明细的一致性（tools/check_help.py）
-    "static": ["check_stack", "stack", "encoding", "help"],
+    # cpu：指令集闸门（tools/check_cpu.py）——外来语言产物里不许有 SSE，
+    # 内核只 fninit 不开 CR4.OSFXSR，撞上就是 #UD（已实测踩过）
+    "static": ["check_stack", "stack", "encoding", "help", "check_cpu"],
 }
 
 # 改动文件 -> 必跑层级。键是路径子串。

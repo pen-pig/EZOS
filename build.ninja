@@ -55,7 +55,15 @@ rule cargo_rs
 rule zig_obj
     # zig 把 .o 输出到**当前目录**（不接受 -o），所以先 cd 进源目录，
     # 产物路径才能和下面的 build 行对上。
-    command = cmd /c cd rust\ezos_zig&& $ZIG build-obj -target x86-freestanding -O ReleaseSafe ezos_zig.zig
+    #
+    # -mcpu i686 不能省：默认的 baseline 档允许 SSE2，编译器的
+    # 向量化会生成 movdqa/movaps。内核只做 fninit（x87），从不设
+    # CR4.OSFXSR、也不保存 SSE 上下文——那些指令必然 #UD。
+    # 实测踩过：levenshtein_zig 里一个定长数组的清零被编成 6 条
+    # movdqa，一进 rstest 就 panic（vector 06 Invalid Opcode）。
+    # Rust 侧早就用 target features "-mmx,-sse" 关掉了，这里要对齐。
+    # tools/check_cpu.py 会在回归里核实产物里没有 SSE 指令。
+    command = cmd /c cd rust\ezos_zig&& $ZIG build-obj -target x86-freestanding -mcpu i686 -O ReleaseSafe ezos_zig.zig
     description = ZIG rust/ezos_zig/ezos_zig.zig
 
 build rust/ezos_rs/target/i686-ezos/release/libezos_rs.a: cargo_rs rust/ezos_rs/src/lib.rs rust/i686-ezos.json
@@ -134,6 +142,8 @@ build boot/task_switch.o: asm_elf boot/task_switch.asm
 
 build kernel/kernel.o: cc kernel/kernel.c
 build kernel/tty.o: cc kernel/tty.c
+build kernel/textenc.o: cc kernel/textenc.c
+build kernel/mem.o: cc kernel/mem.c
 build kernel/idt.o: cc kernel/idt.c
 build kernel/isr.o: cc kernel/isr.c
 build kernel/paging.o: cc kernel/paging.c
@@ -213,7 +223,7 @@ build user/segprobe.elf: link_user user/crt0.o user/segprobe.o | user/user.ld
 build user/netcli.o: cc_user user/netcli.c
 build user/netcli.elf: link_user user/crt0.o user/netcli.o | user/user.ld
 
-build kernel_raw.bin: link boot/kernel_entry.o boot/task_switch.o kernel/kernel.o kernel/tty.o kernel/idt.o kernel/isr.o kernel/paging.o kernel/pmm.o kernel/task.o kernel/fd.o kernel/elf.o kernel/exec.o kernel/fpu.o kernel/calc.o kernel/gdt.o kernel/syscall.o kernel/panic.o kernel/kmalloc.o kernel/dmesg.o kernel/serial.o kernel/acpi.o kernel/ahci.o kernel/nvme.o kernel/keyboard.o kernel/ata.o kernel/pci.o kernel/rtc.o kernel/usb.o kernel/uhci.o kernel/usbenum.o kernel/usbkbd.o kernel/usbmsc.o kernel/usbmouse.o kernel/ehci.o kernel/usbhc.o kernel/lockselftest.o kernel/rtl8139.o kernel/net.o kernel/shell.o kernel/shell_extra.o kernel/exfat.o kernel/fat.o kernel/fs.o kernel/fsck.o kernel/sysvol.o kernel/sysvol_data.o kernel/ext4.o kernel/ntfs.o kernel/f2fs.o kernel/erofs.o kernel/refs.o kernel/div64.o kernel/sysinfo.o kernel/gfx.o kernel/gui.o kernel/mouse.o kernel/gfxwin.o kernel/desktop.o kernel/games.o kernel/hiscore.o rust/ezos_zig/ezos_zig.o rust/ezos_rs/target/i686-ezos/release/libezos_rs.a
+build kernel_raw.bin: link boot/kernel_entry.o boot/task_switch.o kernel/kernel.o kernel/tty.o kernel/textenc.o kernel/mem.o kernel/idt.o kernel/isr.o kernel/paging.o kernel/pmm.o kernel/task.o kernel/fd.o kernel/elf.o kernel/exec.o kernel/fpu.o kernel/calc.o kernel/gdt.o kernel/syscall.o kernel/panic.o kernel/kmalloc.o kernel/dmesg.o kernel/serial.o kernel/acpi.o kernel/ahci.o kernel/nvme.o kernel/keyboard.o kernel/ata.o kernel/pci.o kernel/rtc.o kernel/usb.o kernel/uhci.o kernel/usbenum.o kernel/usbkbd.o kernel/usbmsc.o kernel/usbmouse.o kernel/ehci.o kernel/usbhc.o kernel/lockselftest.o kernel/rtl8139.o kernel/net.o kernel/shell.o kernel/shell_extra.o kernel/exfat.o kernel/fat.o kernel/fs.o kernel/fsck.o kernel/sysvol.o kernel/sysvol_data.o kernel/ext4.o kernel/ntfs.o kernel/f2fs.o kernel/erofs.o kernel/refs.o kernel/div64.o kernel/sysinfo.o kernel/gfx.o kernel/gui.o kernel/mouse.o kernel/gfxwin.o kernel/desktop.o kernel/games.o kernel/hiscore.o rust/ezos_zig/ezos_zig.o rust/ezos_rs/target/i686-ezos/release/libezos_rs.a
 
 build kernel.bin os-image.bin: make_image boot/boot.bin boot/stage2.bin kernel_raw.bin tools/make_image.py boot/layout.inc
 

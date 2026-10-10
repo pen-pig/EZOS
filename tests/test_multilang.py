@@ -12,6 +12,12 @@ Zig: rust/ezos_zig）和两份文件名 hash（Rust / Zig），`rstest` 命令�
     链上了但版本旧，这里变红。
   * **全 0 陷阱**：断言 hash != 0，防止"函数根本没被调用"也显示一致。
 
+第二组（2026-10-10 加）是文件名编解码与文本/网络算法：UTF-16LE<->UTF-8
+（含代理对与落单代理）、Levenshtein 编辑距离、RFC 1071 校验和。这一组刚
+加时立刻抓到两件事：一是 Zig 产物混进了 SSE 指令（内核不开 CR4.OSFXSR，
+一跑就 #UD），二是探针本身把两个落单代理并排放，被正确合并成合法代理对，
+是断言而非实现错了。两件事都留下了防线，见 tools/check_cpu.py 和探针注释。
+
 不替代 exFAT 本身的正确性测试（那是 test_vhd.py 独立重算 checksum 的活），
 这里只保证**三种语言算出来的东西一样**。
 
@@ -110,6 +116,23 @@ def main():
         check("namehash == published vector 0x78A3",
               "namehash c=0x000078a3 rust=0x000078a3 zig=0x000078a3" in f,
               f[:220])
+        # ---- 第二组：UTF-16 <-> UTF-8 三路对拍 ----
+        # 三份实现在 NTFS/exFAT/ReFS 的名字读写边界上被调用，错了的后果
+        # 不是显示难看，是匹配到错误的文件（历史 bug：三个后端三套降级
+        # 策略，NTFS 变 '?'、exFAT 变 '.'、ReFS 判定不匹配）。
+        check("utf16->utf8: C == Rust == Zig",
+              "u16->u8 len c=24 rust=24 zig=24 [ok]" in f, f[-300:])
+        # 缓冲不足必须 fail closed（返回负数），不能返回半截名字
+        check("utf16->utf8 fails closed when buffer too small",
+              "u16->u8 tiny ffffffff/ffffffff/ffffffff [ok]" in f, f[-260:])
+        # 反向编码 + 往返一致
+        check("utf8->utf16: C == Rust == Zig",
+              "u8->u16 n c=14 rust=14 zig=14 [ok]" in f, f[-220:])
+        # Levenshtein：shell 的 "did you mean" 用的就是它
+        check("levenshtein: C == Rust == Zig", "levenshtein [ok]" in f, f[-180:])
+        # RFC 1071 校验和：net.c 生产路径已迁到 Rust
+        check("cksum: C == Rust == Zig", "cksum c=0x0000f311" in f, f[-200:])
+
         check("overall PASS", "result: pass" in f)
         # 全 0 陷阱：三份都返回 0 说明函数压根没被调用
         check("hash is non-zero (not a no-op stub)",
