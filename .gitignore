@@ -105,6 +105,17 @@ usb-image.bin
 # VMware 侧验证产物（vmx 入库，磁盘镜像与串口日志不入库）
 vmware/*.vmdk
 vmware/*.log
+# VMware 运行时垃圾：VM 跑一次就生成，锁文件尤其不能入库——
+# 入库后别人 checkout 出来就是个"有锁但没进程"的假死状态。
+vmware/*.vmem
+vmware/*.vmem.lck/
+vmware/*.vmdk.lck/
+vmware/*.vmx.lck/
+vmware/*.scoreboard
+vmware/*.vmsd
+vmware/*.vmxf
+vmware/nvram
+vmware/vmware.log
 
 # Rust 构建产物（target/ 与 cargo registry 缓存；源码与 Cargo.lock 入库）
 rust/ezos_rs/target/

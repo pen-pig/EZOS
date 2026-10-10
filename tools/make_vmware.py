@@ -28,10 +28,19 @@ ROOT = os.path.dirname(HERE)
 QEMU_IMG = _ezos.qemu_img_exe()
 
 VMX = """.encoding = "UTF-8"
+# 【必填】virtualHW.version 决定硬件/固件兼容性。VMware 26 缺这一行会直接
+# 报 "Cannot read the virtual machine configuration file"，别删。参考值：
+# Workstation 17=20、17.5=21、25/26=22（可用宿主机的 vmx 对照）。
+virtualHW.version = "22"
+# 【必填】config.version = "8" 与上面 virtualHW 配套。缺这一行时 VMware 26
+# 报 "Cannot read the virtual machine configuration file"，加上就能正常启动。
+config.version = "8"
 displayName = "EZOS"
 guestOS = "other-32"
 memsize = "256"
 numvcpus = "1"
+# 固定 uuid.bios，避免每次重新生成 vmx 都被当成另一台新机器（宿主机会问"是否移动或复制"）。
+uuid.bios = "56 4d 0f 96 11 01 ec 21-23 2c f1 83 14 80 32 68"
 
 # legacy BIOS。别改成 efi：VMware 的 EFI 是 64 位，BOOTIA32.EFI 加载不了。
 firmware = "bios"
@@ -84,7 +93,11 @@ def main():
         print("qemu-img convert failed (rc=%d)" % rc)
         return 1
 
-    with open(os.path.join(args.out_dir, "ezos.vmx"), "w", newline="\n") as f:
+    # 行尾必须 CRLF：宿主是 Windows，VMware 的 vmx 解析器对纯 LF 不友好。
+    # 之前用 newline="\n" 写出 LF 文件，叠加缺 virtualHW.version 一起触发
+    # "Internal error. Remove from library?"。
+    with open(os.path.join(args.out_dir, "ezos.vmx"), "w",
+              encoding="utf-8", newline="\r\n") as f:
         f.write(VMX.format(disk="ezos-usb.vmdk"))
 
     print("OK %s (%d bytes)" % (vmdk, os.path.getsize(vmdk)))

@@ -73,7 +73,9 @@ LAYERS = {
     # help：命令表与 cmd_help 明细的一致性（tools/check_help.py）
     # cpu：指令集闸门（tools/check_cpu.py）——外来语言产物里不许有 SSE，
     # 内核只 fninit 不开 CR4.OSFXSR，撞上就是 #UD（已实测踩过）
-    "static": ["check_stack", "stack", "encoding", "help", "check_cpu"],
+    # vmx：VMware 配置闸门（tools/check_vmx.py）——缺 virtualHW.version /
+    # config.version 时 VMware 26 只给一句 "Internal error"，极难定位
+    "static": ["check_stack", "stack", "encoding", "help", "check_cpu", "check_vmx"],
 }
 
 # 改动文件 -> 必跑层级。键是路径子串。

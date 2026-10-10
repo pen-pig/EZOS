@@ -97,6 +97,13 @@ jobs:
       - name: CPU feature guard (no SSE in Rust/Zig objects)
         run: python3 tools/check_cpu.py
 
+      # VMware 配置闸门：vmx 缺 virtualHW.version / config.version 时，
+      # VMware 26 的表现是 "Could not open virtual machine ... Internal error.
+      # Remove from library?"——报错完全不提字段名，只会让人去怀疑虚拟机库。
+      # 模板在 tools/make_vmware.py，改它的时候这道会红。
+      - name: VMware vmx guard (required fields present)
+        run: python3 tools/check_vmx.py
+
       - name: Generate data disk
         run: python3 temp/gen_diskimg.py disk.img
 
