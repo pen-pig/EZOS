@@ -1,9 +1,13 @@
 /*
  * paging.c - 32-bit 分页实现（identity mapping，步骤 3）
  *
- * 两级页表（4KB 页）：PD 在 0x70000，页表池 0x71000 起最多 12 张（48KB）。
- * identity 覆盖 0-32MB，另映射 VBE LFB 8MB 窗口。全部页面 PTE_US=0
- * （仅 ring0），步骤 4 起再为用户映射打 PTE_US。
+ * 两级页表（4KB 页）：页目录固定 PAGING_PD_ADDR（2MB），页表池
+ * PAGING_PT_BASE（0x201000）起最多 PAGING_PT_MAX 张（见 paging.h）。
+ * identity 覆盖 0-PAGING_IDENTITY_END（32MB），另按 VBE LFB 的实际尺寸
+ * 映射显存。全部页面默认 PTE_US=0（仅 ring0），用户映射另打 PTE_US。
+ *
+ * （旧注释写的是"PD 0x70000、页表池 0x71000、12 张"，那是内核还装在低
+ * 1MB 时代的布局，早已随镜像搬到 19MB、主栈搬到 1-2MB 一起改掉了。）
  *
  * 关键约束：
  *  - 页结构必须放在"保证空闲"的物理内存：低 1MB 是镜像（0x10000-0xB8000）
@@ -12,8 +16,10 @@
  *    绝不能放常驻数据。
  *    故固定取 2MB（0x200000），紧跟主栈（1-2MB）之上，而下一个使用者
  *    （GUI 背缓冲）在 16MB，中间全是空闲。
- *  - identity mapping 下虚拟地址 == 物理地址，所以页表指针可直接当物理地址
- *    填进 PDE——这是本阶段刻意保持的简化，步骤 6 换页时会改成显式 phys。
+ *  - identity mapping 下页表**物理地址可以直接当虚拟地址用**（0-32MB
+ *    一一对应），所以 pt_for() 拿到 PDE 里的物理地址能立刻解引用。
+ *    真要访问 identity 以外的物理内存（比如 ACPI 表，常驻在 RAM 顶部
+ *    127MB 附近）不能硬来——得显式映射一个窗口，见 acpi.c。
  *  - 修改页表后必须 invlpg；换 CR3 由硬件隐式全刷 TLB。
  *  - 本模块不依赖 kmalloc（页表池静态），可在 kmalloc 之前/崩溃路径安全调用。
  */

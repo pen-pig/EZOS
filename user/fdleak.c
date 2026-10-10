@@ -9,11 +9,9 @@
  */
 #include "libc.h"
 
-#define O_WRONLY 1
-
 int umain(int argc, char **argv) {
     (void)argc; (void)argv;
-    int fd = open("FDLEAK.TXT", O_WRONLY);
+    int fd = open("FDLEAK.TXT", O_WRONLY | O_CREAT | O_TRUNC);
     if (fd < 0) {
         puts("fdleak: open failed\n");
         return 1;

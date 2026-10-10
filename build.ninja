@@ -252,6 +252,15 @@ rule enc_check
 
 build enc: enc_check tools/check_encoding.py
 
+# 命令表/help 一致性：shell 命令表里出现的每个命令都必须在 cmd_help 的
+# 详细条目里有对应分支（否则用户敲 `help xxx` 会掉进 "unknown command"，
+# 等于手册缺页）。纯扫源码、秒级。用法：ninja helpchk
+rule help_check
+    command = cmd /c python tools/check_help.py
+    description = HELP command table vs help entries
+
+build helpchk: help_check tools/check_help.py
+
 # VMware 侧验证：QEMU 的 SeaBIOS 太干净，VMware 的 PhoenixBIOS + 更接近真机的
 # 芯片组是介于 QEMU 与真机之间的第二道关。同样不进 default。用法：ninja vmware
 rule make_vmware

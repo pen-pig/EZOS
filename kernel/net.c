@@ -125,6 +125,8 @@ static uint8_t *g_frame;            /* 最终帧组装缓冲（与 g_build 分�
 /* 统计 */
 static uint32_t g_udp_rx, g_udp_tx, g_tcp_rx, g_tcp_tx;
 static uint32_t g_arp_replied, g_icmp_replied;
+/* 收包侧 fail closed 计数：首部校验和错 / 分片（不实现重组，必须丢） */
+static uint32_t g_ip_bad_csum, g_ip_frag_drop;
 static uint32_t g_tcp_rtx;          /* 步骤 7.4：重传次数（E2E 断言用） */
 static uint16_t g_ephemeral = 40000u;  /* connect 的临时端口分配游标 */
 
@@ -425,12 +427,12 @@ static void udp_input(const uint8_t *ip, uint32_t ihl) {
  * 0.0.0.0 作源（net_udp_send 用本机 IP）。伪首部与段分别求 RAW 和再相加，
  * 最后统一折叠取反；奇数字节按"高位字节 + 隐式 0 填充"处理（与在缓冲
  * 尾部补 0 等价）。 */
-static uint16_t udp_checksum(uint32_t src_ip, uint32_t dst_ip,
-                             const uint8_t *p, uint32_t n) {
+static uint16_t l4_checksum(uint32_t src_ip, uint32_t dst_ip, uint8_t proto,
+                            const uint8_t *p, uint32_t n) {
     uint8_t ps[12];
     put32(ps + 0, src_ip);
     put32(ps + 4, dst_ip);
-    ps[8] = 0; ps[9] = 17;
+    ps[8] = 0; ps[9] = proto;
     put16(ps + 10, (uint16_t)n);
     uint32_t s = cksum_raw(ps, 12) + cksum_raw(p, n);
     /* 不要在这里补奇数字节：cksum_raw() 末尾的 `if (n) s += p[0] << 8`
@@ -440,6 +442,42 @@ static uint16_t udp_checksum(uint32_t src_ip, uint32_t dst_ip,
     while (s >> 16) s = (s & 0xFFFFu) + (s >> 16);
     uint16_t c = (uint16_t)(~s);
     return (c == 0) ? 0xFFFFu : c;
+}
+
+/* UDP/TCP 收包校验（RFC 768 / RFC 793）。
+ *   UDP：字段为 0 = 发送方没算（IPv4 允许），跳过；非 0 必须完全对上。
+ *   TCP：校验和强制，不存在 0 的情形。
+ * 验的方法不是"重算一遍再跟字段比"——字段里存的是**反码**，重算出来的是
+ * 0（本文件把 0 规范成 0xFFFF）。正确判据是 RFC 1071 的那句：把伪首部 +
+ * 段（含校验和字段本身）一起求反码和，结果必须是全 1（0xFFFF）。 */
+static int l4_csum_ok(const uint8_t *ip, uint32_t ihl, uint32_t totlen) {
+    uint8_t  proto = ip[9];
+    uint32_t ln    = totlen - ihl;
+    const uint8_t *l4 = ip + ihl;
+    uint16_t got;
+    if (proto == 17) {
+        if (ln < UDP_HDR_LEN) return 0;
+        got = be16(l4 + 6);
+        if (got == 0) return 1;                    /* 未计算，合法 */
+    } else if (proto == 6) {
+        if (ln < TCP_HDR_MIN) return 0;
+        got = be16(l4 + 16);
+    } else {
+        return 1;                                  /* ICMP 另有自己的校验和 */
+    }
+    uint8_t ps[12];
+    put32(ps + 0, be32(ip + 12));
+    put32(ps + 4, be32(ip + 16));
+    ps[8] = 0; ps[9] = proto;
+    put16(ps + 10, (uint16_t)ln);
+    uint32_t s = cksum_raw(ps, 12) + cksum_raw(l4, ln);
+    while (s >> 16) s = (s & 0xFFFFu) + (s >> 16);
+    return (s == 0xFFFFu) ? 1 : 0;
+}
+
+static uint16_t udp_checksum(uint32_t src_ip, uint32_t dst_ip,
+                             const uint8_t *p, uint32_t n) {
+    return l4_checksum(src_ip, dst_ip, 17, p, n);
 }
 
 static int net_udp_send(uint32_t dst_ip, uint16_t dst_port, uint16_t src_port,
@@ -475,9 +513,14 @@ static int net_udp_send(uint32_t dst_ip, uint16_t dst_port, uint16_t src_port,
  *       不放行的话，服务器广播回来的 OFFER（目的 255.255.255.255）
  *       或单播到尚未生效的 yiaddr 都会被"不是我的 IP"直接丢掉。
  *
- * 状态机（能省则省）：DISCOVER -> OFFER -> REQUEST -> ACK，各 3 次重试。
- * 刻意没做的：续租（T1/T2 定时器）、ARP 冲突检测、多 DNS、option 覆盖
- * 长度 >4 的非法报文（fail closed 当不存在）。这些都是教学取舍，注释在此。
+ * 状态机：DISCOVER -> OFFER -> REQUEST -> ACK，各 3 次重试；绑定后由
+ * net_tick 在 IRQ0 里跑 T1/T2 续租（RENEWING 单播 / REBINDING 广播）。
+ * option overload（52）按 RFC 2131 9.3 扫 file/sname 两个备用区。
+ *
+ * 刻意没做的（都是"不做也不会配错"的，不是"做了会静默错"的）：
+ *   - ARP 冲突检测（RFC 2131 3.1 step 4 的推荐步骤，非强制）
+ *   - 只保留前 DNS_MAX_SRV 个 DNS，超出部分丢弃
+ *   - NAK 处理：回到 INIT 重新 DISCOVER，不做指数退避
  *
  * 并发：与 ping 同一条 net 等待队列（g_netrx_wq），单等待者——
  * shell 一次只跑一个 dhcp。dhcp_input 可能在 IRQ 上下文被调（rtl8139
@@ -663,21 +706,57 @@ static void dhcp_input(const uint8_t *ip, uint32_t ihl) {
 }
 
 /* 从已收下的报文里取一个 option（返回拷贝字节数，0 = 没有/非法） */
-static uint32_t dhcp_opt(uint8_t code, uint8_t *out, uint32_t max) {
-    const uint8_t *b = g_dhcp_w.buf;
-    uint32_t dlen = g_dhcp_w.len;
-    for (uint32_t i = 240; i + 1 < dlen; ) {
+/* 在一个 option 区里线性找 code。返回拷贝进 out 的字节数，0 = 没有。
+ * 规范细节（RFC 2131 Table 3 / RFC 1497 vendor extensions）：
+ *   0    = Pad，占一字节，必须跳过继续找
+ *   255  = End，区结束
+ *   olen 越出区尾 -> 报文截断，停（不越过边界读） */
+static uint32_t dhcp_opt_in(const uint8_t *b, uint32_t start, uint32_t end,
+                            uint8_t code, uint8_t *out, uint32_t max) {
+    for (uint32_t i = start; i + 1 < end; ) {
         uint8_t c = b[i];
-        if (c == 0)  { i++; continue; }
+        if (c == 0) { i++; continue; }
         if (c == 255) break;
         uint32_t olen = b[i + 1];
-        if (i + 2 + olen > dlen) break;
+        if (i + 2 + olen > end) break;
         if (c == code) {
             uint32_t n = (olen < max) ? olen : max;
             for (uint32_t k = 0; k < n; k++) out[k] = b[i + 2 + k];
             return n;
         }
         i += 2 + olen;
+    }
+    return 0;
+}
+
+/* 取一个 DHCP option（跨 option overload 区）。
+ *
+ * RFC 2131 9.3：option 52（Option Overload）说明 options 区装不下时，
+ * 服务器会把余下的 option 塞进 BOOTP 的 file(108..235) 与/或
+ * sname(44..107) 字段：
+ *   1 = file 区装 option    2 = sname 区装 option    3 = 两者都装
+ * 以前只看 240 之后那段，遇到 overload 的服务器就会"掩码/路由读不到，
+ * 却以为读到了"——配出来的网络是半残的。现在按规范三区都扫。 */
+static uint32_t dhcp_opt(uint8_t code, uint8_t *out, uint32_t max) {
+    const uint8_t *b = g_dhcp_w.buf;
+    uint32_t dlen = g_dhcp_w.len;
+    if (dlen < BOOTP_FIXED + 4) return 0;
+
+    uint32_t n = dhcp_opt_in(b, 240, dlen, code, out, max);
+    if (n) return n;
+
+    uint8_t ov[1];
+    if (dhcp_opt_in(b, 240, dlen, 52, ov, 1) != 1) return 0;    /* 无 overload */
+    /* 只有 file/sname 区真的落到报文里才扫（报文可能被截短） */
+    if ((ov[0] & 1) && dlen > 108) {
+        uint32_t end = (dlen < 236) ? dlen : 236u;
+        n = dhcp_opt_in(b, 108, end, code, out, max);
+        if (n) return n;
+    }
+    if ((ov[0] & 2) && dlen > 44) {
+        uint32_t end = (dlen < 108) ? dlen : 108u;
+        n = dhcp_opt_in(b, 44, end, code, out, max);
+        if (n) return n;
     }
     return 0;
 }
@@ -1598,6 +1677,27 @@ int net_input(const uint8_t *f, uint32_t len) {
     if (ihl < IP_HDR_MIN || ETH_HDR_LEN + ihl > len) return -1;
     uint32_t totlen = be16(ip + 2);
     if (totlen < ihl || totlen > 1500 || ETH_HDR_LEN + totlen > len) return -1;
+
+    /* RFC 791 3.1：首部校验和必须验，错的静默丢弃。
+     * 以前只验长度不验校验和——链路噪声或伪造帧能让它后面每一层
+     * （端口、seq、长度）都在解析一个坏首部派生出来的假报文。 */
+    if (cksum(ip, ihl) != 0) { g_ip_bad_csum++; return -1; }
+
+    /* RFC 791 3.2 分片：MF 置位或片偏移非 0 的都是"不完整的一片"。
+     * 本栈不实现重组，那就必须 fail closed 丢掉，而不是把它当完整包
+     * 递给 UDP/TCP——那会拿第一片的 UDP 头去套一个长度字段，解析出
+     * 无意义甚至有害的结果（治疗比病贵：分片攻击正是这么来的）。 */
+    uint16_t frag = be16(ip + 6);
+    if ((frag & 0x1FFFu) != 0 || (frag & 0x2000u) != 0) {
+        g_ip_frag_drop++;
+        return -1;
+    }
+    /* UDP/TCP 传输层校验和（发送方算了就必须对得上） */
+    if ((ip[9] == 17 || ip[9] == 6) && !l4_csum_ok(ip, ihl, totlen)) {
+        g_ip_bad_csum++;
+        return -1;
+    }
+
     /* 统一 ARP 学习：任何发到本机的 IPv4 帧都记录 (源 IP, 源 MAC)。
      * 同网段直连成立（教学环境无路由）；回包不再需要 ARP 解析。 */
     arp_learn(be32(ip + 12), f + 6);
@@ -1956,6 +2056,8 @@ uint32_t net_tcp_tx(void)      { return g_tcp_tx; }
 uint32_t net_tcp_rtx(void)     { return g_tcp_rtx; }
 uint32_t net_arp_replied(void) { return g_arp_replied; }
 uint32_t net_icmp_replied(void) { return g_icmp_replied; }
+/* 收包侧被 fail closed 丢掉的 IPv4 报文：校验和错 + 分片（无重组） */
+uint32_t net_ip_drops(void) { return g_ip_bad_csum + g_ip_frag_drop; }
 uint32_t net_arp_entries(void) {
     uint32_t n = 0;
     for (int i = 0; i < ARP_CACHE; i++) if (g_arp[i].ip != 0) n++;

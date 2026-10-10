@@ -139,14 +139,17 @@ void usbkbd_init(void) {
         return;
     }
 
-    /* SET_PROTOCOL(boot=0) + SET_IDLE(0)：让设备用固定的 8 字节 boot 报告。
-     * 两者失败都不致命（多数设备默认就是 boot 格式），但要如实打印。 */
+    /* 只发 SET_PROTOCOL(boot=0)：让设备用固定的 8 字节 boot 报告格式。
+     *
+     * SET_IDLE **故意不发**（与 usbmouse.c 一致，别再补回来）：
+     * HID 规范里 boot 协议设备的默认 idle rate 就是 0（="无限"，只在
+     * 变化时报告），与显式 SET_IDLE(0) 语义等价，发它拿不到任何好处；
+     * 而实测 QEMU 的 HID 设备收到显式 SET_IDLE 之后就不再在中断端点
+     * 上报（中断 IN 恒 NAK），鼠标这条坑已经在 usbmouse.c 记过一次，
+     * 键盘同理。 */
     uint8_t ifnum = (uint8_t)(g_kbd->hid_if & 0xFFu);
     uint8_t sp[8] = {0x21, 0x0B, 0x00, 0x00, ifnum, 0x00, 0x00, 0x00};
-    uint8_t si[8] = {0x21, 0x0A, 0x00, 0x00, ifnum, 0x00, 0x00, 0x00};
     int rp = usbhc_control_xfer(&g_kbd->bus, g_kbd->addr, 0, sp, 0, NULL, 0,
-                                NULL);
-    int ri = usbhc_control_xfer(&g_kbd->bus, g_kbd->addr, 0, si, 0, NULL, 0,
                                 NULL);
 
     {
@@ -162,7 +165,6 @@ void usbkbd_init(void) {
         k_str(line, &n2, lim, " int=");
         k_dec(line, &n2, lim, (uint32_t)g_kbd->hid_ep_interval);
         k_str(line, &n2, lim, (rp == 0) ? " proto=ok" : " proto=fail");
-        k_str(line, &n2, lim, (ri == 0) ? " idle=ok" : " idle=fail");
         k_emit(line, n2, lim);
     }
 }

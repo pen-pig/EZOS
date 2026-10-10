@@ -12,11 +12,6 @@
  */
 #include "libc.h"
 
-#define O_RDONLY 0
-#define O_WRONLY 1
-#define SEEK_SET 0
-#define SEEK_END 2
-
 int umain(int argc, char **argv) {
     (void)argc; (void)argv;
     puts("fd test: open/read/lseek/write/close\n");
@@ -45,7 +40,7 @@ int umain(int argc, char **argv) {
     close(fd);
 
     /* 4) 写模式建文件 + 写内容 + close 落盘 */
-    fd = open("FDTEST.TXT", O_WRONLY);
+    fd = open("FDTEST.TXT", O_WRONLY | O_CREAT | O_TRUNC);
     if (fd < 0) { puts("FAIL: open FDTEST.TXT (write)\n"); return 1; }
     const char *msg = "written from ring3 fdtest\n";
     int w = write(fd, msg, strlen(msg));

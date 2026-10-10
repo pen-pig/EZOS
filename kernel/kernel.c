@@ -400,10 +400,6 @@ void kernel_main(void) {
     klog(serial_ready() ? "SERIAL: COM1 115200 8N1 loopback OK"
                         : "SERIAL: COM1 not present - debug output disabled");
 
-    /* ACPI：解析 RSDP/FADT/DSDT-_S5，shutdown 在真机上才真正断电 */
-    acpi_init();
-    klog(acpi_status_line());
-
     kmalloc_init();           /* 内核堆（384KB @ .bss.hi，先于一切使用者） */
 
     /* 分页：identity map 0-32MB + VBE LFB 后开 CR0.PG。
@@ -414,6 +410,11 @@ void kernel_main(void) {
     }
     /* 物理页帧池：ELF 加载（步骤 5）与将来的进程都要从这里拿页。
      * 必须在 paging_init 之后——池本身要能正常访问。 */
+    /* ACPI：解析 RSDP/FADT/DSDT-_S5，shutdown 在真机上才真正断电。
+     * 必须晚于 paging_init：ACPI 表常驻在 32MB 以上（128MB 机器的表在 127MB 附近），超出 identity 映射范围，要靠临时页映射才读得到。 */
+    acpi_init();
+    klog(acpi_status_line());
+
     pmm_init();
 
     /* 加载地址不再写死：镜像由 boot/stage2.asm 搬到 linker.ld 的
@@ -434,7 +435,6 @@ void kernel_main(void) {
 
     idt_init();
     isr_register_stubs();     /* CPU 异常门 0-31（#GP/#PF 等触发蓝屏 panic） */
-    isr_install();
     irq_install();
     syscall_init();           /* int 0x80 DPL=3 门：用户态唯一合法陷入入口 */
     pit_init();               /* 1000Hz 系统时钟：此后的日志时间戳才是真实时间 */

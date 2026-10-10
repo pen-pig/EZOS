@@ -34,6 +34,7 @@ static uint32_t rd32(const uint8_t *p) {
 #define SB_OFF_MAGIC         56    /* s_magic 0xEF53 */
 #define SB_OFF_INODE_SIZE    88    /* s_inode_size */
 #define SB_OFF_FEAT_INCOMPAT 96
+#define SB_OFF_FEAT_RO_COMPAT 100   /* s_feature_ro_compat */
 #define SB_OFF_DESC_SIZE     282   /* 0x11A s_desc_size（64bit 组描述符） */
 #define SB_OFF_BLOCKS_HI     336   /* 0x150 s_blocks_count_hi */
 #define SB_OFF_FREE_BLKS_HI  344
@@ -60,10 +61,23 @@ static uint32_t rd32(const uint8_t *p) {
 #define EXT4F_INCOMPAT_64BIT     0x0080u
 #define EXT4F_INCOMPAT_FLEX_BG   0x0200u
 /* 读不了/不安全的一律拒绝挂载 */
-#define EXT4F_INCOMPAT_REJECT   (0x0001u /* COMPR */ | 0x0010u /* META_BG */ \
-                                 | 0x0100u /* MMP */ | 0x10000u /* ENCRYPT */ \
-                                 | 0x20000u /* CASEFOLD */ | 0x40000u /* VERITY */)
+#define EXT4F_INCOMPAT_REJECT   (0x0001u /* COMPR */ | 0x0004u /* RECOVER */ \
+                                 | 0x0010u /* META_BG */ | 0x0100u /* MMP */ \
+                                 | 0x10000u /* ENCRYPT */ | 0x20000u /* CASEFOLD */ \
+                                 | 0x40000u /* VERITY */)
 /* INLINE_DATA(0x8000) 挂载不拒绝，读到 inline 文件时报错 */
+
+/* ro_compat：卷上开着、但本驱动**写的时候维护不了**的特性。
+ * 这些位意味着元数据带校验和或者分配单位不是块——我们一写就会把一个
+ * Linux 认为合法的卷写成坏的（fsck 报 checksum mismatch），所以一律
+ * 拒绝挂载（fail closed），而不是先挂上再慢慢坏。
+ *   0x0010 GDT_CSUM        组描述符校验和
+ *   0x0200 BIGALLOC        以 cluster（多块）为单位分配，位图语义不同
+ *   0x0400 METADATA_CSUM   全元数据校验和（mkfs.ext4 现代默认开）
+ *   0x0800 SNAPSHOT        ...
+ * 不拒绝的：0x0001 SPARSE_SUPER / 0x0002 LARGE_FILE / 0x0008 EXTRA_ISIZE /
+ * 0x0100 QUOTA / 0x1000 DIR_NLINK / 0x8000 HUGE_FILE（只读不写，无副作用）。 */
+#define EXT4F_ROCOMPAT_REJECT  (0x0010u | 0x0200u | 0x0400u | 0x0800u)
 
 #define EXT4_ROOT_INO        2
 #define EXT4_MAGIC           0xEF53u
@@ -163,6 +177,9 @@ int ext4_mount(uint8_t drive, uint32_t part_start) {
 
     uint32_t incompat = rd32(sb + SB_OFF_FEAT_INCOMPAT);
     if (incompat & EXT4F_INCOMPAT_REJECT) return -1;
+    /* ro_compat 只看"写了会坏卷"的那几位。以前整字段都不看，于是带
+     * metadata_csum 的现代 ext4 能被挂上并被写坏——而它还照样报挂载成功。 */
+    if (rd32(sb + SB_OFF_FEAT_RO_COMPAT) & EXT4F_ROCOMPAT_REJECT) return -1;
 
     e4_bpg = rd32(sb + SB_OFF_BPG);
     e4_ipg = rd32(sb + SB_OFF_IPG);

@@ -125,6 +125,7 @@ void fd_table_init(fd_table_t *t) {
     for (uint32_t i = 0; i < MAX_OPEN_FDS; i++) {
         t->fds[i].type = FD_TYPE_FREE;
         t->fds[i].writable = 0;
+        t->fds[i].append = 0;
         t->fds[i].dirty = 0;
         t->fds[i].size = 0;
         t->fds[i].offset = 0;
@@ -138,21 +139,34 @@ void fd_table_init(fd_table_t *t) {
 
 int fd_open(fd_table_t *t, const char *name, int flags) {
     if (t == 0 || name == 0 || name[0] == '\0') return -1;
-    if (flags != O_RDONLY && flags != O_WRONLY && flags != O_RDWR) return -1;
 
+    /* flags 拆两段校验：访问模式必须合法，其余位必须是本 OS 认识的。
+     * 未知位一律拒绝（fail closed）——宁可 open 失败，也不能猜着执行
+     * 一个语义不明的组合。 */
+    uint32_t f = (uint32_t)flags;
+    if ((f & O_ACCMODE) != (uint32_t)O_RDONLY &&
+        (f & O_ACCMODE) != (uint32_t)O_WRONLY &&
+        (f & O_ACCMODE) != (uint32_t)O_RDWR) return -1;
+    if (f & ~(uint32_t)(O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_APPEND)) return -1;
+
+    int writing = ((f & O_ACCMODE) != (uint32_t)O_RDONLY);
     uint32_t nlen = fd_strlen(name);
     if (nlen >= FD_MAX_NAME) return -1;               /* 文件名过长 */
 
+    /* fs_get_file_size 找不到返回 0，与"空文件"无法区分——本 OS 没有
+     * 空文件的场景，所以 size==0 一律按"不存在"处理。 */
     uint32_t size = fs_get_file_size(name);
-    /* fs_get_file_size 找不到返回 0，与"空文件"无法区分。读模式下
-     * size==0 统一按"不存在或空"拒绝（本 OS 无空文件场景）。写模式下
-     * size==0 视为"不存在或空"，从空开始建。 */
-    if (size == 0 && flags == O_RDONLY) return -1;
+    int exists = (size > 0);
+
+    if (!exists && !(f & O_CREAT)) return -1;         /* 不要求创建 → 打不开 */
+    if (!exists && !writing) return -1;               /* 只读打开"新文件"无意义 */
+    if (exists && (f & O_CREAT) && (f & O_EXCL)) return -1;   /* 要求独占却已存在 */
     if (size > MAX_FD_FILE) return -1;
-    /* O_WRONLY 是"创建或截断覆盖"语义：不读入旧内容，从空开始写。
-     * 否则打开一个残留的大文件后 write 少量字节，close 落盘会把旧尾巴
-     * 一并写回（文件比预期长）。 */
-    if (flags == O_WRONLY) size = 0;
+
+    /* O_TRUNC（且可写）→ 从空开始，不读入旧内容。不带 O_TRUNC 的可写
+     * 打开保留原内容，写多少覆盖多少——这是 POSIX 语义，也是"打开大文件
+     * 只改前几个字节"能正常工作的前提。 */
+    if ((f & O_TRUNC) && writing) size = 0;
 
     /* 从 3 开始找空位（0/1/2 是标准流，永远占住） */
     int slot = -1;
@@ -173,7 +187,8 @@ int fd_open(fd_table_t *t, const char *name, int flags) {
 
     fd_entry_t *e = &t->fds[slot];
     e->type = FD_TYPE_FILE;
-    e->writable = (flags != O_RDONLY) ? 1 : 0;
+    e->writable = writing ? 1 : 0;
+    e->append = (f & O_APPEND) ? 1 : 0;
     e->dirty = 0;
     e->size = size;
     e->offset = 0;
@@ -395,6 +410,8 @@ int fd_write(fd_table_t *t, int fd, const uint8_t *buf, uint32_t n) {
     if (!e->writable) return -1;
     if (n == 0) return 0;
 
+    if (e->append) e->offset = e->size;     /* O_APPEND：写前先移到末尾 */
+
     if (e->offset + n > e->size) {
         if (!fd_grow(e, e->offset + n)) return -1;
     }
@@ -512,7 +529,7 @@ int fd_selftest(void (*out)(const char *)) {
     fd_close(&t, fd);
 
     /* 4) 写模式建文件，write 内容，close 落盘 */
-    fd = fd_open(&t, "FDTEST.TXT", O_WRONLY);
+    fd = fd_open(&t, "FDTEST.TXT", O_WRONLY | O_CREAT | O_TRUNC);
     int ok4 = (fd >= 0);
     out("  open FDTEST.TXT (write/create): ");
     out(ok4 ? "yes [OK]\n" : "NO [FAIL]\n");

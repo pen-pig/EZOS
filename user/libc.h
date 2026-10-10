@@ -15,6 +15,23 @@
 #ifndef LIBC_H
 #define LIBC_H
 
+/* ---- open 的 flags：必须与内核 fd.h 逐位一致 ----
+ * 访问模式（O_RDONLY/O_WRONLY/O_RDWR）+ 可组合的创建/截断/追加位。
+ * 以前这里只定义了 0/1/2 三个值，写文件靠"O_WRONLY 隐含创建+截断"，
+ * 既不标准也让调用方无法表达"只写但别截断"。 */
+#define O_RDONLY  0
+#define O_WRONLY  1
+#define O_RDWR    2
+#define O_CREAT   0x40
+#define O_EXCL    0x80
+#define O_TRUNC   0x200
+#define O_APPEND  0x400
+
+/* lseek 的 whence */
+#define SEEK_SET  0
+#define SEEK_CUR  1
+#define SEEK_END  2
+
 /* ---- crt0.asm 提供的基础系统调用封装（链接时由 crt0.o 解析） ---- */
 int write(int fd, const void *buf, unsigned int n);
 int read(int fd, void *buf, unsigned int n);

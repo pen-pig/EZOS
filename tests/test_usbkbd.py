@@ -6,7 +6,9 @@
 4493-4498。
 
 本步验证 H2-2d 的三件事：
-  1. 认领 HID boot 键盘并切 boot 协议 -> "USB-KBD: boot kbd ... proto=ok idle=ok"
+  1. 认领 HID boot 键盘并切 boot 协议 -> "USB-KBD: boot kbd ... proto=ok"
+     （不发 SET_IDLE：boot 协议默认 idle rate 就是无限，发了反而会让
+      QEMU 的 HID 设备中断 IN 恒 NAK，与 usbmouse.c 同一条坑）
   2. 中断 IN 轮询真的读到报告      -> "USB-KBD: report ok len=8"
   3. 报告被解析并注入键盘缓冲      -> "USB-KBD: key=<ascii> mod=<hex>"
 

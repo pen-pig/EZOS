@@ -9,7 +9,6 @@
 #define IRQ11 43
 #define IRQ12 44
 
-void isr_install(void);
 void irq_install(void);
 void pit_init(void);
 

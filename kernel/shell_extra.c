@@ -472,18 +472,6 @@ void cmd_unalias(const char *args) {
     ezos_console_write(": not found\n");
 }
 
-/* sleep: RDTSC 忙等延时（近似，QEMU 下按 ~1GHz TSC 估算） */
-static void x_delay_ticks(uint64_t ticks) {
-    uint64_t elapsed = 0;
-    uint32_t start;
-    __asm__ __volatile__("rdtsc" : "=a"(start) : : "edx");
-    while (elapsed < ticks) {
-        uint32_t now;
-        __asm__ __volatile__("rdtsc" : "=a"(now) : : "edx");
-        elapsed += (uint32_t)(now - start);
-        start = now;
-    }
-}
 
 /* uptime: 开机时长（PIT 1000Hz tick 计） */
 void cmd_uptime(const char *args) {
@@ -1869,7 +1857,12 @@ void cmd_sleep(const char *args) {
         return;
     }
     if (ms > 60000) ms = 60000;
-    x_delay_ticks((uint64_t)ms * 1000000ull);  /* 约 1ms/1e6 ticks（QEMU 近似） */
+    /* 走调度器的定时睡眠：1000Hz PIT 到期由 task_timer_tick 置 READY。
+     * 以前是 RDTSC 忙等并按"TSC ≈ 1GHz"折算——频率随机器/KVM/省电变化，
+     * 这个常数一错就是好几倍误差；而且忙等把 CPU 占死，别的任务一口都
+     * 吃不到。现在真睡眠，shell 顺便让出 CPU。 */
+    static wait_queue_t wq_sleep;      /* 无人 wake，纯靠超时唤醒 */
+    task_sleep(&wq_sleep, (uint32_t)ms);
     ezos_console_write("Done (");
     ezos_console_print_dec(ms);
     ezos_console_write(" ms).\n");
@@ -2144,6 +2137,92 @@ const char *shell_extra_help(const char *cmd) {
     if (x_strcasecmp(cmd, "snake") == 0) {
         return "snake - play snake game (arrows, P pause, Esc quit)\n  usage: snake";
     }
+    /* 下面这批以前没有 help 条目：`help <cmd>` 静默什么都不打印，等于
+     * 命令存在但查不到用法。补齐后新增命令必须同时在这里登记——
+     * tests/test_help.py 会拿命令表和这里的键做差集守护。 */
+    if (x_strcasecmp(cmd, "fsck") == 0) {
+        return "fsck - check the mounted volume for inconsistencies\n"
+               "  usage: fsck";
+    }
+    if (x_strcasecmp(cmd, "crc16") == 0) {
+        return "crc16 <file> - CRC-16 of a file\n  usage: crc16 README.TXT";
+    }
+    if (x_strcasecmp(cmd, "crc32") == 0) {
+        return "crc32 <file> - CRC-32 of a file\n  usage: crc32 README.TXT";
+    }
+    if (x_strcasecmp(cmd, "crc32c") == 0) {
+        return "crc32c <file> - CRC-32C (Castagnoli) of a file\n  usage: crc32c README.TXT";
+    }
+    if (x_strcasecmp(cmd, "md5") == 0) {
+        return "md5 <file> - MD5 digest of a file\n  usage: md5 README.TXT";
+    }
+    if (x_strcasecmp(cmd, "rmdir") == 0) {
+        return "rmdir <dir> - remove an empty directory\n  usage: rmdir docs";
+    }
+    if (x_strcasecmp(cmd, "desktop") == 0) {
+        return "desktop - enter the graphical desktop (the only way in)\n  usage: desktop";
+    }
+    if (x_strcasecmp(cmd, "exit") == 0) {
+        return "exit - this shell is the system console and cannot be left\n"
+               "  usage: exit        (prints a hint; use 'desktop' or 'shutdown')";
+    }
+    if (x_strcasecmp(cmd, "games") == 0) {
+        return "games - open the game menu\n  usage: games";
+    }
+    if (x_strcasecmp(cmd, "icalc") == 0) {
+        return "icalc - interactive calculator (blank line quits)\n  usage: icalc";
+    }
+    if (x_strcasecmp(cmd, "theme") == 0) {
+        return "theme [n] - list or switch the GUI theme\n  usage: theme\n         theme 1";
+    }
+    if (x_strcasecmp(cmd, "stack") == 0) {
+        return "stack - main stack high-water mark and budget\n  usage: stack";
+    }
+    if (x_strcasecmp(cmd, "jobs") == 0) {
+        return "jobs - list background jobs\n  usage: jobs";
+    }
+    if (x_strcasecmp(cmd, "ktask") == 0) {
+        return "ktask - spawn two kernel tasks and check they really interleave\n  usage: ktask";
+    }
+    if (x_strcasecmp(cmd, "ps") == 0) {
+        return "ps - list tasks (PID / state / switches / name)\n  usage: ps";
+    }
+    if (x_strcasecmp(cmd, "rstest") == 0) {
+        return "rstest - cross-check the C / Rust / Zig checksum implementations\n  usage: rstest";
+    }
+    if (x_strcasecmp(cmd, "uptime") == 0) {
+        return "uptime - time since boot (PIT ticks)\n  usage: uptime";
+    }
+    if (x_strcasecmp(cmd, "pci") == 0) {
+        return "pci [-v] - list PCI devices (-v adds BAR/IRQ detail)\n  usage: pci\n         pci -v";
+    }
+    if (x_strcasecmp(cmd, "crash") == 0) {
+        return "crash [pf|ud] - deliberately fault, to exercise the panic screen\n"
+               "  usage: crash pf\n         crash ud";
+    }
+    if (x_strcasecmp(cmd, "mouseproto") == 0) {
+        return "mouseproto 3|4 - PS/2 packet size (3 = no wheel, 4 = IntelliMouse)\n"
+               "  usage: mouseproto 4";
+    }
+    if (x_strcasecmp(cmd, "nic") == 0) {
+        return "nic ip <a.b.c.d> - set the static IP address\n  usage: nic ip 10.0.2.15";
+    }
+    if (x_strcasecmp(cmd, "dhcp") == 0) {
+        return "dhcp - acquire a lease via DHCP (needs an RTL8139)\n  usage: dhcp";
+    }
+    if (x_strcasecmp(cmd, "dns") == 0) {
+        return "dns [a.b.c.d | flush] - show / set / flush the DNS server\n"
+               "  usage: dns\n         dns 8.8.8.8\n         dns flush";
+    }
+    if (x_strcasecmp(cmd, "lookup") == 0) {
+        return "lookup <hostname> - resolve a name to an IPv4 address\n  usage: lookup example.com";
+    }
+    if (x_strcasecmp(cmd, "ping") == 0) {
+        return "ping <a.b.c.d | hostname> - send ICMP echo requests\n  usage: ping 10.0.2.2";
+    }
+    if (x_strcasecmp(cmd, "httpd") == 0) {
+        return "httpd - serve one HTTP request on port 80 (30s timeout)\n  usage: httpd";
+    }
     if (x_strcasecmp(cmd, "help") == 0) {
         return "help [cmd] - show this help or detailed help for a command\n  usage: help\n         help df";
     }
@@ -2289,7 +2368,9 @@ void cmd_nic(const char *args) {
     ezos_console_print_dec(net_arp_replied());
     ezos_console_write(" replied\nICMP: ");
     ezos_console_print_dec(net_icmp_replied());
-    ezos_console_write(" replied\nIRQ11: ");
+    ezos_console_write(" replied\nIP drop: ");
+    ezos_console_print_dec(net_ip_drops());
+    ezos_console_write(" (bad csum / fragment)\nIRQ11: ");
     ezos_console_print_dec(rtl8139_irq_count());
     ezos_console_write("\nUDP: ");
     ezos_console_print_dec(net_udp_rx());

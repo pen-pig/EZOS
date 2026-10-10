@@ -24,10 +24,24 @@
 #define MAX_FD_FILE    65536u          /* 单文件上限 64KB（内存句柄） */
 #define FD_MAX_NAME    64u             /* 打开时记录的文件名上限 */
 
-/* open 的 flags（教学简化：读/写/读写） */
+/* open 的 flags：与 Linux i386 的 fcntl.h 取值一致。
+ *
+ * 低 2 位是访问模式（O_ACCMODE 掩码取出）：0=只读 1=只写 2=读写。
+ * 其余是可组合的创建/截断/追加位——这些语义**必须显式给出**：以前
+ * O_WRONLY 一个人兼管"不存在就建 + 打开就截断"，既不是 POSIX 语义
+ * （POSIX 里创建是 O_CREAT、截断是 O_TRUNC），也让调用方无法表达
+ * "只写但别截断"。现在按标准拆开。
+ *
+ * 与用户态共用同一组常量：user/libc.h 里的定义必须与这里逐位相同，
+ * 否则 ring3 传进来的 flags 会被内核判成未知位而 fail closed。 */
 #define O_RDONLY  0
 #define O_WRONLY  1
 #define O_RDWR    2
+#define O_ACCMODE 3u          /* 访问模式掩码 */
+#define O_CREAT   0x40u       /* 不存在则创建 */
+#define O_EXCL    0x80u       /* 与 O_CREAT 同用时：已存在则失败 */
+#define O_TRUNC   0x200u      /* 可写打开时把长度截为 0 */
+#define O_APPEND  0x400u      /* 每次 write 前把偏移移到文件末尾 */
 
 /* lseek 的 whence */
 #define SEEK_SET  0
@@ -56,7 +70,7 @@ typedef struct {
     uint8_t  type;              /* FD_* */
     uint8_t  writable;          /* 打开时带写权限（O_WRONLY/O_RDWR） */
     uint8_t  dirty;             /* 被 write 过，close 时需落盘 */
-    uint8_t  _pad;
+    uint8_t  append;            /* O_APPEND：每次 write 先移到文件末尾 */
     uint32_t size;              /* 文件字节数 */
     uint32_t offset;            /* 当前读写偏移 */
     uint8_t *data;              /* 文件内容缓冲（FD_FILE；空文件可为 NULL） */

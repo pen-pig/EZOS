@@ -10,10 +10,6 @@ extern void irq12();
 extern void irq7s();
 extern void irq15s();
 
-void isr_install(void) {
-    /* 暂无异常处理：异常向量已装好，但暂不做具体处理 */
-}
-
 /* PIT 系统时钟 tick 计数（1000Hz，每 tick = 1ms） */
 volatile uint32_t g_pit_ticks = 0;
 

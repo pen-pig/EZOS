@@ -69,7 +69,7 @@ int net_ping(uint32_t dst_ip_be, uint32_t timeout_ms, uint32_t *rtt_ms);
  * 不做常驻监听：shell 无 Ctrl-C 中断机制，accept 常驻会让 shell 永久阻塞。 */
 int net_httpd_once(void);
 
-/* ---- DHCP 客户端（RFC 2131 简化：DISCOVER/OFFER/REQUEST/ACK） ----
+/* ---- DHCP 客户端（RFC 2131：DISCOVER/OFFER/REQUEST/ACK + T1/T2 续租） ----
  * 只能在任务上下文调用（内部睡等响应）。会覆盖 rtl8139 的 IP 配置。
  * 返回：0 = 已取得并应用租约、1 = 无服务器应答（超时）、2 = 被 NAK 或
  * 服务器给的 IP 非法、-1 = 无网卡/缓冲不足/发送失败。
@@ -117,6 +117,7 @@ uint32_t net_tcp_tx(void);
 uint32_t net_tcp_rtx(void);   /* 步骤 7.4：重传次数 */
 uint32_t net_arp_replied(void);
 uint32_t net_icmp_replied(void);
+uint32_t net_ip_drops(void);   /* 收包侧丢弃：首部校验和错 + 分片（不重组） */
 uint32_t net_arp_entries(void);
 uint32_t net_sock_count(void);
 uint32_t net_ping_reqs(void);
