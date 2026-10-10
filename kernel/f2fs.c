@@ -1680,6 +1680,33 @@ static int f2_remove_child(uint32_t parent_nid, const f2_dentry_hit *hit,
                            uint8_t *dir_node) {
     if (hit->ino < 3) return -1;
 
+    /* 1) 父目录块校验放在最前：它是纯读的。以前放在回收之后，于是
+     *    "块已经释放了才发现父块非法"会留下既泄漏又悬空的半截状态。 */
+    uint32_t pblk = f2_nat_lookup(parent_nid);
+    if (pblk == 0 || pblk < f2_main_blkaddr) return -1;
+
+    /* 2) 先摘目录项并落盘。顺序必须是"先摘链、再回收块"：
+     *    反过来的话（这里以前就是反的），一旦中途掉电/返回，就会出现
+     *    "块已标空闲、目录项却还指着它"的悬空引用——接下来的分配器会
+     *    把同一块发给两个文件，两个文件互相覆盖。先摘链则最坏只是
+     *    泄漏几个块（不可达但安全），fsck 能回收。 */
+    if (dir_node[INO_OFF_INLINE] & F2FS_INLINE_DENTRY) {
+        uint8_t *base = f2_inline_base(dir_node);
+        uint8_t *bitmap = base;
+        uint8_t *dentry = base + INLINE_DENTRY_BITMAP_SIZE +
+                          INLINE_RESERVED_SIZE;
+        uint32_t slots = (hit->name_len + F2FS_SLOT_LEN - 1) / F2FS_SLOT_LEN;
+        for (uint32_t k = 0; k < slots && hit->slot + k < NR_INLINE_DENTRY;
+             k++) {
+            uint32_t b = (uint32_t)hit->slot + k;
+            bitmap[b >> 3] &= (uint8_t)~(1u << (b & 7));
+        }
+        uint8_t *de = dentry + (uint32_t)hit->slot * SIZE_OF_DIR_ENTRY;
+        for (int k = 0; k < SIZE_OF_DIR_ENTRY; k++) de[k] = 0;
+    }
+    f2_write_block(pblk, dir_node);
+
+    /* 3) 文件已不可达，此时才回收数据块与节点块 */
     int dblk = 1;    /* 节点块本身 */
     if (f2_read_node(hit->ino, f2_wnode) == 0) {
         if (!(f2_wnode[INO_OFF_INLINE] & F2FS_INLINE_DATA)) {
@@ -1708,26 +1735,6 @@ static int f2_remove_child(uint32_t parent_nid, const f2_dentry_hit *hit,
         f2_free_block(f2_nat_lookup(hit->ino));
     }
     f2_nat_set(hit->ino, 0);
-
-    /* 摘 inline dentry 位图（常规块由 delete_file 先处理） */
-    uint32_t pblk = f2_nat_lookup(parent_nid);
-    if (pblk == 0 || pblk < f2_main_blkaddr) return -1;
-
-    if (dir_node[INO_OFF_INLINE] & F2FS_INLINE_DENTRY) {
-        uint8_t *base = f2_inline_base(dir_node);
-        uint8_t *bitmap = base;
-        uint8_t *dentry = base + INLINE_DENTRY_BITMAP_SIZE +
-                          INLINE_RESERVED_SIZE;
-        uint32_t slots = (hit->name_len + F2FS_SLOT_LEN - 1) / F2FS_SLOT_LEN;
-        for (uint32_t k = 0; k < slots && hit->slot + k < NR_INLINE_DENTRY;
-             k++) {
-            uint32_t b = (uint32_t)hit->slot + k;
-            bitmap[b >> 3] &= (uint8_t)~(1u << (b & 7));
-        }
-        uint8_t *de = dentry + (uint32_t)hit->slot * SIZE_OF_DIR_ENTRY;
-        for (int k = 0; k < SIZE_OF_DIR_ENTRY; k++) de[k] = 0;
-    }
-    f2_write_block(pblk, dir_node);
     f2_cp_commit(-dblk, -1, -1);
     return 0;
 }

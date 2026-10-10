@@ -16,6 +16,7 @@
 #include "port.h"
 #include "fsck.h"
 #include "kmalloc.h"
+#include "rtc.h"
 
 #define ATTR_READONLY  0x01
 #define ATTR_HIDDEN    0x02
@@ -1217,13 +1218,22 @@ int fat_read_dir_path(const char *path, fat_dir_entry_t *entries, int max_entrie
 
 /* ============ 写入：短名/LFN 生成与目录项写回 ============ */
 
+/* 写目录项的时间戳（CrtTime/CrtDate/LstAccDate/WrtTime/WrtDate）。
+ * 以前整段是写死的 2026-01-01 00:00:00，所有文件时间一模一样。现在取
+ * RTC；RTC 不可用才退回那个基准日期（保留原值，不把"没时钟"伪装成
+ * "有时间戳"）。 */
 static void write_timestamp(uint8_t *e) {
-    uint16_t date = 0x5C21;   /* 2026-01-01 */
-    e[14] = 0; e[15] = 0;                          /* CrtTime 00:00:00 */
-    e[16] = (uint8_t)(date & 0xFF); e[17] = (uint8_t)(date >> 8);
-    e[18] = (uint8_t)(date & 0xFF); e[19] = (uint8_t)(date >> 8);   /* LstAccDate */
-    e[22] = 0; e[23] = 0;                          /* WrtTime */
-    e[24] = (uint8_t)(date & 0xFF); e[25] = (uint8_t)(date >> 8);
+    uint16_t date = RTC_FALLBACK_DATE, time = RTC_FALLBACK_TIME;
+    rtc_time_t t;
+    if (rtc_now(&t) == 0) {
+        date = rtc_fat_date(&t);
+        time = rtc_fat_time(&t);
+    }
+    e[14] = (uint8_t)(time & 0xFF); e[15] = (uint8_t)(time >> 8); /* CrtTime  */
+    e[16] = (uint8_t)(date & 0xFF); e[17] = (uint8_t)(date >> 8); /* CrtDate  */
+    e[18] = (uint8_t)(date & 0xFF); e[19] = (uint8_t)(date >> 8); /* LstAccDate */
+    e[22] = (uint8_t)(time & 0xFF); e[23] = (uint8_t)(time >> 8); /* WrtTime  */
+    e[24] = (uint8_t)(date & 0xFF); e[25] = (uint8_t)(date >> 8); /* WrtDate  */
 }
 
 /* 判断字符是否可入 8.3 短名 */

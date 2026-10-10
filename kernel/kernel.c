@@ -14,6 +14,7 @@
 #include "stack.h"
 #include "ata.h"
 #include "pci.h"
+#include "rtc.h"
 #include "shell.h"
 #include "shell_extra.h"
 #include "task.h"
@@ -236,39 +237,36 @@ static void klog_dec32(const char *prefix, uint32_t val, const char *suffix) {
     klog(line);
 }
 
-/* RTC CMOS 读取（关 NMI，别被 BCD 编码绕进去）：寄存器 0x00 秒、0x02 分、0x04 时，
- * 0x07 日、0x08 月、0x09 年（两位，与 gfxwin 显示的时间一致）。 */
-static uint8_t rtc_read(uint8_t reg) {
-    outb(0x70, reg | 0x80);
-    return inb(0x71);
-}
-static uint8_t rtc_bcd(uint8_t v) {
-    return (uint8_t)((v & 0x0F) + ((v >> 4) * 10));
-}
+/* RTC 开机时间改用 kernel/rtc.c 的统一时钟（含 UIP 等待、BCD/二进制判别、
+ * 12/24 小时制换算、跨日时区折算）。以前这里和 gfxwin.c 各有一份 CMOS
+ * 读取，且都写 `outb(0x70, reg | 0x80)` 把 NMI 永久关掉——现在只留一份。 */
 
 /* 从 RTC 读真实启动时间（UTC+8，与 gfxwin 显示一致），prefix 由调用方给 */
 static void klog_rtc_time(const char *prefix) {
-    uint8_t sec  = rtc_bcd(rtc_read(0x00));
-    uint8_t min  = rtc_bcd(rtc_read(0x02));
-    uint8_t hour = (uint8_t)((rtc_bcd(rtc_read(0x04)) + 8) % 24);
-    uint8_t day  = rtc_bcd(rtc_read(0x07));
-    uint8_t mon  = rtc_bcd(rtc_read(0x08));
-    uint8_t year = rtc_bcd(rtc_read(0x09));
+    rtc_time_t t;
+    if (rtc_now(&t) != 0) {
+        klog("RTC: no usable CMOS clock (timestamps fall back to 2026-01-01)");
+        return;
+    }
     char buf[64];
     int n = 0;
     const char *p = prefix;
     while (*p && n < (int)sizeof(buf) - 20) buf[n++] = *p++;
-    buf[n++] = (char)('0' + year / 10); buf[n++] = (char)('0' + year % 10);
+    uint16_t y = t.year;
+    buf[n++] = (char)('0' + (y / 1000) % 10);
+    buf[n++] = (char)('0' + (y / 100) % 10);
+    buf[n++] = (char)('0' + (y / 10) % 10);
+    buf[n++] = (char)('0' + y % 10);
     buf[n++] = '-';
-    buf[n++] = (char)('0' + mon / 10); buf[n++] = (char)('0' + mon % 10);
+    buf[n++] = (char)('0' + t.month / 10); buf[n++] = (char)('0' + t.month % 10);
     buf[n++] = '-';
-    buf[n++] = (char)('0' + day / 10); buf[n++] = (char)('0' + day % 10);
+    buf[n++] = (char)('0' + t.day / 10);   buf[n++] = (char)('0' + t.day % 10);
     buf[n++] = ' ';
-    buf[n++] = (char)('0' + hour / 10); buf[n++] = (char)('0' + hour % 10);
+    buf[n++] = (char)('0' + t.hour / 10);  buf[n++] = (char)('0' + t.hour % 10);
     buf[n++] = ':';
-    buf[n++] = (char)('0' + min / 10); buf[n++] = (char)('0' + min % 10);
+    buf[n++] = (char)('0' + t.minute / 10);buf[n++] = (char)('0' + t.minute % 10);
     buf[n++] = ':';
-    buf[n++] = (char)('0' + sec / 10); buf[n++] = (char)('0' + sec % 10);
+    buf[n++] = (char)('0' + t.second / 10);buf[n++] = (char)('0' + t.second % 10);
     buf[n++] = '\0';
     klog(buf);
 }
@@ -438,9 +436,12 @@ void kernel_main(void) {
     irq_install();
     syscall_init();           /* int 0x80 DPL=3 门：用户态唯一合法陷入入口 */
     pit_init();               /* 1000Hz 系统时钟：此后的日志时间戳才是真实时间 */
+    rtc_init();               /* 读一次 CMOS 作为走时基准（此后靠 PIT 差值推进） */
     asm volatile("sti");
     klog_ok("PIT: system timer 1000Hz (channel 0 rate generator)");
-    klog_rtc_time("RTC: boot time 20");   /* 真实开机时间（CMOS BCD, UTC+8） */
+    /* 前缀只到冒号为止：年份由 klog_rtc_time 输出完整 4 位（以前前缀里
+     * 自带 "20" 再拼两位年，输出成 202026 这种六位年） */
+    klog_rtc_time("RTC: boot time ");
     klog_ok("IDT: 256 gates installed");
     klog_ok("PIC: IRQ0-15 remapped to INT 0x20-0x2f, IRQ0/1/12 enabled");
     klog_ok("ISR: 32 exception gates installed (panic screen on fault)");

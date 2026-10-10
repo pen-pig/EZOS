@@ -46,11 +46,11 @@
  *  - 资源中途失败回滚：帧列表为 .bss 静态区无需分配；PCI BAR 未编程时若基址
  *    越界或非法立即放弃该控制器，不泄漏、不继续。
  *
- * TODO(缓存一致性)：identity 映射为 WB 可缓存回写（PTE_RW）。帧列表/TD/QH
- * 都是 DMA 双向，真机上必须映射为 UC 或写完做 wbinvd/clflush，否则 HC 作为
- * 总线主控读到的是陈旧缓存、甚至读到未写回的 0x00000000（bit0=0 非终止，
- * HC 会去地址 0 取 TD，可能触发 Host System Error）。本步 QEMU 不模拟缓存
- * 一致性（设备直接读 guest RAM），故无碍；真机点亮前必须在传输步骤处理。
+ * 已处理：identity 映射是 WB 可缓存的，而帧列表/TD/QH 是 DMA 双向的，
+ * 真机上 HC 作为总线主控会读到陈旧缓存（甚至未写回的 0x00000000，
+ * 被当成非终止指针后去物理地址 0 取 TD，触发 Host System Error）。
+ * 现在每次传输在"发布链表前 / 读状态前 / 摘链后"都做一次 wbinvd
+ * （见 uhci_dma_sync）。QEMU 不模拟缓存一致性，故此处不影响现有测试。
  */
 #include "uhci.h"
 #include "pci.h"
@@ -108,8 +108,8 @@ static void u_delay_ms(uint32_t ms) {
  * 不解析 HID 报告（那是以后的小目标）。
  *
  * 传输结构全部落在 .bss（identity 映射 == 物理地址，16 字节对齐满足 UHCI
- * 对 TD/QH 的对齐要求），HC 作为总线主控直接读这块 guest RAM。QEMU 不模拟
- * 缓存一致性，无需 wbinvd（真机点亮前须在传输步处理，见文件头 TODO）。
+ * 对 TD/QH 的对齐要求），HC 作为总线主控直接读这块 guest RAM。缓存一致性
+ * 由 uhci_dma_sync()（wbinvd）保证，见文件头。
  * ========================================================================= */
 
 /* TD token PID（UHCI 1.1 spec 3.2.3） */
@@ -235,6 +235,33 @@ int uhci_port_get(int i, uint16_t *io_out, int *port_out, int *ls_out) {
  * 返回 0 成功，<0 失败（超时/硬件错误）；绝不静默挂死（超时上界 fail closed）。
  * 不可信字段上界：addr<=127、ep<=15、blen∈[0,UHCI_XFER_MAX]，越界直接放弃。
  * H2-2b 起对外导出（uhci.h）：上层枚举模块（usbenum）靠它走 USB 标准请求。 */
+/* DMA 缓存同步（真机必需，QEMU 上是无害空转）。
+ *
+ * identity 映射是 WB（写回）可缓存的，而 UHCI 的 HC 是**总线主控**：它
+ * 不经过 CPU 缓存，直接读 guest RAM。于是两个方向都会错：
+ *   写方向：CPU 刚填好的 TD/QH 还躺在缓存里没写回，HC 读到的是旧内容，
+ *           最坏是全 0 —— link 字段 bit0=0 被当成"非终止"，HC 会去
+ *           物理地址 0 取下一个 TD，直接触发 Host System Error。
+ *   读方向：HC 回写的 TD status / IN 数据被 CPU 的陈旧缓存行挡住，
+ *           于是轮询永远看不到 ACTIVE 清零，表现为"传输超时"。
+ * wbinvd 把回写和作废一起做了（QEMU 不模拟缓存，这条指令在那里只是
+ * 慢一点）。真机若要性能，正确做法是把这几块结构映射成 UC / 用
+ * clflush 逐行刷；但先保证不出错。 */
+static void uhci_dma_sync(void) {
+    __asm__ __volatile__("wbinvd" : : : "memory");
+}
+
+/* 轮询循环里用的节流版：wbinvd 冲刷**整个**缓存，一次几十到几百微秒，
+ * 而轮询循环一毫秒能跑几万次——每次都刷会把 USB 传输拖垮。HC 回写状态
+ * 最快也是按帧（1ms）粒度，所以一个 tick 刷一次足够。 */
+static uint32_t g_dma_sync_tick;
+static void uhci_dma_sync_tick(void) {
+    if (g_pit_ticks != g_dma_sync_tick) {
+        g_dma_sync_tick = g_pit_ticks;
+        uhci_dma_sync();
+    }
+}
+
 int uhci_control_xfer(uint16_t io, uint8_t addr, uint8_t ep,
                       const uint8_t *setup, int dir_in,
                       uint8_t *buf, int blen, int lowspeed, int *actlen) {
@@ -305,11 +332,13 @@ int uhci_control_xfer(uint16_t io, uint8_t addr, uint8_t ep,
      * g_qh[0]**（曾把它清成 terminate，把 bulk QH 从链上摘掉——症状是
      * 控制传输全部正常而 bulk 传输一个包都发不出去）。 */
     g_qh[1] = U32PTR(&g_td[0]);                  /* 元素指针 -> TD0 (vertical) */
+    uhci_dma_sync();                             /* 推给 HC 之前先写回 */
 
     /* 轮询完成（以 g_pit_ticks 1ms 为基准，超时 fail closed 不挂死） */
     uint32_t t0 = g_pit_ticks;
     int done = 0;
     while ((uint32_t)(g_pit_ticks - t0) < UHCI_XFER_TO_MS) {
+        uhci_dma_sync_tick();                     /* 重读 TD 状态前先作废缓存 */
         uint32_t s0 = g_td[0][1];
         uint32_t s1 = g_td[1][1];
         uint32_t s2 = g_td[2][1];
@@ -322,6 +351,7 @@ int uhci_control_xfer(uint16_t io, uint8_t addr, uint8_t ep,
     }
     /* 不论成功失败，把控制 QH 的 element 拉回终止（T），防 HC 反复重跑本链路 */
     g_qh[1] = 0x1u;
+    uhci_dma_sync();                             /* 摘链同样要写回 */
 
     if (!done) {
         char line[128]; int li = 0; int lim = (int)sizeof(line) - 1;
@@ -335,6 +365,7 @@ int uhci_control_xfer(uint16_t io, uint8_t addr, uint8_t ep,
     }
 
     /* 检查致命硬件错误位（fail closed，不打 silent） */
+    uhci_dma_sync();
     uint32_t s0 = g_td[0][1], s1 = g_td[1][1], s2 = g_td[2][1];
     if ((s0 & UHCI_TD_FATAL) || (s1 & UHCI_TD_FATAL) || (s2 & UHCI_TD_FATAL)) {
         char line[128]; int li = 0; int lim = (int)sizeof(line) - 1;
@@ -396,16 +427,19 @@ int uhci_interrupt_in(uint16_t io, uint8_t addr, uint8_t ep,
 
     /* 挂上：中断 QH 的 element -> 中断 TD（Q=0 纵向） */
     g_iqh[1] = U32PTR(&g_itd[0]);
+    uhci_dma_sync();                            /* 推给 HC 之前先写回 */
 
     uint32_t t0 = g_pit_ticks;
     int done = 0;
     while ((uint32_t)(g_pit_ticks - t0) < UHCI_INTR_TO_MS) {
+        uhci_dma_sync_tick();                    /* 读 TD 状态前先作废缓存 */
         uint32_t s = g_itd[1];
         if ((s & UHCI_TD_ACTIVE) == 0u) { done = 1; break; }
         if (s & UHCI_TD_FATAL) break;                   /* fail closed，不空等 */
     }
     /* 撤下：防 HC 反复重跑同一个已完成的 TD */
     g_iqh[1] = 0x1u;
+    uhci_dma_sync();
 
     uint32_t st = g_itd[1];
     if (!done) return -1;
@@ -488,6 +522,7 @@ int uhci_bulk_xfer(uint16_t io, uint8_t addr, uint8_t ep,
 
     /* 挂上 bulk QH（element -> TD0，Q=0 纵向），逐包串行等待 */
     g_bqh[1] = U32PTR(&g_btd[0]);
+    uhci_dma_sync();
 
     int total = 0;
     int fail = 0;
@@ -496,6 +531,7 @@ int uhci_bulk_xfer(uint16_t io, uint8_t addr, uint8_t ep,
         int naks = 0;
         int done = 0;
         while ((uint32_t)(g_pit_ticks - t0) < UHCI_BULK_TO_MS) {
+            uhci_dma_sync_tick();
             uint32_t st = g_btd[i][1];
             if (st & UHCI_TD_ACTIVE) continue;             /* HC 还在跑 */
             if (st & UHCI_TD_NAK) {
@@ -506,6 +542,7 @@ int uhci_bulk_xfer(uint16_t io, uint8_t addr, uint8_t ep,
                 g_btd[i][1] = (st & ~(uint32_t)UHCI_TD_NAK & ~0x7FFu)
                             | UHCI_TD_ACTIVE | UHCI_TD_ERR3 | ls
                             | (dir_in ? UHCI_TD_SPD : 0u);
+                uhci_dma_sync();       /* 重新激活的那个字必须先写回 */
                 continue;
             }
             if (st & (UHCI_TD_FATAL | UHCI_TD_STALL)) { fail = 1; break; }
@@ -526,6 +563,7 @@ int uhci_bulk_xfer(uint16_t io, uint8_t addr, uint8_t ep,
 
     /* 撤下：防 HC 反复重跑已完成的 TD 链 */
     g_bqh[1] = 0x1u;
+    uhci_dma_sync();
 
     if (fail) {
         char line[128]; int li = 0; int lim = (int)sizeof(line) - 1;

@@ -5,6 +5,7 @@
 #include "port.h"
 #include "fsck.h"
 #include "kmalloc.h"
+#include "rtc.h"
 
 static exfat_info_t exfat_info;
 static int exfat_ready = 0;
@@ -200,10 +201,19 @@ uint16_t exfat_name_hash_c(const uint16_t *name, int name_len) {
     return hash;
 }
 
-// 写 FAT 风格时间戳（固定 2026-01-01 00:00:00）
+// 写 exFAT 时间戳（DOS 打包格式：日期 16 位 + 时间 16 位）。
+// 以前是写死的 2026-01-01 00:00:00 —— 于是所有文件的创建/修改时间都一样，
+// 拷到别的机器上看不出先后。现在取 RTC；RTC 不可用才退回那个基准日期
+// （退回值保持原样，避免把"没时钟"伪装成"有时间戳"）。
 static void exfat_write_timestamp(uint8_t *dst) {
-    *((uint16_t*)(dst)) = 0x5C21;    // 日期: (2026-1980)<<9 | 1<<5 | 1
-    *((uint16_t*)(dst + 2)) = 0x0000; // 时间: 00:00:00
+    uint16_t date = RTC_FALLBACK_DATE, time = RTC_FALLBACK_TIME;
+    rtc_time_t t;
+    if (rtc_now(&t) == 0) {
+        date = rtc_fat_date(&t);
+        time = rtc_fat_time(&t);
+    }
+    dst[0] = (uint8_t)(date & 0xFF); dst[1] = (uint8_t)(date >> 8);
+    dst[2] = (uint8_t)(time & 0xFF); dst[3] = (uint8_t)(time >> 8);
 }
 
 // 计算 entry set 需要的条目数（0x85 + 0xC0 + ceil(name_len/15) 个 0xC1）

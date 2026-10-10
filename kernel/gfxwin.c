@@ -39,6 +39,7 @@ extern void terminal_set_gfx_hook(void (*fn)(const char *));
 #include "fs.h"
 #include "games.h"
 #include "isr.h"
+#include "rtc.h"
 
 /* 前置声明：定义顺序在调用之后（gw_spawn_app / gw_demo 使用） */
 void gw_redraw_region(int x, int y, int w, int h);
@@ -1132,9 +1133,15 @@ void gw_draw_taskbar(void)
     }
 
     /* 时钟 HH:MM + 小通知图标（GNOME 居中，Win10 靠右） */
-    uint8_t hour = (uint8_t)((gw_bcd(gw_cmos_read(0x04)) + 8) % 24);   /* UTC+8 */
-    uint8_t minute = (uint8_t)gw_bcd(gw_cmos_read(0x02));
-    if (minute > 59) minute = 0;   /* CMOS 无效值（BCD 0xFF -> 105）clamp */
+    /* 走统一的 RTC（kernel/rtc.c）：桌面时钟与文件时间戳必须是同一个
+     * 时间源，否则会出现"屏幕显示 2026-10-10、文件却是 2026-01-01"。 */
+    rtc_time_t rt;
+    uint8_t hour, minute;
+    if (rtc_now(&rt) == 0) {
+        hour = rt.hour; minute = rt.minute;
+    } else {
+        hour = 0; minute = 0;
+    }
     char tbuf[8];
     tbuf[0] = '0' + hour / 10; tbuf[1] = '0' + hour % 10;
     tbuf[2] = ':';
@@ -2099,18 +2106,15 @@ static void clock_draw(gw_window_t *w)
     if (r < 16) r = 16;
     int cy = oy + 12 + r;
 
-    uint8_t hour = (uint8_t)gw_bcd(gw_cmos_read(0x04));
-    uint8_t minute = (uint8_t)gw_bcd(gw_cmos_read(0x02));
-    uint8_t second = (uint8_t)gw_bcd(gw_cmos_read(0x00));
-    uint8_t day = (uint8_t)gw_bcd(gw_cmos_read(0x07));
-    uint8_t month = (uint8_t)gw_bcd(gw_cmos_read(0x08));
-    /* CMOS 无效值（如全 0xFF，BCD 解码可到 105）clamp 到合法范围，
-     * 防止 second/minute 超过 59 越界读 gw_sin128/gw_cos128（仅 60 项） */
-    if (hour > 23) hour = 0;
-    if (minute > 59) minute = 0;
-    if (second > 59) second = 0;
-    if (day < 1 || day > 31) day = 1;
-    if (month < 1 || month > 12) month = 1;
+    /* 同上，走统一 RTC。rtc_now 已保证字段合法，不需要再 clamp。 */
+    rtc_time_t rt;
+    uint8_t hour, minute, second, day, month;
+    if (rtc_now(&rt) == 0) {
+        hour = rt.hour; minute = rt.minute; second = rt.second;
+        day = rt.day;  month = rt.month;
+    } else {
+        hour = minute = second = 0; day = 1; month = 1;
+    }
 
     gw_draw_circle(cx, cy, r, 0x333333u);
     gw_draw_circle(cx, cy, r - 1, 0x333333u);

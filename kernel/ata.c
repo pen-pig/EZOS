@@ -213,6 +213,37 @@ uint32_t ata_capacity(uint8_t drive) {
     return n;
 }
 
+/* 发一条 48 位 LBA 的 PIO 命令（READ SECTORS EXT 0x24 / WRITE EXT 0x34）。
+ *
+ * 为什么需要：ata_capacity() 在设备支持 LBA48 时读的是字 100-103（64 位
+ * 扇区数），返回的上限是 0xFFFFFFFE（2TB）；而读写一直只发 28 位 LBA 的
+ * 0x20/0x30。LBA28 的编址上限是 0x0FFFFFFF（128GB）——超过它的扇区号，
+ * 高 4 位会被 `(lba >> 24) & 0x0F` 静默丢掉，于是"读第 3 亿个扇区"变成
+ * "读第 3 亿 mod 2^28 个扇区"。这不是报错，是**读到错误的扇区还返回成
+ * 功**，文件系统会把别人的元数据当自己的解析。
+ * 现在：超过 LBA28 上限一律走 48 位命令；设备不支持则命令被 ABRT，
+ * ata_wait_idle 会看到 ERR 并返回 -1（fail closed，而不是读错盘）。
+ *
+ * 48 位寄存器写法（ATA/ATAPI-6 7.x）：每个寄存器先写高字节、再写低字节，
+ * 最后 device 寄存器只带 LBA 位（bit6）与从设备位（bit4），不再放 LBA
+ * 的 24-27 位（那 4 位改由 LBA Low 的高字节字节承载）。 */
+static void ata_cmd_lba48(uint16_t base, uint8_t drive, uint32_t lba,
+                          uint8_t cmd) {
+    outb(base + 2, 0);                                   /* 扇区数 高 */
+    outb(base + 2, 1);                                   /* 扇区数 低 = 1 */
+    outb(base + 3, (uint8_t)((lba >> 24) & 0xFF));       /* LBA 24-31 */
+    outb(base + 3, (uint8_t)(lba & 0xFF));               /* LBA 0-7   */
+    outb(base + 4, 0);                                   /* LBA 32-39：lba 是 32 位，恒 0 */
+    outb(base + 4, (uint8_t)((lba >> 8) & 0xFF));        /* LBA 8-15  */
+    outb(base + 5, 0);                                   /* LBA 40-47：同上 */
+    outb(base + 5, (uint8_t)((lba >> 16) & 0xFF));       /* LBA 16-23 */
+    outb(base + 6, ((drive & 1) ? 0x50 : 0x40));         /* LBA48 */
+    outb(base + 7, cmd);
+}
+
+/* LBA28 编址上限：28 位可用（0x0FFFFFFF） */
+#define ATA_LBA28_MAX   0x0FFFFFFFu
+
 int ata_read_sector(uint8_t drive, uint32_t lba, uint8_t *buffer) {
     if (drive >= NVME_DRIVE_BASE) {
         return nvme_read_sector((uint8_t)(drive - NVME_DRIVE_BASE), lba, buffer);
@@ -230,12 +261,16 @@ int ata_read_sector(uint8_t drive, uint32_t lba, uint8_t *buffer) {
     if (drive > 3) return -1;
     if (ata_select(drive) != 0) return -1;
 
-    outb(base + 2, 1);                          /* sector count */
-    outb(base + 3, (uint8_t)(lba & 0xFF));
-    outb(base + 4, (uint8_t)((lba >> 8) & 0xFF));
-    outb(base + 5, (uint8_t)((lba >> 16) & 0xFF));
-    outb(base + 6, ((drive & 1) ? 0xF0 : 0xE0) | ((lba >> 24) & 0x0F));
-    outb(base + 7, 0x20);                       /* READ SECTORS */
+    if (lba <= ATA_LBA28_MAX) {
+        outb(base + 2, 1);                          /* sector count */
+        outb(base + 3, (uint8_t)(lba & 0xFF));
+        outb(base + 4, (uint8_t)((lba >> 8) & 0xFF));
+        outb(base + 5, (uint8_t)((lba >> 16) & 0xFF));
+        outb(base + 6, ((drive & 1) ? 0xF0 : 0xE0) | ((lba >> 24) & 0x0F));
+        outb(base + 7, 0x20);                       /* READ SECTORS */
+    } else {
+        ata_cmd_lba48(base, drive, lba, 0x24);      /* READ SECTORS EXT */
+    }
 
     if (ata_wait_idle(base) != 0) return -1;
     if (ata_wait_drq(base) != 0) return -1;
@@ -265,12 +300,16 @@ int ata_write_sector(uint8_t drive, uint32_t lba, const uint8_t *buffer) {
     if (drive > 3) return -1;
     if (ata_select(drive) != 0) return -1;
 
-    outb(base + 2, 1);                          /* sector count */
-    outb(base + 3, (uint8_t)(lba & 0xFF));
-    outb(base + 4, (uint8_t)((lba >> 8) & 0xFF));
-    outb(base + 5, (uint8_t)((lba >> 16) & 0xFF));
-    outb(base + 6, ((drive & 1) ? 0xF0 : 0xE0) | ((lba >> 24) & 0x0F));
-    outb(base + 7, 0x30);                       /* WRITE SECTORS */
+    if (lba <= ATA_LBA28_MAX) {
+        outb(base + 2, 1);                          /* sector count */
+        outb(base + 3, (uint8_t)(lba & 0xFF));
+        outb(base + 4, (uint8_t)((lba >> 8) & 0xFF));
+        outb(base + 5, (uint8_t)((lba >> 16) & 0xFF));
+        outb(base + 6, ((drive & 1) ? 0xF0 : 0xE0) | ((lba >> 24) & 0x0F));
+        outb(base + 7, 0x30);                       /* WRITE SECTORS */
+    } else {
+        ata_cmd_lba48(base, drive, lba, 0x34);      /* WRITE SECTORS EXT */
+    }
 
     if (ata_wait_idle(base) != 0) return -1;
     if (ata_wait_drq(base) != 0) return -1;
